@@ -483,6 +483,10 @@ enum Cmd {
         out: String,
         #[arg(long)]
         out_pin: String,
+        /// The run's `cal.json` with its Q1 calibration, whose per-fragment decision
+        /// tolerances `features.q1_consistency` reads the Q1 decisions against.
+        #[arg(long)]
+        q1_cal: Option<String>,
         #[arg(long)]
         config: Option<String>,
     },
@@ -2323,10 +2327,20 @@ fn real_main() -> Result<()> {
             seed_psms,
             out,
             out_pin,
+            q1_cal,
             config,
         } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            // `features.q1_consistency` reads the decisions against the run's tolerances.
+            let q1_tolerances = match (&q1_cal, cfg.features.q1_consistency) {
+                (Some(cal), _) => Some(stages::q1frag::read_model(cal)?.tolerances),
+                (None, true) => anyhow::bail!(
+                    "features.q1_consistency needs the run's cal.json with its Q1 \
+                     calibration: pass --q1-cal"
+                ),
+                (None, false) => None,
+            };
             stages::features::run(stages::features::FeaturesParams {
                 psms: &psms_extracted,
                 chromatograms: &chromatograms,
@@ -2338,6 +2352,7 @@ fn real_main() -> Result<()> {
                 // `retrace.apex_features` names the column a retraced psms_extracted
                 // carries; it is read only while the ion-mobility family is on.
                 imc_ref_w: cfg.retrace.apex_features,
+                q1_tolerances,
             })?;
         }
         Cmd::Prescan {

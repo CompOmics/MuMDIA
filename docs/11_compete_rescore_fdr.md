@@ -681,6 +681,25 @@ The library fragments are read in the library's order, the order of the decision
 window test's count does not depend on it. Deterministic: rows are examined independently
 and the pools are sorted.
 
+### rescore: the prefilter and feature families appended to the vector
+
+The classifier reads every column of the competed table's feature list (its `.schema.json`
+companion), so a family the features stage appends (`features.q1_fragment_features`,
+`features.ms1_envelope`, `features.q1_consistency`, ...) reaches it without a rescore change.
+The rescore prefilter (`rescore.prefilter_keep_decoys`, on for pools of at least
+`rescore.prefilter_min_psms` PSMs, docs/35_diapasef.md section 16) does not: its logistic
+regression reads `rescore.prefilter_features`, a fixed default list of 32 columns when unset,
+so an appended family acts only on the rows the prefilter keeps, and a real PSM the prefilter
+removes never reaches it. With `features.q1_consistency` on, four of that family's columns
+(`q1consist::PREFILTER`: `q1c_pred_share`, `q1c_entropy`, `q1c_soft_pred`, `q1c_offset_wmean`)
+join the default list when the competed table carries them (`rescore::prefilter_columns`); an
+explicit `rescore.prefilter_features` is taken as it is, and a table without the family keeps
+the 32 columns, so every other search is unchanged. Measured on ZT Scan REP01 with four NN
+seeds (docs/37_ztscan.md, section 5): on top of the family, +0.7 points of human precursors at
+the base arm's measured entrapment FDP (100,394 against 99,718; seed ranges 100,122-100,681 and
+99,341-99,999) and +0.6% precursors on the human library (102,077 against 101,446). The
+prefilter saw no other family; the rows it removes are where a new family's evidence is lost.
+
 ### rescore: the multi-context q columns
 
 The q columns are computed without per-row staging copies: the pooled PSM q reads

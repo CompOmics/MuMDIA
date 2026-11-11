@@ -3142,6 +3142,20 @@ pub struct FeaturesConfig {
     /// from the canonical configuration at its default.
     #[serde(skip_serializing_if = "is_false")]
     pub q1_deconvolved: bool,
+    /// The Q1-consistency family of scanning-quadrupole spectra (`q1c_*`,
+    /// `stages::q1consist`): the per-fragment Q1 decisions of `extract.q1_fragments` (which it
+    /// needs) read against each fragment's EXPECTED Q1 centre rather than the centre the
+    /// candidate's fragments share, so a precursor whose shared fit an interferer pulled away
+    /// keeps the evidence of its own fragments: how many are consistent (within the learned
+    /// offset tolerance), their share of the predicted and of the observed intensity, the
+    /// agreement of their observed pattern with the prediction, and graded and soft versions of
+    /// the cut: sixteen `q1c_*` columns appended after every other column of the `extended` set.
+    /// With them in the competed table, four join the rescore prefilter's default columns. The
+    /// tolerances come from the run's Q1 calibration (`cal.json`; `mumdia features --q1-cal`).
+    /// Default false; in `configs/examples/ztscan.json`. Benchmark-gated (docs/10_features.md,
+    /// docs/37_ztscan.md). Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_false")]
+    pub q1_consistency: bool,
 }
 impl Default for FeaturesConfig {
     fn default() -> Self {
@@ -3169,6 +3183,7 @@ impl Default for FeaturesConfig {
             q1_precursor: false,
             q1_multiscale: false,
             q1_deconvolved: false,
+            q1_consistency: false,
         }
     }
 }
@@ -6485,6 +6500,13 @@ impl Config {
                 )));
             }
         }
+        if self.features.q1_consistency && !ex.q1_fragments {
+            return Err(Invalid(
+                "features.q1_consistency reads the per-fragment Q1 decision columns that \
+                 extract.q1_fragments writes; set it as well"
+                    .into(),
+            ));
+        }
         if self.rescore.shadow_q1 {
             if !ex.q1_fragments {
                 return Err(Invalid(
@@ -8232,6 +8254,31 @@ mod tests {
         ] {
             assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
         }
+    }
+
+    /// `features.q1_consistency` is omitted at its default, part of the identity when set,
+    /// and refused without the per-fragment Q1 decisions it reads.
+    #[test]
+    fn the_q1_consistency_key_leaves_the_default_config_hash_alone() {
+        let canon = Config::default().canonical_json();
+        assert!(!canon.contains("q1_consistency"), "{canon}");
+        let on = Config::from_json(
+            r#"{"rt_im_train":{"q1_calibrate":true},"extract":{"q1_fragments":true},
+                "features":{"q1_consistency":true}}"#,
+        )
+        .unwrap();
+        assert!(on.features.q1_consistency);
+        let c = on.canonical_json();
+        assert!(c.contains(r#""q1_consistency":true"#), "{c}");
+        let off = Config::from_json(
+            r#"{"rt_im_train":{"q1_calibrate":true},"extract":{"q1_fragments":true}}"#,
+        )
+        .unwrap();
+        assert_ne!(off.canonical_json(), c);
+        assert!(
+            Config::from_json(r#"{"features":{"q1_consistency":true}}"#).is_err(),
+            "q1_consistency without extract.q1_fragments must be refused"
+        );
     }
 
     /// The phase-3 keys of the ZT Scan plan (`quant.q1_*`, `features.ms1_envelope`) are

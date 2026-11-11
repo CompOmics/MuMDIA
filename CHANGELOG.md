@@ -376,6 +376,21 @@ than a number. Both are recorded in every run's `manifest.json`.
   -8.4% at 2 steps, -38% (both); a real fragment's trace merges with other ions of its m/z, so a
   hard count removes real evidence with the interference. Kept off and out of the recipe
   (docs/09_extract.md, section 14).
+- **A Q1-consistency feature family for ZT Scan DIA, opt-in (`features.q1_consistency`).**
+  The per-fragment Q1 decisions of `extract.q1_fragments` read against each fragment's
+  expected Q1 centre rather than the centre the candidate's fragments share, which an
+  interferer can pull away so that none belongs: sixteen `q1c_*` columns appended last under
+  `extended` (consistent fragments, with and without the 2D-correlation floor; their predicted
+  and observed shares; entropy and cosine similarity of their elution-peak sums to the
+  prediction; graded and soft variants of the cut; their mean 2D correlation; the weighted and
+  top-3 offsets), with the run's learned decision tolerances (`mumdia features --q1-cal` for a
+  standalone run). When the competed table carries them, four of the columns join the rescore
+  prefilter's default list. Found by an information-gap analysis at a matched classifier score
+  and screened against fifteen other candidate families; measured on REP01 with four NN seeds:
+  +2.28% human precursors at a matched entrapment FDP (+2.97% with the prefilter columns),
+  +1.85% precursors on the human library (+2.48%), the measured FDP at a reported 1% falling
+  from 1.28% to 1.20%. In `configs/examples/ztscan.json`; off by default and omitted from the
+  canonical configuration (docs/10_features.md, docs/37_ztscan.md section 5).
 
 ### Fixed
 

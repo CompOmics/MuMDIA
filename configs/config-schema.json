@@ -3293,6 +3293,21 @@
       "source_struct": "FeaturesConfig"
     },
     {
+      "path": "features.q1_consistency",
+      "name": "q1_consistency",
+      "section": "features",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "The Q1-consistency family of scanning-quadrupole spectra (`q1c_*`, `stages::q1consist`): the per-fragment Q1 decisions of `extract.q1_fragments` (which it needs) read against each fragment's EXPECTED Q1 centre rather than the centre the candidate's fragments share, so a precursor whose shared fit an interferer pulled away keeps the evidence of its own fragments: how many are consistent (within the learned offset tolerance), their share of the predicted and of the observed intensity, the agreement of their observed pattern with the prediction, and graded and soft versions of the cut: sixteen `q1c_*` columns appended after every other column of the `extended` set. With them in the competed table, four join the rescore prefilter's default columns. The tolerances come from the run's Q1 calibration (`cal.json`; `mumdia features --q1-cal`). Default false; in `configs/examples/ztscan.json`. Benchmark-gated (docs/10_features.md, docs/37_ztscan.md). Omitted from the canonical configuration at its default.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "FeaturesConfig"
+    },
+    {
       "path": "compete.group_by",
       "name": "group_by",
       "section": "compete",
