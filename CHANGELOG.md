@@ -366,7 +366,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   to 40, methionine oxidation and protein N-terminal acetylation as variable modifications, at
   most two a peptide, and precursors inside the range the files sweep (the lowest target minus
   the half-width to the highest plus it, rounded outward, following the half-width), so a
-  library built from a FASTA, by DIA-NN or the built-in predictors, the size estimate and the
+  library built from a FASTA, whichever predictor builds it, the size estimate and the
   library cache key follow them, and a note under the checkbox says what was set. When the
   recipe goes off they are taken back, except a value the user edited since; the two
   modifications are added to the user's choice and never saved as their preference.
