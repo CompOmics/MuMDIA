@@ -649,7 +649,7 @@ can be required to share the apex 1/K0 (`shadow_im_tolerance`, docs/35_diapasef.
 The isolation window is the one the precursor m/z falls in (the last window starting at
 or below it). On a scanning-quadrupole sweep every step is a window of its own, 0.76 m/z
 apart on ZT Scan, so that test pairs only precursors within one step of each other, which
-are also the ones a Q1 test cannot tell apart. **`rescore.shadow_q1`** (default false;
+are also the ones a Q1 test cannot tell apart. **`rescore.shadow_q1`** (automatic for ZT Scan files;
 needs `extract.q1_fragments` and `shadow_min_shared > 0`) replaces it on the runs whose
 `psms_extracted` carries the per-fragment Q1 decisions (docs/09_extract.md, section 12):
 

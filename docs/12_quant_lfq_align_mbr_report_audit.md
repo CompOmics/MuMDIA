@@ -1170,7 +1170,8 @@ Cost: the collapse adds about 1.4 s to a run's quant (2.4 s against 1.0 s per pa
 threads), mostly reading the spectra's sweep and the decisions. All four keys stay off: no
 known-ratio measurement and no second acquisition.
 
-Since the gain is the span, **`quant.q1_cycle_halfwidth`** (default 0, off) states the fixed
+Since the gain is the span, **`quant.q1_cycle_halfwidth`** (4 for a ZT Scan search
+automatically, 0 for every other) states the fixed
 window's half-width in Q1 cycles: on spectra that record the sweep each candidate's half-width
 in samples is the key times its samples per cycle (the median count of its trace's samples in
 one cycle), or the key itself on the cycle traces of `q1_fragments`; on any other run
@@ -1851,9 +1852,9 @@ FDR/reporting).
   ([Quantification from the fragments that belong](#quantification-from-the-fragments-that-belong-quantq1_fragments-zt-scan-dia));
   each omitted from the canonical configuration at its default, and the last three refused
   without the first.
-- `q1_cycle_halfwidth` (0, off): the fixed window's half-width in Q1 cycles on spectra that
-  record the sweep (docs/37_ztscan.md, section 6); omitted from the canonical configuration
-  at its default, refused without the scan form of the fixed window and with
+- `q1_cycle_halfwidth` (`"auto"`: 4 for a ZT Scan search, 0 otherwise): the fixed window's
+  half-width in Q1 cycles on spectra that record the sweep (docs/37_ztscan.md, section 6);
+  omitted from the canonical configuration while unset or 0, refused without the scan form of the fixed window and with
   `fixed_scan_halfwidth_scale`.
 
 **`quant-lfq`** takes no config struct; `--method` (maxlfq/directlfq) and `--normalize`

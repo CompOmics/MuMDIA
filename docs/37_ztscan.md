@@ -3,26 +3,125 @@
 
 This guide describes how MuMDIA reads, searches and quantifies SCIEX ZT Scan DIA runs, in
 which the quadrupole sweeps the precursor range instead of stepping through fixed windows.
-Section 1 describes the acquisition, section 2 how a run is read and recognised before a
-search, section 3 the opt-in model of the sweep layer by layer, section 4 how to run it,
+The section after this introduction says what is automatic for a ZT Scan file and how to
+turn it off. Section 1 describes the acquisition, section 2 how a run is read and recognised
+before a search, section 3 the model of the sweep layer by layer, section 4 how to run it,
 section 5 what was measured, section 6 the quantification window in Q1 cycles, section 7 the
 gate on the fragments that belong that was measured and not added, section 8 where time and
 memory go, section 9 what is refused, section 10 the unfragmented precursor, multi-scale Q1
 scores and Q1-deconvolved evidence, section 11 the library, section 12 the recipe as released,
-measured, section 13 why deamidation must be left out, and section 14 what is open. Reading a ZT
-Scan file
-needs one key (`convert.isolation_half_width`); everything that models the sweep is off by
-default, and `configs/examples/ztscan.json` is the recipe that turns on what measured
-positive. The mechanisms each have a canonical section elsewhere (docs/04, 08, 09, 10, 11 and
-12), which this guide routes to rather than restates.
+measured, section 13 why deamidation must be left out, and section 14 what is open. Since 0.12.0
+a search of ZT Scan files reads them with the half-width their isolation census suggests and
+runs the ZT Scan analysis, the keys of section 3 that measured positive, by default, whatever
+configuration it starts from; no other search does, and every other search runs exactly as
+before. `configs/examples/ztscan.json` writes the same keys out explicitly. The mechanisms each
+have a canonical section elsewhere (docs/04, 08, 09, 10, 11 and 12), which this guide routes to
+rather than restates.
 
 Every measurement here is on one acquisition: three K562 replicates on a ZenoTOF 8600 (100
 ng, 15 min gradient, Q1 window 3.8 m/z), with an imported spectral library restricted to the
 scanned 392-900 m/z and predicted decoys, and the same library extended with yeast and E.
-coli entries for entrapment (r = 0.397, combined FDP = N_E (1 + 1/r) / (N_H + N_E)). That is
-why no default changes: CLAUDE.md asks for a second acquisition, and the ZenoTOF ZT Scan
-files of the benchmark collection are vendor files whose conversion with isolation targets
-is a licence decision (section 14).
+coli entries for entrapment (r = 0.397, combined FDP = N_E (1 + 1/r) / (N_H + N_E)). CLAUDE.md
+asks for a second acquisition before a default changes; the ZT Scan analysis is the default for
+ZT Scan files by the user's decision (2026-11-11), and the second acquisition is still owed: the
+ZenoTOF ZT Scan files of the benchmark collection are vendor files whose conversion with
+isolation targets is a licence decision (section 14).
+
+## Automatic for ZT Scan files
+
+**The gate.** `mumdia run` and `run-experiment` read the head of every input once, before the
+configuration is hashed (`mumdia::ztscan`): the first 10,000 spectra of an mzML, spectrum
+metadata only, streamed from the start of the file without its index
+(`stages::convert::census_of_head`), and the isolation census of section 2 on them, the rule
+`convert` refuses by. An input is a ZT Scan run when its MS2 spectra name differing isolation
+targets and no window (`convert_refuses`) in the layout of a scanning quadrupole
+(`scanning_quadrupole`: at least 50 distinct targets, repeating cycle after cycle, in steps
+under 1.5 m/z). That is exactly the file `convert` reads into spectra_ms2 v3, the version that
+records the Q1 sweep (`q1_cycle`, `q1_step`) every key of the analysis reads. A file whose first
+64 MS2 spectra state their windows (or isolate nothing) is settled there; a diaPASEF `.d`, a
+Thermo `.raw` read natively and a file that cannot be read are not read at all, and are never
+ZT Scan runs. A ZT Scan file converted with window offsets (a converter that writes the Q1
+window as the offsets) is read as fixed windows and is not recognised: the sweep is recorded
+only for spectra that name their targets alone.
+
+**What is automatic.** Every key below is `"auto"` (or unset) by default and resolves once per
+search (`Config::resolve_ztscan`); on a ZT Scan search it takes the value in the second
+column unless the configuration rules it out, and on every other search it is off:
+
+| key | on a ZT Scan search | held off when |
+|---|---|---|
+| `convert.isolation_half_width` | the census's suggestion: 2.5 steps, rounded to 0.05 m/z (1.9 for the K562 method) | (a value set is kept) |
+| `rt_im_train.q1_calibrate` | on | `groups.window_groups > 1`; nothing reads it (`extract.q1_fragments = false`, or `extract.q1_cycles`, and `extract.q1_deconvolved` off) |
+| `extract.q1_fragments` | on | the calibration is off; `extract.q1_cycles` |
+| `features.q1_fragment_features`, `q1_precursor`, `q1_multiscale`, `q1_deconvolved`, `q1_consistency` | on | `extract.q1_fragments` is off; `features.set` other than `extended` |
+| `retrace.q1_repick` (`q1_repick_peaks` stays 5) | on | `extract.q1_fragments` is off; `extract.promote_top_peaks > 1`, `extract.apex_refine_intensity` or `retrace.repick` |
+| `rescore.shadow_q1` | on | `extract.q1_fragments` is off; `rescore.shadow_min_shared = 0` |
+| `quant.q1_cycle_halfwidth` | 4 | `groups.window_groups > 1`; a fixed window other than the scan form |
+
+When a key is held off on ZT Scan input the log says which and why. These are the keys
+`configs/examples/ztscan.json` sets (an engine test holds the two lists equal): the imported-library
+recipe (`configs/examples/diann-library.json`) resolved on a ZT Scan run has exactly the
+canonical configuration of `ztscan.json`, and so the same configuration hash and the same
+tables (section 12). What stays opt-in, as before: the classifier's sensitivity settings
+(section 4), the counts of Q1-consistent peaks (`extract.q1_deconvolved`,
+`search_seed.q1_deconvolved`, section 10.3), `features.ms1_envelope`, `quant.q1_fragments`,
+`extract.q1_cycles`, `extract.q1_profile`, `features.q1_features`, and the MS1 calibration keys
+of docs/09 section 11.
+
+**Spelling, and the configuration hash.** Each switch takes `"auto"`, `true` or `false`;
+`quant.q1_cycle_halfwidth` a number of cycles (0 is off), `"auto"` or `null`;
+`convert.isolation_half_width` a half-width in m/z, `"auto"` or `null`. `"auto"` and off are
+left out of the canonical configuration, so a search of any other data keeps the configuration
+hash it had before the keys were automatic (validated table by table against v0.11.1, section
+12); on a ZT Scan search the resolved values are part of it, and the manifest records them.
+
+**Turning it off.** Set a key to `false` (`quant.q1_cycle_halfwidth` to 0). A key turned off
+takes the keys that read it along (`extract.q1_fragments = false` turns off the calibration,
+the feature families, the re-pick and the shadow term, and leaves the cycle window), with a
+warning naming them. With every key off a ZT Scan file is searched as section 2 reads it, with
+the half-width alone, which hashes and writes as the half-width alone always did (section 12).
+The desktop application's "ZT Scan analysis (recommended)" checkbox, ticked for ZT Scan files,
+writes exactly these off values when it is cleared.
+
+**What is refused.** An explicit `true` (a number above 0 for the cycle window, a
+`retrace.q1_repick_peaks` other than 5, or one of the opt-in keys that read the sweep) on a
+search with no ZT Scan input is refused before any work, naming the keys: they read the Q1
+sweep, which no other input has. So is one in an experiment that mixes ZT Scan and other runs
+(below). A file that names differing targets and no offsets in a layout that is not a scanning
+quadrupole is refused up front, as `convert` refuses it, unless `convert.isolation_half_width`
+is set; ZT Scan inputs whose censuses suggest different half-widths (two methods in one
+experiment) need it set too, because one configuration reads them all.
+
+**Experiments that mix ZT Scan and other runs.** The pooled rescore needs one feature set for
+every run, and the ZT Scan analysis adds columns no other run has, so when only some runs of an
+experiment are ZT Scan runs every key resolves off for all of them, with a warning that
+recommends searching the ZT Scan files separately. The ZT Scan runs are still read with the
+census's half-width (the half-width does not touch a file that states its windows), so the
+experiment runs, with the reading of section 2 for its ZT Scan runs.
+
+**Standalone stages.** Only `run` and `run-experiment` detect a ZT Scan run and calibrate its
+Q1 sweep (`mumdia rt-im-train` reads no spectra). `mumdia convert` reads a ZT Scan file with the
+census's half-width; every other standalone stage reads `"auto"` as off. To run the analysis
+stage by stage, or to rescore a ZT Scan run's competed table with `mumdia rescore`, set the keys
+explicitly: `configs/examples/ztscan.json` does.
+
+**A library built from the FASTA.** The library settings of section 11 are not applied by the
+engine. They were measured with an imported library predicted by another predictor, the
+engine's own digest and predictors (charge 1 and protein N-terminal acetylation included) were
+not measured with them, and a FASTA library's search space and its library cache key are what
+the configuration states. For ZT Scan input with a library built from the FASTA, `run` warns
+with each setting that differs from section 11 (and with deamidation of N or Q, section 13);
+the desktop application sets them in its Search space card while the analysis is on.
+
+**Measured with the automatic default** (section 12, "Automatic for ZT Scan files, measured"):
+REP01 searched with the imported-library recipe, which names no ZT Scan key, writes the competed
+table and every seed's scored table of the released recipe byte for byte (105,788 precursors on
+the human library, 103,327 human precursors at a combined entrapment FDP of 1.22%), and searched
+as one experiment the three runs give the released recipe's experiment byte for byte (119,932
+precursors); with every key off it writes the
+half-width reading of the release candidate byte for byte; an experiment of a ZT Scan run and an
+Astral run runs without the analysis, as designed; and seven standard searches of other data
+write every table byte for byte as v0.11.1 did.
 
 ## 1. What a ZT Scan run is
 
@@ -44,16 +143,18 @@ knows the cycles (section 6).
 ## 2. Reading it, and knowing before a run
 
 The SCIEX MS Data Converter writes each step as an MS2 spectrum that names its isolation
-target and no window offsets. `convert` refuses such a file unless
-`convert.isolation_half_width` gives the window's half-width: read as before, every
-spectrum covered the whole m/z range, the run became one isolation window and extract grew
-past 500 GB (docs/04_convert.md, "SCIEX ZT Scan DIA", has the converters, the refusal rule
-and the measurements). With the key each step is a window `[target - h, target + h]` and
-convert records the sweep (spectra_ms2 v3: `q1_cycle`, `q1_step`). The half-width the file
-does not record has to come from the method: 1.9 m/z for the 3.8 m/z window, and 1.5, 1.9
-and 2.3 identified the same within one seed's noise.
+target and no window offsets. Read as such a file used to be read, every spectrum covered the
+whole m/z range, the run became one isolation window and extract grew past 500 GB, so
+`convert` reads it only with a half-width (docs/04_convert.md, "SCIEX ZT Scan DIA", has the
+converters, the refusal rule and the measurements): each step is then a window
+`[target - h, target + h]`, and convert records the sweep (spectra_ms2 v3: `q1_cycle`,
+`q1_step`). The half-width the file does not record has to come from the method: 1.9 m/z for
+the 3.8 m/z window, and 1.5, 1.9 and 2.3 identified the same within one seed's noise. Since
+0.12.0 it is the census's suggestion below unless `convert.isolation_half_width` is set
+("Automatic for ZT Scan files"); any other file that names its targets alone is refused
+without the key, as before.
 
-`mumdia peak-census` tells before a run whether a file needs the key. For an mzML its JSON
+`mumdia peak-census` tells before a run what a file is. For an mzML its JSON
 carries an `isolation` block, from the spectra it reads (`--max-spectra 10000`, the sample
 `convert` decides its refusal on: 15 cycles of the K562 method, about 2 s on a 42 GB file,
 most of it reading the file's index), computed with the rule `convert` refuses by
@@ -71,47 +172,52 @@ most of it reading the file's index), computed with the rule `convert` refuses b
 }
 ```
 
-`convert_refuses` is what `convert` does without the key: MS2 spectra that name differing
+`convert_refuses` says the file needs a half-width: MS2 spectra that name differing
 targets and no offsets. `scanning_quadrupole` is the layout the refusal names (at least 50
 distinct targets repeating cycle after cycle in steps under 1.5 m/z). The suggestion is
 `SCANNING_HALF_WIDTH_STEPS` (2.5) steps, a window five steps wide, rounded to 0.05 m/z: the
 measured method's 3.8 m/z window over 0.7614 m/z steps. It is a starting point, not a
 measurement of the file: the Q1 calibration (section 3) fits an effective window of about
 5.1 m/z with soft edges on the same runs, and a method with a different window per step
-needs its own half-width. A target-only file that is not a scanning quadrupole (fixed
-windows whose converter dropped the offsets) is refused with no suggestion: converting the
-vendor file again with offsets is the better fix.
+needs its own half-width (set `convert.isolation_half_width` to half its Q1 window). A
+target-only file that is not a scanning quadrupole (fixed windows whose converter dropped the
+offsets) is refused with no suggestion: converting the vendor file again with offsets is the
+better fix. A file with `convert_refuses` and `scanning_quadrupole` is a ZT Scan run, which is
+the gate of the automatic analysis; a search reads the same census of its inputs with a
+streaming reader that skips the peak arrays and the file's index.
 
 The desktop application asks the same census of every selected mzML when it is added
 (`scanning_probe`, of the first 10,000 spectra of each, four files at a time, vendor files not
-probed because the census would convert them first). When one of them would be refused it
+probed because the census would convert them first). When one of them needs a half-width it
 shows a "SCIEX ZT Scan DIA" card on the Search screen: what the file is (the positions, step
-and cycle from the census), why it
-cannot be read without the half-width, an input filled with the suggestion (a value the user
-types is kept), and a checkbox for the ZT Scan recipe on top of the chosen preset, enabled only
-when every selected file is a scanning-quadrupole run, because the recipe's keys refuse
-spectra without a sweep. The checkbox is ticked whenever it is enabled, until the user ticks or
-clears it: a ZT Scan file cannot be searched without the half-width, and the recipe is the best
-measured configuration for it (section 12); it never appears for any other file. While the
-recipe is on, the Search space card holds the library settings of section 11 (charges 1-4,
-lengths 6-40, methionine oxidation and protein N-terminal acetylation as variable
+and cycle from the census), the half-width the engine reads it with (the suggestion; a value
+the user types is kept and written into the configuration), and a checkbox "ZT Scan analysis
+(recommended)". The engine runs the analysis for ZT Scan files by itself, so the console writes
+none of its keys while the box is ticked; cleared, it writes every key off ("Automatic for ZT
+Scan files", `ztscan_off`). The box is enabled only when every selected file is a ZT Scan run
+(a mixed selection is searched without the analysis, which the card says) and ticked whenever
+it is enabled, until the user ticks or clears it; it never appears for any other file. While
+the analysis is on, the Search space card holds the library settings of section 11 (charges
+1-4, lengths 6-40, methionine oxidation and protein N-terminal acetylation as variable
 modifications, at most two a peptide, and precursors inside the swept range, which follows the
 half-width), so a library built from a FASTA, the size estimate and the library cache key follow
 them; when it goes off they are taken back, except a value the user edited since. When
 deamidation of N or Q is selected for a ZT Scan run the card says why to leave it out (section
-13); nothing refuses it. A search with
-such a file and no half-width is not started; the recipe is refused with bands, which
-`rt_im_train.q1_calibrate` refuses.
+13); nothing refuses it. A search with a file that needs a half-width the census cannot suggest
+(not a scanning quadrupole) and none typed is not started; the analysis is refused with bands,
+which `rt_im_train.q1_calibrate` refuses.
 
 ## 3. The model of the sweep, layer by layer
 
-Each layer is one opt-in key, off by default and omitted from the canonical configuration, so
-every other search is byte-identical. Measured on REP01 with four NN seeds per arm (section
-5); "in the recipe" is `configs/examples/ztscan.json`.
+Each layer is one key, omitted from the canonical configuration unless it is on, so every
+other search is byte-identical. Measured on REP01 with four NN seeds per arm (section 5); "in the
+recipe" is `configs/examples/ztscan.json`, and each key in it is automatic: on for a ZT Scan
+search unless the configuration rules it out, off for every other search ("Automatic for ZT Scan
+files"). The others stay opt-in.
 
-| layer | key | canonical section | measured | in the recipe |
+| layer | key | canonical section | measured | in the recipe (automatic) |
 |---|---|---|---|---|
-| read each step as a window, record the sweep | `convert.isolation_half_width` | docs/04, "SCIEX ZT Scan DIA" | required to read the file at all | yes (1.9) |
+| read each step as a window, record the sweep | `convert.isolation_half_width` | docs/04, "SCIEX ZT Scan DIA" | required to read the file at all | yes (1.9; automatically the census's suggestion) |
 | sum a cycle's steps, a Q1-profile family, a gate on it | `extract.q1_cycles`, `extract.q1_profile`, `extract.q1_gate_max_offset`, `features.q1_features` | docs/09, section 10 | summing -13.7%; the profile family +0.4% inside seed noise; the gate cuts targets and decoys alike | no |
 | calibrate the Q1 window from the seed | `rt_im_train.q1_calibrate` | docs/08, section 4h | the target is the window centre; an effective window wider and softer than nominal; changes no identification by itself | yes (the decisions need it) |
 | MS1 error surface and an MS1 tolerance from the seed | `extract.ms1_calibrate = "surface"`, `extract.prec_tol_auto` | docs/09, section 11 | +0.46% precursors, inside seed noise | no |
@@ -129,7 +235,7 @@ every other search is byte-identical. Measured on REP01 with four NN seeds per a
 | the three together | (the three keys) | section 10 below | +0.76% precursors, +1.38% human precursors at matched FDP, beyond the seed spread on both libraries | |
 | count only Q1-consistent peaks in the seed, in extract | `search_seed.q1_deconvolved`, `extract.q1_deconvolved` | docs/07, docs/09 section 14 | -2.5% (seed), -25.6% (extract), -38% (both) | no |
 | score each fragment's Q1 centre against its expected one | `features.q1_consistency` | docs/10, "q1_consistency" | on top of the four: +2.97% human precursors at the measured FDP and +2.48% precursors on the human library (the family alone, its columns kept out of the rescore prefilter: +2.28% and +1.85%) | yes |
-| the library's search space: charges 1-4, lengths 6-40, protein N-terminal acetylation, two variable modifications | the library build (`digest.*`, `peptidoforms.*`, or the predictor of an imported library) | section 11 below | +3.47% precursors, +4.09% human precursors at matched FDP, the measured FDP 1.18% against 1.22%; two missed cleavages -1.0% | the desktop sets it with the recipe |
+| the library's search space: charges 1-4, lengths 6-40, protein N-terminal acetylation, two variable modifications | the library build (`digest.*`, `peptidoforms.*`, or the predictor of an imported library) | section 11 below | +3.47% precursors, +4.09% human precursors at matched FDP, the measured FDP 1.18% against 1.22%; two missed cleavages -1.0% | the desktop sets it with the analysis; `run` names what differs for a FASTA library |
 | the sensitivity rescore | `rescore.folds` 5, `rescore.train_margin_frac` 0.75, `rescore.seeds` 3 | docs/28, section 21; section 11 below | on the section 11 library +1.24% / +0.57% at matched FDP; on top of the released recipe +0.82% / +0.78% (section 12), for 2-6x the rescore time | no (an option for a final pass, section 4) |
 | N/Q deamidation in the library | the library build | section 13 below | precursors +80%, half of them isotope aliases of co-eluting unmodified peptides, at a decoy and entrapment FDP that read as valid; peptides -11%, protein groups -7% | no (leave it out; the desktop warns) |
 
@@ -145,12 +251,13 @@ the library of section 11.
 
 ## 4. How to run it
 
-Check the environment against the recipe first. It is the imported-library recipe
-(`configs/examples/diann-library.json`: the `nn_torch` classifier, DeepLC for the library's
-retention times, both interpreters `"auto"`) plus the keys of section 3:
+The analysis is automatic, so a ZT Scan run is searched with any configuration; the measured
+one is the imported-library recipe (`configs/examples/diann-library.json`: the `nn_torch`
+classifier, DeepLC for the library's retention times, both interpreters `"auto"`). Check the
+environment against it first:
 
 ```text
-mumdia doctor --config configs/examples/ztscan.json
+mumdia doctor --config configs/examples/diann-library.json
 ```
 
 One run, and the three replicates as one experiment (pooled rescore, second pass, per-run and
@@ -158,19 +265,26 @@ cross-run quantification):
 
 ```text
 mumdia run --lib-precursors lib/lib_precursors.parquet --lib-fragments lib/lib_fragments.parquet \
-  --mzml REP01.mzML --out-dir out_rep01 --config configs/examples/ztscan.json
+  --mzml REP01.mzML --out-dir out_rep01 --config configs/examples/diann-library.json
 
 mumdia run --lib-precursors lib/lib_precursors.parquet --lib-fragments lib/lib_fragments.parquet \
   --mzml REP01.mzML --mzml REP02.mzML --mzml REP03.mzML --out-dir out_k562 \
-  --config configs/examples/ztscan.json
+  --config configs/examples/diann-library.json
 ```
 
-- Change `convert.isolation_half_width` to half of your method's Q1 window (`mumdia
-  peak-census` suggests one, section 2).
+The log names the inputs it recognised and the keys it turned on (`run: SCIEX ZT Scan DIA
+input ...`). `configs/examples/ztscan.json` is the same configuration with the keys written out;
+it searches ZT Scan files identically and refuses any other file, and it is what a stage run
+standalone (or `mumdia rescore` of a ZT Scan run's competed table) needs, because a standalone
+stage reads `"auto"` as off.
+
+- If the method's Q1 window is not five steps wide, set `convert.isolation_half_width` to half
+  of it (`mumdia peak-census` shows the suggestion and the step, section 2).
 - Build the library with the settings of section 11: charges 1-4, lengths 6-40, methionine
   oxidation and protein N-terminal acetylation, at most two variable modifications, and the
   precursor range the method scanned (here 392-900 m/z; the sweep covers nothing outside it).
-  The desktop application sets them when the recipe is on.
+  The desktop application sets them while the analysis is on; for a library the engine
+  builds from a FASTA, `run` names each setting that differs.
 - Uncapped peaks (the default `--top-peaks-ms2 0`): ZT Scan spectra hold about 800 peaks
   each (p25 545, p95 1,078 at the start of the run).
 - Expect about 30 min and 43 GB for one run with the section 11 library on 64 threads, and
@@ -178,15 +292,15 @@ mumdia run --lib-precursors lib/lib_precursors.parquet --lib-fragments lib/lib_f
   second-pass extracts (section 12; on the base library the recipe before the feature
   families took 18.5 min and 35 GB on 32 threads, with the three families of section 10 20 min
   and 40 GB, section 10.7).
-- The recipe is refused with `groups.window_groups > 1` (the Q1 calibration needs the whole
-  sweep), so a machine too small for one run cannot band it; the base reading
-  (`isolation_half_width` alone) can be banded.
+- With `groups.window_groups > 1` the analysis stays off (the Q1 calibration needs the whole
+  sweep, and the explicit keys are refused), so a machine too small for one run searches the
+  bands with the base reading (`isolation_half_width` alone).
 - For a final pass, the classifier's sensitivity settings (`rescore.folds` 5,
   `rescore.train_margin_frac` 0.75, `rescore.seeds` 3) add 0.6-0.8% on top of everything the
   recipe sets, beyond the seed spread on both libraries (sections 5 and 12), for two to six
   times the rescore wall (13.5 min against 2.6 min for one run on the shared hosts of section 5,
   "Features for the classifier"; 2-3x, 8-14% of a run, on the 64-thread hosts of section 12);
-  they are not in the recipe.
+  they are not in the recipe and not automatic.
 
 ## 5. Measured results
 
@@ -537,8 +651,15 @@ byte; 2 is the setting to take when extract's time matters more than half a perc
 
 ## 9. What is refused
 
-- A file whose MS2 spectra name differing isolation targets and no offsets, without
-  `convert.isolation_half_width` (convert, before the first 10,000 such spectra are read).
+- A file whose MS2 spectra name differing isolation targets and no offsets in a layout that is
+  not a scanning quadrupole, without `convert.isolation_half_width` (`run` and `run-experiment`
+  before any work; convert, before the first 10,000 such spectra are read). A ZT Scan file is
+  read with the census's half-width.
+- A key of the ZT Scan analysis set to `true` (a number above 0 for `quant.q1_cycle_halfwidth`,
+  a `retrace.q1_repick_peaks` other than 5), or an opt-in key that reads the sweep, in a search
+  with no ZT Scan input or in an experiment that mixes ZT Scan and other runs (before any
+  work); ZT Scan inputs whose censuses suggest different half-widths, without
+  `convert.isolation_half_width`.
 - An extraction whose estimated hit store passes the machine's memory, which is what a ZT
   Scan run read as one all-ion window does (`extract.max_footprint_gib`, docs/09).
 - Every sweep key on a layout that is not a scanning quadrupole, on spectra with 1/K0, and,
@@ -763,7 +884,8 @@ their features are label-blind. So `configs/examples/ztscan.json` sets `features
 carry most of it: leaving the multi-scale family out costs 0.34% on the entrapment library, and
 the set was measured as a whole. The keys that count only Q1-consistent peaks
 (`search_seed.q1_deconvolved`, `extract.q1_deconvolved`) lose identifications at every
-tolerance and stay off and out of the recipe. No default changes (section 14).
+tolerance and stay off and out of the recipe. The three families are automatic for ZT Scan
+files since 0.12.0, as the rest of the recipe is ("Automatic for ZT Scan files").
 
 ## 11. The library for a ZT Scan search
 
@@ -915,6 +1037,70 @@ the feature families 118,385, 94,130, 9,230 and 114,249 / 114,362 / 114,373. The
 the one the 4-cycle window gives (section 6); the feature families change no trace. The peak is
 the concurrent second-pass extracts of the three runs (section 10.8).
 
+### Automatic for ZT Scan files, measured
+
+The final 0.12.0 build (rust tree 3ea88f24, `mumdia 0.12.0` sha256 `478e244ab92d…`), each arm on
+the host and with the thread count of the arm it is compared with, `MUMDIA_CACHE_DIR=off`.
+
+**ZT Scan files with a configuration that names no ZT Scan key.** REP01 with the imported-library
+recipe (`configs/examples/diann-library.json`, nothing else set) on the section 11 libraries, 64
+threads, against the released-recipe arms above (seeds 1-3 rescore the competed table with
+`configs/examples/ztscan.json`, since a standalone `mumdia rescore` reads `"auto"` as off):
+
+| library (host) | competed table | scored tables, seeds 0-3 | precursors at 1%, mean (range) | human precursors at a combined FDP of 1.22% / 1.0%, mean | FDP at a reported 1% |
+|---|---|---|---|---|---|
+| human (horntail) | md5 `bf23794b…`, the released recipe's | byte-identical to the released recipe's, each seed | 105,788 (105,400-106,059) | | |
+| entrapment (hippogriff) | md5 `d486f285…` (the released arm kept its scored tables only) | byte-identical to the released recipe's, each seed | 103,129 (102,854-103,481) | 103,327 / 100,971 | 1.15-1.18% |
+
+The resolved configuration is the recipe's: the manifests differ from those of the released
+arms only in the three sensitivity keys those arms were run with. One run took 26:50 (human) and
+27:18 (entrapment) at a 40-42 GB peak. The probe of the input took 0.86 s on the 42 GB REP01 over
+the network share.
+
+The three runs as one experiment with the same configuration (horntail, 64 threads, NN seed 0):
+the scored tables of both passes byte for byte those of the released recipe's experiment, and the
+configuration hash equal to it (`152d60ec…`): 119,932 precursors, 95,345 peptides and 9,303
+protein groups at 1%, 116,007 / 115,876 / 116,074 precursors per run on `run_psm_q`, in 71:44
+at a 100 GB peak. The single run's hash is the same, so the imported-library recipe resolved on
+ZT Scan input is the released recipe, as the engine's test asserts.
+
+**Every key off.** REP01, human library (ashwinder, 64 threads): the configuration above with every
+automatic key set to `false` (0 for the cycle window), against the 0.12.0 release candidate that
+had no automatic keys (sha256 `2affb97b…`) with `convert.isolation_half_width` 1.9 alone: 16 of 16
+Parquet tables byte-identical, the configuration hashes equal, 100,416 precursors, 80,738
+peptides and 7,726 protein groups at 1% in both (15 min each).
+
+**An experiment that mixes ZT Scan and other runs.** REP01 with the Astral HeLa QC run of the
+single-cell study (140 samples a day) as one experiment, the human library of section 11, the
+imported-library recipe, 64 threads (ashwinder): the warning of "Automatic for ZT Scan files",
+`convert.isolation_half_width` 1.9 and no ZT Scan key in the resolved configuration; REP01 read
+into spectra_ms2 v3 (3,238 cycles of 663 steps) and the HeLa run into v1 with its own windows;
+both runs scored with one feature set (426 features, one schema id); 101,176 precursors, 82,295
+peptides and 8,963 protein groups at 1%, 99,248 and 17,092 precursors per run on `run_psm_q`,
+in 17:47. `configs/examples/ztscan.json` (every key explicit) was refused before any work on the
+same pair (4 s, the probe of the inputs) and on the HeLa run alone (0.1 s), and so was one
+explicit key (`quant.q1_cycle_halfwidth` 4) on the HeLa run. `mumdia convert` with no
+configuration read the head of REP01 into spectra_ms2 v3 with the half-width 1.9; the release
+candidate without the automatic keys refused it.
+
+**Every other search.** Against v0.11.1, each set twice on one host (v0.11.1, then this build):
+
+| set (host, threads) | precursors (peptides) at 1%, both builds | comparison |
+|---|---|---|
+| ProteoBench Astral HYE, 6 runs (doxy, 64) | 145,067 (126,514) | 136 / 136 Parquet tables byte-identical, 4 / 4 TSVs equal |
+| ProteoBench diaPASEF HYE, 6 runs, native `.d` (demiguise, 48) | 107,020 (96,298) | 158 / 158, 4 / 4 |
+| Q Exactive AIF E. coli entrapment run (hippogriff, 32) | 11,815 real precursors at FDP 1% | 15 / 15, 3 / 3 |
+| ProteoBench Astral entrapment, 3 runs (hippogriff, 32) | 90,347 (79,728) | 73 / 73, 4 / 4 |
+| single-cell Astral HeLa QC, species-entrapment library (dementor, 32) | 16,208 real precursors at FDP 1% | 19 / 19, 3 / 3 |
+| single cell Cell_A C10 (dementor, 32) | (6,271) | 19 / 19, 3 / 3 |
+| `ci/smoke.sh` (hippogriff) | SMOKE_OK | 1,863 / 1,863 |
+
+The configuration hash, every content hash and every schema version in the reports and
+manifests are equal (in the smoke test, except two searches whose configuration names a directory
+of the smoke's own output); what differs is the version, timings and paths. Each of these searches
+read the head of its inputs and found no ZT Scan run, which costs reading the first 64 MS2
+spectra of an mzML (nothing for a `.d`).
+
 ## 13. Deamidation aliases the 13C isotope: leave it out
 
 On ZT Scan the Q1 window passes a precursor's whole isotope envelope into every MS2 step that
@@ -954,8 +1140,10 @@ ZT Scan card when deamidation of N or Q is selected for a ZT Scan run; nothing r
   foreign-species nulls), which would settle both gates at once, but as `.wiff`/`.wiff2`
   files. The converters that write their isolation targets (the SCIEX MS Data Converter, or
   ProteoWizard built with the vendor readers) carry a vendor licence, and whether to accept it
-  is the user's decision; until then no ZT Scan key can become a default (CLAUDE.md), and the
-  suggested half-width (five steps) is unverified on those methods. The collection's
+  is the user's decision. The ZT Scan analysis became the default for ZT Scan files without
+  it, by the user's decision (2026-11-11), where CLAUDE.md asks for a second acquisition first:
+  until it is measured, the analysis, and the suggested half-width (five steps), are unverified
+  on any other method. The collection's
   TripleTOF 6600 Scanning SWATH arm (PXD028735) has one pure-human run converted to mzML
   already, but its spectra carry the 1 m/z bin as their window rather than the quadrupole's,
   so the sweep model would first need a convert key that replaces those offsets with the

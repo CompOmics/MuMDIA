@@ -146,13 +146,14 @@ Key semantics:
   target without offsets once the file names more than one (it used to read them
   as one all-ion window, and extract then grew past 521 GB) and names the
   scanning-quadrupole layout; `convert.isolation_half_width` (half the Q1 window,
-  1.9 for 3.8 m/z; unset and hash-neutral by default) reads each bin as
-  `[target - h, target + h]`, byte-identical to a rewrite that adds the offsets.
+  1.9 for 3.8 m/z) reads each bin as `[target - h, target + h]`, byte-identical to a
+  rewrite that adds the offsets. Unset (the default) it is the census's suggestion
+  for a scanning quadrupole and stays unset for any other file, which is still
+  refused (see "The ZT Scan analysis is automatic for ZT Scan files" below).
   msconvert 3.0.25036 writes such a `.wiff2` with no precursor at all, which only
   extract's footprint guard (`extract.max_footprint_gib`, auto = the machine's
-  memory) stops. By default the engine does not model the Q1 sweep across bins
-  (the opt-in keys are under "Changes that remain benchmark-gated");
-  `docs/04_convert.md` "SCIEX ZT Scan DIA" has the measured recipe.
+  memory) stops. `docs/04_convert.md` "SCIEX ZT Scan DIA" has the measurements and
+  docs/37 the guide.
 - An imported library row with an empty `protein` is grouped as `UNASSIGNED` at
   load, with a warning that counts the rows (DIA-NN writes the iRT-kit standards
   without a protein); `scripts/import_diann_lib.py` writes the same group at
@@ -948,6 +949,32 @@ Open: seeds; the measured FDP at a reported q of 1% is still 1.25-1.39% on the A
 HeLa entrapment pool (DIA-NN 0.48%), so compare at a measured FDP; the immuno gain has
 no entrapment check; 3 ppm MS1 is unmeasured on timsTOF.
 
+## The ZT Scan analysis is automatic for ZT Scan files (2026-11-11)
+
+By the user's decision for 0.12.0, a search of SCIEX ZT Scan DIA files runs the ZT Scan
+analysis by default, and no other search does (docs/37_ztscan.md, "Automatic for ZT Scan
+files"). One gate, `mumdia::ztscan`: `run` and `run-experiment` read the head of every input
+before the configuration is hashed, and an input is a ZT Scan run when the isolation census
+`convert` refuses by calls its MS2 spectra a scanning quadrupole that names its targets alone.
+The keys (`rt_im_train.q1_calibrate`, `extract.q1_fragments`, the five `features.q1_*`
+families, `retrace.q1_repick`, `rescore.shadow_q1`, `quant.q1_cycle_halfwidth` 4, and
+`convert.isolation_half_width` the census's suggestion) are `"auto"`, resolved by
+`Config::resolve_ztscan`: on only when every input is a ZT Scan run; off, and left out of the
+canonical configuration, otherwise, so every other search is byte-identical to v0.11.1 (seven
+sets, every table). An explicit `true` without ZT Scan input, or in an experiment that mixes ZT
+Scan and other runs, is refused; a mixed experiment resolves the keys off with a warning.
+Standalone stages read `"auto"` as off; `configs/examples/ztscan.json` writes the keys out.
+
+Measured on one acquisition with entrapment (ZenoTOF 8600 K562, docs/37 section 12):
+105,788 precursors on the human library (four NN seeds) and 103,327 human precursors at a
+combined entrapment FDP of 1.22% on the entrapment library, measured FDP at a reported 1% of
+1.15-1.18%; the imported-library recipe resolved on those runs writes the recipe's tables byte
+for byte. This default did NOT pass the gate this file sets for one: a second acquisition and
+known ratios are still owed (docs/37 section 14). Do not extend it to other scanning-quadrupole
+methods, or promote the opt-in sweep keys, without them. The engine does not change a FASTA
+library's search space for ZT Scan input; it warns with the library settings of docs/37
+section 11.
+
 ## Defaults promoted on correctness grounds, not on a count
 
 Four defaults changed because the previous value was wrong on its own terms, not
@@ -1035,12 +1062,14 @@ Do not enable these by default from a single AIF count:
   gated;
 - acquisition-specific fragment/peak caps. The shipped default stays uncapped;
   see the peak-cap subsection above;
-- the scanning-quadrupole (ZT Scan DIA) model: `extract.q1_profile` with
-  `features.q1_features` measured +0.4% precursors on one ZenoTOF 8600 run (four
-  NN seeds) and +0.1% human precursors on its entrapment library at an unchanged
-  measured FDP; `extract.q1_cycles`, which sums a candidate's bins of a cycle into
-  one point, lost 12-14% and should stay off; no second ZT Scan acquisition has
-  been converted with its isolation targets (docs/09_extract.md, section 10).
+- the opt-in keys of the scanning-quadrupole (ZT Scan DIA) model, outside the
+  automatic analysis: `extract.q1_profile` with `features.q1_features` measured +0.4%
+  precursors on one ZenoTOF 8600 run (four NN seeds) and +0.1% human precursors on its
+  entrapment library at an unchanged measured FDP; `extract.q1_cycles`, which sums a
+  candidate's bins of a cycle into one point, lost 12-14% and should stay off; the
+  counts of Q1-consistent peaks lose identifications at every tolerance; no second ZT
+  Scan acquisition has been converted with its isolation targets (docs/09_extract.md,
+  section 10; docs/37 sections 10 and 14).
 
 `compete.group_by = peptidoform_charge` is the default (2026-09-06) and is
 required, not optional, for a PTM or modification search. Under `base_peptide`

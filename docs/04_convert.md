@@ -95,7 +95,8 @@ window id then deduplicates on the m/z and the 1/K0 bounds (`IsolationWindow::ke
 v3 (`SPECTRA_MS2_V3`, `artifact::spectra_ms2_q1`) is written only when
 `convert.isolation_half_width` widened the first MS2 spectrum of the file, that is for a
 scanning-quadrupole acquisition whose spectra name a target and no offsets (section "SCIEX
-ZT Scan DIA"). It is v1 plus two `u32` columns, appended last:
+ZT Scan DIA"; the half-width is automatic for such a file since 0.12.0). It is v1 plus two
+`u32` columns, appended last:
 
 | Column | Type | Meaning |
 |---|---|---|
@@ -226,7 +227,10 @@ reader plus four table writes.
      explicit offsets, so a file with offsets of `h` and the same file without them read
      with `h` give the same windows bit for bit (`the_half_width_reproduces_explicit_offsets`).
      Offsets a spectrum carries win over the key.
-   - **A target and no offsets, without the key**: written as the all-ion window, as
+   - **A target and no offsets, without the key** (since 0.12.0 `run`, `run-experiment`
+     and `mumdia convert` set it to the census's suggestion for a scanning quadrupole
+     before convert runs, so this is a file of any other layout, or `convert::run` called
+     without it): written as the all-ion window, as
      every such spectrum was until 2026-11-10, and counted by `Fold` (`TargetOnly`). A
      file whose target-only spectra name more than one target is refused, once 10,000
      of them have been seen (`TARGET_ONLY_SAMPLE`) or at the end of the file, and the
@@ -362,10 +366,13 @@ acquisition does not inflate them.
 
 ## Configuration
 
-For an mzML, convert reads one `Config` field, `convert.isolation_half_width` (unset by
-default; step 6 above and "SCIEX ZT Scan DIA" below). It is omitted from the canonical
-configuration while unset, and recorded in the spectra reports as
-`params.isolation_half_width` when set. The `config_hash` convert receives is recorded
+For an mzML, convert reads one `Config` field, `convert.isolation_half_width` (step 6 above
+and "SCIEX ZT Scan DIA" below). Unset (`null` or `"auto"`, the default) it is automatic: `run`,
+`run-experiment` and `mumdia convert` read the head of the input before the configuration is
+hashed (`mumdia::ztscan`) and set it to the isolation census's suggestion when the file is a
+scanning quadrupole that names its targets alone (SCIEX ZT Scan DIA), and leave it unset for
+every other file. It is omitted from the canonical configuration while unset, and recorded in
+the spectra reports as `params.isolation_half_width` when set. The `config_hash` convert receives is recorded
 for provenance, `config_hash = blake3(cfg.canonical_json() + separators + caps)`, so the
 config's canonical JSON is embedded in the hash. The native diaPASEF reader reads the seven `convert.tdf_*` keys
 (`TdfParams::from_config`): the centroiding tolerance, gap and floor, and the two valley
@@ -744,7 +751,7 @@ How converters write it, as measured:
 
 | converter | what an MS2 spectrum carries | what convert does |
 |---|---|---|
-| SCIEX MS Data Converter 2.0.1.0 (SCIEX OS 5.0) | `isolation window target m/z` = `selected ion m/z` of its bin, no offsets | refuses the file without `convert.isolation_half_width`; with it, reads each bin as `[target - h, target + h]` |
+| SCIEX MS Data Converter 2.0.1.0 (SCIEX OS 5.0) | `isolation window target m/z` = `selected ion m/z` of its bin, no offsets | reads each bin as `[target - h, target + h]`, `h` the census's suggestion (automatic since 0.12.0) or `convert.isolation_half_width`; refused without a half-width before 0.12.0 |
 | ProteoWizard msconvert 3.0.25036 (ABI reader), ZenoTOF 7600 `.wiff2` | no `precursorList` at all | one all-ion window; extract's footprint guard refuses it (docs/09_extract.md, "The footprint guard"). Not searchable: the bin of each spectrum is not recorded |
 | ProteoWizard msconvert 3.0.23339, TripleTOF 6600 Scanning SWATH | target and offsets of +-0.513 m/z: the bin, not the Q1 window | read as 505 windows of 1.03 m/z. Not measured; the Q1 window is wider than the bin, so each window then holds a fraction of the precursor's signal |
 
@@ -760,7 +767,11 @@ fixed-window method (the narrowest step 2 m/z), is called a scanning quadrupole.
 `mumdia peak-census` applies the same rule to the spectra it counts and reports it in its
 `isolation` block before a run, with a half-width to start from (five steps; the file does
 not record the window), and the desktop application shows it for every selected mzML
-(docs/37_ztscan.md, section 2). The fix is the method's Q1 half-width:
+(docs/37_ztscan.md, section 2). What reads such a file is the method's Q1 half-width. Since
+0.12.0 `run`, `run-experiment` and `mumdia convert` take the census's suggestion themselves when
+the layout is a scanning quadrupole (docs/37_ztscan.md, "Automatic for ZT Scan files"), so a ZT
+Scan file needs no key; set it when the method's window is not five steps wide, and for a
+target-only file of another layout, which is refused without it:
 
 ```json
 {"convert": {"isolation_half_width": 1.9}}
@@ -804,8 +815,10 @@ groups at 1%, about 106,500 precursors per run on `run_psm_q`, in 40 min at an 8
 peak on 64 threads (the rewritten files: 110,581 / 89,032 / 8,958), the peak from three
 concurrent second-pass extracts; a single run takes about 36-40 GB.
 
-By default the engine does not model the quadrupole sweep: each bin is an independent
-fixed window, and a candidate's chromatogram interleaves the bins that cover its precursor.
+Read with the half-width alone (every key of the ZT Scan analysis off), the engine does not
+model the quadrupole sweep: each bin is an independent fixed window, and a candidate's
+chromatogram interleaves the bins that cover its precursor. Since 0.12.0 a ZT Scan search runs
+the analysis below by default (docs/37_ztscan.md, "Automatic for ZT Scan files").
 Search the precursor range the method scanned with a library restricted to it. Three
 opt-in keys model the sweep (`extract.q1_cycles`, `extract.q1_profile`,
 `features.q1_features`; docs/09_extract.md, section 10): summing the bins of a cycle lost
@@ -840,8 +853,9 @@ compared on its own host):
 
 The calibration changes the count by little: +0.46% precursors over four seeds on the human
 library, +0.19% human precursors on the entrapment library at the same combined FDP. Each
-single key moves seed 0 by -0.1% to +0.5%, inside the seed spread. All three stay off
-(benchmark-gated, one acquisition).
+single key moves seed 0 by -0.1% to +0.5%, inside the seed spread. The two MS1 keys stay off
+(benchmark-gated, one acquisition); `q1_calibrate` is automatic for ZT Scan searches since
+0.12.0, because the per-fragment decisions below decide with it.
 
 The per-fragment Q1 decisions read the recorded sweep (spectra_ms2 v3 is required:
 `extract.q1_fragments`, docs/09_extract.md, section 12): for every library fragment of every
@@ -850,8 +864,10 @@ candidate's precursor, with three consumers (`features.q1_fragment_features`,
 `retrace.q1_repick`, `rescore.shadow_q1`). On REP01 the four keys together gave +3.0%
 precursors over four seeds and +3.2% human precursors on the entrapment library at the base
 arm's measured FDP, whose value at a reported 1% fell from 1.39% to 1.22%; three runs as one
-experiment +2.3% (113,013 against 110,433). All four stay off (benchmark-gated, one
-acquisition).
+experiment +2.3% (113,013 against 110,433). The four, with the feature families and the
+quantification window of docs/37_ztscan.md, are automatic for ZT Scan searches since 0.12.0 by
+the user's decision (one acquisition, measured with entrapment; docs/37_ztscan.md, "Automatic
+for ZT Scan files" and section 14).
 
 ### The two extension collisions
 

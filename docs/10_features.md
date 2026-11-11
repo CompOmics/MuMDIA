@@ -42,7 +42,7 @@ recipe use `Extended`.
 | `rust/mumdia/crates/mumdia/src/stages/features/peak_scans.rs` | Extended family: peak-scan count / window-degeneracy indicator (2 names) |
 | `rust/mumdia/crates/mumdia/src/stages/features/apex_dispersion.rs` | Extended family: fragment apex dispersion + consensus peak shape (13 names) |
 | `rust/mumdia/crates/mumdia/src/stages/features/mass_uncertainty.rs` | Extended family: fragment mass-error dispersion + evidence breadth (10 names) |
-| `rust/mumdia/crates/mumdia/src/stages/q1consist.rs` | the opt-in Q1-consistency family of scanning-quadrupole spectra (`features.q1_consistency`, 16 names): the per-fragment Q1 decisions against each fragment's expected Q1 centre |
+| `rust/mumdia/crates/mumdia/src/stages/q1consist.rs` | the Q1-consistency family of scanning-quadrupole spectra (`features.q1_consistency`, automatic for ZT Scan files, 16 names): the per-fragment Q1 decisions against each fragment's expected Q1 centre |
 | `rust/mumdia/crates/mumdia/src/stats.rs` | shared `pearson`/`cosine`/`spectral_angle` kernels used by every family |
 | `rust/mumdia/crates/mumdia-core/src/config.rs:578` | `FeaturesConfig` |
 
@@ -916,7 +916,8 @@ of entrapment targets (false) against decoys is 0.4997-0.5008 for every `q1c_*` 
 `coelution_mean`, `rt_error_abs`, the `q1f_*` columns); among the rows below the decoys'
 median `prelim_score` the Kolmogorov-Smirnov statistic of decoys against targets is
 0.0027-0.0079 (0.0004-0.0059 for the same references). Cost: the features pass +3.5% (83 s
-against 80 s), rescore peak +0.5 GB. Off by default; in the ZT Scan recipe.
+against 80 s), rescore peak +0.5 GB. Automatic for ZT Scan files (docs/37_ztscan.md, "Automatic for
+ZT Scan files"); in the ZT Scan recipe.
 
 ## The Percolator PIN (`write_pin`, `features.rs:1537`)
 
