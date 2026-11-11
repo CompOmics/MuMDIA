@@ -109,6 +109,15 @@ pub const ALL: [&str; 24] = [
     "q1c_offset_top3",
 ];
 
+/// The family's columns the rescore prefilter adds to its default list when the competed table
+/// carries them (`rescore::prefilter_columns`).
+pub const PREFILTER: [&str; 4] = [
+    "q1c_pred_share",
+    "q1c_entropy",
+    "q1c_soft_pred",
+    "q1c_offset_wmean",
+];
+
 /// The psms_extracted v6 lists the family reads, in the order [`Input`] takes them.
 pub const LISTS: [&str; 3] = ["q1f_frag_class", "q1f_frag_offset", "q1f_frag_corr2d"];
 
@@ -352,6 +361,7 @@ mod tests {
             assert_eq!(s.len(), list.len());
         }
         assert!(NAMES.iter().all(|n| ALL.contains(n)));
+        assert!(PREFILTER.iter().all(|n| NAMES.contains(n)));
         let pred = [1.0, 0.5, 0.2];
         let obs = [100.0, 30.0, 10.0];
         let inp = Input {
