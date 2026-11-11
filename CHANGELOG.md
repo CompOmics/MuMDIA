@@ -349,6 +349,33 @@ than a number. Both are recorded in every run's `manifest.json`.
   measured and not added (it removes 11-26% of the accepted precursors, mostly real ones),
   where time and memory go, the refusals and what is open: a second acquisition, which needs a
   vendor-licence decision, and known-ratio data. No default changes.
+- **Three scanning-quadrupole feature families, opt-in (`features.q1_precursor`,
+  `features.q1_multiscale`, `features.q1_deconvolved`).** On a ZT Scan run under
+  `extract.q1_fragments` (psms_extracted v8, appended last): the unfragmented precursor's
+  isotopes read in the MS2 steps of the decision's patch, each at its own Q1 position (eight
+  `q1p_*` features: presence, intensity share, the isotopes' Q1 shift and residual, the
+  fragments' correlation with the precursor's Q1 profile, the belonging count referenced to it
+  and its distance from the fragments' centre); the fragments' Q1 profile similarity to the most
+  intense fragment's, their consensus shape against the transmission and the strongest
+  fragment's centroid over 3, 7 and 11 steps (nine `q1m*` features, twelve with the precursor);
+  and every MS2 peak's Q1 centroid along the sweep against the expected Q1 centre of the
+  fragment it matches, at the apex (five `q1d_*` features). Measured on the ZenoTOF 8600 K562
+  run with four NN seeds per arm: the three together +0.76% precursors (100,664 against 99,902)
+  and +1.38% human precursors at a matched entrapment FDP (98,841 against 97,493), beyond the
+  seed spread on both libraries, the measured FDP at a reported 1% 1.21-1.30% against
+  1.25-1.31%. The deconvolved evidence carries most of it; the three are added to
+  `configs/examples/ztscan.json` (docs/37_ztscan.md, section 10).
+- **Q1-deconvolved evidence in the seed and in extract, opt-in (`search_seed.q1_deconvolved`,
+  `extract.q1_deconvolved`).** Every MS2 peak of a ZT Scan run is given the Q1 centroid of its
+  trace along the sweep (`stages::q1dec`: mutual-nearest peaks of adjacent steps of one cycle,
+  split at valleys; about 6 s and one byte a peak, never written), and the seed or extract counts
+  a peak for a candidate only near the candidate's expected Q1 centre (the seed within two steps
+  of the nominal one, extract within the tolerance the Q1 calibration learns from the confident
+  seed PSMs against the decoy seeds, `q1_calibration.deconvolution`). Measured to lose
+  identifications in every form: -2.5% (seed), -25.6% (extract, learned 1.0-step tolerance),
+  -8.4% at 2 steps, -38% (both); a real fragment's trace merges with other ions of its m/z, so a
+  hard count removes real evidence with the interference. Kept off and out of the recipe
+  (docs/09_extract.md, section 14).
 
 ### Fixed
 

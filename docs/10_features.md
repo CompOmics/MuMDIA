@@ -809,6 +809,44 @@ feature (0.0005-0.0054 for `n_matched_fragments`, `frag_corr`, `log_apex_intensi
 against 0.26, `ms1e_mono_ppm_abs` 3.5 against 7.9 ppm, `ms1e_q1_agree` 0.42 against 3.2 steps).
 Extract +0.6% wall on the entrapment library. Off by default.
 
+### q1_precursor (8; `features.q1_precursor`)
+
+Scanning-quadrupole spectra only. In the battery only when `features.q1_precursor` is on
+(`false` by default), which needs `extract.q1_fragments`; appended after every other column of
+the `extended` set, after the `ms1_envelope` family when that is on (`Q1P_FEATURES`). The
+unfragmented precursor's isotopes M0, M+1 and M+2 read in the MS2 steps of the per-fragment
+decision's patch, each at its own Q1 position (docs/09_extract.md, section 14), under the same
+names from psms_extracted v8: `q1p_n_iso`, `q1p_share`, `q1p_offset`, `q1p_resid`,
+`q1p_frag_corr_mean`, `q1p_frag_corr_max`, `q1p_n_belong`, `q1p_centre_agree` (docs/15 has
+their meaning). On the ZenoTOF runs the precursor is visible in the MS2 steps of nearly every
+candidate, decoys included: a reversed decoy has its target's precursor m/z, and the precursor
+region of an MS2 spectrum is crowded (docs/37_ztscan.md, section 10), so the family adds through
+the shape and the agreement terms rather than through presence.
+
+### q1_multiscale (9 or 12; `features.q1_multiscale`)
+
+Scanning-quadrupole spectra only, needs `extract.q1_fragments`; appended after `q1_precursor`
+(`q1m_features`). For 3, 7 and 11 steps around the fragments' fitted Q1 centre:
+`q1mK_corr_best`, `q1mK_shape`, `q1mK_centroid`, and with `features.q1_precursor` on as well
+`q1mK_corr_prec` (three more), read from psms_extracted v8 (docs/09_extract.md, section 14).
+
+### q1_deconvolved (5; `features.q1_deconvolved`)
+
+Scanning-quadrupole spectra only, needs `extract.q1_fragments` (and with it the Q1
+calibration, which learns the tolerance); appended last (`Q1D_FEATURES`). Every MS2 peak's Q1
+centroid along the sweep against the expected Q1 centre of the library fragment it matches, in
+the apex cycle and the two either side: `q1d_n_frag`, `q1d_n_incons`, `q1d_share`,
+`q1d_pred_share`, `q1d_apex_share` (docs/09_extract.md, section 14). The extraction is not
+changed; `extract.q1_deconvolved`, which counts only the consistent peaks, is the hard form of
+the same evidence.
+
+For all three the switch comes from the configuration, so a psms_extracted table without the
+columns is an error rather than zeros, and the schema id changes only with a family on. Every
+value is read from the spectra and the library; nothing reads a label, and among the rows whose
+untrained `prelim_score` is below the decoys' median the Kolmogorov-Smirnov statistic of decoys
+against targets is at most 0.008 for every one of the 25 features (the reference features
+0.0005-0.006). What they measured, alone and together, is in docs/37_ztscan.md, section 10.
+
 ## The Percolator PIN (`write_pin`, `features.rs:1537`)
 
 Streamed row-by-row through a `BufWriter` (not materialized as one String).
@@ -927,6 +965,9 @@ variant no longer exists).
 | `q1_features` | false | the `q1_profile` family of scanning-quadrupole spectra, which needs `extract.q1_profile`; appended last under `extended`. Omitted from the canonical configuration at its default |
 | `q1_fragment_features` | false | the `q1_fragments` family (eight `q1f_*` features of the per-fragment Q1 decision), which needs `extract.q1_fragments`; appended last under `extended`, after `q1_profile`. Omitted from the canonical configuration at its default |
 | `ms1_envelope` | false | the `ms1_envelope` family (nine `ms1e_*` features of the MS1 isotope envelope around the apex), whose evidence extract reads under the same key (psms_extracted v7); appended last under `extended`, after the Q1 families. Refused on 1/K0 spectra and grouped runs. Omitted from the canonical configuration at its default |
+| `q1_precursor` | false | the `q1_precursor` family (eight `q1p_*` features of the unfragmented precursor in the MS2 steps), whose evidence extract reads under the same key (psms_extracted v8); needs `extract.q1_fragments`; appended after `ms1_envelope`. Omitted from the canonical configuration at its default |
+| `q1_multiscale` | false | the `q1_multiscale` family (nine `q1m*` features at 3, 7 and 11 Q1 steps, twelve with `q1_precursor`), psms_extracted v8; needs `extract.q1_fragments`; appended after `q1_precursor`. Omitted from the canonical configuration at its default |
+| `q1_deconvolved` | false | the `q1_deconvolved` family (five `q1d_*` features of the per-peak Q1 centroids at the apex), psms_extracted v8; needs `extract.q1_fragments`; appended last. Omitted from the canonical configuration at its default |
 | `im_features` | `off` | the `ion_mobility` family (`off`, `on`, `auto` = on when the spectra carry 1/K0). `run` and `run-experiment` resolve it once (`Config::resolve_im_features`) and hand every stage `on` or `off`; a standalone `mumdia features` resolves `auto` from the reader extract recorded in the chromatograms report. On a 4D run it also makes extract write the chromatograms' per-point 1/K0 (v3/v4). Omitted from the canonical configuration at its default |
 
 Note that the fragment tolerance used inside `mass_accuracy` is a hardcoded
