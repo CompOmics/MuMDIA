@@ -979,6 +979,25 @@ a 2D-correlation floor of 0.556 (first pass 1.31, 0.82 and 0.519), under which 7
 anchors' fragments belong, 20.8% are interfered and 0.1% are absent. The entrapment-library
 run learns 1.10, 0.68 and 0.578.
 
+**The deconvolution tolerance** (`deconvolution`, only under `extract.q1_deconvolved` or
+`features.q1_deconvolved`, which read it; docs/09_extract.md, section 14). For at most 3,000
+anchors and 3,000 decoy seed PSMs (each one per candidate at its best scan, every k-th), the
+full peak lists of the seed scan's cycle in the steps within the window's reach plus six
+either side of the expected centre are read, every peak is given its trace's Q1 centroid
+(`q1dec::annotate_run`, the rule extract applies to the whole run), and for every library
+fragment the nearest peak within the fragment tolerance in each step whose window covers the
+precursor contributes its centroid minus the fragment's calibrated expected centre
+(`q1dec::fragment_centre`), in steps. The tolerance is the point of a 1/8-step grid from 0.5 to
+4 steps where the share of the anchors' peaks within it most exceeds the decoys' (the smaller
+on a tie, at least 0.5; without decoys the median plus three robust SD of the anchors'). The
+block records both counts, the rule, the anchors' offset distribution, the kept shares of both
+at every grid point and at the tolerance; the log line `q1-calibrate: Q1-deconvolution
+tolerance learned from the seed` carries them. On REP01 (2,812 anchors, 161,412 peaks; 2,993
+decoys, 87,771 peaks; the calibration took 78 s against 64 s without it on a shared host): 1.0
+step, at which 77.4% of the anchors' peaks and 26.0% of the
+decoys' are kept (0.5 steps 56.7% / 13.3%, 2 steps 90.8% / 48.6%, 4 steps 97.1% / 78.8%); the
+anchors' offsets have a median of +0.09 steps and a robust SD of 0.60.
+
 **`cal.json` `q1_calibration`.** `status` (`fitted`, or `too_few_profiles` under 200),
 `anchors`, `profiles`, `sweep` (`recorded`, `cycles`, `step_mz`, `half_width_as_read_mz`),
 `isotope_model`, `target_marks`, `hypotheses` (sum of squares and median residual of each

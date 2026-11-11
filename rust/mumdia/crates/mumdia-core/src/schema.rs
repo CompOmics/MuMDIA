@@ -96,6 +96,12 @@ pub mod artifact {
     /// intensity at the half-spacing positions above M0 and M+1 (`ms1e_i_half`), and the
     /// MS1 scans read (`ms1e_scans`), all Float64. Readers select columns by name.
     pub const PSMS_EXTRACTED_V7: (&str, u32) = ("psms_extracted", 7);
+    /// v8, written only under `features.q1_precursor` or `features.q1_multiscale`
+    /// (scanning-quadrupole spectra under `extract.q1_fragments`, which carry no 1/K0): the
+    /// table of v6 or v7 plus, appended last, the unfragmented-precursor evidence `q1p_*`
+    /// and the multi-scale Q1 scores `q1m3_*`, `q1m7_*` and `q1m11_*` (Float64), each
+    /// family only under its key. Readers select columns by name.
+    pub const PSMS_EXTRACTED_V8: (&str, u32) = ("psms_extracted", 8);
     /// v1: every row stores its whole `rt` axis and its whole `intensity` trace.
     pub const CHROMATOGRAMS: (&str, u32) = ("chromatograms", 1);
     /// v2, the default (`extract.chromatogram_schema = 2`): the axis once per candidate
@@ -333,6 +339,23 @@ pub mod artifact {
         }
     }
 
+    /// [`psms_extracted_ms1e`], or [`PSMS_EXTRACTED_V8`] when the table carries the
+    /// unfragmented-precursor or multi-scale Q1 columns (`q1s`, `features.q1_precursor` /
+    /// `features.q1_multiscale`), which extract refuses on spectra with 1/K0.
+    pub fn psms_extracted_q1s(
+        has_im: bool,
+        q1: bool,
+        q1f: bool,
+        ms1e: bool,
+        q1s: bool,
+    ) -> (&'static str, u32) {
+        if q1s && !has_im {
+            PSMS_EXTRACTED_V8
+        } else {
+            psms_extracted_ms1e(has_im, q1, q1f, ms1e)
+        }
+    }
+
     /// The seed schema a search writes: [`SEED_PSMS_V2`] when the searched spectra carry
     /// per-peak 1/K0, else [`SEED_PSMS`].
     /// `run_windows` v1 (Float64), or v2 under `rt_im_train.run_windows_f32`.
@@ -428,6 +451,22 @@ mod tests {
         }
         assert_eq!(
             psms_extracted_ms1e(true, false, false, true),
+            ("psms_extracted", 4)
+        );
+        // v8 only with the unfragmented-precursor or multi-scale Q1 columns; without them
+        // every earlier version is what it was.
+        for (q1f, ms1e) in [(false, false), (true, false), (true, true)] {
+            assert_eq!(
+                psms_extracted_q1s(false, false, q1f, ms1e, false),
+                psms_extracted_ms1e(false, false, q1f, ms1e)
+            );
+            assert_eq!(
+                psms_extracted_q1s(false, false, q1f, ms1e, true),
+                ("psms_extracted", 8)
+            );
+        }
+        assert_eq!(
+            psms_extracted_q1s(true, false, false, false, true),
             ("psms_extracted", 4)
         );
         assert_eq!(chromatograms(1, false), CHROMATOGRAMS);

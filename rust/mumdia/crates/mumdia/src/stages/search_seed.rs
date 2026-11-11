@@ -336,12 +336,65 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
         "search-seed: loaded"
     );
 
+    // `search_seed.q1_deconvolved`: every MS2 peak's Q1 centroid (`stages::q1dec`) and each
+    // candidate's nominal expected centre; a peak counts for a candidate only within
+    // `q1dec::SEED_TOL_STEPS` of it.
+    let q1_gate: Option<crate::stages::q1dec::Q1Gate> = if p.cfg.q1_deconvolved {
+        anyhow::ensure!(
+            !scans.iter().any(|s| s.im.is_some()),
+            "search-seed: search_seed.q1_deconvolved reads a scanning quadrupole's Q1 steps, \
+             and these spectra carry 1/K0 (diaPASEF); unset it for them"
+        );
+        let sweep = crate::spectra::load_q1_sweep(p.ms2)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "search-seed: search_seed.q1_deconvolved needs the Q1 sweep spectra_ms2 v3 \
+                 records (q1_cycle, q1_step), and {} has none: convert it again with \
+                 convert.isolation_half_width",
+                p.ms2
+            )
+        })?;
+        let t1 = Instant::now();
+        let grid = crate::stages::q1frag::Q1Grid::build(scans, &sweep)?;
+        let dec = crate::stages::q1dec::Q1Dec::build(scans, &grid, p.cfg.fragment_tol_ppm);
+        let centre: Vec<f32> = (0..lib.n_candidates())
+            .map(|c| {
+                let cd = lib.cand(c as u32);
+                crate::stages::q1dec::expected_centre(None, cd.precursor_mz, cd.charge, 0.0) as f32
+            })
+            .collect();
+        let tol_steps = crate::stages::q1dec::SEED_TOL_STEPS;
+        let tol_mz = tol_steps * dec.step_mz;
+        info!(
+            elapsed_ms = t1.elapsed().as_millis() as u64,
+            bytes = dec.bytes(),
+            moved_share = dec.moved_share(),
+            tol_steps,
+            tol_mz,
+            "search-seed: Q1-deconvolved evidence (per-peak Q1 centroids)"
+        );
+        Some(crate::stages::q1dec::Q1Gate {
+            dec,
+            centre,
+            frag_first: Vec::new(),
+            frag_shift: Vec::new(),
+            tol_mz,
+        })
+    } else {
+        None
+    };
     // Best-per-candidate PSM at the configured fragment tolerance, and once more at a wider
     // one when that finds too few confident targets (`search_seed.widen_tol_below`). The
     // bands of a grouped run keep the configured tolerance: `seed-pool` pools their
     // calibrants at one tolerance.
-    let (best, widened_cfg, widening) =
-        search_with_widening(lib, fidx, scans, p.cfg, !p.emit_calibrants);
+    let (best, widened_cfg, widening) = search_with_widening_q1(
+        lib,
+        fidx,
+        scans,
+        p.cfg,
+        !p.emit_calibrants,
+        q1_gate.as_ref(),
+    );
+    drop(q1_gate);
     // The tolerance of the search that was kept, which the mass calibration, the observed
     // 1/K0 and the report below follow.
     let cfg: &SearchSeedConfig = widened_cfg.as_ref().unwrap_or(p.cfg);
@@ -606,6 +659,12 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
             if p.cfg.count_fragments_once {
                 v["count_fragments_once"] = json!(true);
             }
+            if p.cfg.q1_deconvolved {
+                v["q1_deconvolved"] = json!({
+                    "tol_steps": crate::stages::q1dec::SEED_TOL_STEPS,
+                    "valley": crate::stages::q1dec::VALLEY,
+                });
+            }
             // Only when the retry ran, so a seed that searched once reports as before.
             if let Some(w) = &widening {
                 v["widen_tol"] = json!({
@@ -638,14 +697,27 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
 /// that tolerance) parallelizes across isolation-window groups (each scan belongs to exactly
 /// one window, so groups are independent) and is bit-identical to the serial path via a
 /// deterministic per-candidate merge; the bucketed path stays serial.
+#[cfg(test)]
 fn search_best(
     lib: &Library,
     idx: Option<&FragIndex>,
     scans: &[Ms2Scan],
     cfg: &SearchSeedConfig,
 ) -> HashMap<u32, Best> {
+    search_best_q1(lib, idx, scans, cfg, None)
+}
+
+/// [`search_best`], counting a peak for a candidate only where `q1` admits it
+/// (`search_seed.q1_deconvolved`); `None` counts every peak.
+fn search_best_q1(
+    lib: &Library,
+    idx: Option<&FragIndex>,
+    scans: &[Ms2Scan],
+    cfg: &SearchSeedConfig,
+    q1: Option<&crate::stages::q1dec::Q1Gate>,
+) -> HashMap<u32, Best> {
     if let Some(idx) = idx {
-        return seed_fragindex_windows(idx, scans, cfg);
+        return seed_fragindex_windows(idx, scans, cfg, q1);
     }
     let mut best: HashMap<u32, Best> = HashMap::new();
     for scan in scans {
@@ -661,6 +733,9 @@ fn search_best(
             // Observed m/z is stored f32; widen once, the value is unchanged.
             let obs_mz = peak.mz as f64;
             lib.page_search(obs_mz, cfg.fragment_tol_ppm, lo, hi, |cid, _mz, _pi| {
+                if q1.is_some_and(|g| !g.admits(cid as usize, scan, pidx)) {
+                    return;
+                }
                 let e = acc.entry(cid).or_insert((0, 0.0));
                 e.0 += 1;
                 e.1 += inten;
@@ -724,6 +799,7 @@ struct Widening {
 /// is kept only when it finds more confident targets. Returns the kept search, its
 /// configuration when it is the wider one (`None`: the configured one), and what the retry
 /// did (`None`: no retry).
+#[cfg(test)]
 fn search_with_widening(
     lib: &Library,
     idx: Option<&FragIndex>,
@@ -735,7 +811,23 @@ fn search_with_widening(
     Option<SearchSeedConfig>,
     Option<Widening>,
 ) {
-    let best = search_best(lib, idx, scans, cfg);
+    search_with_widening_q1(lib, idx, scans, cfg, allow, None)
+}
+
+/// [`search_with_widening`], both searches counting a peak only where `q1` admits it.
+fn search_with_widening_q1(
+    lib: &Library,
+    idx: Option<&FragIndex>,
+    scans: &[Ms2Scan],
+    cfg: &SearchSeedConfig,
+    allow: bool,
+    q1: Option<&crate::stages::q1dec::Q1Gate>,
+) -> (
+    HashMap<u32, Best>,
+    Option<SearchSeedConfig>,
+    Option<Widening>,
+) {
+    let best = search_best_q1(lib, idx, scans, cfg, q1);
     if !allow || cfg.widen_tol_below == 0 {
         return (best, None, None);
     }
@@ -753,7 +845,7 @@ fn search_with_widening(
                 FragIndex::build_mz_only(lib, wide_cfg.fragment_tol_ppm)
             }
         });
-        search_best(lib, wide_idx.as_ref(), scans, &wide_cfg)
+        search_best_q1(lib, wide_idx.as_ref(), scans, &wide_cfg, q1)
     };
     let wide_confident = confident_targets(&wide_best, lib, cfg.fdr_seed);
     let w = Widening {
@@ -938,13 +1030,15 @@ fn seed_fragindex_windows(
     idx: &FragIndex,
     scans: &[Ms2Scan],
     cfg: &SearchSeedConfig,
+    q1: Option<&crate::stages::q1dec::Q1Gate>,
 ) -> HashMap<u32, Best> {
-    seed_fragindex_windows_chunked(
+    seed_fragindex_windows_chunked_q1(
         idx,
         scans,
         cfg,
         rayon::current_num_threads(),
         SEED_MIN_CHUNK_SCANS,
+        q1,
     )
 }
 
@@ -996,12 +1090,26 @@ fn seed_chunk_plan(
 
 /// [`seed_fragindex_windows`] with the task plan's inputs explicit, so a test can force
 /// every group into many chunks and compare against one task per group.
+#[cfg(test)]
 fn seed_fragindex_windows_chunked(
     idx: &FragIndex,
     scans: &[Ms2Scan],
     cfg: &SearchSeedConfig,
     threads: usize,
     min_chunk: usize,
+) -> HashMap<u32, Best> {
+    seed_fragindex_windows_chunked_q1(idx, scans, cfg, threads, min_chunk, None)
+}
+
+/// [`seed_fragindex_windows_chunked`], counting a peak for a candidate only where `q1` admits
+/// it (`search_seed.q1_deconvolved`).
+fn seed_fragindex_windows_chunked_q1(
+    idx: &FragIndex,
+    scans: &[Ms2Scan],
+    cfg: &SearchSeedConfig,
+    threads: usize,
+    min_chunk: usize,
+    q1: Option<&crate::stages::q1dec::Q1Gate>,
 ) -> HashMap<u32, Best> {
     use std::collections::BTreeMap;
     // Group scan indices by window; BTreeMap keys give a deterministic group order
@@ -1084,7 +1192,15 @@ fn seed_fragindex_windows_chunked(
                         .iter()
                         .map(|&pi| (scan.peaks[pi].mz as f64, scan.peaks[pi].intensity))
                         .collect();
-                    if cfg.count_fragments_once {
+                    if let Some(g) = q1 {
+                        // Each selected peak's Q1 centroid; a candidate counts it only near
+                        // its own expected centre.
+                        let cen: Vec<f64> = peak_idx
+                            .iter()
+                            .map(|&pi| g.dec.centroid(scan, pi))
+                            .collect();
+                        scratch.accumulate_q1(idx, &peaks, &cen, &g.centre, g.tol_mz, lo, hi);
+                    } else if cfg.count_fragments_once {
                         scratch.accumulate_count_once(idx, &peaks, lo, hi);
                     } else {
                         scratch.accumulate(idx, &peaks, lo, hi);

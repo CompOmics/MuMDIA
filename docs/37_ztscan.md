@@ -7,7 +7,8 @@ Section 1 describes the acquisition, section 2 how a run is read and recognised 
 search, section 3 the opt-in model of the sweep layer by layer, section 4 how to run it,
 section 5 what was measured, section 6 the quantification window in Q1 cycles, section 7 the
 gate on the fragments that belong that was measured and not added, section 8 where time and
-memory go, section 9 what is refused, and section 10 what is open. Reading a ZT Scan file
+memory go, section 9 what is refused, section 10 the unfragmented precursor, multi-scale Q1
+scores and Q1-deconvolved evidence, and section 11 what is open. Reading a ZT Scan file
 needs one key (`convert.isolation_half_width`); everything that models the sweep is off by
 default, and `configs/examples/ztscan.json` is the recipe that turns on what measured
 positive. The mechanisms each have a canonical section elsewhere (docs/04, 08, 09, 10, 11 and
@@ -19,7 +20,7 @@ scanned 392-900 m/z and predicted decoys, and the same library extended with yea
 coli entries for entrapment (r = 0.397, combined FDP = N_E (1 + 1/r) / (N_H + N_E)). That is
 why no default changes: CLAUDE.md asks for a second acquisition, and the ZenoTOF ZT Scan
 files of the benchmark collection are vendor files whose conversion with isolation targets
-is a licence decision (section 10).
+is a licence decision (section 11).
 
 ## 1. What a ZT Scan run is
 
@@ -110,11 +111,18 @@ every other search is byte-identical. Measured on REP01 with four NN seeds per a
 | quantify from the fragments that belong | `quant.q1_fragments` | docs/12, "Quantification from the fragments that belong" | replicate CV 0.120 against 0.273; restricting to belonging fragments costs precision against the collapse alone; the known-ratio gate is open | no |
 | the quantification window in Q1 cycles | `quant.q1_cycle_halfwidth` | section 6 below | replicate CV 0.102 at 4 cycles against 0.273, the identifications unchanged | yes (4) |
 | an MS1 isotope-envelope family | `features.ms1_envelope` | docs/10 | within noise (+0.01% at matched FDP) | no |
+| the unfragmented precursor's Q1 profile in MS2 | `features.q1_precursor` | docs/09, section 14 | +0.13% precursors, +0.65% human precursors at matched FDP, inside the seed spread; in the three-family set it carries 0.16% | yes |
+| multi-scale Q1 scores (3, 7, 11 steps) | `features.q1_multiscale` | docs/09, section 14 | +0.32% / +0.09%, inside the seed spread; nothing on top of the other two | yes |
+| Q1-deconvolved evidence as features | `features.q1_deconvolved` | docs/09, section 14 | +0.51% precursors, +0.64% at matched FDP, just beyond the seed spread | yes |
+| the three together | (the three keys) | section 10 below | +0.76% precursors, +1.38% human precursors at matched FDP, beyond the seed spread on both libraries | |
+| count only Q1-consistent peaks in the seed, in extract | `search_seed.q1_deconvolved`, `extract.q1_deconvolved` | docs/07, docs/09 section 14 | -2.5% (seed), -25.6% (extract), -38% (both) | no |
 
-The four identification keys of the recipe are the phase-2 set, measured together: +3.0%
+The four decision keys of the recipe are the phase-2 set, measured together: +3.0%
 precursors on the human library and +3.2% human precursors on the entrapment library at the
 base arm's measured FDP, whose value at a reported precursor q of 1% falls from 1.39% to
-1.22%.
+1.22%. The three feature families of section 10 add +0.76% and +1.38% on top of them, with
+the measured FDP unchanged. Sections 5 to 8 were measured with the recipe before those three
+were added; section 10 has their numbers.
 
 ## 4. How to run it
 
@@ -144,10 +152,10 @@ mumdia run --lib-precursors lib/lib_precursors.parquet --lib-fragments lib/lib_f
   sweep covers nothing outside it.
 - Uncapped peaks (the default `--top-peaks-ms2 0`): ZT Scan spectra hold about 800 peaks
   each (p25 545, p95 1,078 at the start of the run).
-- Expect about 19 min and 35 GB for one run with the human library on 40 threads (28 min and
-  37 GB with the 4.1 million-target entrapment library on 64 threads of a busier host), and
-  about 60 min and 89 GB for the three runs as one experiment on 64 threads, the peak from
-  three concurrent second-pass extracts (section 8).
+- Expect about 20 min and 40 GB for one run with the human library on 32 threads, and about
+  51 min and 78 GB for the three runs as one experiment, the peak from the concurrent
+  second-pass extracts (sections 8 and 10.7; the recipe before the feature families of section
+  10 took 18.5 min and 35 GB on the same host).
 - The recipe is refused with `groups.window_groups > 1` (the Q1 calibration needs the whole
   sweep), so a machine too small for one run cannot band it; the base reading
   (`isolation_half_width` alone) can be banded.
@@ -392,8 +400,217 @@ byte; 2 is the setting to take when extract's time matters more than half a perc
 - `quant.q1_cycle_halfwidth` without the scan form of the fixed window or with
   `fixed_scan_halfwidth_scale`; `mumdia quant` with it and no `--spectra-ms2`.
 - `features.ms1_envelope` on spectra with 1/K0 and with window groups.
+- `features.q1_precursor`, `features.q1_multiscale` and `features.q1_deconvolved` without
+  `extract.q1_fragments`; `extract.q1_deconvolved` without `rt_im_train.q1_calibrate` or with
+  `extract.q1_cycles`; `search_seed.q1_deconvolved` with `count_fragments_once`; both
+  `q1_deconvolved` keys with `groups.window_groups > 1`, on spectra with 1/K0 and on
+  spectra_ms2 without the recorded sweep.
 
-## 10. Open items
+## 10. The unfragmented precursor, multi-scale Q1 scores and Q1-deconvolved evidence
+
+Three further readings of the sweep, each taken from scanning-quadrupole practice in the
+literature: score each fragment's Q1 profile against the most intense fragment's and against
+the unfragmented precursor's, its shape against the transmission and its centroid against the
+precursor m/z, at several Q1 widths (Messner et al., 2021); and assign every fragment signal to
+a precursor along the Q1 axis before it is counted (Q1 deconvolution). The mechanisms are in
+docs/09_extract.md, section 14; this section has what they measured and what went into the
+recipe. Every key is off by default and omitted from the canonical configuration; with all of
+them off, the recipe on REP01, an Orbitrap AIF run, a native diaPASEF run and `ci/smoke.sh`
+write every table byte for byte as before (section 10.7).
+
+REP01 with the recipe of section 4 as the base, the human library on doxy and the entrapment
+library on demiguise (32 threads each, both hosts shared, so walls there are indicative), NN
+seeds 0-3 per arm (seeds 1-3 rescore the run's competed table), every arm of a library on one
+host with one thread count. Matched FDP as in section 5: the human precursors where the arm's
+combined entrapment FDP reaches the base arm's mean at a reported 1% (1.277% on this host),
+interpolated along the `precursor_q` thresholds.
+
+### 10.1 Where the identifications go
+
+Against a reference search of REP01 in another engine's scanning-quadrupole mode (94,259
+precursors at 1%), every reference precursor is put in the first class that applies
+(`run_windows`, `psms_extracted`, `psms_scored` of the arm):
+
+| class | base (human library) | + the three feature keys | base (entrapment library) | + the three feature keys |
+|---|---|---|---|---|
+| accepted at 1% | 84,215 (89.3%) | 84,546 (89.7%) | 82,288 (89.1%) | 82,566 (89.4%) |
+| reference RT outside the candidate's window | 1,226 (1.3%) | 1,226 | 1,177 (1.3%) | 1,177 |
+| inside the window, not extracted | 785 (0.8%) | 785 | 753 (0.8%) | 753 |
+| extracted, removed by the rescore prefilter | 1,985 (2.1%) | 1,985 | 1,817 (2.0%) | 1,817 |
+| scored, `precursor_q` above 1% | 6,048 (6.4%) | 5,717 (6.1%) | 6,287 (6.8%) | 6,009 (6.5%) |
+
+The library covers every reference precursor. The largest loss is the scored bucket, of which
+1,441 lie between 1% and 2% on the human library: the evidence is extracted and the classifier
+ranks it below the threshold. Features can only act there (the prefilter reads a fixed set of
+32 columns, so the 2.1% it removes are the same in every feature arm), and the three feature
+keys take 4-5% of that bucket (331 and 278 reference precursors). The MuMDIA-only set grows from
+15,006 to 15,782 human precursors on the entrapment library, at a combined FDP of 6.98% against
+7.46%.
+
+### 10.2 The unfragmented precursor is visible in MS2, and the decoys see it too
+
+Measured first, on the base run (`vis.py`, 1,500 sampled seed PSMs per class): in the five
+cycles around the seed scan, the precursor's M0 is present by the decision's coherent-cell rule
+for 97.5% of the confident target seeds (M+1 97.3%, M+2 97.7%), but also for 83.9% of the decoy
+seeds, 77.9% of the low-scoring target seeds and 72.1% at an m/z 0.37 below M0, where no isotope
+of the candidate lies: the precursor region of a ZT Scan MS2 spectrum is crowded with the other
+precursors the window transmits. The M0 share of M0 plus the six strongest fragments is 0.19
+(median) for the confident seeds and 0.09 for decoys; their M0 Q1 profile correlates with the
+transmission at 0.95 (median) against 0.81, and its centroid sits +0.27 steps from where the
+window puts it (IQR -0.01 to +0.73). On the extracted rows of the arm with the family (4.18
+million at peak rank 0): all three isotopes are present for 94.1% of the accepted targets,
+80.8% of the decoys and 80.5% of the other targets, and the precursor holds half of the
+precursor plus fragment intensity in every class (median 0.49-0.50). What separates is where:
+the isotopes' fitted shift is 0.90 steps from the expected position (median) for the accepted
+targets and 2.84 for the decoys, its distance from the fragments' shared centre 1.24 against
+3.89, and the fragments' Q1 profiles correlate with the precursor's at 0.48 against 0.03. A
+reversed decoy has its target's precursor m/z and Q1 position, so the family helps the
+classifier only through those agreement terms.
+
+### 10.3 Q1-deconvolved evidence: the separation, and what a hard count does with it
+
+Every MS2 peak's Q1 centroid against the expected centre of the library fragment it matches,
+in the steps whose window covers the precursor (the cells the seed and extract probe), as the
+Q1 calibration learns the tolerance on the anchors and the decoy seeds (docs/08, section 4h):
+
+| tolerance, steps | 0.5 | 0.75 | 1.0 (learned) | 1.5 | 2.0 | 3.0 | 4.0 |
+|---|---|---|---|---|---|---|---|
+| anchors' peaks kept | 56.7% | 69.4% | 77.4% | 86.3% | 90.8% | 95.3% | 97.1% |
+| decoys' peaks kept | 13.3% | 19.8% | 26.0% | 37.9% | 48.6% | 65.8% | 78.8% |
+
+A real fragment's trace merges with any other ion of its m/z within the tolerance in the
+neighbouring steps, which moves its centroid; 23% of the anchors' peaks fall outside one step.
+Counting only the consistent peaks therefore removes real evidence along with the interference,
+and every hard form lost identifications on the human library (four NN seeds each):
+
+| arm | seed's confident targets | rows extracted | precursors at 1%, mean (range) | vs base | extract | wall |
+|---|---|---|---|---|---|---|
+| base | 25,305 | 4,179,683 | 99,902 (99,672-100,058) | | 559 s | 1,227 s |
+| `extract.q1_deconvolved` (learned, 1.0 step) | 25,305 | 368,759 | 74,325 (74,151-74,461) | -25.6% | 209 s | 1,006 s |
+| the same at 2.0 steps (development build) | 25,305 | 1,314,886 | 91,466 (91,345-91,694) | -8.4% | 400 s | 1,228 s |
+| `search_seed.q1_deconvolved` (2 steps) | 21,482 | 4,072,093 | 97,379 (97,239-97,546) | -2.5% | 570 s | 1,257 s |
+| both | 21,482 | 225,381 | 61,800 (61,615-61,940) | -38.1% | 152 s | 775 s |
+
+The seed alone, searched again on the base run's spectra and library: 25,305 confident targets
+without the key, 14,544 / 18,909 / 21,482 / 23,681 at 1 / 1.5 / 2 / 3 steps. In the ladder of
+the extract arm (learned tolerance), 24.1% of the reference precursors are not extracted
+(against 0.8%), while the scored bucket shrinks from 6.4% to 4.2%: the evidence that remains
+is cleaner, but a quarter of the real precursors no longer meet the presence rules. On the
+entrapment library the extract form keeps 73,653 human precursors at the matched FDP
+(73,476-73,868, -24.5%) and both forms 61,671 (-36.7%), at a lower measured FDP at a reported
+1% (1.09-1.19% and 1.05-1.13% against 1.25-1.31%): a smaller pool, not a better ranking. The
+hard forms stay off: they are a speed lever (extract 209 s against 559 s) with an
+identification loss no tolerance removed. The 2-step arm was run with a development build that
+overrode the learned tolerance; the shipped keys have no such override.
+
+The same evidence as features (`features.q1_deconvolved`, the extraction unchanged) separates
+cleanly: among the accepted targets the consistent share of the matched intensity at the apex
+is 0.53 (median) against 0.19 for decoys, and 10 fragments have a consistent match against 6.
+
+### 10.4 Measured
+
+| arm | human library: precursors at 1%, mean (range) | vs base | peptides / protein groups (mean) | entrapment: human precursors at the matched FDP (1.277%), mean (range) | vs base | at a combined FDP of 1.0% | combined FDP at a reported 1% |
+|---|---|---|---|---|---|---|---|
+| base (the recipe) | 99,902 (99,672-100,058) | | 80,456 / 7,739 | 97,493 (97,247-97,809) | | 95,285 | 1.25-1.31% |
+| + `q1_precursor` | 100,033 (99,838-100,167) | +0.13% | 80,432 / 7,763 | 98,122 (97,773-98,759) | +0.65% | 95,744 | 1.18-1.26% |
+| + `q1_multiscale` | 100,219 (99,946-100,408) | +0.32% | 80,635 / 7,723 | 97,580 (97,171-97,810) | +0.09% | 95,284 | 1.26-1.33% |
+| + both | 100,112 (99,966-100,225) | +0.21% | 80,572 / 7,745 | 97,994 (97,671-98,248) | +0.51% | 95,528 | 1.26-1.31% |
+| + `q1_deconvolved` (features) | 100,416 (100,167-100,546) | +0.51% | 80,916 / 7,764 | 98,116 (97,881-98,267) | +0.64% | 95,786 | 1.24-1.29% |
+| + the three | 100,664 (100,424-100,840) | +0.76% | 81,019 / 7,765 | 98,841 (98,308-99,195) | +1.38% | 96,449 (+1.22%) | 1.21-1.30% |
+
+Decoy fraction 0.0100 in every arm. On both libraries the three keys together are beyond the
+seed spread of the base arm (the ranges do not overlap); each alone is inside it, except the
+deconvolved evidence, whose ranges clear the base arm's on both libraries (narrowly on the
+entrapment one).
+
+### 10.5 Ablation
+
+Each family left out of the three, by rescoring the competed table of the arm with all three
+with `rescore.features_file` listing every other column (four NN seeds; this reproduces an arm
+exactly: the three without `q1_deconvolved` gives the counts of "+ both" above to the last
+digit, seed by seed):
+
+| left out | human library: precursors, mean (range) | vs the three | entrapment: human at the matched FDP, mean (range) | vs the three |
+|---|---|---|---|---|
+| nothing (the three) | 100,664 (100,424-100,840) | | 98,845 (98,311-99,198) | |
+| `q1_precursor` | 100,502 (100,346-100,658) | -0.16% | 98,251 (97,735-98,610) | -0.60% |
+| `q1_multiscale` | 100,744 (100,620-100,811) | +0.08% | 98,507 (98,398-98,654) | -0.34% |
+| `q1_deconvolved` | 100,112 (99,966-100,225) | -0.55% | 97,997 (97,674-98,251) | -0.86% |
+
+The deconvolved evidence carries most of the gain on both libraries. The precursor family adds
+on both; the multi-scale family adds on the entrapment library and nothing on the human one.
+Each contribution alone is inside the seed spread; together they are not. The entrapment
+ablations were rescored on doxy from the demiguise run's competed table, and the three there
+reproduce the demiguise seeds' counts to the last digit, so the hosts' arithmetic agrees.
+
+### 10.6 Label blindness
+
+Among the rows whose untrained `prelim_score` is below the decoys' median (1.04 million decoys,
+0.99 million targets, overwhelmingly false), the two-sample Kolmogorov-Smirnov statistic of
+decoys against targets is 0.0019-0.0077 for every `q1p_*` feature, 0.0007-0.0049 for every
+`q1m*` and 0.0020-0.0042 for every `q1d_*`, as for features already in the vector
+(`n_matched_fragments` 0.0005, `frag_corr` 0.0037, `coelution_mean` 0.0034, `rt_error_abs`
+0.0062). The accepted targets differ (`q1p_frag_corr_mean` median 0.48 against 0.03,
+`q1m11_shape` 0.08 against 0.58, `q1d_share` 0.53 against 0.19).
+
+### 10.7 Cost, byte identity
+
+REP01 with the human library on thestral, 32 threads, the host otherwise idle, the recipe
+without and with the three feature keys, one after the other (both write the scored table of
+the doxy arms' seed 0: 99,915 and 100,840 precursors, so the hosts agree):
+
+| stage | the recipe | + the three feature keys |
+|---|---|---|
+| convert / seed / multi-head RT calibration | 111 / 38 / 207 s | 115 / 38 / 204 s |
+| Q1 calibration (with the deconvolution tolerance) | 64 s | 68 s |
+| extract | 486 s | 522 s (+7%) |
+| features / compete | 72 / 2 s | 83 / 3 s |
+| rescore (459 features against 434) | 101 s | 152 s |
+| quant | 19 s | 20 s |
+| whole run, peak | 1,107 s, 35.3 GB | 1,217 s (+9.9%), 39.6 GB (+4.3 GB) |
+
+The per-peak centroids are computed in about 6 s and hold 3.3 GB (one byte for each of the 3.34
+billion MS2 peaks); the precursor patch adds one read of three m/z per row. The hard forms
+make the run faster (1,006 s with extract's count on doxy against 1,227 s), which is all they
+offer.
+
+With every key off, the phase-5 binary against main's (both built from the same tree but for
+this change, one after the other on one host): the recipe on REP01, 16 of 16 parquet tables
+byte-identical and 19 of 20 reports (the multi-head summary: timings); the Orbitrap Q Exactive
+AIF E. coli entrapment run, 15 of 15 and 19 of 20 (the same); the native diaPASEF run (timsTOF
+Ultra 2, HYE 15 min, the diaPASEF recipe with retrace and second pass), 20 of 20 and 27 of 30
+(retrace's stage timers and the multi-head summaries' timings); `ci/smoke.sh`, SMOKE_OK on both
+and 1,863 of 1,863 parquet tables byte-identical, the reports identical but for the binary's
+path in the manifests' `cli_args` and the library-cache key, which includes the binary.
+
+### 10.8 Three runs as one experiment
+
+REP01-03 as one `mumdia run` (pooled rescore, second pass), human library, one NN seed,
+thestral, 32 threads, both arms with the phase-5 binary (the base with the three keys off):
+
+| experiment | precursors | peptides | protein groups | per run on `run_psm_q` (second pass) | first pass per run | median precursor / protein CV | wall, peak |
+|---|---|---|---|---|---|---|---|
+| the recipe (section 4) | 113,439 | 91,063 | 9,041 | 109,526 / 109,600 / 109,604 | 101,518 / 101,425 / 100,851 | 0.1024 / 0.0448 | 53 min, 69.9 GB |
+| + the three feature keys | 113,858 (+0.37%) | 91,270 (+0.23%) | 9,084 (+0.48%) | 109,482 / 110,141 / 110,308 (+0.26%) | 101,715 / 101,940 / 101,467 (+0.33%) | 0.1024 / 0.0449 | 51 min, 77.5 GB |
+
+Smaller than the single-run gain, as with every identification key measured in an experiment
+here (the second pass adds the same precursors to every run in both arms). The quantification
+is unchanged, as it must be: the keys change no trace and no integration. The peak is 7.6 GB
+higher: each concurrent second-pass extract holds the run's per-peak Q1 centroids (3.3 GB).
+
+### 10.9 What went into the recipe
+
+The three feature keys together are beyond the seed spread of the base arm on both libraries
+(+0.76% precursors on the human library, +1.38% human precursors at the matched entrapment FDP
+and +1.22% at a combined FDP of 1.0%), they do not raise the measured FDP at a reported 1%, and
+their features are label-blind. So `configs/examples/ztscan.json` sets `features.q1_precursor`,
+`features.q1_multiscale` and `features.q1_deconvolved`. All three, rather than the two that
+carry most of it: leaving the multi-scale family out costs 0.34% on the entrapment library, and
+the set was measured as a whole. The keys that count only Q1-consistent peaks
+(`search_seed.q1_deconvolved`, `extract.q1_deconvolved`) lose identifications at every
+tolerance and stay off and out of the recipe. No default changes (section 11).
+
+## 11. Open items
 
 - **A second acquisition, and known ratios.** Every number here is one ZenoTOF 8600 method on
   one sample. The benchmark collection holds the ZenoTOF 7600+ ZT Scan DIA arms of PXD070049
@@ -413,10 +630,19 @@ byte; 2 is the setting to take when extract's time matters more than half a perc
   removes ratio bias, and how much background the 4-cycle window adds, needs ZT Scan data with
   known ratios (the arms above).
 - **Calibration of the reported FDR.** With the four keys the measured entrapment FDP at a
-  reported precursor q of 1% is 1.22% (1.39% without them); compare counts at a measured
-  FDP.
+  reported precursor q of 1% is 1.22% (1.39% without them), and with the recipe as it is now
+  1.21-1.30% on another host (section 10.4); compare counts at a measured FDP.
 - **The re-pick's cost** (section 8): `retrace.q1_repick_peaks` 2 takes 28% off extract for
   0.2-0.5% of the identifications; a cheaper statistic that ranks the alternatives without
   deciding them was not found.
 - **The Q1 window's softness** (wider and softer than nominal, section 3) is not separated
   into quadrupole edges and ions in transit while the sweep moves on.
+- **Q1-deconvolved evidence as a count.** Counting only the peaks whose Q1 centroid is where
+  the candidate is expected loses identifications at every tolerance tried (section 10.3),
+  because a real fragment's trace merges with other ions of its m/z; the same evidence as
+  features gains. Weighting each hit by its Q1 consistency instead of cutting it, or
+  splitting merged traces with the transmission model rather than at valleys, were not tried.
+- **The precursor in MS2 against reversed decoys.** A reversed decoy shares its target's
+  precursor m/z and Q1 position, so the unfragmented precursor cannot separate a decoy from a
+  present target; the family adds through the agreement of the fragments with it (section
+  10.2).

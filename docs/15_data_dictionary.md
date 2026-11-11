@@ -446,6 +446,29 @@ are read at the calibrated MS1 m/z, within twice `extract.prec_tol_ppm` and at l
 | `ms1e_tol_ppm` | Float64 | no | ppm | the search tolerance |
 | `ms1e_q1_agree` | Float64 | no (NaN) | Q1 steps | under `extract.q1_fragments`, for a row whose decision has a fit: `q1f_centre` less the centre the observed envelope predicts; NaN otherwise |
 
+Conditional columns of v8, appended last under `extract.q1_fragments` (scanning-quadrupole
+spectra; docs/09_extract.md, section 14), each group only under its key: the
+unfragmented-precursor evidence (`features.q1_precursor`), the multi-scale Q1 scores
+(`features.q1_multiscale`) and the Q1-deconvolved evidence (`features.q1_deconvolved`). A row
+whose apex is not in the sweep carries the "no evidence" values given.
+
+| column | Arrow type | nullable | units | meaning |
+|---|---|---|---|---|
+| `q1p_n_iso` | Float64 | no | count | precursor isotopes (M0, M+1, M+2) present in the MS2 patch by the coherent-cell rule |
+| `q1p_share` | Float64 | no | fraction | the precursor's share of the precursor plus fragment intensity at the 2D apex |
+| `q1p_offset` | Float64 | no | Q1 steps | the isotopes' shared shift from their expected Q1 centres (0 without a fit) |
+| `q1p_resid` | Float64 | no | fraction | their mean `1 - R^2` under it (1 without a fit) |
+| `q1p_frag_corr_mean`, `q1p_frag_corr_max` | Float64 | no | correlation | the present fragments' Q1 profiles against the precursor's |
+| `q1p_n_belong` | Float64 | no | count | fragments within the offset tolerance of the precursor's shift and above the 2D-correlation floor |
+| `q1p_centre_agree` | Float64 | no | Q1 steps | the precursor's shift against the fragments' shared centre (6 without both fits) |
+| `q1m3_*`, `q1m7_*`, `q1m11_*`: `corr_best`, `shape`, `centroid` | Float64 | no | correlation, fraction, Q1 steps | over 3, 7 and 11 steps around the fitted centre: mean correlation with the most intense fragment's profile, `1 - R^2` of the consensus profile against the transmission, the most intense fragment's centroid against its expected centre (0, 1, 0 without a patch) |
+| `q1m3_corr_prec`, `q1m7_corr_prec`, `q1m11_corr_prec` | Float64 | no | correlation | under `features.q1_precursor` as well: mean correlation of the fragments' profiles with the precursor's |
+| `q1d_n_frag` | Float64 | no | count | fragments with a Q1-consistent nearest peak in the apex cycle and two either side |
+| `q1d_n_incons` | Float64 | no | count | fragments matched only by peaks whose Q1 centroid lies elsewhere |
+| `q1d_share` | Float64 | no | fraction | the Q1-consistent share of the matched intensity (0 without a match) |
+| `q1d_pred_share` | Float64 | no | fraction | the predicted-intensity share of the fragments with a consistent match |
+| `q1d_apex_share` | Float64 | no | fraction | the consistent share in the apex cycle alone |
+
 ### chromatograms (`extract.rs:1512-1526`)
 
 One row per predicted transition per accepted candidate, plus MS1 isotope XIC

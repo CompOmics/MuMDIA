@@ -338,6 +338,22 @@ pub const Q1F_FEATURES: &[&str] = &[
 /// set (after [`Q1F_FEATURES`] when that is on).
 pub const MS1E_FEATURES: &[&str] = super::ms1env::FEATURES;
 
+/// The unfragmented-precursor family (`features.q1_precursor`, [`super::q1score`]): the
+/// psms_extracted v8 columns of the same names, appended after every other column of the
+/// `extended` set (after [`MS1E_FEATURES`] when that is on).
+pub const Q1P_FEATURES: &[&str] = super::q1score::Q1P_COLUMNS;
+
+/// The Q1-deconvolved evidence family (`features.q1_deconvolved`, [`super::q1dec`]): the
+/// psms_extracted v8 columns of the same names, appended last (after [`q1m_features`]).
+pub const Q1D_FEATURES: &[&str] = super::q1dec::Q1D_COLUMNS;
+
+/// The multi-scale Q1 family (`features.q1_multiscale`, [`super::q1score`]): the psms_extracted
+/// v8 columns of the same names, with the precursor-referenced ones when `q1p` is on as well,
+/// appended last.
+pub fn q1m_features(q1p: bool) -> Vec<&'static str> {
+    super::q1score::q1m_columns(q1p)
+}
+
 /// The ordered active feature list for the configured set. `im` is the resolved
 /// `features.im_features`, with `imc_ref_w` when `retrace.apex_features` wrote it
 /// ([`ImFamily`]): under `extended` it appends the ion-mobility columns after the other
@@ -372,6 +388,66 @@ pub fn active_features_all(
     q1f: bool,
     ms1e: bool,
 ) -> Vec<String> {
+    active_features_fam(
+        set,
+        im,
+        Q1Families {
+            q1,
+            q1f,
+            ms1e,
+            ..Q1Families::default()
+        },
+    )
+}
+
+/// The switches of the families appended last under `extended`, in their order.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Q1Families {
+    /// `features.q1_features` ([`Q1_FEATURES`]).
+    pub q1: bool,
+    /// `features.q1_fragment_features` ([`Q1F_FEATURES`]).
+    pub q1f: bool,
+    /// `features.ms1_envelope` ([`MS1E_FEATURES`]).
+    pub ms1e: bool,
+    /// `features.q1_precursor` ([`Q1P_FEATURES`]).
+    pub q1p: bool,
+    /// `features.q1_multiscale` ([`q1m_features`]).
+    pub q1m: bool,
+    /// `features.q1_deconvolved` ([`Q1D_FEATURES`]).
+    pub q1d: bool,
+}
+
+impl Q1Families {
+    /// The switches of a features configuration.
+    pub fn of(cfg: &FeaturesConfig) -> Q1Families {
+        Q1Families {
+            q1: cfg.q1_features,
+            q1f: cfg.q1_fragment_features,
+            ms1e: cfg.ms1_envelope,
+            q1p: cfg.q1_precursor,
+            q1m: cfg.q1_multiscale,
+            q1d: cfg.q1_deconvolved,
+        }
+    }
+}
+
+/// [`active_features_all`] with every family switch ([`Q1Families`]): after the
+/// MS1-envelope family, the unfragmented-precursor family ([`Q1P_FEATURES`]), the
+/// multi-scale Q1 family ([`q1m_features`]) and the Q1-deconvolved evidence family
+/// ([`Q1D_FEATURES`]), each only when on, under `extended`.
+pub fn active_features_fam(
+    set: FeatureSet,
+    im: impl Into<ImFamily>,
+    fam: Q1Families,
+) -> Vec<String> {
+    let Q1Families {
+        q1,
+        q1f,
+        ms1e,
+        q1p,
+        q1m,
+        q1d,
+    } = fam;
     let mut v: Vec<String> = MINIMAL_FEATURES.iter().map(|s| s.to_string()).collect();
     if matches!(set, FeatureSet::Rich | FeatureSet::Extended) {
         v.extend(RICH_EXTRA.iter().map(|s| s.to_string()));
@@ -399,6 +475,31 @@ pub fn active_features_all(
         if ms1e {
             v.extend(MS1E_FEATURES.iter().map(|s| s.to_string()));
         }
+        if q1p {
+            v.extend(Q1P_FEATURES.iter().map(|s| s.to_string()));
+        }
+        if q1m {
+            v.extend(q1m_features(q1p).into_iter().map(|s| s.to_string()));
+        }
+        if q1d {
+            v.extend(Q1D_FEATURES.iter().map(|s| s.to_string()));
+        }
+    }
+    v
+}
+
+/// The `q1p_*` and `q1m*` features a features configuration appends (the v8 columns it
+/// reads), in feature order.
+fn q1s_feature_names(cfg: &FeaturesConfig) -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = Vec::new();
+    if cfg.q1_precursor {
+        v.extend_from_slice(Q1P_FEATURES);
+    }
+    if cfg.q1_multiscale {
+        v.extend(q1m_features(cfg.q1_precursor));
+    }
+    if cfg.q1_deconvolved {
+        v.extend_from_slice(Q1D_FEATURES);
     }
     v
 }
@@ -407,13 +508,7 @@ pub fn active_features_all(
 /// that do (`has_im`) or do not carry 1/K0. An orchestrator resolves it once
 /// (`Config::resolve_im_features`), so `has_im` then changes nothing.
 pub fn active_features_for(cfg: &FeaturesConfig, has_im: bool) -> Vec<String> {
-    active_features_all(
-        cfg.set,
-        cfg.im_features.on(has_im),
-        cfg.q1_features,
-        cfg.q1_fragment_features,
-        cfg.ms1_envelope,
-    )
+    active_features_fam(cfg.set, cfg.im_features.on(has_im), Q1Families::of(cfg))
 }
 
 /// The active feature list of a run's search pass, for the schema id an orchestrator
@@ -422,12 +517,10 @@ pub fn active_features_for(cfg: &FeaturesConfig, has_im: bool) -> Vec<String> {
 /// `retrace.enabled` and without the ion-mobility family).
 pub fn active_features_of(cfg: &mumdia_core::config::Config, has_im: bool) -> Vec<String> {
     let im = cfg.features.im_features.on(has_im);
-    active_features_all(
+    active_features_fam(
         cfg.features.set,
         ImFamily::of(im, cfg.retrace.apex_features),
-        cfg.features.q1_features,
-        cfg.features.q1_fragment_features,
-        cfg.features.ms1_envelope,
+        Q1Families::of(&cfg.features),
     )
 }
 
@@ -3565,6 +3658,24 @@ fn run_chunked(
     } else {
         Vec::new()
     };
+    // The unfragmented-precursor and multi-scale Q1 families (`features.q1_precursor`,
+    // `features.q1_multiscale`) from psms_extracted v8, read by name; an error without the
+    // columns, as above.
+    let q1s_names = q1s_feature_names(p.cfg);
+    let q1s_cols: Vec<Vec<f64>> = q1s_names
+        .iter()
+        .map(|c| {
+            if !ps.has_column(c) {
+                anyhow::bail!(
+                    "features: features.q1_precursor / q1_multiscale / q1_deconvolved is on, but \
+                     {} has no {c} column; extract writes it under the same key with \
+                     extract.q1_fragments",
+                    p.psms
+                );
+            }
+            ps.f64(c)
+        })
+        .collect::<Result<_>>()?;
     let contested = ps
         .f64("contested_frac")
         .unwrap_or_else(|_| vec![0.0; ps.nrows]);
@@ -3745,13 +3856,13 @@ fn run_chunked(
     };
 
     let gradient = apex_rt.iter().cloned().fold(0.0f64, f64::max).max(1.0);
-    let cols_active = active_features_all(
-        p.cfg.set,
-        im_fam,
-        p.cfg.q1_features,
-        p.cfg.q1_fragment_features,
-        p.cfg.ms1_envelope,
-    );
+    let cols_active = active_features_fam(p.cfg.set, im_fam, Q1Families::of(p.cfg));
+    // The `q1p_*` / `q1m*` columns (psms_extracted v8) and their feature columns, resolved by
+    // name; empty with both keys off.
+    let q1s_ix: Vec<Option<usize>> = q1s_names
+        .iter()
+        .map(|n| cols_active.iter().position(|c| c == n))
+        .collect();
     let n = ps.nrows;
 
     // --- Cross-candidate charge-state corroboration (Extended set) ---
@@ -4241,6 +4352,9 @@ fn run_chunked(
                             put(ix.ms1e_mono_ppm_abs, ms1e_cols[6][i]);
                             put(ix.ms1e_ibar_dev, ms1e_cols[7][i]);
                             put(ix.ms1e_q1_agree, ms1e_cols[8][i]);
+                        }
+                        for (k, c) in q1s_ix.iter().enumerate() {
+                            put(*c, q1s_cols[k][i]);
                         }
 
                         pr[rl] = n_matched[i] as f64 * (0.5 + ff.frag_corr.max(0.0))
@@ -6114,6 +6228,107 @@ mod tests {
         cfg.q1_fragment_features = true;
         assert_eq!(active_features_for(&cfg, false), on);
         assert_ne!(feature_schema_id(&on), feature_schema_id(&off));
+    }
+
+    /// The unfragmented-precursor and multi-scale Q1 families are appended last under the
+    /// extended set only, the precursor one first and the precursor-referenced multi-scale
+    /// columns only with both on; the schema id changes only with them.
+    #[test]
+    fn the_q1p_and_q1m_families_are_appended_last_and_only_when_asked() {
+        let q1f = active_features_q1(FeatureSet::Extended, false, false, true);
+        let p = active_features_fam(
+            FeatureSet::Extended,
+            false,
+            Q1Families {
+                q1: false,
+                q1f: true,
+                ms1e: false,
+                q1p: true,
+                q1m: false,
+                q1d: false,
+            },
+        );
+        let m = active_features_fam(
+            FeatureSet::Extended,
+            false,
+            Q1Families {
+                q1: false,
+                q1f: true,
+                ms1e: false,
+                q1p: false,
+                q1m: true,
+                q1d: false,
+            },
+        );
+        let pm = active_features_fam(
+            FeatureSet::Extended,
+            false,
+            Q1Families {
+                q1: false,
+                q1f: true,
+                ms1e: false,
+                q1p: true,
+                q1m: true,
+                q1d: false,
+            },
+        );
+        assert_eq!(&p[..q1f.len()], &q1f[..]);
+        assert_eq!(&p[q1f.len()..], Q1P_FEATURES);
+        assert_eq!(&m[q1f.len()..], &q1m_features(false)[..]);
+        assert_eq!(&pm[q1f.len()..q1f.len() + Q1P_FEATURES.len()], Q1P_FEATURES);
+        assert_eq!(
+            &pm[q1f.len() + Q1P_FEATURES.len()..],
+            &q1m_features(true)[..]
+        );
+        assert_eq!(
+            active_features_fam(
+                FeatureSet::Extended,
+                false,
+                Q1Families {
+                    q1: false,
+                    q1f: true,
+                    ms1e: false,
+                    q1p: false,
+                    q1m: false,
+                    q1d: false
+                }
+            ),
+            q1f
+        );
+        for set in [FeatureSet::Minimal, FeatureSet::Rich] {
+            assert_eq!(
+                active_features_fam(
+                    set,
+                    false,
+                    Q1Families {
+                        q1: false,
+                        q1f: true,
+                        ms1e: false,
+                        q1p: true,
+                        q1m: true,
+                        q1d: false
+                    }
+                ),
+                active_features(set, false)
+            );
+        }
+        let mut cfg = FeaturesConfig {
+            set: FeatureSet::Extended,
+            q1_fragment_features: true,
+            ..FeaturesConfig::default()
+        };
+        assert!(q1s_feature_names(&cfg).is_empty());
+        cfg.q1_precursor = true;
+        cfg.q1_multiscale = true;
+        assert_eq!(active_features_for(&cfg, false), pm);
+        assert_eq!(q1s_feature_names(&cfg), &pm[q1f.len()..]);
+        assert_ne!(feature_schema_id(&pm), feature_schema_id(&q1f));
+        // The deconvolved-evidence family comes last.
+        cfg.q1_deconvolved = true;
+        let pmd = active_features_for(&cfg, false);
+        assert_eq!(&pmd[..pm.len()], &pm[..]);
+        assert_eq!(&pmd[pm.len()..], Q1D_FEATURES);
+        assert_eq!(q1s_feature_names(&cfg), &pmd[q1f.len()..]);
     }
 
     /// The MS1 isotope-envelope family is appended last under the extended set only (after

@@ -1678,6 +1678,21 @@
       "source_struct": "SearchSeedConfig"
     },
     {
+      "path": "search_seed.q1_deconvolved",
+      "name": "q1_deconvolved",
+      "section": "search_seed",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Scanning-quadrupole spectra (SCIEX ZT Scan DIA read with `convert.isolation_half_width`, spectra_ms2 v3): count a peak for a candidate only when its Q1 centroid lies within 2 steps of the candidate's nominal expected Q1 centre (`stages::q1dec`). Every MS2 peak is given the centroid of its trace along the Q1 axis (mutual-nearest peaks of adjacent steps of one cycle, split at valleys), so a fragment m/z another precursor shares, transmitted around that precursor's position, no longer counts for this one. The seed runs before the Q1 calibration, so the centre is the precursor's isotope envelope with no window offset. Refused on spectra that carry 1/K0 and with window groups. Default false. Benchmark-gated (docs/37_ztscan.md). Omitted from the canonical configuration at its default.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "SearchSeedConfig"
+    },
+    {
       "path": "search_seed.frag_tol_mad_k",
       "name": "frag_tol_mad_k",
       "section": "search_seed",
@@ -2279,6 +2294,21 @@
       "default": false,
       "default_text": "false",
       "help": "Scanning-quadrupole spectra: decide for every library fragment of an accepted candidate whether its signal belongs to the candidate's precursor (`stages::q1frag`, psms_extracted v6). For each fragment the matched intensity is read in every Q1 step whose calibrated window reaches the precursor (plus two steps either side) over the seven cycles around the apex: an RT x step patch, with every step kept apart. One Q1 centre and width shared by the candidate's fragments are fitted to the patch with a height per fragment, each fragment's own centre and residual are read against it, and its 2D correlation with the other fragments' elution times the expected transmission; a fragment is then `belongs`, `interfered` or `absent` by tolerances `rt_im_train.q1_calibrate` learns from the confident seed PSMs, and the fit is repeated once on the fragments that belong. Writes per row the decision of every library fragment (`q1f_frag_*` lists) and its summary (`q1f_*`), which `features.q1_fragment_features`, `retrace.q1_repick` and `rescore.shadow_q1` read. Needs `rt_im_train.q1_calibrate` and spectra_ms2 v3 (a run converted with `convert.isolation_half_width`); refused with `q1_cycles`, on any other layout and on spectra that carry 1/K0. Default false. Benchmark-gated (docs/09_extract.md, \"Per-fragment Q1 decisions\"). Omitted from the canonical configuration at its default.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "ExtractConfig"
+    },
+    {
+      "path": "extract.q1_deconvolved",
+      "name": "q1_deconvolved",
+      "section": "extract",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Scanning-quadrupole spectra: count a peak for a candidate only when its Q1 centroid (the intensity-weighted mean step target of its trace along the Q1 axis within one cycle, `stages::q1dec`) lies within the tolerance the Q1 calibration learns from the confident seed PSMs (`q1_calibration.deconvolution`) of the candidate's calibrated expected Q1 centre. Applies to every hit extract collects (the traces, the apex, the presence rules, the gate and the features read them), not to the per-fragment decision's patches, which read the spectra directly. Needs `rt_im_train.q1_calibrate` (which then learns the tolerance) and spectra_ms2 v3; refused with `q1_cycles`, on spectra that carry 1/K0 and with window groups. Default false. Benchmark-gated (docs/37_ztscan.md). Omitted from the canonical configuration at its default.",
       "gates": [
         "benchmark-gated"
       ],
@@ -3212,6 +3242,51 @@
       "default": false,
       "default_text": "false",
       "help": "The MS1 isotope-envelope family (`ms1e_*`): extract reads the precursor's isotopes M-1 to M+4 and the half-spacing positions in the MS1 scans around the apex (the nearest one and two either side), at the calibrated MS1 m/z (`extract.ms1_calibrate`, the surface under `\"surface\"`) within twice `extract.prec_tol_ppm` (at least 10 ppm), and writes the evidence to psms_extracted v7; the features stage derives the envelope's agreement with the averagine envelope over five isotopes (`ms1e_env_r2`), the isotopes found in a row from M0 (`ms1e_env_n`), the M-1 share (`ms1e_m1_share`), the share at the half-spacing positions (`ms1e_half_share`, a species of twice the charge), the spacing error of the isotopes found (`ms1e_spacing_ppm`), the monoisotopic m/z error after the calibration (`ms1e_mono_ppm`, signed, and `ms1e_mono_ppm_abs`), the observed envelope's mean isotope index against averagine (`ms1e_ibar_dev`) and, under `extract.q1_fragments`, the fitted Q1 centre against the centre the observed envelope predicts (`ms1e_q1_agree`, steps; 0 without the decisions), appended after every other column of the `extended` set. Refused on spectra that carry 1/K0. Default false. Benchmark-gated (docs/10_features.md). Omitted from the canonical configuration at its default.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "FeaturesConfig"
+    },
+    {
+      "path": "features.q1_precursor",
+      "name": "q1_precursor",
+      "section": "features",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "The unfragmented-precursor family of scanning-quadrupole spectra (`q1p_*`): extract reads the precursor's own m/z (M0, M+1, M+2, at the calibrated fragment m/z) in every cell of the per-fragment decision's RT x step patch, where each isotope is transmitted at its own Q1 position, and writes per row (psms_extracted v8) how many isotopes are present by the decision's coherent-cell rule (`q1p_n_iso`), the precursor's share of the precursor plus fragment intensity at the 2D apex (`q1p_share`), the shift of its isotopes' Q1 profiles from where the calibrated window puts them (`q1p_offset`, steps, one shift shared by the isotopes, fitted as the fragments' shared centre is) and their residual under it (`q1p_resid`), the mean and largest correlation of the fragments' Q1 profiles with the precursor's (`q1p_frag_corr_mean`, `q1p_frag_corr_max`), the fragments whose own Q1 centre lies within the decision's offset tolerance of the precursor's (and whose 2D correlation reaches its floor, `q1p_n_belong`) and the distance between the precursor's shift and the fragments' shared centre (`q1p_centre_agree`, steps), appended after every other column of the `extended` set. Needs `extract.q1_fragments`. Default false. Benchmark-gated (docs/37_ztscan.md). Omitted from the canonical configuration at its default.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "FeaturesConfig"
+    },
+    {
+      "path": "features.q1_multiscale",
+      "name": "q1_multiscale",
+      "section": "features",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "The multi-scale Q1 family of scanning-quadrupole spectra (`q1m*`): over the 3, 7 and 11 steps centred on the step nearest the fragments' fitted Q1 centre, with the fragments' Q1 profiles summed over the cycles around the 2D apex (the per-fragment decision's), the mean correlation of each present fragment's profile with the most intense one's (`q1m3_corr_best`, `q1m7_corr_best`, `q1m11_corr_best`), the residual of the fragments' consensus profile under the calibrated transmission at the fitted centre (`q1mK_shape`, `1 - R^2`) and the most intense fragment's Q1 centroid against its expected centre (`q1mK_centroid`, steps), and with `q1_precursor` on the mean correlation of the fragments' profiles with the unfragmented precursor's (`q1mK_corr_prec`), written to psms_extracted v8 and appended after every other column of the `extended` set. Needs `extract.q1_fragments`. Default false. Benchmark-gated (docs/37_ztscan.md). Omitted from the canonical configuration at its default.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "FeaturesConfig"
+    },
+    {
+      "path": "features.q1_deconvolved",
+      "name": "q1_deconvolved",
+      "section": "features",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "The Q1-deconvolved evidence family of scanning-quadrupole spectra (`q1d_*`): every MS2 peak is given the Q1 centroid of its trace along the sweep (`stages::q1dec`, the evidence of `extract.q1_deconvolved`), and at each row's apex, over the scans of the apex cycle and the two either side whose window covers the precursor, extract reads for every library fragment the nearest peak and whether its centroid lies within the tolerance the Q1 calibration learns of the fragment's expected Q1 centre: the fragments with such a consistent match (`q1d_n_frag`), those matched only inconsistently (`q1d_n_incons`), the consistent share of the matched intensity (`q1d_share`, and in the apex cycle alone `q1d_apex_share`) and the predicted-intensity share of the fragments with a consistent match (`q1d_pred_share`), written to psms_extracted v8 and appended after every other column of the `extended` set. The extraction itself is unchanged (unlike `extract.q1_deconvolved`, which counts only the consistent peaks). Needs `extract.q1_fragments`. Default false. Benchmark-gated (docs/37_ztscan.md). Omitted from the canonical configuration at its default.",
       "gates": [
         "benchmark-gated"
       ],
