@@ -153,6 +153,11 @@ mumdia run --lib-precursors lib/lib_precursors.parquet --lib-fragments lib/lib_f
 - The recipe is refused with `groups.window_groups > 1` (the Q1 calibration needs the whole
   sweep), so a machine too small for one run cannot band it; the base reading
   (`isolation_half_width` alone) can be banded.
+- For a final pass, the classifier's sensitivity settings (`rescore.folds` 5,
+  `rescore.train_margin_frac` 0.75, `rescore.seeds` 3) add 0.6-0.8% on top of everything the
+  recipe sets, beyond the seed spread on both libraries, for five to six times the rescore wall
+  (13.5 min against 2.6 min for one run, section 5, "Features for the classifier"); they are not
+  in the recipe.
 
 ## 5. Measured results
 
@@ -288,8 +293,44 @@ higher. The recipe with the family's columns rescored with them projected out (a
 prefilter's default columns) writes the scored table of the run made without the family byte
 for byte, which is how the same-host bases of the combined arms below were taken.
 
-The three runs as one experiment (REP01-03, second pass, one NN seed, niffler, 64 threads, the
-family alone): 113,013 to 115,152 precursors (+1.9%), 90,739 to 92,396 peptides (+1.8%), 9,027 to
+**With the other recipe additions.** The same comparison on top of the precursor, multi-scale and
+deconvolved Q1 families (`features.q1_precursor`, `features.q1_multiscale`,
+`features.q1_deconvolved`), and on top of those with a wider library (charge 1-4, length 6-40,
+methionine oxidation and N-terminal acetylation, two variable modifications) and the
+classifier's sensitivity settings (`rescore.folds` 5, `train_margin_frac` 0.75, `seeds` 3). One
+binary with both changes, four NN seeds; every arm without `q1_consistency` is the same
+competed table rescored with the family's columns projected out (shown above to reproduce the
+run made without it); the entrapment library on ashwinder, the human library on basilisk.
+Human precursors at the recipe arm's measured FDP (1.277%) and at 1.0%, precursors on the human
+library:
+
+| arm | entrapment: human at 1.277%, mean (range) | at FDP 1.0% | FDP at a reported 1% | human library: precursors, mean (range) |
+|---|---|---|---|---|
+| the recipe | 97,493 (97,247-97,809) | 95,285 | 1.25-1.31% | 99,605 (99,331-99,817) |
+| + the three Q1 families | 98,841 (98,308-99,195), +1.38% | 96,449 | 1.21-1.30% | 100,400 (100,283-100,508), +0.80% |
+| + the three Q1 families + `q1_consistency` | **100,532 (100,246-100,918), +3.12%** | 98,403 | 1.18-1.26% | **102,277 (101,853-102,607), +2.68%** |
+| + the three Q1 families, wider library, sensitivity settings | 102,416 (102,295-102,607), +5.05% | 99,655 | 1.23-1.26% | 104,996 (104,863-105,188), +5.41% |
+| + the three Q1 families, wider library, `q1_consistency` | 103,909 (103,792-104,124), +6.58% | 100,971 | 1.15-1.18% | 105,788 (105,400-106,059), +6.21% |
+| + all of it: three Q1 families, wider library, sensitivity, `q1_consistency` | **104,545 (104,381-104,618), +7.23%** | **102,158, +7.21%** | 1.17-1.24% | **106,659 (106,476-106,933), +7.08%** |
+
+`q1_consistency` adds +1.71% (entrapment, at the matched FDP) and +1.87% (human library) on top of
+the three Q1 families and +2.08% and +1.58% on top of those with the wider library and the
+sensitivity settings: it is additive, with ranges disjoint at every step. Its columns overlap
+little with the three families (the largest Spearman correlation of a `q1c_*` column with any of
+their 25 columns is 0.32-0.53, `q1c_obs_share` with `q1d_share` 0.51), and at the matched score
+of the arm with the three families the `q1c_*` shares and similarities still separate the
+near-miss precursors from decoys with an AUC of 0.69-0.71, against 0.44-0.60 for theirs. The
+sensitivity settings add +0.61% and +0.82% on top of everything else.
+
+The three runs as one experiment (REP01-03, second pass, one NN seed, niffler, 64 threads),
+with the three families, the wider library and the sensitivity settings: 119,030 precursors
+without `q1_consistency` and **120,892 with it (+1.6%)**, peptides 94,606 and 95,970, protein
+groups 9,238 and 9,332, per run on `run_psm_q` 114,715 / 115,275 / 115,266 and 116,894 / 116,933
+/ 116,655, first pass 105,524 / 105,677 / 106,242 and 107,427 / 107,730 / 108,011; 178 and 180 min
+on a shared host, peaks 105 and 110 GB. Against the recipe's experiment (113,013) that is +7.0%.
+
+The three runs as one experiment with the recipe alone (REP01-03, second pass, one NN seed,
+niffler, 64 threads, the family alone): 113,013 to 115,152 precursors (+1.9%), 90,739 to 92,396 peptides (+1.8%), 9,027 to
 9,116 protein groups (+1.0%), per run on `run_psm_q` 109,028 / 109,185 / 109,093 to 111,483 /
 111,482 / 111,529 (+2.2%), first pass 101,104 / 101,212 / 100,449 to 102,945 / 103,101 / 102,613;
 80 and 78 min on a shared host, 89 GB both. The base writes the phase-4 recipe experiment's
