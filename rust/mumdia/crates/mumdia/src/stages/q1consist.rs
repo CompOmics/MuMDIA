@@ -7,8 +7,9 @@
 //! that are present, so when interfering fragments dominate the fit it moves towards the
 //! interferer, the 2D correlations of the candidate's own fragments fall, and none belongs.
 //! The `q1f_*` summary then reads 0 for a precursor whose strongest fragments sit exactly
-//! where its m/z says they should. On the ZT Scan K562 runs that is 60% of the precursors the
-//! classifier scored just above 1% while their peak was the one another engine accepted.
+//! where its m/z says they should. On a ZT Scan K562 run none belongs for 60% of the
+//! precursors the classifier scored above 1% while their peak was the one another engine
+//! accepted at 1% (docs/37_ztscan.md, section 5).
 //!
 //! This family reads the same per-fragment decisions against the EXPECTED centre instead:
 //! a fragment is consistent when it is present and its own Q1 centre (`q1f_frag_offset`,

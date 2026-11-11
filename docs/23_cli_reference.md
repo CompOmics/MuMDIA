@@ -627,6 +627,9 @@ Options:
 
       --out-pin <OUT_PIN>
 
+      --q1-cal <Q1_CAL>
+          The run's `cal.json` with its Q1 calibration, whose per-fragment decision tolerances `features.q1_consistency` reads the Q1 decisions against
+
       --config <CONFIG>
 ```
 

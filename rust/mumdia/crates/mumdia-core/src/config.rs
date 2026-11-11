@@ -3047,12 +3047,13 @@ pub struct FeaturesConfig {
     /// needs) read against each fragment's EXPECTED Q1 centre rather than the centre the
     /// candidate's fragments share, so a precursor whose shared fit an interferer pulled away
     /// keeps the evidence of its own fragments: how many are consistent (within the learned
-    /// offset tolerance), their share of the predicted and of the observed intensity, and the
-    /// agreement of their observed pattern with the prediction (and the same scores over the
-    /// fragments that belong), appended after every other column of the `extended` set. The
+    /// offset tolerance), their share of the predicted and of the observed intensity, the
+    /// agreement of their observed pattern with the prediction, and graded and soft versions of
+    /// the cut: sixteen `q1c_*` columns appended after every other column of the `extended` set.
+    /// With them in the competed table, four join the rescore prefilter's default columns. The
     /// tolerances come from the run's Q1 calibration (`cal.json`; `mumdia features --q1-cal`).
-    /// Default false. Benchmark-gated (docs/10_features.md, docs/37_ztscan.md). Omitted from the
-    /// canonical configuration at its default.
+    /// Default false; in `configs/examples/ztscan.json`. Benchmark-gated (docs/10_features.md,
+    /// docs/37_ztscan.md). Omitted from the canonical configuration at its default.
     #[serde(skip_serializing_if = "is_false")]
     pub q1_consistency: bool,
 }
