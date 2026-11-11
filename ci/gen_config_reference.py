@@ -338,6 +338,7 @@ class EnumVariant:
 CUSTOM_SERDE_SPELLING = {
     "BaselineSubtract": {"Off": "false", "On": "true", "Auto": "auto"},
     "Ms1Calibrate": {"Off": "false", "Offset": "true", "Surface": "surface"},
+    "ZtSwitch": {"Auto": "auto", "On": "true", "Off": "false"},
 }
 
 

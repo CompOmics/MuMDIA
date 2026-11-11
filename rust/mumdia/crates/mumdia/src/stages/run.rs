@@ -190,6 +190,15 @@ pub fn run(p: RunParams) -> Result<()> {
     // raw dispatch before anything is converted, as the library-build keys are. Every stage
     // then sees `on` or `off`, and the manifest records what ran.
     resolved.resolve_im_features(crate::instrument::input_has_im(p.mzml));
+    // The ZT Scan analysis resolves on the input as well: on for a SCIEX ZT Scan DIA run,
+    // off for every other run, which then runs exactly as before (`ztscan`, docs/37_ztscan.md,
+    // "Automatic for ZT Scan files").
+    crate::ztscan::resolve(
+        &mut resolved,
+        &[p.mzml.to_string()],
+        p.lib_precursors.is_some(),
+        "run",
+    )?;
     crate::stages::retrace::refuse_inputs_without_raw_events(&resolved, &[p.mzml])?;
     pre.step("resolve_interpreters");
     let cfg = &resolved;

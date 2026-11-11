@@ -1004,7 +1004,7 @@ Peaks per MS2 spectrum for an mzML or a diaPASEF `.d`, as JSON: percentiles plus
 
 The pre-flight for a decision the documentation says must be made per acquisition. Reading it before setting a cap is the difference between bounding peak volume and deleting fragment evidence from most spectra. A diaPASEF `.d` is counted after the native reader's centroiding, which is what `convert` writes for it.
 
-For an mzML the `isolation` block says how `convert` reads the MS2 isolation windows of the spectra counted: with offsets, without isolation, or a target and no offsets. A scanning-quadrupole file of the last kind (SCIEX ZT Scan DIA) is refused without `convert.isolation_half_width`; the block names the layout of its targets and a half-width to start from (docs/37_ztscan.md).
+For an mzML the `isolation` block says how `convert` reads the MS2 isolation windows of the spectra counted: with offsets, without isolation, or a target and no offsets. A file of the last kind needs a half-width (`convert_refuses`). A scanning quadrupole of that kind (`scanning_quadrupole`: SCIEX ZT Scan DIA) is the one input `run`, `run-experiment` and `convert` read with the half-width the block suggests unless `convert.isolation_half_width` is set, and search with the ZT Scan analysis; any other file of that kind is refused without the key (docs/37_ztscan.md).
 
 Usage: mumdia peak-census [OPTIONS] --mzml <MZML>
 

@@ -812,43 +812,122 @@ impl IsolationCensus {
         Some(d[d.len() / 2])
     }
 
+    /// What the census decides, typed: the fields of its JSON a search acts on
+    /// (`mumdia::ztscan`).
+    pub fn decision(&self) -> IsolationDecision {
+        let t = &self.target_only;
+        let refused = t.differ;
+        let layout = (t.n > 0).then(|| target_layout(&t.sample));
+        let scanning = layout
+            .as_ref()
+            .is_some_and(TargetLayout::is_scanning_quadrupole);
+        // Rounded to 0.05 m/z: the suggestion is a method's half-width, not a fit.
+        let suggested_half_width = layout
+            .as_ref()
+            .filter(|_| scanning && refused)
+            .map(|l| (SCANNING_HALF_WIDTH_STEPS * l.median_step * 20.0).round() / 20.0);
+        IsolationDecision {
+            ms2_spectra: self.ms2,
+            target_only: t.n,
+            convert_refuses: refused,
+            scanning_quadrupole: scanning,
+            suggested_half_width,
+            positions: layout.as_ref().map_or(0, |l| l.distinct),
+            lowest_target: layout.as_ref().map(|l| l.lo),
+            highest_target: layout.as_ref().map(|l| l.hi),
+            median_step: layout.as_ref().map(|l| l.median_step),
+        }
+    }
+
+    /// The error `convert` refuses this file with, for a census that refuses it
+    /// ([`IsolationDecision::convert_refuses`]).
+    pub fn refusal(&self, path: &str) -> anyhow::Error {
+        target_only_refusal(path, &self.target_only)
+    }
+
     /// The census as JSON (the `isolation` block of `mumdia peak-census`).
     pub fn to_json(&self) -> serde_json::Value {
         let t = &self.target_only;
-        let refused = t.differ;
-        let (layout, scanning, suggested) = if t.n > 0 {
+        let d = self.decision();
+        let layout = if t.n > 0 {
             let l = target_layout(&t.sample);
-            let scanning = l.is_scanning_quadrupole();
-            // Rounded to 0.05 m/z: the suggestion is a method's half-width, not a fit.
-            let hw = (scanning && refused)
-                .then(|| (SCANNING_HALF_WIDTH_STEPS * l.median_step * 20.0).round() / 20.0);
-            (
-                json!({
-                    "distinct_targets": l.distinct,
-                    "lowest_target": l.lo,
-                    "highest_target": l.hi,
-                    "median_step": l.median_step,
-                    "spectra_per_target": l.repeats,
-                    "cycle_s": self.cycle_s(),
-                }),
-                scanning,
-                hw,
-            )
+            json!({
+                "distinct_targets": l.distinct,
+                "lowest_target": l.lo,
+                "highest_target": l.hi,
+                "median_step": l.median_step,
+                "spectra_per_target": l.repeats,
+                "cycle_s": self.cycle_s(),
+            })
         } else {
-            (serde_json::Value::Null, false, None)
+            serde_json::Value::Null
         };
         json!({
             "ms2_spectra": self.ms2,
             "with_offsets": self.with_offsets,
             "no_isolation": self.no_isolation,
             "target_only": t.n,
-            "convert_refuses": refused,
+            "convert_refuses": d.convert_refuses,
             "layout": layout,
-            "scanning_quadrupole": scanning,
-            "suggested_half_width": suggested,
-            "suggested_half_width_steps": suggested.map(|_| SCANNING_HALF_WIDTH_STEPS),
+            "scanning_quadrupole": d.scanning_quadrupole,
+            "suggested_half_width": d.suggested_half_width,
+            "suggested_half_width_steps": d.suggested_half_width.map(|_| SCANNING_HALF_WIDTH_STEPS),
         })
     }
+}
+
+/// What an [`IsolationCensus`] decides about a file ([`IsolationCensus::decision`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct IsolationDecision {
+    /// MS2 spectra counted.
+    pub ms2_spectra: usize,
+    /// Of them, those that name an isolation target and no offsets.
+    pub target_only: usize,
+    /// `convert` refuses the file without `convert.isolation_half_width`: its target-only
+    /// spectra name more than one target.
+    pub convert_refuses: bool,
+    /// The target-only spectra are a scanning quadrupole's: at least 50 distinct targets
+    /// repeating cycle after cycle in steps under 1.5 m/z.
+    pub scanning_quadrupole: bool,
+    /// The half-width to read a refused scanning quadrupole with
+    /// ([`SCANNING_HALF_WIDTH_STEPS`] steps, rounded to 0.05 m/z).
+    pub suggested_half_width: Option<f64>,
+    /// Distinct targets of the target-only spectra (0 without any).
+    pub positions: usize,
+    /// The lowest and highest target, and the median step between targets, m/z.
+    pub lowest_target: Option<f64>,
+    pub highest_target: Option<f64>,
+    pub median_step: Option<f64>,
+}
+
+/// The [`IsolationCensus`] of the head of an mzML, read as cheaply as it can be: spectrum
+/// metadata only (no peak array is decoded), streamed from the start of the file without its
+/// offset index, at most `max_spectra` spectra (MS1 included, as `--max-spectra` counts them),
+/// and no further than `plain_ms2` MS2 spectra when none of those names a target without
+/// offsets, which settles a file that states its windows. A file that cannot be opened or
+/// parsed gives an empty census: `convert` reports it when it reads the file.
+pub fn census_of_head(path: &str, max_spectra: usize, plain_ms2: usize) -> IsolationCensus {
+    let mut census = IsolationCensus::default();
+    let Ok(file) = std::fs::File::open(path) else {
+        return census;
+    };
+    let mut reader = MzMLReaderType::<std::fs::File>::with_buffer_capacity_and_detail_level(
+        file,
+        READER_BUFFER_BYTES,
+        DetailLevel::MetadataOnly,
+    );
+    let mut read = 0usize;
+    while read < max_spectra {
+        let Some(spec) = reader.read_next() else {
+            break;
+        };
+        read += 1;
+        census.record(&spec);
+        if census.ms2 >= plain_ms2 && census.target_only.n == 0 {
+            break;
+        }
+    }
+    census
 }
 
 /// The order-dependent half of the conversion: the accumulators, the parquet
@@ -3129,6 +3208,116 @@ mod tests {
         assert_eq!(c["scanning_quadrupole"], false);
         assert_eq!(c["layout"]["distinct_targets"], 24);
         assert!(c["suggested_half_width"].is_null(), "{c}");
+
+        // The head census a search detects ZT Scan input with (metadata only, streamed, no
+        // index) decides exactly as the full reader's census does.
+        for (path, ms2) in [(&bare, 480), (&explicit, 64), (&fixed, 144)] {
+            let head = census_of_head(path.to_str().unwrap(), 10_000, 64);
+            let mut full = census_of(path);
+            let mut fast = head.to_json();
+            assert_eq!(fast["ms2_spectra"], ms2, "{fast}");
+            // A file that states its windows is settled after 64 MS2 spectra.
+            for c in [&mut full, &mut fast] {
+                for k in ["ms2_spectra", "with_offsets"] {
+                    c.as_object_mut().unwrap().remove(k);
+                }
+            }
+            assert_eq!(fast, full, "{}", path.display());
+        }
+        let zt = census_of_head(bare.to_str().unwrap(), 10_000, 64).decision();
+        assert!(zt.convert_refuses && zt.scanning_quadrupole);
+        assert_eq!(zt.suggested_half_width, Some(1.9));
+        assert_eq!(zt.positions, 120);
+        assert!(
+            (zt.lowest_target.unwrap() - 394.2558).abs() < 1e-3,
+            "{zt:?}"
+        );
+        let refusal = census_of_head(fixed.to_str().unwrap(), 10_000, 64).refusal("fixed.mzML");
+        assert!(format!("{refusal}").contains("no lower or upper offset"));
+        // A file that cannot be read gives an empty census, which refuses nothing.
+        let none = census_of_head(d.join("absent.mzML").to_str().unwrap(), 10_000, 64);
+        assert!(!none.decision().convert_refuses && none.decision().ms2_spectra == 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The gate of the ZT Scan analysis (`ztscan::detect`): a scanning quadrupole that names
+    /// its targets only is a ZT Scan run, the same file with offsets and a fixed-window file
+    /// are not; a search is all, none or some of them, the half-width is the census's, and a
+    /// target-only file of fixed windows or two ZT Scan methods in one search are refused
+    /// unless the configuration sets the half-width.
+    #[test]
+    fn the_ztscan_gate_is_the_isolation_census() {
+        use crate::ztscan::{detect, probe, InputKind};
+        use mumdia_core::config::ZtScanInputs;
+        let d = tmpdir("ztscan_gate");
+        let write = |name: &str, spectra: Vec<String>| {
+            let p = d.join(name);
+            std::fs::write(&p, mzml(spectra.len(), &spectra)).unwrap();
+            p.to_str().unwrap().to_string()
+        };
+        let zt = write("zt.mzML", scanning_run(4, 120, None));
+        let zt2 = write("zt2.mzML", scanning_run(3, 120, None));
+        let windows = write("windows.mzML", scanning_run(4, 120, Some(1.9)));
+        let mut f = Vec::new();
+        for cyc in 0..6 {
+            let rt = format!("{:.6}", 0.05 * cyc as f64);
+            for w in 0..24 {
+                let t = 412.5 + 25.0 * w as f64;
+                let iso = format!(
+                    r#"<cvParam cvRef="MS" accession="MS:1000827" name="isolation window target m/z" value="{t}"/>"#
+                );
+                f.push(
+                    spectrum(f.len(), 2, &rt, &[150.0, 300.0], &[5.0, 6.0])
+                        .replace(FIXED_ISOLATION, &iso),
+                );
+            }
+        }
+        let fixed = write("fixed.mzML", f);
+        match probe(&zt).kind {
+            InputKind::ZtScan(l) => {
+                assert_eq!((l.half_width, l.positions), (1.9, 120));
+            }
+            k => panic!("{k:?}"),
+        }
+        assert_eq!(probe(&windows).kind, InputKind::Other);
+        assert_eq!(probe(&fixed).kind, InputKind::TargetOnly);
+        let inputs = |paths: &[&String], set: bool| {
+            let v: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+            detect(&v, set).map(|d| d.inputs)
+        };
+        let all = ZtScanInputs::All { half_width: 1.9 };
+        assert_eq!(inputs(&[&zt, &zt2], false).unwrap(), all);
+        assert_eq!(inputs(&[&windows], false).unwrap(), ZtScanInputs::None);
+        assert_eq!(
+            inputs(&[&zt, &windows], false).unwrap(),
+            ZtScanInputs::Mixed {
+                half_width: 1.9,
+                zt: 1,
+                total: 2
+            }
+        );
+        let e = inputs(&[&fixed], false).unwrap_err().to_string();
+        assert!(e.contains("no lower or upper offset"), "{e}");
+        assert_eq!(inputs(&[&fixed], true).unwrap(), ZtScanInputs::None);
+        // A second method (a coarser sweep) in the same search.
+        let mut wide = Vec::new();
+        for c in 0..4 {
+            let rt = format!("{:.6}", 0.0167 * c as f64);
+            for b in 0..120 {
+                let t = 400.0 + 1.2 * b as f64;
+                let iso = format!(
+                    r#"<cvParam cvRef="MS" accession="MS:1000827" name="isolation window target m/z" value="{t}"/>"#
+                );
+                wide.push(
+                    spectrum(wide.len(), 2, &rt, &[150.0, 300.0], &[5.0, 6.0])
+                        .replace(FIXED_ISOLATION, &iso),
+                );
+            }
+        }
+        let wide = write("wide.mzML", wide);
+        let e = inputs(&[&zt, &wide], false).unwrap_err().to_string();
+        assert!(e.contains("different Q1"), "{e}");
+        assert!(inputs(&[&zt, &wide], true).is_ok());
         let _ = std::fs::remove_dir_all(&d);
     }
 

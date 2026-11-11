@@ -121,10 +121,11 @@ const state = {
   knownDropped: readStored("mumdia.folders.dropped", 0),
   // SCIEX ZT Scan DIA files (`refreshZtscanNote`): the engine's isolation census of each
   // selected mzML by path (null when it could not be read), whether the user typed the
-  // half-width, the recipe's overrides once read, whether the user changed the recipe
-  // checkbox (until then it is ticked whenever the recipe is allowed), and what the recipe's
-  // library settings changed in the Search space card (`syncZtscanLibrary`).
-  ztscan: { probes: {}, hwTyped: false, recipe: null, recipeTouched: false, lib: null },
+  // half-width, the overrides that turn the ZT Scan analysis off once read (`ztscan_off`),
+  // whether the user changed the analysis checkbox (until then it is ticked whenever the
+  // analysis applies), and what the analysis's library settings changed in the Search space
+  // card (`syncZtscanLibrary`).
+  ztscan: { probes: {}, hwTyped: false, off: null, analysisTouched: false, lib: null },
 };
 
 function readStored(key, fallback) {
@@ -288,9 +289,9 @@ async function init() {
     state.ztscan.hwTyped = true;
     syncZtscanLibrary();
   });
-  // Once the user ticks or clears the recipe, the choice is theirs.
-  $("ztscan-recipe").addEventListener("change", () => {
-    state.ztscan.recipeTouched = true;
+  // Once the user ticks or clears the ZT Scan analysis, the choice is theirs.
+  $("ztscan-analysis").addEventListener("change", () => {
+    state.ztscan.analysisTouched = true;
     renderZtscanNote();
   });
   $("suggest-conditions").addEventListener("click", () => {
@@ -503,7 +504,7 @@ function settingRow(f, label) {
     control =
       `<select data-path="${esc(f.path)}">` +
       f.choices
-        .map((c) => `<option value="${esc(c)}"${c === v ? " selected" : ""}>${esc(c)}</option>`)
+        .map((c) => `<option value="${esc(c)}"${String(c) === String(v) ? " selected" : ""}>${esc(c)}</option>`)
         .join("") +
       `</select>`;
   } else {
@@ -606,6 +607,9 @@ function onSettingChanged(el) {
   let raw = el.value;
   let value = raw;
   if (f.kind === "bool") value = raw === "true";
+  // A choice spelled `true` or `false` is a JSON boolean to the engine (the ZT Scan switches,
+  // `quant.baseline_subtract`, `extract.ms1_calibrate`), not the string.
+  else if (f.kind === "enum" && (raw === "true" || raw === "false")) value = raw === "true";
   else if (f.kind === "integer" || f.kind === "float") {
     // An OPTIONAL number left blank means "unset", which is a real value for these
     // (`rt_im_train.multihead_calibration` unset is what turns the automatic default
@@ -1610,13 +1614,14 @@ async function renderMzmlList() {
 
 // -- SCIEX ZT Scan DIA ------------------------------------------------------------------
 // A ZT Scan DIA mzML names each MS2 spectrum's quadrupole position and not the window it
-// isolated. The engine refuses such a file unless `convert.isolation_half_width` says how
-// wide the window was: read as it is, every spectrum would cover the whole m/z range and
-// the search would grow until the machine runs out of memory. The engine's own census of
-// each selected mzML (`scanning_probe`, the rule `convert` refuses by) says which files are
-// such and suggests a half-width; this card explains it, fills the half-width in and offers
-// the ZT Scan recipe on top of the preset. Vendor files are not probed: the census would
-// convert them first.
+// isolated. The engine recognises such a file by its isolation census, reads it with the
+// half-width the census suggests and searches it with the ZT Scan analysis by itself
+// (docs/37_ztscan.md, "Automatic for ZT Scan files"). The same census of each selected mzML
+// (`scanning_probe`) tells this card which files are such: it says what they are, shows the
+// half-width (a value the user types is sent instead), offers to turn the analysis off, and
+// sets the library's search space while the analysis is on. A file that names targets
+// without offsets in any other layout is refused without a half-width the user enters.
+// Vendor files are not probed: the census would convert them first.
 async function refreshZtscanNote() {
   const z = state.ztscan;
   const todo = state.picks.mzml.filter((f) => !isVendor(f) && !(f in z.probes));
@@ -1631,17 +1636,19 @@ async function refreshZtscanNote() {
     }
     for (const p of got || []) z.probes[p.path] = p.isolation || null;
   }
-  if (ztscanFiles().length && !z.recipe) {
+  if (ztscanFiles().length && !z.off) {
     try {
-      z.recipe = await invoke("ztscan_recipe");
+      z.off = await invoke("ztscan_off");
     } catch {
-      z.recipe = null;
+      z.off = null;
     }
   }
   renderZtscanNote();
 }
 
-// The selected files the engine would refuse without a half-width, in selection order.
+// The selected files that need a half-width (`convert_refuses`), in selection order: the
+// ZT Scan files, whose half-width the engine takes from the census, and any other file that
+// names targets without offsets, which it refuses without one.
 function ztscanFiles() {
   return state.picks.mzml.filter((f) => state.ztscan.probes[f]?.convert_refuses);
 }
@@ -1650,15 +1657,23 @@ function ztscanScanning() {
   return ztscanFiles().filter((f) => state.ztscan.probes[f].scanning_quadrupole);
 }
 
-// The recipe's keys refuse spectra without a Q1 sweep, so it is offered only when every
-// selected file is a scanning-quadrupole run.
-function ztscanRecipeAllowed() {
+// The engine runs the ZT Scan analysis when every file of the search is a ZT Scan run (its
+// keys read the Q1 sweep, and a pooled rescore needs one feature set), so it is offered then.
+function ztscanAnalysisAllowed() {
   const scanning = ztscanScanning();
   return scanning.length > 0 && scanning.length === state.picks.mzml.length;
 }
 
-function ztscanRecipeOn() {
-  return ztscanRecipeAllowed() && !!$("ztscan-recipe").checked && !!state.ztscan.recipe;
+// Whether the search runs the ZT Scan analysis: the engine's default for these files, unless
+// the user cleared the box.
+function ztscanAnalysisOn() {
+  return ztscanAnalysisAllowed() && !!$("ztscan-analysis").checked;
+}
+
+// The user cleared the analysis but the overrides that turn it off are not known: the engine
+// would run it anyway, so the search is not started.
+function ztscanAllowedOffMissing() {
+  return ztscanAnalysisAllowed() && !ztscanAnalysisOn() && !state.ztscan.off;
 }
 
 function renderZtscanNote() {
@@ -1685,14 +1700,10 @@ function renderZtscanNote() {
         `names the quadrupole's position (${fmtInt(l.distinct_targets)} positions from ` +
         `${fmt(l.lowest_target, 1)} to ${fmt(l.highest_target, 1)} m/z, ` +
         `${fmt(l.median_step, 4)} m/z apart, repeating every ${fmt(l.cycle_s, 2)} s), but not ` +
-        "the width of the window it isolated. MuMDIA needs that width to read the file: " +
-        "without it every spectrum would cover the whole m/z range and the search would " +
-        "run out of memory, so it refuses the file."
-    );
-    parts.push(
-      "The file does not record the width. The half-width below assumes a window five " +
-        "positions wide, as on the measured 3.8 m/z method, where half-widths from 1.5 to " +
-        "2.3 m/z identified the same; enter half of your method's Q1 window if it differs."
+        "the width of the window it isolated. MuMDIA reads it with the half-width below, " +
+        "which assumes a window five positions wide, as on the measured 3.8 m/z method, " +
+        "where half-widths from 1.5 to 2.3 m/z identified the same; enter half of your " +
+        "method's Q1 window if it differs."
     );
   }
   if (other.length) {
@@ -1710,20 +1721,23 @@ function renderZtscanNote() {
     const hw = first?.suggested_half_width;
     $("ztscan-hw").value = Number.isFinite(hw) ? String(hw) : "";
   }
-  // The recipe is the best measured configuration for these files, so it is ticked whenever
-  // it is allowed, until the user ticks or clears it themselves.
-  const allowed = ztscanRecipeAllowed();
-  $("ztscan-recipe").disabled = !allowed;
-  if (!allowed) $("ztscan-recipe").checked = false;
-  else if (!state.ztscan.recipeTouched) $("ztscan-recipe").checked = true;
-  $("ztscan-recipe-note").textContent = allowed
+  // The engine runs the analysis for these files by default, so the box is ticked whenever
+  // it applies, until the user ticks or clears it themselves.
+  const allowed = ztscanAnalysisAllowed();
+  $("ztscan-analysis").disabled = !allowed;
+  if (!allowed) $("ztscan-analysis").checked = false;
+  else if (!state.ztscan.analysisTouched) $("ztscan-analysis").checked = true;
+  $("ztscan-analysis-note").textContent = allowed
     ? "Measured on one ZT Scan acquisition (K562 on a ZenoTOF 8600): with its library " +
       "settings, about 9% more precursors than the half-width alone, a measured false " +
       "discovery proportion of about 1.2% at a reported 1% (1.4% with the half-width alone), " +
       "and under half the replicate CV of the default quantification; extraction and " +
-      "rescoring take longer. Not yet validated on a second acquisition."
-    : "The recipe's settings need every selected file to be a ZT Scan run; select only " +
-      "those to use it.";
+      "rescoring take longer. Not yet validated on a second acquisition. Clearing the box " +
+      "searches the files with the half-width alone."
+    : "The ZT Scan analysis needs every selected file to be a ZT Scan run (a pooled search " +
+      "scores every run with one feature set), so this search reads the ZT Scan files with " +
+      "the half-width and leaves the analysis out. Search the ZT Scan files on their own to " +
+      "use it.";
   syncZtscanLibrary();
 }
 
@@ -1752,7 +1766,7 @@ function renderZtscanModsNote() {
   $("ztscan-mods-note").textContent = ztscanDeamidationWarning();
 }
 
-// The search space a library built from a FASTA takes under the ZT Scan recipe: the library
+// The search space a library built from a FASTA takes under the ZT Scan analysis: the library
 // settings measured on the K562 ZT Scan runs (docs/37_ztscan.md, "The library for a ZT Scan
 // search"): charges 1 to 4, lengths 6 to 40, methionine oxidation and protein N-terminal
 // acetylation as variable modifications, at most two a peptide, and precursors inside the
@@ -1790,9 +1804,9 @@ function ztscanLibraryFields() {
   return out;
 }
 
-// While the recipe is on, the Search space card holds the ZT Scan library settings, so a
+// While the analysis is on, the Search space card holds the ZT Scan library settings, so a
 // library built from a FASTA (by DIA-NN or the built-in predictors), the size estimate and
-// the cache key all follow them; when it goes off they are taken back. Only what the recipe
+// the cache key all follow them; when it goes off they are taken back. Only what the analysis
 // set and the user has not changed since is taken back: a value edited after is the user's,
 // and stays. The two modifications are added to the user's choice (the default one,
 // carbamidomethyl fixed and oxidation variable, becomes the measured one) and are not saved
@@ -1800,7 +1814,7 @@ function ztscanLibraryFields() {
 function syncZtscanLibrary() {
   const z = state.ztscan;
   let changed = false;
-  if (ztscanRecipeOn()) {
+  if (ztscanAnalysisOn()) {
     if (!z.lib) z.lib = { before: {}, set: {}, mods: [] };
     for (const [id, v] of Object.entries(ztscanLibraryFields())) {
       const el = $(id);
@@ -1851,14 +1865,23 @@ function syncZtscanLibrary() {
   scheduleSpace();
 }
 
-// What the ZT Scan card adds to the run's configuration: the half-width for the files that
-// need one, and with the recipe chosen its settings (the half-width the user confirmed
-// replaces the recipe's).
+// What the ZT Scan card adds to the run's configuration. The engine takes the half-width of
+// a ZT Scan file from its census and runs the ZT Scan analysis by itself, so only the user's
+// choices are written: the half-width when they typed one, or when a selected file names
+// targets without offsets in another layout (the engine has no half-width for it), and the
+// analysis's keys set off when they cleared the box.
 function ztscanOverrides() {
-  if (!ztscanFiles().length) return {};
-  const out = ztscanRecipeOn() ? { ...state.ztscan.recipe } : {};
+  const files = ztscanFiles();
+  if (!files.length) return {};
+  const out = {};
+  if (ztscanAnalysisAllowed() && !ztscanAnalysisOn() && state.ztscan.off) {
+    Object.assign(out, state.ztscan.off);
+  }
   const hw = parseFloat($("ztscan-hw").value);
-  if (Number.isFinite(hw) && hw > 0) out["convert.isolation_half_width"] = hw;
+  const other = files.some((f) => !state.ztscan.probes[f].scanning_quadrupole);
+  if (Number.isFinite(hw) && hw > 0 && (state.ztscan.hwTyped || other)) {
+    out["convert.isolation_half_width"] = hw;
+  }
   return out;
 }
 
@@ -2800,10 +2823,16 @@ function searchProblems() {
         `${zt.map(baseName).join(", ")}. Enter it in the SCIEX ZT Scan DIA card.`
     );
   }
-  if (ztscanRecipeOn() && $("bands").value === "custom" && customBands().bands > 1) {
+  if (ztscanAllowedOffMissing()) {
     out.push(
-      "The ZT Scan recipe calibrates the Q1 sweep of the whole run, which cannot be split " +
-        "into bands. Set Bands to Off, or leave the recipe out."
+      "The ZT Scan analysis could not be turned off: the settings that do so could not be " +
+        "read. Tick it again, or restart the application."
+    );
+  }
+  if (ztscanAnalysisOn() && $("bands").value === "custom" && customBands().bands > 1) {
+    out.push(
+      "The ZT Scan analysis calibrates the Q1 sweep of the whole run, which cannot be split " +
+        "into bands. Set Bands to Off, or clear the ZT Scan analysis."
     );
   }
   return out;
@@ -3678,13 +3707,13 @@ async function startSearch() {
   }
 
   const bands = await resolveBands(built ? built[0] : null);
-  if (ztscanRecipeOn() && bands.bands > 1) {
+  if (ztscanAnalysisOn() && bands.bands > 1) {
     banner(
       $("start-error"),
       `This search would be split into ${bands.bands} bands to fit the memory of this ` +
-        "machine, and the ZT Scan recipe calibrates the Q1 sweep of the whole run, which " +
-        "cannot be split. Leave the recipe out, or set Bands to Off if the machine has the " +
-        "memory."
+        "machine, and the ZT Scan analysis calibrates the Q1 sweep of the whole run, which " +
+        "cannot be split. Clear the ZT Scan analysis, or set Bands to Off if the machine has " +
+        "the memory."
     );
     screen("input");
     return;

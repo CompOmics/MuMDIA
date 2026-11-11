@@ -1120,7 +1120,7 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
                 rt_s: p.cfg.shadow_rt_s,
                 region: p.cfg.shadow_region,
                 im_tol: p.cfg.shadow_im_tolerance,
-                q1: p.cfg.shadow_q1,
+                q1: p.cfg.shadow_q1.on(),
             },
         )?;
         let floor = scores

@@ -595,10 +595,11 @@ async fn scanning_probe(mzml: Vec<String>) -> Result<Vec<mumdia_console::ztscan:
         .map_err(|e| e.to_string())
 }
 
-/// The ZT Scan recipe as overrides on top of the chosen preset (`ztscan::recipe_overrides`).
+/// The ZT Scan analysis turned off, as overrides on top of the chosen preset
+/// (`ztscan::off_overrides`): the engine runs it for ZT Scan files by itself.
 #[tauri::command]
-fn ztscan_recipe() -> Result<std::collections::BTreeMap<String, serde_json::Value>, String> {
-    mumdia_console::ztscan::recipe_overrides()
+fn ztscan_off() -> Result<std::collections::BTreeMap<String, serde_json::Value>, String> {
+    mumdia_console::ztscan::off_overrides()
 }
 
 /// The settings schema the editor renders its form from.
@@ -920,9 +921,9 @@ const PRESET_FILES: &[(&str, &str)] = &[
         "diapasef.json",
         include_str!("../../../configs/examples/diapasef.json"),
     ),
-    // The SCIEX ZT Scan DIA recipe: the imported-library recipe plus the scanning-quadrupole
-    // keys (`ztscan::RECIPE`). The search screen also offers its keys on top of any preset
-    // when it recognises a ZT Scan file.
+    // The SCIEX ZT Scan DIA recipe: the imported-library recipe plus the keys of the ZT Scan
+    // analysis, set explicitly (`ztscan::RECIPE`). The engine turns the same keys on for ZT
+    // Scan files by itself under any preset; the search screen only turns them off on request.
     ("ztscan.json", mumdia_console::ztscan::RECIPE),
     (
         "fasta-sidecars.json",
@@ -996,7 +997,7 @@ fn main() {
             config_overrides,
             peak_census,
             scanning_probe,
-            ztscan_recipe,
+            ztscan_off,
             history,
             history_check,
             preflight,

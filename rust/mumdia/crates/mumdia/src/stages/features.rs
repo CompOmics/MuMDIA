@@ -431,12 +431,12 @@ impl Q1Families {
     pub fn of(cfg: &FeaturesConfig) -> Q1Families {
         Q1Families {
             q1: cfg.q1_features,
-            q1f: cfg.q1_fragment_features,
+            q1f: cfg.q1_fragment_features.on(),
             ms1e: cfg.ms1_envelope,
-            q1p: cfg.q1_precursor,
-            q1m: cfg.q1_multiscale,
-            q1d: cfg.q1_deconvolved,
-            q1c: cfg.q1_consistency,
+            q1p: cfg.q1_precursor.on(),
+            q1m: cfg.q1_multiscale.on(),
+            q1d: cfg.q1_deconvolved.on(),
+            q1c: cfg.q1_consistency.on(),
         }
     }
 }
@@ -530,13 +530,13 @@ pub fn active_features_q1c(
 /// reads), in feature order.
 fn q1s_feature_names(cfg: &FeaturesConfig) -> Vec<&'static str> {
     let mut v: Vec<&'static str> = Vec::new();
-    if cfg.q1_precursor {
+    if cfg.q1_precursor.on() {
         v.extend_from_slice(Q1P_FEATURES);
     }
-    if cfg.q1_multiscale {
-        v.extend(q1m_features(cfg.q1_precursor));
+    if cfg.q1_multiscale.on() {
+        v.extend(q1m_features(cfg.q1_precursor.on()));
     }
-    if cfg.q1_deconvolved {
+    if cfg.q1_deconvolved.on() {
         v.extend_from_slice(Q1D_FEATURES);
     }
     v
@@ -3663,7 +3663,7 @@ fn run_chunked(
     };
     // The per-fragment Q1 decision family (`features.q1_fragment_features`) from
     // psms_extracted v6, the same way.
-    let q1f_cols: Vec<Vec<f64>> = if p.cfg.q1_fragment_features {
+    let q1f_cols: Vec<Vec<f64>> = if p.cfg.q1_fragment_features.on() {
         Q1F_FEATURES
             .iter()
             .map(|c| {
@@ -3740,7 +3740,7 @@ fn run_chunked(
     // tolerances, as for the other Q1 families.
     type FlatList = (Vec<usize>, Vec<f32>);
     let q1c_in: Option<(Q1FragTolerances, Vec<FlatList>)> =
-        if p.cfg.q1_consistency && matches!(p.cfg.set, FeatureSet::Extended) {
+        if p.cfg.q1_consistency.on() && matches!(p.cfg.set, FeatureSet::Extended) {
             let tol = p.q1_tolerances.ok_or_else(|| {
                 anyhow!(
                     "features: features.q1_consistency reads the per-fragment Q1 decisions \
@@ -5384,6 +5384,7 @@ fn isotope_features(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mumdia_core::config::ZtSwitch;
 
     #[test]
     fn bands_below_the_anchor_floor_clear_it_once_pooled() {
@@ -6374,7 +6375,7 @@ mod tests {
             ..FeaturesConfig::default()
         };
         assert_eq!(active_features_for(&cfg, false), off);
-        cfg.q1_fragment_features = true;
+        cfg.q1_fragment_features = ZtSwitch::On;
         assert_eq!(active_features_for(&cfg, false), on);
         assert_ne!(feature_schema_id(&on), feature_schema_id(&off));
     }
@@ -6468,17 +6469,17 @@ mod tests {
         }
         let mut cfg = FeaturesConfig {
             set: FeatureSet::Extended,
-            q1_fragment_features: true,
+            q1_fragment_features: ZtSwitch::On,
             ..FeaturesConfig::default()
         };
         assert!(q1s_feature_names(&cfg).is_empty());
-        cfg.q1_precursor = true;
-        cfg.q1_multiscale = true;
+        cfg.q1_precursor = ZtSwitch::On;
+        cfg.q1_multiscale = ZtSwitch::On;
         assert_eq!(active_features_for(&cfg, false), pm);
         assert_eq!(q1s_feature_names(&cfg), &pm[q1f.len()..]);
         assert_ne!(feature_schema_id(&pm), feature_schema_id(&q1f));
         // The deconvolved-evidence family comes last.
-        cfg.q1_deconvolved = true;
+        cfg.q1_deconvolved = ZtSwitch::On;
         let pmd = active_features_for(&cfg, false);
         assert_eq!(&pmd[..pm.len()], &pm[..]);
         assert_eq!(&pmd[pm.len()..], Q1D_FEATURES);
@@ -6569,7 +6570,7 @@ mod tests {
             ..FeaturesConfig::default()
         };
         assert_eq!(active_features_for(&cfg, false), off);
-        cfg.q1_consistency = true;
+        cfg.q1_consistency = ZtSwitch::On;
         assert_eq!(active_features_for(&cfg, false), on);
         assert_ne!(feature_schema_id(&on), feature_schema_id(&off));
     }
@@ -7976,7 +7977,7 @@ mod tests {
                 .to_string();
             let cfg = FeaturesConfig {
                 set: FeatureSet::Extended,
-                q1_consistency: q1c,
+                q1_consistency: q1c.into(),
                 ..Default::default()
             };
             run(FeaturesParams {

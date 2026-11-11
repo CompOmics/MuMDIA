@@ -2704,7 +2704,7 @@ fn q1_cycle_window(
     index: &CandIndex,
     q1a: Option<&Q1Applied>,
 ) -> Result<CycleWindow> {
-    let k = p.cfg.q1_cycle_halfwidth;
+    let k = p.cfg.q1_cycles();
     let spectra = p.q1.map(|q| q.spectra_ms2).ok_or_else(|| {
         anyhow!(
             "quant.q1_cycle_halfwidth reads the run's Q1 sweep from its spectra_ms2 \
@@ -3162,7 +3162,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     let q1_elution = q1a.is_some() && p.cfg.q1_integration == Q1Integration::ElutionFit;
     // `quant.q1_cycle_halfwidth`: each candidate's fixed-window half-width in samples, from its
     // samples per Q1 cycle. `None` with the key off.
-    let cycle_win: Option<CycleWindow> = if p.cfg.q1_cycle_halfwidth > 0 {
+    let cycle_win: Option<CycleWindow> = if p.cfg.q1_cycles() > 0 {
         Some(q1_cycle_window(&p, &store, &index, q1a.as_ref())?)
     } else {
         None

@@ -252,7 +252,7 @@
       "optional": true,
       "default": "null",
       "default_text": "null",
-      "help": "Half-width in m/z of the quadrupole isolation window, for MS2 spectra that name an isolation window target but no lower or upper offset. Unset (the default), such a spectrum is refused when the file has more than one distinct target, because the m/z range it isolated is unknown (docs/04_convert.md, \"SCIEX ZT Scan DIA\"). Set, each such spectrum is read as the window `[target - h, target + h]`, computed in the same f32 arithmetic the mzML reader applies to explicit offsets, so a file with offsets of `h` and the same file without them read with `h` give the same windows. The case it is for is SCIEX ZT Scan DIA (scanning-quadrupole DIA) as the SCIEX MS Data Converter writes it: every Q1 bin of a cycle is a spectrum carrying only its target, and `h` is half of the method's Q1 window (1.9 for a 3.8 m/z window). On a ZenoTOF 8600 K562 run, 1.5, 1.9 and 2.3 were equal within one-seed noise. Spectra that carry offsets keep them. Must be finite and > 0; omitted from the canonical configuration while unset, so it changes no config hash then, and recorded in the spectra reports (`params.isolation_half_width`) when set.",
+      "help": "",
       "gates": [],
       "source_struct": "ConvertConfig"
     },
@@ -2201,17 +2201,19 @@
       "path": "rt_im_train.q1_calibrate",
       "name": "q1_calibrate",
       "section": "rt_im_train",
-      "rust_type": "bool",
-      "kind": "bool",
+      "rust_type": "ZtSwitch",
+      "kind": "enum",
       "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "Scanning-quadrupole spectra (SCIEX ZT Scan DIA read with `convert.isolation_half_width`): calibrate the Q1 dimension on the confident seed PSMs (`stages::q1cal`). For each anchor's strongest library fragments, the matched intensity in every Q1 step near its precursor over the cycles around its seed scan gives the fragment's observed Q1 centre; the expected centre is that of the transmission, summed over the precursor's isotopes weighted by their abundance. The window-centre offset is fitted as a smooth function of precursor m/z (and of fragment m/z and retention time when they reduce the residuals), with the effective half-width and edge width, and written to `cal.json` (`q1_calibration`), with the residual distribution in steps before and after and which reading of the target (centre or edge) fits. Diagnostic: nothing reads it back yet, so every other artifact is unchanged. Refused on any other layout, on spectra with 1/K0 and with `groups.window_groups > 1`. Default false. Benchmark-gated (docs/08_rt_im_train.md, section 4h). Omitted from the canonical configuration at its default.",
-      "gates": [
-        "benchmark-gated",
-        "diagnostic"
-      ],
-      "source_struct": "RtImTrainConfig"
+      "default": "auto",
+      "default_text": "`auto`",
+      "help": "Scanning-quadrupole spectra (SCIEX ZT Scan DIA read with `convert.isolation_half_width`): calibrate the Q1 dimension on the confident seed PSMs (`stages::q1cal`). For each anchor's strongest library fragments, the matched intensity in every Q1 step near its precursor over the cycles around its seed scan gives the fragment's observed Q1 centre; the expected centre is that of the transmission, summed over the precursor's isotopes weighted by their abundance. The window-centre offset is fitted as a smooth function of precursor m/z (and of fragment m/z and retention time when they reduce the residuals), with the effective half-width and edge width, and written to `cal.json` (`q1_calibration`), with the residual distribution in steps before and after and which reading of the target (centre or edge) fits; `extract.q1_fragments` and the Q1-deconvolved keys decide with it. Refused on any other layout, on spectra with 1/K0 and with `groups.window_groups > 1`. `\"auto\"` (the default since 0.12.0): on for a ZT Scan search unless `groups.window_groups > 1` or `extract.q1_fragments = false` (and `extract.q1_deconvolved` off) leave nothing to read it, off for every other search (`ZtSwitch`, docs/37_ztscan.md, \"Automatic for ZT Scan files\"; docs/08_rt_im_train.md, section 4h). Omitted from the canonical configuration unless on.",
+      "gates": [],
+      "source_struct": "RtImTrainConfig",
+      "choices": [
+        "auto",
+        "true",
+        "false"
+      ]
     },
     {
       "path": "extract.windows_in_flight",
@@ -2288,16 +2290,19 @@
       "path": "extract.q1_fragments",
       "name": "q1_fragments",
       "section": "extract",
-      "rust_type": "bool",
-      "kind": "bool",
+      "rust_type": "ZtSwitch",
+      "kind": "enum",
       "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "Scanning-quadrupole spectra: decide for every library fragment of an accepted candidate whether its signal belongs to the candidate's precursor (`stages::q1frag`, psms_extracted v6). For each fragment the matched intensity is read in every Q1 step whose calibrated window reaches the precursor (plus two steps either side) over the seven cycles around the apex: an RT x step patch, with every step kept apart. One Q1 centre and width shared by the candidate's fragments are fitted to the patch with a height per fragment, each fragment's own centre and residual are read against it, and its 2D correlation with the other fragments' elution times the expected transmission; a fragment is then `belongs`, `interfered` or `absent` by tolerances `rt_im_train.q1_calibrate` learns from the confident seed PSMs, and the fit is repeated once on the fragments that belong. Writes per row the decision of every library fragment (`q1f_frag_*` lists) and its summary (`q1f_*`), which `features.q1_fragment_features`, `retrace.q1_repick` and `rescore.shadow_q1` read. Needs `rt_im_train.q1_calibrate` and spectra_ms2 v3 (a run converted with `convert.isolation_half_width`); refused with `q1_cycles`, on any other layout and on spectra that carry 1/K0. Default false. Benchmark-gated (docs/09_extract.md, \"Per-fragment Q1 decisions\"). Omitted from the canonical configuration at its default.",
-      "gates": [
-        "benchmark-gated"
-      ],
-      "source_struct": "ExtractConfig"
+      "default": "auto",
+      "default_text": "`auto`",
+      "help": "Scanning-quadrupole spectra: decide for every library fragment of an accepted candidate whether its signal belongs to the candidate's precursor (`stages::q1frag`, psms_extracted v6). For each fragment the matched intensity is read in every Q1 step whose calibrated window reaches the precursor (plus two steps either side) over the seven cycles around the apex: an RT x step patch, with every step kept apart. One Q1 centre and width shared by the candidate's fragments are fitted to the patch with a height per fragment, each fragment's own centre and residual are read against it, and its 2D correlation with the other fragments' elution times the expected transmission; a fragment is then `belongs`, `interfered` or `absent` by tolerances `rt_im_train.q1_calibrate` learns from the confident seed PSMs, and the fit is repeated once on the fragments that belong. Writes per row the decision of every library fragment (`q1f_frag_*` lists) and its summary (`q1f_*`), which `features.q1_fragment_features`, `retrace.q1_repick` and `rescore.shadow_q1` read. Needs `rt_im_train.q1_calibrate` and spectra_ms2 v3 (a run converted with `convert.isolation_half_width`); refused with `q1_cycles`, on any other layout and on spectra that carry 1/K0. `\"auto\"` (the default since 0.12.0): on for a ZT Scan search with the Q1 calibration on and `q1_cycles` off, off for every other search (`ZtSwitch`; docs/09_extract.md, \"Per-fragment Q1 decisions\"). Omitted from the canonical configuration unless on.",
+      "gates": [],
+      "source_struct": "ExtractConfig",
+      "choices": [
+        "auto",
+        "true",
+        "false"
+      ]
     },
     {
       "path": "extract.q1_deconvolved",
@@ -3221,16 +3226,19 @@
       "path": "features.q1_fragment_features",
       "name": "q1_fragment_features",
       "section": "features",
-      "rust_type": "bool",
-      "kind": "bool",
+      "rust_type": "ZtSwitch",
+      "kind": "enum",
       "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "The per-fragment Q1 decision family of scanning-quadrupole spectra: `q1f_n_belong`, `q1f_belong_share` (predicted-intensity share of the fragments that belong), `q1f_interfered_share` (observed-intensity share of the interfered ones), `q1f_offset_median` and `q1f_offset_mad` (the fragments' Q1 centres against the expected one, in steps), `q1f_corr2d` (2D correlation of the fragments that belong), `q1f_fit_resid` (residual of the shared-centre fit) and `q1f_centre` (the shared centre, steps), from psms_extracted v6 (`extract.q1_fragments`, which it needs), appended after every other column of the `extended` set. Default false. Benchmark-gated (docs/10_features.md). Omitted from the canonical configuration at its default.",
-      "gates": [
-        "benchmark-gated"
-      ],
-      "source_struct": "FeaturesConfig"
+      "default": "auto",
+      "default_text": "`auto`",
+      "help": "The per-fragment Q1 decision family of scanning-quadrupole spectra: `q1f_n_belong`, `q1f_belong_share` (predicted-intensity share of the fragments that belong), `q1f_interfered_share` (observed-intensity share of the interfered ones), `q1f_offset_median` and `q1f_offset_mad` (the fragments' Q1 centres against the expected one, in steps), `q1f_corr2d` (2D correlation of the fragments that belong), `q1f_fit_resid` (residual of the shared-centre fit) and `q1f_centre` (the shared centre, steps), from psms_extracted v6 (`extract.q1_fragments`, which it needs), appended after every other column of the `extended` set (docs/10_features.md). `\"auto\"` (the default since 0.12.0): on for a ZT Scan search under the `extended` set with `extract.q1_fragments` on, off for every other search (`ZtSwitch`, docs/37_ztscan.md, \"Automatic for ZT Scan files\"). Omitted from the canonical configuration unless on.",
+      "gates": [],
+      "source_struct": "FeaturesConfig",
+      "choices": [
+        "auto",
+        "true",
+        "false"
+      ]
     },
     {
       "path": "features.ms1_envelope",
@@ -3251,61 +3259,73 @@
       "path": "features.q1_precursor",
       "name": "q1_precursor",
       "section": "features",
-      "rust_type": "bool",
-      "kind": "bool",
+      "rust_type": "ZtSwitch",
+      "kind": "enum",
       "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "The unfragmented-precursor family of scanning-quadrupole spectra (`q1p_*`): extract reads the precursor's own m/z (M0, M+1, M+2, at the calibrated fragment m/z) in every cell of the per-fragment decision's RT x step patch, where each isotope is transmitted at its own Q1 position, and writes per row (psms_extracted v8) how many isotopes are present by the decision's coherent-cell rule (`q1p_n_iso`), the precursor's share of the precursor plus fragment intensity at the 2D apex (`q1p_share`), the shift of its isotopes' Q1 profiles from where the calibrated window puts them (`q1p_offset`, steps, one shift shared by the isotopes, fitted as the fragments' shared centre is) and their residual under it (`q1p_resid`), the mean and largest correlation of the fragments' Q1 profiles with the precursor's (`q1p_frag_corr_mean`, `q1p_frag_corr_max`), the fragments whose own Q1 centre lies within the decision's offset tolerance of the precursor's (and whose 2D correlation reaches its floor, `q1p_n_belong`) and the distance between the precursor's shift and the fragments' shared centre (`q1p_centre_agree`, steps), appended after every other column of the `extended` set. Needs `extract.q1_fragments`. Default false. Benchmark-gated (docs/37_ztscan.md). Omitted from the canonical configuration at its default.",
-      "gates": [
-        "benchmark-gated"
-      ],
-      "source_struct": "FeaturesConfig"
+      "default": "auto",
+      "default_text": "`auto`",
+      "help": "The unfragmented-precursor family of scanning-quadrupole spectra (`q1p_*`): extract reads the precursor's own m/z (M0, M+1, M+2, at the calibrated fragment m/z) in every cell of the per-fragment decision's RT x step patch, where each isotope is transmitted at its own Q1 position, and writes per row (psms_extracted v8) how many isotopes are present by the decision's coherent-cell rule (`q1p_n_iso`), the precursor's share of the precursor plus fragment intensity at the 2D apex (`q1p_share`), the shift of its isotopes' Q1 profiles from where the calibrated window puts them (`q1p_offset`, steps, one shift shared by the isotopes, fitted as the fragments' shared centre is) and their residual under it (`q1p_resid`), the mean and largest correlation of the fragments' Q1 profiles with the precursor's (`q1p_frag_corr_mean`, `q1p_frag_corr_max`), the fragments whose own Q1 centre lies within the decision's offset tolerance of the precursor's (and whose 2D correlation reaches its floor, `q1p_n_belong`) and the distance between the precursor's shift and the fragments' shared centre (`q1p_centre_agree`, steps), appended after every other column of the `extended` set. Needs `extract.q1_fragments`. `\"auto\"` (the default since 0.12.0): on for a ZT Scan search under the `extended` set with `extract.q1_fragments` on, off for every other search (`ZtSwitch`, docs/37_ztscan.md, \"Automatic for ZT Scan files\"). Omitted from the canonical configuration unless on.",
+      "gates": [],
+      "source_struct": "FeaturesConfig",
+      "choices": [
+        "auto",
+        "true",
+        "false"
+      ]
     },
     {
       "path": "features.q1_multiscale",
       "name": "q1_multiscale",
       "section": "features",
-      "rust_type": "bool",
-      "kind": "bool",
+      "rust_type": "ZtSwitch",
+      "kind": "enum",
       "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "The multi-scale Q1 family of scanning-quadrupole spectra (`q1m*`): over the 3, 7 and 11 steps centred on the step nearest the fragments' fitted Q1 centre, with the fragments' Q1 profiles summed over the cycles around the 2D apex (the per-fragment decision's), the mean correlation of each present fragment's profile with the most intense one's (`q1m3_corr_best`, `q1m7_corr_best`, `q1m11_corr_best`), the residual of the fragments' consensus profile under the calibrated transmission at the fitted centre (`q1mK_shape`, `1 - R^2`) and the most intense fragment's Q1 centroid against its expected centre (`q1mK_centroid`, steps), and with `q1_precursor` on the mean correlation of the fragments' profiles with the unfragmented precursor's (`q1mK_corr_prec`), written to psms_extracted v8 and appended after every other column of the `extended` set. Needs `extract.q1_fragments`. Default false. Benchmark-gated (docs/37_ztscan.md). Omitted from the canonical configuration at its default.",
-      "gates": [
-        "benchmark-gated"
-      ],
-      "source_struct": "FeaturesConfig"
+      "default": "auto",
+      "default_text": "`auto`",
+      "help": "The multi-scale Q1 family of scanning-quadrupole spectra (`q1m*`): over the 3, 7 and 11 steps centred on the step nearest the fragments' fitted Q1 centre, with the fragments' Q1 profiles summed over the cycles around the 2D apex (the per-fragment decision's), the mean correlation of each present fragment's profile with the most intense one's (`q1m3_corr_best`, `q1m7_corr_best`, `q1m11_corr_best`), the residual of the fragments' consensus profile under the calibrated transmission at the fitted centre (`q1mK_shape`, `1 - R^2`) and the most intense fragment's Q1 centroid against its expected centre (`q1mK_centroid`, steps), and with `q1_precursor` on the mean correlation of the fragments' profiles with the unfragmented precursor's (`q1mK_corr_prec`), written to psms_extracted v8 and appended after every other column of the `extended` set. Needs `extract.q1_fragments`. `\"auto\"` (the default since 0.12.0): on for a ZT Scan search under the `extended` set with `extract.q1_fragments` on, off for every other search (`ZtSwitch`, docs/37_ztscan.md, \"Automatic for ZT Scan files\"). Omitted from the canonical configuration unless on.",
+      "gates": [],
+      "source_struct": "FeaturesConfig",
+      "choices": [
+        "auto",
+        "true",
+        "false"
+      ]
     },
     {
       "path": "features.q1_deconvolved",
       "name": "q1_deconvolved",
       "section": "features",
-      "rust_type": "bool",
-      "kind": "bool",
+      "rust_type": "ZtSwitch",
+      "kind": "enum",
       "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "The Q1-deconvolved evidence family of scanning-quadrupole spectra (`q1d_*`): every MS2 peak is given the Q1 centroid of its trace along the sweep (`stages::q1dec`, the evidence of `extract.q1_deconvolved`), and at each row's apex, over the scans of the apex cycle and the two either side whose window covers the precursor, extract reads for every library fragment the nearest peak and whether its centroid lies within the tolerance the Q1 calibration learns of the fragment's expected Q1 centre: the fragments with such a consistent match (`q1d_n_frag`), those matched only inconsistently (`q1d_n_incons`), the consistent share of the matched intensity (`q1d_share`, and in the apex cycle alone `q1d_apex_share`) and the predicted-intensity share of the fragments with a consistent match (`q1d_pred_share`), written to psms_extracted v8 and appended after every other column of the `extended` set. The extraction itself is unchanged (unlike `extract.q1_deconvolved`, which counts only the consistent peaks). Needs `extract.q1_fragments`. Default false. Benchmark-gated (docs/37_ztscan.md). Omitted from the canonical configuration at its default.",
-      "gates": [
-        "benchmark-gated"
-      ],
-      "source_struct": "FeaturesConfig"
+      "default": "auto",
+      "default_text": "`auto`",
+      "help": "The Q1-deconvolved evidence family of scanning-quadrupole spectra (`q1d_*`): every MS2 peak is given the Q1 centroid of its trace along the sweep (`stages::q1dec`, the evidence of `extract.q1_deconvolved`), and at each row's apex, over the scans of the apex cycle and the two either side whose window covers the precursor, extract reads for every library fragment the nearest peak and whether its centroid lies within the tolerance the Q1 calibration learns of the fragment's expected Q1 centre: the fragments with such a consistent match (`q1d_n_frag`), those matched only inconsistently (`q1d_n_incons`), the consistent share of the matched intensity (`q1d_share`, and in the apex cycle alone `q1d_apex_share`) and the predicted-intensity share of the fragments with a consistent match (`q1d_pred_share`), written to psms_extracted v8 and appended after every other column of the `extended` set. The extraction itself is unchanged (unlike `extract.q1_deconvolved`, which counts only the consistent peaks). Needs `extract.q1_fragments`. `\"auto\"` (the default since 0.12.0): on for a ZT Scan search under the `extended` set with `extract.q1_fragments` on, off for every other search (`ZtSwitch`, docs/37_ztscan.md, \"Automatic for ZT Scan files\"). Omitted from the canonical configuration unless on.",
+      "gates": [],
+      "source_struct": "FeaturesConfig",
+      "choices": [
+        "auto",
+        "true",
+        "false"
+      ]
     },
     {
       "path": "features.q1_consistency",
       "name": "q1_consistency",
       "section": "features",
-      "rust_type": "bool",
-      "kind": "bool",
+      "rust_type": "ZtSwitch",
+      "kind": "enum",
       "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "The Q1-consistency family of scanning-quadrupole spectra (`q1c_*`, `stages::q1consist`): the per-fragment Q1 decisions of `extract.q1_fragments` (which it needs) read against each fragment's EXPECTED Q1 centre rather than the centre the candidate's fragments share, so a precursor whose shared fit an interferer pulled away keeps the evidence of its own fragments: how many are consistent (within the learned offset tolerance), their share of the predicted and of the observed intensity, the agreement of their observed pattern with the prediction, and graded and soft versions of the cut: sixteen `q1c_*` columns appended after every other column of the `extended` set. With them in the competed table, four join the rescore prefilter's default columns. The tolerances come from the run's Q1 calibration (`cal.json`; `mumdia features --q1-cal`). Default false; in `configs/examples/ztscan.json`. Benchmark-gated (docs/10_features.md, docs/37_ztscan.md). Omitted from the canonical configuration at its default.",
-      "gates": [
-        "benchmark-gated"
-      ],
-      "source_struct": "FeaturesConfig"
+      "default": "auto",
+      "default_text": "`auto`",
+      "help": "The Q1-consistency family of scanning-quadrupole spectra (`q1c_*`, `stages::q1consist`): the per-fragment Q1 decisions of `extract.q1_fragments` (which it needs) read against each fragment's EXPECTED Q1 centre rather than the centre the candidate's fragments share, so a precursor whose shared fit an interferer pulled away keeps the evidence of its own fragments: how many are consistent (within the learned offset tolerance), their share of the predicted and of the observed intensity, the agreement of their observed pattern with the prediction, and graded and soft versions of the cut: sixteen `q1c_*` columns appended after every other column of the `extended` set. With them in the competed table, four join the rescore prefilter's default columns. The tolerances come from the run's Q1 calibration (`cal.json`; `mumdia features --q1-cal`). In `configs/examples/ztscan.json` (docs/10_features.md). `\"auto\"` (the default since 0.12.0): on for a ZT Scan search under the `extended` set with `extract.q1_fragments` on, off for every other search (`ZtSwitch`, docs/37_ztscan.md, \"Automatic for ZT Scan files\"). Omitted from the canonical configuration unless on.",
+      "gates": [],
+      "source_struct": "FeaturesConfig",
+      "choices": [
+        "auto",
+        "true",
+        "false"
+      ]
     },
     {
       "path": "compete.group_by",
@@ -3818,16 +3838,19 @@
       "path": "rescore.shadow_q1",
       "name": "shadow_q1",
       "section": "rescore",
-      "rust_type": "bool",
-      "kind": "bool",
+      "rust_type": "ZtSwitch",
+      "kind": "enum",
       "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "The Q1 term of the shadow test on scanning-quadrupole spectra (`extract.q1_fragments`, which it needs, with `shadow_min_shared > 0`). A lender is co-isolated when the two precursors share a Q1 step (their m/z closer than twice the calibrated window's reach) instead of when both fall in one isolation window, and each shared fragment counts by where its signal sits in Q1: nothing when the candidate's patch has no signal for it, nothing when its Q1 centre is the candidate's, all of it when it is the lender's, a share in between (a two-component split of its centre), and all of it when the two precursors are closer than the decision's offset tolerance, where Q1 cannot tell them apart. Default false. Benchmark-gated (docs/11_compete_rescore_fdr.md). Omitted from the canonical configuration at its default.",
-      "gates": [
-        "benchmark-gated"
-      ],
-      "source_struct": "RescoreConfig"
+      "default": "auto",
+      "default_text": "`auto`",
+      "help": "The Q1 term of the shadow test on scanning-quadrupole spectra (`extract.q1_fragments`, which it needs, with `shadow_min_shared > 0`). A lender is co-isolated when the two precursors share a Q1 step (their m/z closer than twice the calibrated window's reach) instead of when both fall in one isolation window, and each shared fragment counts by where its signal sits in Q1: nothing when the candidate's patch has no signal for it, nothing when its Q1 centre is the candidate's, all of it when it is the lender's, a share in between (a two-component split of its centre), and all of it when the two precursors are closer than the decision's offset tolerance, where Q1 cannot tell them apart (docs/11_compete_rescore_fdr.md). `\"auto\"` (the default since 0.12.0): on for a ZT Scan search with `extract.q1_fragments` on and `shadow_min_shared > 0`, off for every other search (`ZtSwitch`, docs/37_ztscan.md). Omitted from the canonical configuration unless on.",
+      "gates": [],
+      "source_struct": "RescoreConfig",
+      "choices": [
+        "auto",
+        "true",
+        "false"
+      ]
     },
     {
       "path": "rescore.min_train_decoys",
@@ -4295,15 +4318,13 @@
       "path": "quant.q1_cycle_halfwidth",
       "name": "q1_cycle_halfwidth",
       "section": "quant",
-      "rust_type": "usize",
+      "rust_type": "Option<usize>",
       "kind": "integer",
-      "optional": false,
-      "default": 0,
-      "default_text": "0",
-      "help": "Scanning-quadrupole spectra (SCIEX ZT Scan DIA, spectra_ms2 v3 written under `convert.isolation_half_width`): the fixed scan window's half-width in Q1 cycles rather than in samples. A ZT Scan trace interleaves the steps of every window that covers the precursor, about five a cycle for a 3.8 m/z window swept in 0.76 m/z steps, so `fixed_scan_halfwidth` 3 spans about 1.4 cycles of a peak 3-6 cycles wide. With this set, each candidate's half-width in samples is this many cycles times its samples per cycle (the median count of its trace's samples in one cycle, each located in the sweep by retention time), and under `q1_fragments`, whose traces hold one value per cycle, this many values. Everything that reads the scan window (the profile centre, the pattern fit, the background flanks beyond it) reads that half-width. Applies only to a run whose spectra record the sweep; on any other run `fixed_scan_halfwidth` applies, which the quant report records. Needs the scan form of the fixed window (`fixed_scan_halfwidth > 0`, `fixed_window_s = 0`); refused with `fixed_scan_halfwidth_scale`, which chooses each candidate's half-width too. `run` and `run-experiment` pass the spectra; `mumdia quant` takes `--spectra-ms2`. 0 (default) is off. Measured on the ZT Scan K562 three-run experiment (docs/37_ztscan.md): median precursor CV 0.273 at the default window, 0.107 at 3 cycles and 0.102 at 4, the identifications unchanged; no known-ratio ZT Scan data has been measured, so whether the wider span adds interference bias is open. Benchmark-gated. Omitted from the canonical configuration at its default.",
-      "gates": [
-        "benchmark-gated"
-      ],
+      "optional": true,
+      "default": "null",
+      "default_text": "null",
+      "help": "",
+      "gates": [],
       "source_struct": "QuantConfig"
     },
     {
@@ -4745,16 +4766,19 @@
       "path": "retrace.q1_repick",
       "name": "q1_repick",
       "section": "retrace",
-      "rust_type": "bool",
-      "kind": "bool",
+      "rust_type": "ZtSwitch",
+      "kind": "enum",
       "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "The scanning-quadrupole analogue of `repick` (ZT Scan has no raw events beyond its centroids, so it needs neither `enabled` nor a `.d`): extract re-chooses each candidate's apex in RT x Q1 among its own apex and the next peaks of its count profile, by the agreement of the fragments that belong (`extract.q1_fragments`, which it needs) with the library, and moves it to that peak's 2D apex: the cycle where the fragments that belong peak, at the step nearest their fitted Q1 centre. The apex scalars are read again there. Refused with `extract.promote_top_peaks > 1`, `extract.apex_refine_intensity` and `repick`. Default false. Benchmark-gated (docs/09_extract.md, \"Per-fragment Q1 decisions\").",
-      "gates": [
-        "benchmark-gated"
-      ],
-      "source_struct": "RetraceConfig"
+      "default": "auto",
+      "default_text": "`auto`",
+      "help": "The scanning-quadrupole analogue of `repick` (ZT Scan has no raw events beyond its centroids, so it needs neither `enabled` nor a `.d`): extract re-chooses each candidate's apex in RT x Q1 among its own apex and the next peaks of its count profile, by the agreement of the fragments that belong (`extract.q1_fragments`, which it needs) with the library, and moves it to that peak's 2D apex: the cycle where the fragments that belong peak, at the step nearest their fitted Q1 centre. The apex scalars are read again there. Refused with `extract.promote_top_peaks > 1`, `extract.apex_refine_intensity` and `repick` (docs/09_extract.md, \"Per-fragment Q1 decisions\"). `\"auto\"` (the default since 0.12.0): on for a ZT Scan search with `extract.q1_fragments` on and none of those three, off for every other search (`ZtSwitch`, docs/37_ztscan.md). Omitted from the canonical configuration unless on.",
+      "gates": [],
+      "source_struct": "RetraceConfig",
+      "choices": [
+        "auto",
+        "true",
+        "false"
+      ]
     },
     {
       "path": "retrace.q1_repick_peaks",

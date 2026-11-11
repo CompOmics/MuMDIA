@@ -1,17 +1,19 @@
-//! SCIEX ZT Scan DIA files in the console: recognised before a search starts, and the recipe.
+//! SCIEX ZT Scan DIA files in the console: recognised before a search starts, and the
+//! ZT Scan analysis.
 //!
 //! A ZT Scan DIA mzML written by the SCIEX MS Data Converter names each MS2 spectrum's
 //! quadrupole position (the isolation window target) and not the window the quadrupole
-//! isolated. The engine refuses such a file unless `convert.isolation_half_width` says how
-//! wide that window was: read without it, every spectrum would cover the whole m/z range and
-//! the search would grow until the machine runs out of memory (docs/37_ztscan.md). The
-//! console asks the engine before a search starts, through the `isolation` block of
-//! `mumdia peak-census`, which applies the same rule `convert` refuses by rather than a copy
-//! of it here, explains what it found, and fills in the half-width the engine suggests.
+//! isolated. The engine recognises such a file by its isolation census (the `isolation` block
+//! of `mumdia peak-census`), reads it with the half-width the census suggests and searches it
+//! with the ZT Scan analysis by itself (docs/37_ztscan.md, "Automatic for ZT Scan files"). The
+//! console asks the same census before a search starts, rather than keeping a copy of the
+//! rule here, so it can say what it found, show the half-width the engine will use, and set
+//! the library's search space for a library it builds from a FASTA.
 //!
-//! The recipe (`configs/examples/ztscan.json`) is the imported-library recipe plus the keys
-//! measured on ZT Scan; [`recipe_overrides`] is that difference, offered as overrides so it
-//! applies on top of whichever preset the search uses.
+//! The analysis needs nothing from the console. Only turning it off does: [`off_overrides`]
+//! sets every key the engine would turn on to its off value, explicitly. The keys are those
+//! the recipe (`configs/examples/ztscan.json`) sets on top of the imported-library recipe,
+//! which the engine's tests hold equal to the keys it turns on.
 
 use std::collections::BTreeMap;
 
@@ -115,8 +117,7 @@ pub fn probe_all(paths: &[String]) -> Vec<Probe> {
 }
 
 /// The ZT Scan recipe as overrides: every setting of [`RECIPE`] that [`LIBRARY_RECIPE`] does
-/// not set to the same value. `convert.isolation_half_width` is among them; the interface
-/// replaces it with the half-width the user confirmed.
+/// not set to the same value: the half-width and the keys of the ZT Scan analysis.
 pub fn recipe_overrides() -> Result<BTreeMap<String, serde_json::Value>, String> {
     let parse = |body: &str, name: &str| -> Result<BTreeMap<String, serde_json::Value>, String> {
         let v: serde_json::Value = serde_json::from_str(body)
@@ -129,6 +130,24 @@ pub fn recipe_overrides() -> Result<BTreeMap<String, serde_json::Value>, String>
         .into_iter()
         .filter(|(k, v)| lib.get(k) != Some(v))
         .collect())
+}
+
+/// The ZT Scan analysis turned off: every key of [`recipe_overrides`] but the half-width
+/// (which a ZT Scan file needs to be read at all), set to its off value (`false`, or 0 for a
+/// number). What the console writes when the user clears the analysis; the engine turns these
+/// keys on for a ZT Scan run unless they say otherwise.
+pub fn off_overrides() -> Result<BTreeMap<String, serde_json::Value>, String> {
+    recipe_overrides()?
+        .into_iter()
+        .filter(|(k, _)| k != "convert.isolation_half_width")
+        .map(|(k, v)| match v {
+            serde_json::Value::Bool(_) => Ok((k, serde_json::Value::Bool(false))),
+            serde_json::Value::Number(_) => Ok((k, serde_json::json!(0))),
+            other => Err(format!(
+                "the ZT Scan recipe sets {k} to {other}, which has no off value here"
+            )),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -170,6 +189,29 @@ mod tests {
         );
         assert_eq!(o["convert.isolation_half_width"], json!(1.9));
         assert_eq!(o["extract.q1_fragments"], json!(true));
+    }
+
+    /// Turning the analysis off writes every key of the recipe but the half-width, off.
+    #[test]
+    fn the_off_overrides_turn_every_recipe_key_off_but_the_half_width() {
+        let off = off_overrides().unwrap();
+        let recipe = recipe_overrides().unwrap();
+        assert_eq!(off.len(), recipe.len() - 1);
+        assert!(!off.contains_key("convert.isolation_half_width"));
+        for (k, v) in &off {
+            assert!(recipe.contains_key(k), "{k}");
+            assert!(v == &json!(false) || v == &json!(0), "{k}: {v}");
+        }
+        assert_eq!(off["rt_im_train.q1_calibrate"], json!(false));
+        assert_eq!(off["quant.q1_cycle_halfwidth"], json!(0));
+        // Each one is a setting the engine resolves automatically (`"auto"` or unset).
+        let schema = crate::settings::load_schema().unwrap();
+        for k in off.keys() {
+            let f = schema.fields.iter().find(|f| &f.path == k).unwrap();
+            // `"auto"`, or unset (`null`, which the schema spells as text for an optional value).
+            let auto = f.default.is_null() || f.default == "auto" || f.default == "null";
+            assert!(auto, "{k} defaults to {:?}", f.default);
+        }
     }
 
     /// Every key the recipe sets is a setting the engine's schema knows, so a configuration

@@ -1083,7 +1083,7 @@ mod run_tests {
         let fx = fixture("cyc");
         let q = |t: &Table| t.opt_f64("quantity").unwrap();
         let cyc = QuantConfig {
-            q1_cycle_halfwidth: 2,
+            q1_cycle_halfwidth: Some(2),
             ..QuantConfig::default()
         };
         let (tc, rep) = quant(&fx, &cyc, "cyc2");
@@ -1107,7 +1107,7 @@ mod run_tests {
         // Collapsed traces: one value a cycle, so the key is the half-width itself.
         let q1c = QuantConfig {
             q1_fragments: true,
-            q1_cycle_halfwidth: 3,
+            q1_cycle_halfwidth: Some(3),
             ..QuantConfig::default()
         };
         let q1s = QuantConfig {

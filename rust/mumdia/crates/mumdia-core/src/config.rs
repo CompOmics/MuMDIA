@@ -486,9 +486,8 @@ pub struct ConvertConfig {
     #[serde(skip_serializing_if = "is_true")]
     pub tdf_ms1_denoise: bool,
     /// Half-width in m/z of the quadrupole isolation window, for MS2 spectra that name an
-    /// isolation window target but no lower or upper offset. Unset (the default), such a
-    /// spectrum is refused when the file has more than one distinct target, because the
-    /// m/z range it isolated is unknown (docs/04_convert.md, "SCIEX ZT Scan DIA").
+    /// isolation window target but no lower or upper offset (docs/04_convert.md, "SCIEX ZT
+    /// Scan DIA").
     ///
     /// Set, each such spectrum is read as the window `[target - h, target + h]`, computed in
     /// the same f32 arithmetic the mzML reader applies to explicit offsets, so a file with
@@ -497,10 +496,20 @@ pub struct ConvertConfig {
     /// Data Converter writes it: every Q1 bin of a cycle is a spectrum carrying only its
     /// target, and `h` is half of the method's Q1 window (1.9 for a 3.8 m/z window). On a
     /// ZenoTOF 8600 K562 run, 1.5, 1.9 and 2.3 were equal within one-seed noise. Spectra
-    /// that carry offsets keep them. Must be finite and > 0; omitted from the canonical
-    /// configuration while unset, so it changes no config hash then, and recorded in the
-    /// spectra reports (`params.isolation_half_width`) when set.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// that carry offsets keep them. Must be finite and > 0.
+    ///
+    /// Unset (`null` or `"auto"`, the default since 0.12.0) it is automatic: `run`,
+    /// `run-experiment` and `convert` read a file whose isolation census calls it a scanning
+    /// quadrupole (SCIEX ZT Scan DIA) with the half-width the census suggests (2.5 steps of
+    /// the sweep, rounded to 0.05 m/z: 1.9 for the K562 method), and refuse any other file
+    /// whose spectra name differing targets and no offsets, as before, because the m/z range
+    /// each one isolated is unknown. Omitted from the canonical configuration while unset,
+    /// so a search of any other file keeps its config hash; the resolved value is part of it,
+    /// and recorded in the spectra reports (`params.isolation_half_width`).
+    #[serde(
+        deserialize_with = "de_half_width",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub isolation_half_width: Option<f64>,
 }
 impl Default for ConvertConfig {
@@ -1643,11 +1652,171 @@ fn is_zero_f64(v: &f64) -> bool {
     *v == 0.0
 }
 
-/// A count left at 0 ("off"), which the canonical configuration omits for keys added after
-/// the configuration hash was frozen for their section.
-fn is_zero_usize(v: &usize) -> bool {
-    *v == 0
+/// A switch of the ZT Scan analysis (docs/37_ztscan.md, "Automatic for ZT Scan files"):
+/// `"auto"` (the default), `true` or `false`.
+///
+/// `run` and `run-experiment` resolve `"auto"` once per search, before the configuration is
+/// hashed ([`Config::resolve_ztscan`]): on when every input is a SCIEX ZT Scan run, which is
+/// what the isolation census `convert` refuses by says of its MS2 spectra (a scanning
+/// quadrupole: many isolation targets, repeating every cycle, in steps far finer than any
+/// window), and off for every other search. A standalone stage reads `"auto"` as off. `true`
+/// asks for the key whatever the inputs are, and is refused when one of them is not a ZT Scan
+/// run, because every key of the analysis reads the Q1 sweep; `false` turns it off. The
+/// canonical configuration carries the key only when it is on, as `true`, so a search of any
+/// other data hashes as it did before the key was automatic.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ZtSwitch {
+    /// Decided by the search (`"auto"`, the default).
+    #[default]
+    Auto,
+    /// On (`true`).
+    On,
+    /// Off (`false`).
+    Off,
 }
+
+impl ZtSwitch {
+    /// On: `true`, or `"auto"` resolved on. An unresolved `"auto"` reads as off.
+    pub fn on(self) -> bool {
+        self == Self::On
+    }
+
+    /// Off by request (`false`) or by resolution; an unresolved `"auto"` is not.
+    pub fn is_off(self) -> bool {
+        self == Self::Off
+    }
+
+    /// Not yet decided (`"auto"`).
+    pub fn is_auto(self) -> bool {
+        self == Self::Auto
+    }
+
+    /// The canonical configuration carries the key only when it is on.
+    fn omitted(&self) -> bool {
+        !self.on()
+    }
+
+    /// Resolve `"auto"` to `on`; an explicit value is kept.
+    fn resolve(&mut self, on: bool) {
+        if self.is_auto() {
+            *self = if on { Self::On } else { Self::Off };
+        }
+    }
+}
+
+impl From<bool> for ZtSwitch {
+    fn from(on: bool) -> Self {
+        if on {
+            Self::On
+        } else {
+            Self::Off
+        }
+    }
+}
+
+impl Serialize for ZtSwitch {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Off => s.serialize_bool(false),
+            Self::On => s.serialize_bool(true),
+            Self::Auto => s.serialize_str("auto"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ZtSwitch {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = ZtSwitch;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("true, false or \"auto\"")
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(ZtSwitch::from(v))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                if v.trim().eq_ignore_ascii_case("auto") {
+                    Ok(ZtSwitch::Auto)
+                } else {
+                    Err(E::invalid_value(serde::de::Unexpected::Str(v), &self))
+                }
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// `convert.isolation_half_width`: a half-width in m/z, or `"auto"` or `null`, both stored
+/// as `None`: the search decides ([`Config::resolve_ztscan`]).
+fn de_half_width<'de, D>(d: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Width {
+        Mz(f64),
+        Word(String),
+    }
+    match Option::<Width>::deserialize(d)? {
+        None => Ok(None),
+        Some(Width::Mz(h)) => Ok(Some(h)),
+        Some(Width::Word(w)) if w.trim().eq_ignore_ascii_case("auto") => Ok(None),
+        Some(Width::Word(w)) => Err(serde::de::Error::custom(format!(
+            "convert.isolation_half_width must be a half-width in m/z or \"auto\" (got \"{w}\")"
+        ))),
+    }
+}
+
+/// `quant.q1_cycle_halfwidth`: a number of cycles (0 is off), or `"auto"` or `null`, both
+/// stored as `None`: the search decides ([`Config::resolve_ztscan`]).
+fn de_q1_cycle_halfwidth<'de, D>(d: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Cycles {
+        Count(usize),
+        Word(String),
+    }
+    match Option::<Cycles>::deserialize(d)? {
+        None => Ok(None),
+        Some(Cycles::Count(n)) => Ok(Some(n)),
+        Some(Cycles::Word(w)) if w.trim().eq_ignore_ascii_case("auto") => Ok(None),
+        Some(Cycles::Word(w)) => Err(serde::de::Error::custom(format!(
+            "quant.q1_cycle_halfwidth must be a number of Q1 cycles or \"auto\" (got \"{w}\")"
+        ))),
+    }
+}
+
+/// A count that is unset (automatic) or 0 (off), which the canonical configuration omits.
+fn is_unset_or_zero(v: &Option<usize>) -> bool {
+    v.unwrap_or(0) == 0
+}
+
+/// What the inputs of a search are, for the automatic ZT Scan analysis
+/// ([`Config::resolve_ztscan`]). `mumdia::ztscan` reads it from the files: a ZT Scan run is
+/// one whose isolation census (`stages::convert::IsolationCensus`, the rule `convert` refuses
+/// by) calls its MS2 spectra a scanning quadrupole.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ZtScanInputs {
+    /// No input is a ZT Scan run.
+    None,
+    /// Every input is one; the half-width the census suggests for them, in m/z.
+    All { half_width: f64 },
+    /// `zt` of the `total` inputs are; the half-width the census suggests for those.
+    Mixed {
+        half_width: f64,
+        zt: usize,
+        total: usize,
+    },
+}
+
+/// The quantification window, in Q1 cycles, that `quant.q1_cycle_halfwidth = "auto"` takes on
+/// a ZT Scan run (docs/37_ztscan.md, section 6).
+pub const ZTSCAN_Q1_CYCLE_HALFWIDTH: usize = 4;
 
 /// Heads `rt_im_train.multihead_calibration` uses when it is left to decide.
 ///
@@ -1984,12 +2153,15 @@ pub struct RtImTrainConfig {
     /// fragment m/z and retention time when they reduce the residuals), with the effective
     /// half-width and edge width, and written to `cal.json` (`q1_calibration`), with the
     /// residual distribution in steps before and after and which reading of the target
-    /// (centre or edge) fits. Diagnostic: nothing reads it back yet, so every other artifact
-    /// is unchanged. Refused on any other layout, on spectra with 1/K0 and with
-    /// `groups.window_groups > 1`. Default false. Benchmark-gated (docs/08_rt_im_train.md,
-    /// section 4h). Omitted from the canonical configuration at its default.
-    #[serde(skip_serializing_if = "is_false")]
-    pub q1_calibrate: bool,
+    /// (centre or edge) fits; `extract.q1_fragments` and the Q1-deconvolved keys decide with
+    /// it. Refused on any other layout, on spectra with 1/K0 and with
+    /// `groups.window_groups > 1`. `"auto"` (the default since 0.12.0): on for a ZT Scan
+    /// search unless `groups.window_groups > 1` or `extract.q1_fragments = false` (and
+    /// `extract.q1_deconvolved` off) leave nothing to read it, off for every other search
+    /// ([`ZtSwitch`], docs/37_ztscan.md, "Automatic for ZT Scan files"; docs/08_rt_im_train.md,
+    /// section 4h). Omitted from the canonical configuration unless on.
+    #[serde(skip_serializing_if = "ZtSwitch::omitted")]
+    pub q1_calibrate: ZtSwitch,
 }
 
 /// Source of `predicted_irt` for an imported library; see `RtImTrainConfig::library_irt`.
@@ -2130,7 +2302,7 @@ impl Default for RtImTrainConfig {
             im_window_sizing_q: 0.1,
             deeplc_predict_shards: 0,
             deeplc_projection_cache: Some("auto".to_string()),
-            q1_calibrate: false,
+            q1_calibrate: ZtSwitch::Auto,
         }
     }
 }
@@ -2223,10 +2395,12 @@ pub struct ExtractConfig {
     /// `features.q1_fragment_features`, `retrace.q1_repick` and `rescore.shadow_q1` read.
     /// Needs `rt_im_train.q1_calibrate` and spectra_ms2 v3 (a run converted with
     /// `convert.isolation_half_width`); refused with `q1_cycles`, on any other layout and on
-    /// spectra that carry 1/K0. Default false. Benchmark-gated (docs/09_extract.md,
-    /// "Per-fragment Q1 decisions"). Omitted from the canonical configuration at its default.
-    #[serde(skip_serializing_if = "is_false")]
-    pub q1_fragments: bool,
+    /// spectra that carry 1/K0. `"auto"` (the default since 0.12.0): on for a ZT Scan search
+    /// with the Q1 calibration on and `q1_cycles` off, off for every other search
+    /// ([`ZtSwitch`]; docs/09_extract.md, "Per-fragment Q1 decisions"). Omitted from the
+    /// canonical configuration unless on.
+    #[serde(skip_serializing_if = "ZtSwitch::omitted")]
+    pub q1_fragments: ZtSwitch,
     /// What `stages::q1frag` read from the run's `cal.json` (`q1_calibration`) under
     /// `q1_fragments`: the calibrated window and the decision tolerances, set by `run` /
     /// `run-experiment` (and `mumdia extract --q1-cal`) before extract. Never read from a
@@ -2835,7 +3009,7 @@ impl Default for ExtractConfig {
             q1_cycles: false,
             q1_profile: false,
             q1_gate_max_offset: None,
-            q1_fragments: false,
+            q1_fragments: ZtSwitch::Auto,
             q1_model: None,
             q1_repick: false,
             q1_repick_peaks: Q1_REPICK_PEAKS,
@@ -3070,11 +3244,13 @@ pub struct FeaturesConfig {
     /// expected one, in steps), `q1f_corr2d` (2D correlation of the fragments that belong),
     /// `q1f_fit_resid` (residual of the shared-centre fit) and `q1f_centre` (the shared
     /// centre, steps), from psms_extracted v6 (`extract.q1_fragments`, which it needs),
-    /// appended after every other column of the `extended` set. Default false.
-    /// Benchmark-gated (docs/10_features.md). Omitted from the canonical configuration at
-    /// its default.
-    #[serde(skip_serializing_if = "is_false")]
-    pub q1_fragment_features: bool,
+    /// appended after every other column of the `extended` set (docs/10_features.md).
+    /// `"auto"` (the default since 0.12.0): on for a ZT Scan search under the `extended`
+    /// set with `extract.q1_fragments` on, off for every other search ([`ZtSwitch`],
+    /// docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical
+    /// configuration unless on.
+    #[serde(skip_serializing_if = "ZtSwitch::omitted")]
+    pub q1_fragment_features: ZtSwitch,
     /// The MS1 isotope-envelope family (`ms1e_*`): extract reads the precursor's isotopes
     /// M-1 to M+4 and the half-spacing positions in the MS1 scans around the apex (the
     /// nearest one and two either side), at the calibrated MS1 m/z (`extract.ms1_calibrate`,
@@ -3093,69 +3269,73 @@ pub struct FeaturesConfig {
     /// its default.
     #[serde(skip_serializing_if = "is_false")]
     pub ms1_envelope: bool,
-    /// The unfragmented-precursor family of scanning-quadrupole spectra (`q1p_*`): extract
-    /// reads the precursor's own m/z (M0, M+1, M+2, at the calibrated fragment m/z) in every
-    /// cell of the per-fragment decision's RT x step patch, where each isotope is transmitted
-    /// at its own Q1 position, and writes per row (psms_extracted v8) how many isotopes are
-    /// present by the decision's coherent-cell rule (`q1p_n_iso`), the precursor's share of
-    /// the precursor plus fragment intensity at the 2D apex (`q1p_share`), the shift of its
-    /// isotopes' Q1 profiles from where the calibrated window puts them (`q1p_offset`, steps,
-    /// one shift shared by the isotopes, fitted as the fragments' shared centre is) and their
-    /// residual under it (`q1p_resid`), the mean and largest correlation of the fragments' Q1
-    /// profiles with the precursor's (`q1p_frag_corr_mean`, `q1p_frag_corr_max`), the
-    /// fragments whose own Q1 centre lies within the decision's offset tolerance of the
-    /// precursor's (and whose 2D correlation reaches its floor, `q1p_n_belong`) and the
-    /// distance between the precursor's shift and the fragments' shared centre
-    /// (`q1p_centre_agree`, steps), appended after every other column of the `extended` set.
-    /// Needs `extract.q1_fragments`. Default false. Benchmark-gated (docs/37_ztscan.md).
-    /// Omitted from the canonical configuration at its default.
-    #[serde(skip_serializing_if = "is_false")]
-    pub q1_precursor: bool,
+    /// The unfragmented-precursor family of scanning-quadrupole spectra (`q1p_*`): extract reads
+    /// the precursor's own m/z (M0, M+1, M+2, at the calibrated fragment m/z) in every cell of the
+    /// per-fragment decision's RT x step patch, where each isotope is transmitted at its own Q1
+    /// position, and writes per row (psms_extracted v8) how many isotopes are present by the
+    /// decision's coherent-cell rule (`q1p_n_iso`), the precursor's share of the precursor plus
+    /// fragment intensity at the 2D apex (`q1p_share`), the shift of its isotopes' Q1 profiles from
+    /// where the calibrated window puts them (`q1p_offset`, steps, one shift shared by the
+    /// isotopes, fitted as the fragments' shared centre is) and their residual under it
+    /// (`q1p_resid`), the mean and largest correlation of the fragments' Q1 profiles with the
+    /// precursor's (`q1p_frag_corr_mean`, `q1p_frag_corr_max`), the fragments whose own Q1 centre
+    /// lies within the decision's offset tolerance of the precursor's (and whose 2D correlation
+    /// reaches its floor, `q1p_n_belong`) and the distance between the precursor's shift and the
+    /// fragments' shared centre (`q1p_centre_agree`, steps), appended after every other column of
+    /// the `extended` set. Needs `extract.q1_fragments`. `"auto"` (the default since 0.12.0): on
+    /// for a ZT Scan search under the `extended` set with `extract.q1_fragments` on, off for every
+    /// other search ([`ZtSwitch`], docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from
+    /// the canonical configuration unless on.
+    #[serde(skip_serializing_if = "ZtSwitch::omitted")]
+    pub q1_precursor: ZtSwitch,
     /// The multi-scale Q1 family of scanning-quadrupole spectra (`q1m*`): over the 3, 7 and 11
-    /// steps centred on the step nearest the fragments' fitted Q1 centre, with the fragments'
-    /// Q1 profiles summed over the cycles around the 2D apex (the per-fragment decision's),
-    /// the mean correlation of each present fragment's profile with the most intense one's
+    /// steps centred on the step nearest the fragments' fitted Q1 centre, with the fragments' Q1
+    /// profiles summed over the cycles around the 2D apex (the per-fragment decision's), the mean
+    /// correlation of each present fragment's profile with the most intense one's
     /// (`q1m3_corr_best`, `q1m7_corr_best`, `q1m11_corr_best`), the residual of the fragments'
-    /// consensus profile under the calibrated transmission at the fitted centre (`q1mK_shape`,
-    /// `1 - R^2`) and the most intense fragment's Q1 centroid against its expected centre
-    /// (`q1mK_centroid`, steps), and with `q1_precursor` on the mean correlation of the
-    /// fragments' profiles with the unfragmented precursor's (`q1mK_corr_prec`), written to
-    /// psms_extracted v8 and appended after every other column of the `extended` set. Needs
-    /// `extract.q1_fragments`. Default false. Benchmark-gated (docs/37_ztscan.md). Omitted
-    /// from the canonical configuration at its default.
-    #[serde(skip_serializing_if = "is_false")]
-    pub q1_multiscale: bool,
-    /// The Q1-deconvolved evidence family of scanning-quadrupole spectra (`q1d_*`): every MS2
-    /// peak is given the Q1 centroid of its trace along the sweep (`stages::q1dec`, the
-    /// evidence of `extract.q1_deconvolved`), and at each row's apex, over the scans of the
-    /// apex cycle and the two either side whose window covers the precursor, extract reads
-    /// for every library fragment the nearest peak and whether its centroid lies within the
-    /// tolerance the Q1 calibration learns of the fragment's expected Q1 centre: the
-    /// fragments with such a consistent match (`q1d_n_frag`), those matched only
-    /// inconsistently (`q1d_n_incons`), the consistent share of the matched intensity
-    /// (`q1d_share`, and in the apex cycle alone `q1d_apex_share`) and the
-    /// predicted-intensity share of the fragments with a consistent match
-    /// (`q1d_pred_share`), written to psms_extracted v8 and appended after every other column
-    /// of the `extended` set. The extraction itself is unchanged (unlike
-    /// `extract.q1_deconvolved`, which counts only the consistent peaks). Needs
-    /// `extract.q1_fragments`. Default false. Benchmark-gated (docs/37_ztscan.md). Omitted
-    /// from the canonical configuration at its default.
-    #[serde(skip_serializing_if = "is_false")]
-    pub q1_deconvolved: bool,
-    /// The Q1-consistency family of scanning-quadrupole spectra (`q1c_*`,
-    /// `stages::q1consist`): the per-fragment Q1 decisions of `extract.q1_fragments` (which it
-    /// needs) read against each fragment's EXPECTED Q1 centre rather than the centre the
-    /// candidate's fragments share, so a precursor whose shared fit an interferer pulled away
-    /// keeps the evidence of its own fragments: how many are consistent (within the learned
-    /// offset tolerance), their share of the predicted and of the observed intensity, the
-    /// agreement of their observed pattern with the prediction, and graded and soft versions of
-    /// the cut: sixteen `q1c_*` columns appended after every other column of the `extended` set.
-    /// With them in the competed table, four join the rescore prefilter's default columns. The
-    /// tolerances come from the run's Q1 calibration (`cal.json`; `mumdia features --q1-cal`).
-    /// Default false; in `configs/examples/ztscan.json`. Benchmark-gated (docs/10_features.md,
-    /// docs/37_ztscan.md). Omitted from the canonical configuration at its default.
-    #[serde(skip_serializing_if = "is_false")]
-    pub q1_consistency: bool,
+    /// consensus profile under the calibrated transmission at the fitted centre (`q1mK_shape`, `1 -
+    /// R^2`) and the most intense fragment's Q1 centroid against its expected centre
+    /// (`q1mK_centroid`, steps), and with `q1_precursor` on the mean correlation of the fragments'
+    /// profiles with the unfragmented precursor's (`q1mK_corr_prec`), written to psms_extracted v8
+    /// and appended after every other column of the `extended` set. Needs `extract.q1_fragments`.
+    /// `"auto"` (the default since 0.12.0): on for a ZT Scan search under the `extended` set with
+    /// `extract.q1_fragments` on, off for every other search ([`ZtSwitch`], docs/37_ztscan.md,
+    /// "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on.
+    #[serde(skip_serializing_if = "ZtSwitch::omitted")]
+    pub q1_multiscale: ZtSwitch,
+    /// The Q1-deconvolved evidence family of scanning-quadrupole spectra (`q1d_*`): every MS2 peak
+    /// is given the Q1 centroid of its trace along the sweep (`stages::q1dec`, the evidence of
+    /// `extract.q1_deconvolved`), and at each row's apex, over the scans of the apex cycle and the
+    /// two either side whose window covers the precursor, extract reads for every library fragment
+    /// the nearest peak and whether its centroid lies within the tolerance the Q1 calibration
+    /// learns of the fragment's expected Q1 centre: the fragments with such a consistent match
+    /// (`q1d_n_frag`), those matched only inconsistently (`q1d_n_incons`), the consistent share of
+    /// the matched intensity (`q1d_share`, and in the apex cycle alone `q1d_apex_share`) and the
+    /// predicted-intensity share of the fragments with a consistent match (`q1d_pred_share`),
+    /// written to psms_extracted v8 and appended after every other column of the `extended` set.
+    /// The extraction itself is unchanged (unlike `extract.q1_deconvolved`, which counts only the
+    /// consistent peaks). Needs `extract.q1_fragments`. `"auto"` (the default since 0.12.0): on for
+    /// a ZT Scan search under the `extended` set with `extract.q1_fragments` on, off for every
+    /// other search ([`ZtSwitch`], docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from
+    /// the canonical configuration unless on.
+    #[serde(skip_serializing_if = "ZtSwitch::omitted")]
+    pub q1_deconvolved: ZtSwitch,
+    /// The Q1-consistency family of scanning-quadrupole spectra (`q1c_*`, `stages::q1consist`): the
+    /// per-fragment Q1 decisions of `extract.q1_fragments` (which it needs) read against each
+    /// fragment's EXPECTED Q1 centre rather than the centre the candidate's fragments share, so a
+    /// precursor whose shared fit an interferer pulled away keeps the evidence of its own
+    /// fragments: how many are consistent (within the learned offset tolerance), their share of the
+    /// predicted and of the observed intensity, the agreement of their observed pattern with the
+    /// prediction, and graded and soft versions of the cut: sixteen `q1c_*` columns appended after
+    /// every other column of the `extended` set. With them in the competed table, four join the
+    /// rescore prefilter's default columns. The tolerances come from the run's Q1 calibration
+    /// (`cal.json`; `mumdia features --q1-cal`). In `configs/examples/ztscan.json`
+    /// (docs/10_features.md). `"auto"` (the default since 0.12.0): on for a ZT Scan search under
+    /// the `extended` set with `extract.q1_fragments` on, off for every other search ([`ZtSwitch`],
+    /// docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration
+    /// unless on.
+    #[serde(skip_serializing_if = "ZtSwitch::omitted")]
+    pub q1_consistency: ZtSwitch,
 }
 impl Default for FeaturesConfig {
     fn default() -> Self {
@@ -3178,12 +3358,12 @@ impl Default for FeaturesConfig {
             chrom_loaders: 3,
             im_features: ImFeatures::Off,
             q1_features: false,
-            q1_fragment_features: false,
+            q1_fragment_features: ZtSwitch::Auto,
             ms1_envelope: false,
-            q1_precursor: false,
-            q1_multiscale: false,
-            q1_deconvolved: false,
-            q1_consistency: false,
+            q1_precursor: ZtSwitch::Auto,
+            q1_multiscale: ZtSwitch::Auto,
+            q1_deconvolved: ZtSwitch::Auto,
+            q1_consistency: ZtSwitch::Auto,
         }
     }
 }
@@ -3643,13 +3823,19 @@ pub struct QuantConfig {
     /// quant report records. Needs the scan form of the fixed window (`fixed_scan_halfwidth >
     /// 0`, `fixed_window_s = 0`); refused with `fixed_scan_halfwidth_scale`, which chooses each
     /// candidate's half-width too. `run` and `run-experiment` pass the spectra; `mumdia quant`
-    /// takes `--spectra-ms2`. 0 (default) is off. Measured on the ZT Scan K562 three-run
-    /// experiment (docs/37_ztscan.md): median precursor CV 0.273 at the default window, 0.107 at
-    /// 3 cycles and 0.102 at 4, the identifications unchanged; no known-ratio ZT Scan data has
-    /// been measured, so whether the wider span adds interference bias is open.
-    /// Benchmark-gated. Omitted from the canonical configuration at its default.
-    #[serde(skip_serializing_if = "is_zero_usize")]
-    pub q1_cycle_halfwidth: usize,
+    /// takes `--spectra-ms2`. 0 is off. Measured on the ZT Scan K562 three-run experiment
+    /// (docs/37_ztscan.md): median precursor CV 0.273 at the default window, 0.107 at 3
+    /// cycles and 0.102 at 4, the identifications unchanged; no known-ratio ZT Scan data has
+    /// been measured, so whether the wider span adds interference bias is open. Unset
+    /// (`null` or `"auto"`, the default since 0.12.0) it is automatic: 4
+    /// ([`ZTSCAN_Q1_CYCLE_HALFWIDTH`]) for a ZT Scan search whose fixed window has the scan
+    /// form, 0 for every other search (docs/37_ztscan.md, "Automatic for ZT Scan files").
+    /// Omitted from the canonical configuration while unset or 0.
+    #[serde(
+        deserialize_with = "de_q1_cycle_halfwidth",
+        skip_serializing_if = "is_unset_or_zero"
+    )]
+    pub q1_cycle_halfwidth: Option<usize>,
     /// Which keys of the quantification recipe the configuration file set. Not part of the
     /// configuration: [`Config::from_json`] fills it, and [`Config::resolve_quant_recipe`]
     /// reads it to tell a default that does not fit the rest of the configuration (replaced,
@@ -3881,7 +4067,12 @@ impl QuantConfig {
     /// [`QuantConfig::q1_fragments`] or [`QuantConfig::q1_cycle_halfwidth`]. `run` and
     /// `run-experiment` hand quant the spectra exactly then.
     pub fn reads_q1_sweep(&self) -> bool {
-        self.q1_fragments || self.q1_cycle_halfwidth > 0
+        self.q1_fragments || self.q1_cycles() > 0
+    }
+
+    /// [`QuantConfig::q1_cycle_halfwidth`] in cycles: 0 while it is off or unresolved.
+    pub fn q1_cycles(&self) -> usize {
+        self.q1_cycle_halfwidth.unwrap_or(0)
     }
 
     /// Whether the cross-run MaxLFQ of `run-experiment` reads the normalised quantity
@@ -4044,7 +4235,7 @@ impl Default for QuantConfig {
             q1_min_belonging: 3, // Q1_MIN_BELONGING
             q1_step_weights: Q1StepWeights::Transmission,
             q1_integration: Q1Integration::Trapezoid,
-            q1_cycle_halfwidth: 0,
+            q1_cycle_halfwidth: None,
             explicit: QuantExplicit::default(),
             resolved: Vec::new(),
         }
@@ -4382,10 +4573,12 @@ pub struct RescoreConfig {
     /// nothing when its Q1 centre is the candidate's, all of it when it is the lender's, a
     /// share in between (a two-component split of its centre), and all of it when the two
     /// precursors are closer than the decision's offset tolerance, where Q1 cannot tell
-    /// them apart. Default false. Benchmark-gated (docs/11_compete_rescore_fdr.md). Omitted
-    /// from the canonical configuration at its default.
-    #[serde(skip_serializing_if = "is_false")]
-    pub shadow_q1: bool,
+    /// them apart (docs/11_compete_rescore_fdr.md). `"auto"` (the default since 0.12.0):
+    /// on for a ZT Scan search with `extract.q1_fragments` on and `shadow_min_shared > 0`,
+    /// off for every other search ([`ZtSwitch`], docs/37_ztscan.md). Omitted from the
+    /// canonical configuration unless on.
+    #[serde(skip_serializing_if = "ZtSwitch::omitted")]
+    pub shadow_q1: ZtSwitch,
     /// Fewest decoys the classifier is trained with. Below this the learned classifier
     /// is not trained (a handful of decoys lets it overfit, one decoy then outranks every
     /// target and nothing passes 1%): the candidates are ranked by their untrained
@@ -4440,7 +4633,7 @@ impl Default for RescoreConfig {
             shadow_rt_s: 3.0,
             shadow_region: 8,
             shadow_im_tolerance: 0.0,
-            shadow_q1: false,
+            shadow_q1: ZtSwitch::Auto,
             classifier: t(),
             folds: 3,
             train_fdr: 0.01,
@@ -5110,10 +5303,13 @@ pub struct RetraceConfig {
     /// it needs) with the library, and moves it to that peak's 2D apex: the cycle where the
     /// fragments that belong peak, at the step nearest their fitted Q1 centre. The apex
     /// scalars are read again there. Refused with `extract.promote_top_peaks > 1`,
-    /// `extract.apex_refine_intensity` and `repick`. Default false. Benchmark-gated
-    /// (docs/09_extract.md, "Per-fragment Q1 decisions").
-    #[serde(skip_serializing_if = "is_false")]
-    pub q1_repick: bool,
+    /// `extract.apex_refine_intensity` and `repick` (docs/09_extract.md, "Per-fragment Q1
+    /// decisions"). `"auto"` (the default since 0.12.0): on for a ZT Scan search with
+    /// `extract.q1_fragments` on and none of those three, off for every other search
+    /// ([`ZtSwitch`], docs/37_ztscan.md). Omitted from the canonical configuration unless
+    /// on.
+    #[serde(skip_serializing_if = "ZtSwitch::omitted")]
+    pub q1_repick: ZtSwitch,
     /// `q1_repick`: how many peaks of the candidate's count profile it enumerates to compare
     /// with the apex, strongest first by area (the apex's own peak among them is skipped).
     /// Each alternative costs a full per-fragment decision, which is what makes the re-pick
@@ -5129,7 +5325,7 @@ impl Default for RetraceConfig {
         Self {
             enabled: false,
             repick: false,
-            q1_repick: false,
+            q1_repick: ZtSwitch::Auto,
             q1_repick_peaks: 5, // Q1_REPICK_PEAKS
             im_half_width: 0.015,
             ms1: true,
@@ -5154,7 +5350,14 @@ impl RetraceConfig {
     /// Whether every key is at its default, so the canonical configuration omits the
     /// section.
     pub fn is_default(&self) -> bool {
-        *self == RetraceConfig::default()
+        // `q1_repick` off, resolved or not, is the default as the canonical configuration
+        // sees it, so a search that resolved it off keeps the hash it had before the key
+        // was automatic.
+        let mut s = self.clone();
+        if !s.q1_repick.on() {
+            s.q1_repick = ZtSwitch::Auto;
+        }
+        s == RetraceConfig::default()
     }
 }
 
@@ -5540,6 +5743,287 @@ impl Config {
         }
     }
 
+    /// The keys that ask for the ZT Scan analysis explicitly: an automatic key set to `true`
+    /// (a number above 0 for `quant.q1_cycle_halfwidth`, a count other than the default for
+    /// `retrace.q1_repick_peaks`), and the opt-in keys that read the Q1 sweep as well
+    /// (`extract.q1_cycles`, `extract.q1_profile`, `features.q1_features`,
+    /// `extract.q1_deconvolved`, `search_seed.q1_deconvolved`, `quant.q1_fragments`). Called
+    /// before [`Config::resolve_ztscan`], so on means asked for.
+    pub fn ztscan_keys_on(&self) -> Vec<&'static str> {
+        let (ex, f) = (&self.extract, &self.features);
+        [
+            (
+                self.rt_im_train.q1_calibrate.on(),
+                "rt_im_train.q1_calibrate",
+            ),
+            (ex.q1_fragments.on(), "extract.q1_fragments"),
+            (f.q1_fragment_features.on(), "features.q1_fragment_features"),
+            (f.q1_precursor.on(), "features.q1_precursor"),
+            (f.q1_multiscale.on(), "features.q1_multiscale"),
+            (f.q1_deconvolved.on(), "features.q1_deconvolved"),
+            (f.q1_consistency.on(), "features.q1_consistency"),
+            (self.retrace.q1_repick.on(), "retrace.q1_repick"),
+            (
+                self.retrace.q1_repick_peaks != Q1_REPICK_PEAKS,
+                "retrace.q1_repick_peaks",
+            ),
+            (self.rescore.shadow_q1.on(), "rescore.shadow_q1"),
+            (self.quant.q1_cycles() > 0, "quant.q1_cycle_halfwidth"),
+            (ex.q1_cycles, "extract.q1_cycles"),
+            (ex.q1_profile, "extract.q1_profile"),
+            (f.q1_features, "features.q1_features"),
+            (ex.q1_deconvolved, "extract.q1_deconvolved"),
+            (
+                self.search_seed.q1_deconvolved,
+                "search_seed.q1_deconvolved",
+            ),
+            (self.quant.q1_fragments, "quant.q1_fragments"),
+        ]
+        .into_iter()
+        .filter_map(|(on, key)| on.then_some(key))
+        .collect()
+    }
+
+    /// Resolve every automatic key of the ZT Scan analysis to off, as a standalone stage reads
+    /// it (`mumdia extract`, `features`, `quant`, ...): only `run` and `run-experiment` detect
+    /// a ZT Scan run and calibrate its Q1 sweep. `convert.isolation_half_width` is left to the
+    /// caller (`mumdia convert` detects a ZT Scan file itself). An explicit value is kept.
+    pub fn resolve_ztscan_off(&mut self) {
+        self.rt_im_train.q1_calibrate.resolve(false);
+        self.extract.q1_fragments.resolve(false);
+        let f = &mut self.features;
+        for k in [
+            &mut f.q1_fragment_features,
+            &mut f.q1_precursor,
+            &mut f.q1_multiscale,
+            &mut f.q1_deconvolved,
+            &mut f.q1_consistency,
+        ] {
+            k.resolve(false);
+        }
+        self.retrace.q1_repick.resolve(false);
+        self.rescore.shadow_q1.resolve(false);
+        if self.quant.q1_cycle_halfwidth.is_none() {
+            self.quant.q1_cycle_halfwidth = Some(0);
+        }
+    }
+
+    /// [`Config::resolve_ztscan_off`], then what each key that is on reads
+    /// ([`Config::validate_ztscan`]): the configuration of a standalone stage.
+    pub fn resolve_ztscan_standalone(&mut self) -> Result<(), crate::error::ConfigError> {
+        self.resolve_ztscan_off();
+        self.validate_ztscan()
+    }
+
+    /// Resolve the automatic keys of the ZT Scan analysis (docs/37_ztscan.md, "Automatic for
+    /// ZT Scan files") for a search whose inputs are `inputs`, and validate the result. `run`
+    /// and `run-experiment` call it once, before the configuration is hashed, with what
+    /// `mumdia::ztscan` read from the inputs; every stage then sees concrete values, and the
+    /// manifest records what ran. Returns one line per warning.
+    ///
+    /// - No input a ZT Scan run: every automatic key off. A key that asks for the analysis
+    ///   ([`Config::ztscan_keys_on`]) is refused, because it reads the Q1 sweep.
+    /// - Every input a ZT Scan run: `convert.isolation_half_width` the census's suggestion
+    ///   unless set, and every automatic key on unless the configuration rules it out
+    ///   (window groups, `extract.q1_cycles`, a feature set other than `extended`, the
+    ///   re-pick's or the shadow test's exclusions, a fixed window other than the scan form,
+    ///   an explicit `false` of a key it needs), with a warning naming what stayed off and
+    ///   why.
+    /// - Some inputs ZT Scan runs and some not: the pooled rescore needs one feature set, so
+    ///   every automatic key is off, with a warning that recommends searching the ZT Scan
+    ///   files separately; `convert.isolation_half_width` is still the suggestion unless set,
+    ///   so the ZT Scan files can be read. A key that asks for the analysis is refused.
+    ///
+    /// An explicit `false` (or 0) is kept everywhere; an explicit `true` on ZT Scan input is
+    /// kept and validated as before.
+    pub fn resolve_ztscan(
+        &mut self,
+        inputs: ZtScanInputs,
+    ) -> Result<Vec<String>, crate::error::ConfigError> {
+        use crate::error::ConfigError::Invalid;
+        let mut notes: Vec<String> = Vec::new();
+        let asked = self.ztscan_keys_on();
+        let named = |keys: &[&str]| -> String {
+            let (verb, it) = if keys.len() == 1 {
+                ("asks", "it")
+            } else {
+                ("ask", "they")
+            };
+            format!(
+                "{} {verb} for the ZT Scan analysis, which reads the Q1 sweep of a SCIEX ZT Scan \
+                 DIA run (a scanning quadrupole), and {it} cannot be used",
+                keys.join(", ")
+            )
+        };
+        match inputs {
+            ZtScanInputs::None => {
+                if !asked.is_empty() {
+                    return Err(Invalid(format!(
+                        "{} here: no input of this search is a ZT Scan run (its MS2 spectra \
+                         would each name a quadrupole position and no window, repeating every \
+                         cycle in steps far finer than any isolation window; `mumdia \
+                         peak-census` says what a file is). Leave these keys at \"auto\" (the \
+                         default), which turns the analysis on for ZT Scan files and off for \
+                         every other file (docs/37_ztscan.md, \"Automatic for ZT Scan files\").",
+                        named(&asked)
+                    )));
+                }
+                self.resolve_ztscan_off();
+            }
+            ZtScanInputs::Mixed {
+                half_width,
+                zt,
+                total,
+            } => {
+                if !asked.is_empty() {
+                    return Err(Invalid(format!(
+                        "{} in an experiment that mixes ZT Scan runs ({zt} of its {total} inputs) \
+                         with other runs: the pooled rescore needs one feature set for every \
+                         run. Search the ZT Scan files separately (a run or an experiment of \
+                         their own), or leave these keys at \"auto\" (docs/37_ztscan.md, \
+                         \"Automatic for ZT Scan files\").",
+                        named(&asked)
+                    )));
+                }
+                let hw = *self.convert.isolation_half_width.get_or_insert(half_width);
+                self.resolve_ztscan_off();
+                notes.push(format!(
+                    "this experiment mixes SCIEX ZT Scan DIA runs ({zt} of its {total} inputs) \
+                     with other runs: the ZT Scan files are read with the Q1 half-width {hw} \
+                     m/z, and the ZT Scan analysis is off for every run of the experiment, \
+                     because the pooled rescore needs one feature set. Search the ZT Scan files \
+                     separately to use it (docs/37_ztscan.md, \"Automatic for ZT Scan files\")."
+                ));
+            }
+            ZtScanInputs::All { half_width } => {
+                self.convert.isolation_half_width.get_or_insert(half_width);
+                notes.extend(self.resolve_ztscan_on());
+            }
+        }
+        self.validate_ztscan()?;
+        Ok(notes)
+    }
+
+    /// [`Config::resolve_ztscan`] for a search whose every input is a ZT Scan run: each
+    /// automatic key on unless the configuration rules it out. Returns the warning naming
+    /// what stayed off, if anything did.
+    fn resolve_ztscan_on(&mut self) -> Option<String> {
+        let mut held: Vec<String> = Vec::new();
+        let mut hold = |key: ZtSwitch, name: &str, why: &str| {
+            if key.is_auto() {
+                held.push(format!("{name} ({why})"));
+            }
+        };
+        let grouped = self.groups.window_groups > 1;
+        // The Q1 calibration runs when something reads it: the per-fragment decisions, or
+        // the Q1-deconvolved count of `extract.q1_deconvolved`.
+        let decisions = !self.extract.q1_fragments.is_off() && !self.extract.q1_cycles;
+        let cal_why = if grouped {
+            Some("groups.window_groups > 1: it calibrates the Q1 sweep of an ungrouped run")
+        } else if !decisions && !self.extract.q1_deconvolved {
+            Some("nothing reads it: extract.q1_fragments is off")
+        } else {
+            None
+        };
+        if let Some(why) = cal_why {
+            hold(
+                self.rt_im_train.q1_calibrate,
+                "rt_im_train.q1_calibrate",
+                why,
+            );
+        }
+        self.rt_im_train.q1_calibrate.resolve(cal_why.is_none());
+        let frag_why = if self.extract.q1_cycles {
+            Some("extract.q1_cycles sums the Q1 steps it keeps apart")
+        } else if !self.rt_im_train.q1_calibrate.on() {
+            Some("it needs rt_im_train.q1_calibrate")
+        } else {
+            None
+        };
+        if let Some(why) = frag_why {
+            hold(self.extract.q1_fragments, "extract.q1_fragments", why);
+        }
+        self.extract.q1_fragments.resolve(frag_why.is_none());
+        let frag = self.extract.q1_fragments.on();
+        let family_why = if !frag {
+            Some("it needs extract.q1_fragments")
+        } else if self.features.set != FeatureSet::Extended {
+            Some("the Q1 feature families exist under features.set = extended")
+        } else {
+            None
+        };
+        let f = &mut self.features;
+        for (k, name) in [
+            (&mut f.q1_fragment_features, "features.q1_fragment_features"),
+            (&mut f.q1_precursor, "features.q1_precursor"),
+            (&mut f.q1_multiscale, "features.q1_multiscale"),
+            (&mut f.q1_deconvolved, "features.q1_deconvolved"),
+            (&mut f.q1_consistency, "features.q1_consistency"),
+        ] {
+            if let Some(why) = family_why {
+                hold(*k, name, why);
+            }
+            k.resolve(family_why.is_none());
+        }
+        let ex = &self.extract;
+        let repick_why = if !frag {
+            Some("it needs extract.q1_fragments")
+        } else if ex.promote_top_peaks > 1 || ex.apex_refine_intensity || self.retrace.repick {
+            Some(
+                "extract.promote_top_peaks > 1, extract.apex_refine_intensity or retrace.repick \
+                 chooses the apex",
+            )
+        } else {
+            None
+        };
+        if let Some(why) = repick_why {
+            hold(self.retrace.q1_repick, "retrace.q1_repick", why);
+        }
+        self.retrace.q1_repick.resolve(repick_why.is_none());
+        let shadow_why = if !frag {
+            Some("it needs extract.q1_fragments")
+        } else if self.rescore.shadow_min_shared == 0 {
+            Some("rescore.shadow_min_shared = 0 turns the shadow test off")
+        } else {
+            None
+        };
+        if let Some(why) = shadow_why {
+            hold(self.rescore.shadow_q1, "rescore.shadow_q1", why);
+        }
+        self.rescore.shadow_q1.resolve(shadow_why.is_none());
+        if self.quant.q1_cycle_halfwidth.is_none() {
+            let q = &self.quant;
+            let why = if grouped {
+                Some("groups.window_groups > 1")
+            } else if q.fixed_scan_halfwidth == 0
+                || q.fixed_window_s > 0.0
+                || q.fixed_scan_halfwidth_scale > 0.0
+            {
+                Some(
+                    "it needs the scan form of the fixed window: quant.fixed_scan_halfwidth > 0, \
+                     fixed_window_s = 0 and fixed_scan_halfwidth_scale = 0",
+                )
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                held.push(format!("quant.q1_cycle_halfwidth ({why})"));
+            }
+            self.quant.q1_cycle_halfwidth = Some(if why.is_none() {
+                ZTSCAN_Q1_CYCLE_HALFWIDTH
+            } else {
+                0
+            });
+        }
+        (!held.is_empty()).then(|| {
+            format!(
+                "ZT Scan input: these keys of the ZT Scan analysis stay off: {} \
+                 (docs/37_ztscan.md, \"Automatic for ZT Scan files\")",
+                held.join("; ")
+            )
+        })
+    }
+
     /// Whether this run's library retention times come from DeepLC.
     ///
     /// Imported library: whatever `library_irt` resolves to. FASTA: whether the library
@@ -5872,13 +6356,6 @@ impl Config {
         }
         let q = &self.quant;
         if q.q1_fragments {
-            if !self.extract.q1_fragments {
-                return Err(Invalid(
-                    "quant.q1_fragments quantifies from the per-fragment Q1 decisions that \
-                     extract.q1_fragments writes; set it as well"
-                        .into(),
-                ));
-            }
             if q.fragment_selection == FragmentSelection::CrossRun {
                 return Err(Invalid(
                     "quant.q1_fragments leaves out the fragments that do not belong, and the \
@@ -5912,7 +6389,7 @@ impl Config {
                     .into(),
             ));
         }
-        if q.q1_cycle_halfwidth > 0 {
+        if q.q1_cycles() > 0 {
             if q.fixed_scan_halfwidth_scale > 0.0 {
                 return Err(Invalid(
                     "quant.q1_cycle_halfwidth and quant.fixed_scan_halfwidth_scale each choose \
@@ -6428,21 +6905,15 @@ impl Config {
                     .into(),
             ));
         }
-        if ex.q1_fragments {
-            if !self.rt_im_train.q1_calibrate {
-                return Err(Invalid(
-                    "extract.q1_fragments decides with the calibrated Q1 window and the \
-                     tolerances rt_im_train.q1_calibrate learns from the seed; set it as well"
-                        .into(),
-                ));
-            }
-            if ex.q1_cycles {
-                return Err(Invalid(
-                    "extract.q1_fragments keeps every Q1 step of a cycle apart, and \
-                     extract.q1_cycles sums them; unset q1_cycles"
-                        .into(),
-                ));
-            }
+        // What each key of the ZT Scan analysis reads (`validate_ztscan`), checked again
+        // once `"auto"` is resolved.
+        self.validate_ztscan()?;
+        if ex.q1_fragments.on() && ex.q1_cycles {
+            return Err(Invalid(
+                "extract.q1_fragments keeps every Q1 step of a cycle apart, and \
+                 extract.q1_cycles sums them; unset q1_cycles"
+                    .into(),
+            ));
         }
         if self.features.ms1_envelope && self.groups.window_groups > 1 {
             return Err(Invalid(
@@ -6451,29 +6922,12 @@ impl Config {
                     .into(),
             ));
         }
-        if self.features.q1_fragment_features && !ex.q1_fragments {
+        if ex.q1_deconvolved && ex.q1_cycles {
             return Err(Invalid(
-                "features.q1_fragment_features reads the per-fragment Q1 decision columns \
-                 that extract.q1_fragments writes; set it as well"
+                "extract.q1_deconvolved keeps every Q1 step of a cycle apart, and \
+                 extract.q1_cycles sums them; unset q1_cycles"
                     .into(),
             ));
-        }
-        if ex.q1_deconvolved {
-            if !self.rt_im_train.q1_calibrate {
-                return Err(Invalid(
-                    "extract.q1_deconvolved compares each peak's Q1 centroid with the \
-                     calibrated expected centre, within the tolerance rt_im_train.q1_calibrate \
-                     learns from the seed; set it as well"
-                        .into(),
-                ));
-            }
-            if ex.q1_cycles {
-                return Err(Invalid(
-                    "extract.q1_deconvolved keeps every Q1 step of a cycle apart, and \
-                     extract.q1_cycles sums them; unset q1_cycles"
-                        .into(),
-                ));
-            }
         }
         if self.search_seed.q1_deconvolved && self.search_seed.count_fragments_once {
             return Err(Invalid(
@@ -6488,40 +6942,12 @@ impl Config {
                     .into(),
             ));
         }
-        for (on, key) in [
-            (self.features.q1_precursor, "features.q1_precursor"),
-            (self.features.q1_multiscale, "features.q1_multiscale"),
-            (self.features.q1_deconvolved, "features.q1_deconvolved"),
-        ] {
-            if on && !ex.q1_fragments {
-                return Err(Invalid(format!(
-                    "{key} is computed on the RT x step patch and the decision of \
-                     extract.q1_fragments; set it as well"
-                )));
-            }
-        }
-        if self.features.q1_consistency && !ex.q1_fragments {
+        if self.rescore.shadow_q1.on() && self.rescore.shadow_min_shared == 0 {
             return Err(Invalid(
-                "features.q1_consistency reads the per-fragment Q1 decision columns that \
-                 extract.q1_fragments writes; set it as well"
+                "rescore.shadow_q1 is a term of the shadow test, which \
+                 rescore.shadow_min_shared = 0 turns off"
                     .into(),
             ));
-        }
-        if self.rescore.shadow_q1 {
-            if !ex.q1_fragments {
-                return Err(Invalid(
-                    "rescore.shadow_q1 reads the per-fragment Q1 decisions that \
-                     extract.q1_fragments writes; set it as well"
-                        .into(),
-                ));
-            }
-            if self.rescore.shadow_min_shared == 0 {
-                return Err(Invalid(
-                    "rescore.shadow_q1 is a term of the shadow test, which \
-                     rescore.shadow_min_shared = 0 turns off"
-                        .into(),
-                ));
-            }
         }
         if let Some(h) = cv.isolation_half_width {
             if !(h.is_finite() && h > 0.0) {
@@ -6609,7 +7035,7 @@ impl Config {
         }
         // The Q1 calibration runs in the chain of an ungrouped run (`stages::chain`), which a
         // grouped run does not use.
-        if self.rt_im_train.q1_calibrate && self.groups.window_groups > 1 {
+        if self.rt_im_train.q1_calibrate.on() && self.groups.window_groups > 1 {
             return Err(Invalid(
                 "rt_im_train.q1_calibrate is not supported with groups.window_groups > 1: it \
                  calibrates the Q1 sweep of an ungrouped run. Use window_groups = 1."
@@ -7005,6 +7431,89 @@ impl Config {
         Ok(())
     }
 
+    /// What each key of the ZT Scan analysis reads, as [`Config::validate`] checks it: a key
+    /// that is on needs the keys it reads, and `retrace.q1_repick_peaks` the re-pick. An
+    /// unresolved `"auto"` passes (it may resolve on), so these are checked again once
+    /// [`Config::resolve_ztscan`] or [`Config::resolve_ztscan_off`] has resolved it, without
+    /// the rest of the validation, which a standalone stage's configuration (its interpreters
+    /// resolved best effort) need not pass.
+    pub fn validate_ztscan(&self) -> Result<(), crate::error::ConfigError> {
+        use crate::error::ConfigError::Invalid;
+        let (ex, f) = (&self.extract, &self.features);
+        let calibrated = !self.rt_im_train.q1_calibrate.is_off();
+        if ex.q1_fragments.on() && !calibrated {
+            return Err(Invalid(
+                "extract.q1_fragments decides with the calibrated Q1 window and the \
+                 tolerances rt_im_train.q1_calibrate learns from the seed; set it as well"
+                    .into(),
+            ));
+        }
+        if ex.q1_deconvolved && !calibrated {
+            return Err(Invalid(
+                "extract.q1_deconvolved compares each peak's Q1 centroid with the \
+                 calibrated expected centre, within the tolerance rt_im_train.q1_calibrate \
+                 learns from the seed; set it as well"
+                    .into(),
+            ));
+        }
+        let decided = !ex.q1_fragments.is_off();
+        if f.q1_fragment_features.on() && !decided {
+            return Err(Invalid(
+                "features.q1_fragment_features reads the per-fragment Q1 decision columns \
+                 that extract.q1_fragments writes; set it as well"
+                    .into(),
+            ));
+        }
+        for (on, key) in [
+            (f.q1_precursor, "features.q1_precursor"),
+            (f.q1_multiscale, "features.q1_multiscale"),
+            (f.q1_deconvolved, "features.q1_deconvolved"),
+        ] {
+            if on.on() && !decided {
+                return Err(Invalid(format!(
+                    "{key} is computed on the RT x step patch and the decision of \
+                     extract.q1_fragments; set it as well"
+                )));
+            }
+        }
+        if f.q1_consistency.on() && !decided {
+            return Err(Invalid(
+                "features.q1_consistency reads the per-fragment Q1 decision columns that \
+                 extract.q1_fragments writes; set it as well"
+                    .into(),
+            ));
+        }
+        if self.rescore.shadow_q1.on() && !decided {
+            return Err(Invalid(
+                "rescore.shadow_q1 reads the per-fragment Q1 decisions that \
+                 extract.q1_fragments writes; set it as well"
+                    .into(),
+            ));
+        }
+        if self.retrace.q1_repick.on() && !decided {
+            return Err(Invalid(
+                "retrace.q1_repick re-chooses the apex on the per-fragment Q1 decisions \
+                 that extract.q1_fragments makes; set it as well"
+                    .into(),
+            ));
+        }
+        if self.retrace.q1_repick.is_off() && self.retrace.q1_repick_peaks != Q1_REPICK_PEAKS {
+            return Err(Invalid(
+                "retrace.q1_repick_peaks sets how many peaks retrace.q1_repick compares; set \
+                 retrace.q1_repick as well"
+                    .into(),
+            ));
+        }
+        if self.quant.q1_fragments && !decided {
+            return Err(Invalid(
+                "quant.q1_fragments quantifies from the per-fragment Q1 decisions that \
+                 extract.q1_fragments writes; set it as well"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// The refusals of the `retrace` section (docs/35_diapasef.md section 6). Whether the
     /// input is a diaPASEF `.d` is a property of the run, not of the configuration, so that
     /// one is checked where the run's spectra are known (`retrace::raw_input`).
@@ -7017,14 +7526,7 @@ impl Config {
                 r.im_half_width
             )));
         }
-        if r.q1_repick {
-            if !self.extract.q1_fragments {
-                return Err(Invalid(
-                    "retrace.q1_repick re-chooses the apex on the per-fragment Q1 decisions \
-                     that extract.q1_fragments makes; set it as well"
-                        .into(),
-                ));
-            }
+        if r.q1_repick.on() {
             if self.extract.promote_top_peaks > 1 {
                 return Err(Invalid(format!(
                     "retrace.q1_repick moves the selected apex (peak_rank 0), so it cannot be \
@@ -7039,12 +7541,6 @@ impl Config {
                         .into(),
                 ));
             }
-        } else if r.q1_repick_peaks != Q1_REPICK_PEAKS {
-            return Err(Invalid(
-                "retrace.q1_repick_peaks sets how many peaks retrace.q1_repick compares; set \
-                 retrace.q1_repick as well"
-                    .into(),
-            ));
         }
         if !r.enabled {
             for (on, key) in [
@@ -8112,6 +8608,18 @@ mod tests {
         assert!((e.ms1_shift(500.0, 1500.0) - (1.0 + 2.5e-6)).abs() < 1e-15);
     }
 
+    /// Refused at the parse, or, for a key whose prerequisite is left automatic, once a
+    /// standalone stage resolves the automatic keys of the ZT Scan analysis (off).
+    fn refused_standalone(json: &str) -> bool {
+        match Config::from_json(json) {
+            Err(_) => true,
+            Ok(mut c) => {
+                c.resolve_ztscan_off();
+                c.validate().is_err()
+            }
+        }
+    }
+
     /// The scanning-quadrupole keys change what extract and features write, so a set value
     /// is part of the configuration's identity; at their defaults they are omitted.
     #[test]
@@ -8137,7 +8645,7 @@ mod tests {
             r#"{"extract":{"q1_profile":true,"q1_gate_max_offset":0}}"#,
             r#"{"features":{"q1_features":true}}"#,
         ] {
-            assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
+            assert!(refused_standalone(bad), "{bad} must be refused");
         }
     }
 
@@ -8192,7 +8700,7 @@ mod tests {
             r#"{"rt_im_train":{"q1_calibrate":true},"extract":{"q1_fragments":true,
                 "apex_refine_intensity":true},"retrace":{"q1_repick":true}}"#,
         ] {
-            assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
+            assert!(refused_standalone(bad), "{bad} must be refused");
         }
     }
 
@@ -8252,7 +8760,7 @@ mod tests {
             r#"{"search_seed":{"q1_deconvolved":true,"count_fragments_once":true}}"#,
             r#"{"search_seed":{"q1_deconvolved":true},"groups":{"window_groups":4}}"#,
         ] {
-            assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
+            assert!(refused_standalone(bad), "{bad} must be refused");
         }
     }
 
@@ -8267,7 +8775,7 @@ mod tests {
                 "features":{"q1_consistency":true}}"#,
         )
         .unwrap();
-        assert!(on.features.q1_consistency);
+        assert!(on.features.q1_consistency.on());
         let c = on.canonical_json();
         assert!(c.contains(r#""q1_consistency":true"#), "{c}");
         let off = Config::from_json(
@@ -8276,7 +8784,7 @@ mod tests {
         .unwrap();
         assert_ne!(off.canonical_json(), c);
         assert!(
-            Config::from_json(r#"{"features":{"q1_consistency":true}}"#).is_err(),
+            refused_standalone(r#"{"features":{"q1_consistency":true}}"#),
             "q1_consistency without extract.q1_fragments must be refused"
         );
     }
@@ -8341,7 +8849,7 @@ mod tests {
             r#"{"quant":{"q1_integration":"elution_fit"}}"#.to_string(),
             r#"{"features":{"ms1_envelope":true},"groups":{"window_groups":2}}"#.to_string(),
         ] {
-            assert!(Config::from_json(&bad).is_err(), "{bad} must be refused");
+            assert!(refused_standalone(&bad), "{bad} must be refused");
         }
     }
 
@@ -8369,7 +8877,7 @@ mod tests {
             r#"{"convert":{"isolation_half_width":-1.9}}"#,
             r#"{"extract":{"max_footprint_gib":-1}}"#,
         ] {
-            assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
+            assert!(refused_standalone(bad), "{bad} must be refused");
         }
     }
 
@@ -8394,7 +8902,7 @@ mod tests {
         .unwrap();
         assert_eq!(none.retrace.q1_repick_peaks, 0);
         assert!(none.canonical_json().contains(r#""q1_repick_peaks":0"#));
-        assert!(Config::from_json(r#"{"retrace":{"q1_repick_peaks":0}}"#).is_err());
+        assert!(refused_standalone(r#"{"retrace":{"q1_repick_peaks":0}}"#));
     }
 
     /// `quant.q1_cycle_halfwidth` (phase 4 of the ZT Scan plan) is omitted at its default,
@@ -8404,14 +8912,14 @@ mod tests {
     #[test]
     fn the_q1_cycle_halfwidth_key_leaves_the_default_config_hash_alone() {
         let d = Config::default();
-        assert_eq!(d.quant.q1_cycle_halfwidth, 0);
+        assert_eq!(d.quant.q1_cycle_halfwidth, None);
         assert!(!d.quant.reads_q1_sweep());
         let canon = d.canonical_json();
         assert!(!canon.contains("q1_cycle_halfwidth"), "{canon}");
         let zero = Config::from_json(r#"{"quant":{"q1_cycle_halfwidth":0}}"#).unwrap();
         assert_eq!(zero.canonical_json(), canon);
         let on = Config::from_json(r#"{"quant":{"q1_cycle_halfwidth":3}}"#).unwrap();
-        assert_eq!(on.quant.q1_cycle_halfwidth, 3);
+        assert_eq!(on.quant.q1_cycle_halfwidth, Some(3));
         assert!(on.quant.reads_q1_sweep());
         assert!(on.canonical_json().contains(r#""q1_cycle_halfwidth":3"#));
         // With the per-fragment quantification it counts that key's cycle values.
@@ -8428,8 +8936,273 @@ mod tests {
             r#"{"quant":{"q1_cycle_halfwidth":3,"fixed_scan_halfwidth_scale":2.5,
                 "baseline_subtract":true,"baseline_source":"experiment"}}"#,
         ] {
+            assert!(refused_standalone(bad), "{bad} must be refused");
+        }
+    }
+
+    /// The automatic ZT Scan keys and their spellings: `"auto"`, `true` or `false` (a number
+    /// or `"auto"` for the half-width and the cycle window); `"auto"` and off never reach the
+    /// canonical configuration, on does, as `true`.
+    #[test]
+    fn the_ztscan_switches_parse_auto_true_and_false() {
+        let d = Config::default();
+        assert!(d.rt_im_train.q1_calibrate.is_auto());
+        assert!(d.extract.q1_fragments.is_auto());
+        assert!(d.features.q1_consistency.is_auto());
+        assert!(d.retrace.q1_repick.is_auto());
+        assert!(d.rescore.shadow_q1.is_auto());
+        assert_eq!(d.quant.q1_cycle_halfwidth, None);
+        assert_eq!(d.convert.isolation_half_width, None);
+        assert!(d.retrace.is_default());
+        let canon = d.canonical_json();
+        for spelled in [
+            r#"{"rt_im_train":{"q1_calibrate":"auto"},"extract":{"q1_fragments":"auto"},
+                "features":{"q1_precursor":"auto","q1_consistency":"auto"},
+                "retrace":{"q1_repick":"auto"},"rescore":{"shadow_q1":"auto"},
+                "quant":{"q1_cycle_halfwidth":"auto"},"convert":{"isolation_half_width":"auto"}}"#,
+            r#"{"quant":{"q1_cycle_halfwidth":null},"convert":{"isolation_half_width":null}}"#,
+            r#"{"rt_im_train":{"q1_calibrate":false},"extract":{"q1_fragments":false},
+                "features":{"q1_fragment_features":false,"q1_precursor":false,
+                    "q1_multiscale":false,"q1_deconvolved":false,"q1_consistency":false},
+                "retrace":{"q1_repick":false},"rescore":{"shadow_q1":false},
+                "quant":{"q1_cycle_halfwidth":0}}"#,
+        ] {
+            let c = Config::from_json(spelled).unwrap();
+            assert_eq!(c.canonical_json(), canon, "{spelled}");
+        }
+        let off = Config::from_json(r#"{"retrace":{"q1_repick":false}}"#).unwrap();
+        assert!(off.retrace.q1_repick.is_off() && off.retrace.is_default());
+        for bad in [
+            r#"{"rt_im_train":{"q1_calibrate":"yes"}}"#,
+            r#"{"rt_im_train":{"q1_calibrate":1}}"#,
+            r#"{"quant":{"q1_cycle_halfwidth":"four"}}"#,
+            r#"{"convert":{"isolation_half_width":"wide"}}"#,
+        ] {
             assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
         }
+        let s = serde_json::to_string(&ZtSwitch::Auto).unwrap();
+        assert_eq!(s, r#""auto""#);
+        assert_eq!(
+            serde_json::from_str::<ZtSwitch>(&s).unwrap(),
+            ZtSwitch::Auto
+        );
+        assert_eq!(
+            serde_json::from_str::<ZtSwitch>("true").unwrap(),
+            ZtSwitch::On
+        );
+        assert_eq!(
+            serde_json::from_str::<ZtSwitch>("false").unwrap(),
+            ZtSwitch::Off
+        );
+    }
+
+    /// A search without a ZT Scan input resolves every automatic key off and keeps the
+    /// configuration hash it had before the keys were automatic; a key that asks for the
+    /// analysis is refused, naming itself; an explicit off is accepted.
+    #[test]
+    fn a_search_without_ztscan_input_resolves_the_keys_off_and_keeps_its_hash() {
+        let plain = r#"{"features":{"set":"extended"},"rescore":{"folds":5}}"#;
+        let before = Config::from_json(plain).unwrap().canonical_json();
+        let mut c = Config::from_json(plain).unwrap();
+        assert!(c.resolve_ztscan(ZtScanInputs::None).unwrap().is_empty());
+        assert!(c.rt_im_train.q1_calibrate.is_off());
+        assert!(c.extract.q1_fragments.is_off());
+        assert!(c.features.q1_consistency.is_off());
+        assert!(c.retrace.q1_repick.is_off());
+        assert_eq!(c.quant.q1_cycle_halfwidth, Some(0));
+        assert_eq!(c.convert.isolation_half_width, None);
+        assert_eq!(c.canonical_json(), before);
+        for (json, key) in [
+            (
+                r#"{"rt_im_train":{"q1_calibrate":true}}"#,
+                "rt_im_train.q1_calibrate",
+            ),
+            (
+                r#"{"features":{"q1_consistency":true}}"#,
+                "features.q1_consistency",
+            ),
+            (
+                r#"{"quant":{"q1_cycle_halfwidth":4}}"#,
+                "quant.q1_cycle_halfwidth",
+            ),
+            (
+                r#"{"retrace":{"q1_repick_peaks":2}}"#,
+                "retrace.q1_repick_peaks",
+            ),
+            (
+                r#"{"search_seed":{"q1_deconvolved":true}}"#,
+                "search_seed.q1_deconvolved",
+            ),
+        ] {
+            let mut c = Config::from_json(json).unwrap();
+            let e = c
+                .resolve_ztscan(ZtScanInputs::None)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(key) && e.contains("no input"), "{json}: {e}");
+        }
+        // The half-width alone is a reading key, harmless on a file that states its windows.
+        let mut hw = Config::from_json(r#"{"convert":{"isolation_half_width":2.0}}"#).unwrap();
+        assert!(hw.resolve_ztscan(ZtScanInputs::None).is_ok());
+        let mut off = Config::from_json(
+            r#"{"rt_im_train":{"q1_calibrate":false},"quant":{"q1_cycle_halfwidth":0}}"#,
+        )
+        .unwrap();
+        assert!(off.resolve_ztscan(ZtScanInputs::None).is_ok());
+    }
+
+    /// Every input a ZT Scan run: the half-width is the census's suggestion and every
+    /// automatic key is on, so the imported-library recipe resolves to exactly the canonical
+    /// configuration of the shipped ZT Scan recipe (which sets the keys explicitly). An
+    /// explicit off is kept and takes what needs it along, with a warning.
+    #[test]
+    fn a_ztscan_search_resolves_the_imported_library_recipe_to_the_ztscan_recipe() {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../..");
+        let read = |name: &str| std::fs::read_to_string(format!("{root}/configs/examples/{name}"));
+        let (Ok(lib), Ok(zt)) = (read("diann-library.json"), read("ztscan.json")) else {
+            return; // absent in some checkout layouts; `shipped_configs_parse` insists
+        };
+        let all = ZtScanInputs::All { half_width: 1.9 };
+        let mut plain = Config::from_json(&lib).unwrap();
+        assert!(plain.resolve_ztscan(all).unwrap().is_empty());
+        let mut recipe = Config::from_json(&zt).unwrap();
+        assert!(recipe.resolve_ztscan(all).unwrap().is_empty());
+        assert_eq!(plain.canonical_json(), recipe.canonical_json());
+        assert_eq!(plain.convert.isolation_half_width, Some(1.9));
+        assert_eq!(
+            plain.quant.q1_cycle_halfwidth,
+            Some(ZTSCAN_Q1_CYCLE_HALFWIDTH)
+        );
+        // The recipe asks for exactly the automatic keys (and the half-width).
+        let asked = Config::from_json(&zt).unwrap().ztscan_keys_on();
+        assert_eq!(
+            asked,
+            [
+                "rt_im_train.q1_calibrate",
+                "extract.q1_fragments",
+                "features.q1_fragment_features",
+                "features.q1_precursor",
+                "features.q1_multiscale",
+                "features.q1_deconvolved",
+                "features.q1_consistency",
+                "retrace.q1_repick",
+                "rescore.shadow_q1",
+                "quant.q1_cycle_halfwidth",
+            ]
+        );
+        // A half-width given explicitly is kept.
+        let mut own = Config::from_json(r#"{"convert":{"isolation_half_width":2.3}}"#).unwrap();
+        own.resolve_ztscan(all).unwrap();
+        assert_eq!(own.convert.isolation_half_width, Some(2.3));
+        // Everything off by request: the reading of section 2 of docs/37, the half-width
+        // alone, which hashes as the half-width alone always did.
+        let off = r#"{"rt_im_train":{"q1_calibrate":false},"extract":{"q1_fragments":false},
+            "features":{"set":"extended","q1_fragment_features":false,"q1_precursor":false,
+                "q1_multiscale":false,"q1_deconvolved":false,"q1_consistency":false},
+            "retrace":{"q1_repick":false},"rescore":{"shadow_q1":false},
+            "quant":{"q1_cycle_halfwidth":0}}"#;
+        let mut c = Config::from_json(off).unwrap();
+        assert!(c.resolve_ztscan(all).unwrap().is_empty());
+        let base = Config::from_json(
+            r#"{"features":{"set":"extended"},"convert":{"isolation_half_width":1.9}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.canonical_json(), base.canonical_json());
+        // One key off by request takes what reads it along, with a warning naming them.
+        let mut c = Config::from_json(
+            r#"{"features":{"set":"extended"},
+            "extract":{"q1_fragments":false}}"#,
+        )
+        .unwrap();
+        let notes = c.resolve_ztscan(all).unwrap();
+        assert!(c.rt_im_train.q1_calibrate.is_off() && c.features.q1_consistency.is_off());
+        assert!(c.retrace.q1_repick.is_off() && c.rescore.shadow_q1.is_off());
+        assert_eq!(c.quant.q1_cycle_halfwidth, Some(ZTSCAN_Q1_CYCLE_HALFWIDTH));
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("features.q1_consistency (it needs extract.q1_fragments)"));
+        // An explicit key with an automatic prerequisite works on ZT Scan input.
+        let mut c =
+            Config::from_json(r#"{"features":{"set":"extended","q1_consistency":true}}"#).unwrap();
+        c.resolve_ztscan(all).unwrap();
+        assert!(c.extract.q1_fragments.on() && c.rt_im_train.q1_calibrate.on());
+    }
+
+    /// On ZT Scan input a setting that rules a key out keeps that key off, with a warning,
+    /// and an explicit request that conflicts is refused as before.
+    #[test]
+    fn a_ztscan_search_keeps_off_what_the_configuration_rules_out() {
+        let all = ZtScanInputs::All { half_width: 1.9 };
+        // Window groups: the calibration needs the whole sweep, so the analysis is off.
+        let mut g = Config::from_json(r#"{"groups":{"window_groups":4}}"#).unwrap();
+        let notes = g.resolve_ztscan(all).unwrap();
+        assert!(g.rt_im_train.q1_calibrate.is_off() && g.extract.q1_fragments.is_off());
+        assert_eq!(g.quant.q1_cycle_halfwidth, Some(0));
+        assert_eq!(g.convert.isolation_half_width, Some(1.9));
+        assert!(notes[0].contains("groups.window_groups > 1"), "{notes:?}");
+        // Not the extended set: the feature families stay off, the rest is on.
+        let mut m = Config::default();
+        let notes = m.resolve_ztscan(all).unwrap();
+        assert!(m.extract.q1_fragments.on() && m.retrace.q1_repick.on());
+        assert!(m.features.q1_fragment_features.is_off());
+        assert!(notes[0].contains("features.set = extended"), "{notes:?}");
+        // The re-pick's and the shadow test's exclusions.
+        let mut r = Config::from_json(
+            r#"{"features":{"set":"extended"},"extract":{"apex_refine_intensity":true},
+                "rescore":{"shadow_min_shared":0}}"#,
+        )
+        .unwrap();
+        r.resolve_ztscan(all).unwrap();
+        assert!(r.retrace.q1_repick.is_off() && r.rescore.shadow_q1.is_off());
+        assert!(r.features.q1_consistency.on());
+        // A fixed window other than the scan form keeps the cycle window off.
+        let mut q = Config::from_json(
+            r#"{"quant":{"fixed_window_s":5.0,"fragment_selection":"predicted",
+                "window_centre":"apex"}}"#,
+        )
+        .unwrap();
+        q.resolve_ztscan(all).unwrap();
+        assert_eq!(q.quant.q1_cycle_halfwidth, Some(0));
+        // `extract.q1_cycles` keeps the decisions off.
+        let mut s = Config::from_json(r#"{"extract":{"q1_cycles":true}}"#).unwrap();
+        s.resolve_ztscan(all).unwrap();
+        assert!(s.extract.q1_fragments.is_off() && s.rt_im_train.q1_calibrate.is_off());
+        // Explicit requests that conflict are refused.
+        let mut x = Config::from_json(
+            r#"{"retrace":{"q1_repick":true},"extract":{"apex_refine_intensity":true}}"#,
+        );
+        assert!(x.is_err() || x.as_mut().unwrap().resolve_ztscan(all).is_err());
+        let mut y = Config::from_json(
+            r#"{"features":{"q1_consistency":true},"extract":{"q1_cycles":true}}"#,
+        )
+        .unwrap();
+        assert!(y.resolve_ztscan(all).is_err());
+    }
+
+    /// Some inputs ZT Scan runs and some not: every automatic key off with a warning that
+    /// recommends separate searches, the half-width still set so the ZT Scan files can be
+    /// read, and an explicit request refused.
+    #[test]
+    fn a_mixed_experiment_resolves_the_analysis_off_and_reads_the_ztscan_files() {
+        let mixed = ZtScanInputs::Mixed {
+            half_width: 1.9,
+            zt: 1,
+            total: 2,
+        };
+        let mut c = Config::from_json(r#"{"features":{"set":"extended"}}"#).unwrap();
+        let notes = c.resolve_ztscan(mixed).unwrap();
+        assert!(c.rt_im_train.q1_calibrate.is_off() && c.features.q1_consistency.is_off());
+        assert_eq!(c.quant.q1_cycle_halfwidth, Some(0));
+        assert_eq!(c.convert.isolation_half_width, Some(1.9));
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("1 of its 2 inputs") && notes[0].contains("separately"));
+        let mut on = Config::from_json(r#"{"extract":{"q1_fragments":true}}"#).unwrap();
+        let e = on.resolve_ztscan(mixed).unwrap_err().to_string();
+        assert!(
+            e.contains("extract.q1_fragments") && e.contains("1 of its 2"),
+            "{e}"
+        );
+        let mut off = Config::from_json(r#"{"extract":{"q1_fragments":false}}"#).unwrap();
+        assert!(off.resolve_ztscan(mixed).is_ok());
     }
 
     /// The cross-run quant keys are omitted from the canonical configuration at their
