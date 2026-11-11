@@ -66,10 +66,10 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`rt_im_train`](#rt_im_train) | `RtImTrainConfig` | 35 | [docs/08_rt_im_train.md](08_rt_im_train.md) |
 | [`extract`](#extract) | `ExtractConfig` | 51 | [docs/09_extract.md](09_extract.md) |
 | [`extract.claim_cues`](#extractclaim_cues) | `ClaimCues` | 7 | [docs/09_extract.md](09_extract.md) |
-| [`features`](#features) | `FeaturesConfig` | 14 | [docs/10_features.md](10_features.md) |
+| [`features`](#features) | `FeaturesConfig` | 15 | [docs/10_features.md](10_features.md) |
 | [`compete`](#compete) | `CompeteConfig` | 6 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
 | [`rescore`](#rescore) | `RescoreConfig` | 32 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
-| [`quant`](#quant) | `QuantConfig` | 26 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
+| [`quant`](#quant) | `QuantConfig` | 30 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`mbr`](#mbr) | `MbrConfig` | 11 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`experiment`](#experiment) | `ExperimentConfig` | 5 | [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md) |
 | [`groups`](#groups) | `GroupsConfig` | 9 |  |
@@ -456,6 +456,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 | `im_features` | `ImFeatures` | `off` | benchmark-gated | The ion-mobility family (`im.rs`, docs/10_features.md): the apex 1/K0 against the calibrated prediction, the fragment 1/K0 dispersion at the apex, the MS1 precursor 1/K0, and the 1/K0 of the fragment traces over the elution peak. Part of the `extended` set only, appended after the other families. See `ImFeatures`. On a run whose spectra carry 1/K0 it also makes extract write the per-point 1/K0 list of each chromatogram row (chromatograms v3/v4). Default `off`. Benchmark-gated (docs/35_diapasef.md). Omitted from the canonical configuration at its default. |
 | `q1_features` | `bool` | `false` | benchmark-gated | The Q1-profile family of scanning-quadrupole spectra: `q1_corr`, `q1_offset`, `q1_frag_sd` and `q1_bin_frac` from psms_extracted v5 (`extract.q1_profile`, which it needs), appended after every other column of the `extended` set. Default false. Benchmark-gated (docs/09_extract.md, "Scanning-quadrupole data"). Omitted from the canonical configuration at its default. |
 | `q1_fragment_features` | `bool` | `false` | benchmark-gated | The per-fragment Q1 decision family of scanning-quadrupole spectra: `q1f_n_belong`, `q1f_belong_share` (predicted-intensity share of the fragments that belong), `q1f_interfered_share` (observed-intensity share of the interfered ones), `q1f_offset_median` and `q1f_offset_mad` (the fragments' Q1 centres against the expected one, in steps), `q1f_corr2d` (2D correlation of the fragments that belong), `q1f_fit_resid` (residual of the shared-centre fit) and `q1f_centre` (the shared centre, steps), from psms_extracted v6 (`extract.q1_fragments`, which it needs), appended after every other column of the `extended` set. Default false. Benchmark-gated (docs/10_features.md). Omitted from the canonical configuration at its default. |
+| `ms1_envelope` | `bool` | `false` | benchmark-gated | The MS1 isotope-envelope family (`ms1e_*`): extract reads the precursor's isotopes M-1 to M+4 and the half-spacing positions in the MS1 scans around the apex (the nearest one and two either side), at the calibrated MS1 m/z (`extract.ms1_calibrate`, the surface under `"surface"`) within twice `extract.prec_tol_ppm` (at least 10 ppm), and writes the evidence to psms_extracted v7; the features stage derives the envelope's agreement with the averagine envelope over five isotopes (`ms1e_env_r2`), the isotopes found in a row from M0 (`ms1e_env_n`), the M-1 share (`ms1e_m1_share`), the share at the half-spacing positions (`ms1e_half_share`, a species of twice the charge), the spacing error of the isotopes found (`ms1e_spacing_ppm`), the monoisotopic m/z error after the calibration (`ms1e_mono_ppm`, signed, and `ms1e_mono_ppm_abs`), the observed envelope's mean isotope index against averagine (`ms1e_ibar_dev`) and, under `extract.q1_fragments`, the fitted Q1 centre against the centre the observed envelope predicts (`ms1e_q1_agree`, steps; 0 without the decisions), appended after every other column of the `extended` set. Refused on spectra that carry 1/K0. Default false. Benchmark-gated (docs/10_features.md). Omitted from the canonical configuration at its default. |
 
 ## compete
 
@@ -541,6 +542,10 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 | `normalisation_rank` | `Option<usize>` | `null` |  | `stable_set` only: the dimension of the subspace of the run space that holds the composition effects, fixed. Unset (the default), each iteration counts the eigenvalues of the most abundant complete ions' deviations above 3 times their median (at least 1, at most `n_runs - 2`), the rule the method was confirmed with. That count is fragile: on Q Exactive AIF it chose 2 where the design has two conditions (docs/12, "Cross-run normalisation"), so a design with `G` sample groups can fix it at `G - 1`. Must be >= 1. Omitted from the canonical configuration when unset. |
 | `window_centre` | `WindowCentre` | `profile` |  | Where the fixed scan window is centred. `apex`: on the sample nearest the identification apex. `profile`: on the centre of the 3-sample block, within 2 samples of that sample, with the largest summed raw intensity of the 6 fragments with the highest library intensity (ties to the smaller shift), one centre for all of the candidate's fragments (docs/12, "Profile-centred window and pattern fit"). The identification apex and `integration_apex_rt` do not move; `integration_lo_rt` and `integration_hi_rt` report the shifted window. Needs the scan form of the fixed window (`fixed_scan_halfwidth > 0`, `fixed_window_s = 0`, `fixed_scan_halfwidth_scale = 0`). Default `profile` since 2026-11-07 (docs/12, "Default quantification recipe"); `apex` restores the previous default. A configuration that does not set this key gets `apex` when it sets a fragment rule other than `pattern_fit` / `pattern_profile` (the window that rule was chosen with), and, with a warning, when it sets a window that is not the scan form. Written to the canonical configuration except at `apex`, so that a configuration setting `apex` keeps the hash it had when `apex` was the default. |
 | `fragment_detail` | `bool` | `false` |  | Write which fragments made each precursor quantity: the final quant of `run` and of `run-experiment` (after the cross-run step and the second pass, when they run) also writes `quant_fragments.parquet` beside each run's `peptide_quant.parquet` (`quant_fragments` v1, docs/15): one row per fragment of every quantified candidate, with its integrated area (after any baseline and envelope, zero areas kept), whether the rule selected it, its weight and rank in that rule, and the background subtracted from it. Under the top-N rules and `cross_run` the selected areas times their weights add up to `quantity`; the pattern rules write NaN weights, because their quantity is a fit rather than a sum. A viewer reads it to show the fragments behind a quantity. Off by default: no other artifact, report or manifest entry changes with it, and the table costs one row per fragment of the quantified candidates. Omitted from the canonical configuration at its default. |
+| `q1_fragments` | `bool` | `false` | benchmark-gated | Scanning-quadrupole spectra (SCIEX ZT Scan DIA): quantify from the per-fragment Q1 decisions of `extract.q1_fragments` (which it needs; psms_extracted v6). Every fragment trace of an accepted candidate is first collapsed to one value per cycle: the steps of a cycle (the interleaved samples of the windows that cover the precursor) are combined as the least-squares amplitude `sum(w x) / sum(w^2)` under the weights `w` of `q1_step_weights` (the calibrated isotope-envelope transmission at the row's fitted Q1 centre and width, by default), at the mean retention time of the cycle. On those cycle traces the fragments that do not belong (interfered or absent) are left out of the quantity when at least `q1_min_belonging` fragments belong: out of the profile that centres the window, out of the top-N ranking and out of the pattern fit in that run (the pattern set and its scale stay those of the experiment). With fewer, the candidate keeps every fragment (`q1_quant = fallback` in peptide_quant v4). The fixed window then counts cycles, not steps. Reads the run's `psms_extracted` (its report records the Q1 model) and its spectra_ms2 v3 (step and cycle of each sample): `run` and `run-experiment` pass them, `mumdia quant` takes `--psms-extracted` and `--spectra-ms2`. Refused with `fragment_selection = cross_run` (its weights would read a left-out fragment as zero). Default false. Benchmark-gated: no known-ratio ZT Scan data has been measured (docs/12, "Quantification from the fragments that belong"). Omitted from the canonical configuration at its default. |
+| `q1_min_belonging` | `usize` | `3` |  | `q1_fragments`: the fewest fragments that belong for the quantity to be restricted to them; a candidate with fewer keeps every fragment, on the same cycle traces. At least 1. Default 3 (75.6% of the accepted targets on the ZT Scan K562 run, 0.8% of the decoys). Omitted from the canonical configuration at its default. |
+| `q1_step_weights` | `Q1StepWeights` | `transmission` |  | `q1_fragments`: how the steps of a cycle are weighted when they are collapsed. `transmission` (default): the expected Q1 profile of the fragment (the calibrated trapezoid transmission summed over the precursor's isotopes) at the row's fitted centre and width; `uniform`: every step alike (the mean of the cycle's steps). Omitted from the canonical configuration at its default. |
+| `q1_integration` | `Q1Integration` | `trapezoid` |  | `q1_fragments`: how a cycle trace is integrated over the fixed window. `trapezoid` (default): the trapezoid rule over the window's cycles, as every other trace. `elution_fit`: one Gaussian elution profile per candidate and run, fitted (a weighted parabola of the log intensity) to the summed window samples of the fragments it quantifies, and each fragment's area its least-squares amplitude under that profile times the profile's area; the trapezoid where the fit fails. Needs the scan form of the fixed window. Omitted from the canonical configuration at its default. |
 
 ## mbr
 
@@ -1154,6 +1159,28 @@ Which trace evidence the trace component scores (`prescreen.trace.score`).
 | `tag_coherence` | yes | Tag coherence: for each candidate trimer, the best (minimum pairwise trace cosine of the four path features x whole-path fit) in a pool; summed over distinct trimers. |
 | `coherent_fragments` |  | Disconnected ladders: candidate fragments matched to pooled features, counted when their trace is compatible (cosine >= `min_quality`) with the most intense matched feature. |
 
+### `Q1Integration`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+How a cycle trace of `quant.q1_fragments` is integrated. See `QuantConfig::q1_integration`.
+
+| Value | Default | Description |
+|---|---|---|
+| `trapezoid` | yes | The trapezoid rule over the window's cycles (default). |
+| `elution_fit` |  | A Gaussian elution profile fitted per candidate and run. |
+
+### `Q1StepWeights`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+How the steps of a cycle are weighted when `quant.q1_fragments` collapses them. See `QuantConfig::q1_step_weights`.
+
+| Value | Default | Description |
+|---|---|---|
+| `transmission` | yes | The fragment's expected Q1 profile at the row's fitted centre and width (default). |
+| `uniform` |  | Every step alike. |
+
 ### `QuantQColumn`
 
 (rust/mumdia/crates/mumdia-core/src/config.rs)
@@ -1463,6 +1490,6 @@ instead of looking like an absent field.
 
 ## Coverage
 
-26 structs and 368 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 49 enumerations, 1 named profile(s), 108 environment variables read and 27 set.
+26 structs and 373 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 51 enumerations, 1 named profile(s), 108 environment variables read and 27 set.
 
-43 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.
+45 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.

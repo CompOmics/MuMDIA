@@ -2218,6 +2218,11 @@ pub struct ExtractConfig {
     /// extract, where the Q1 patches are read). Never read from a configuration file.
     #[serde(skip)]
     pub q1_repick: bool,
+    /// `features.ms1_envelope`, handed to extract by the same callers: extract reads the MS1
+    /// isotope-envelope evidence that family derives its features from (psms_extracted v7,
+    /// `stages::ms1env`). Never read from a configuration file.
+    #[serde(skip)]
+    pub ms1_envelope: bool,
     pub fixed_scan_window: usize,
     pub frag_tol_ppm: f64,
     pub prec_tol_ppm: f64,
@@ -2777,6 +2782,7 @@ impl Default for ExtractConfig {
             q1_fragments: false,
             q1_model: None,
             q1_repick: false,
+            ms1_envelope: false,
             fixed_scan_window: 2,
             frag_tol_ppm: 20.0,
             prec_tol_ppm: 3.0,
@@ -3007,6 +3013,24 @@ pub struct FeaturesConfig {
     /// its default.
     #[serde(skip_serializing_if = "is_false")]
     pub q1_fragment_features: bool,
+    /// The MS1 isotope-envelope family (`ms1e_*`): extract reads the precursor's isotopes
+    /// M-1 to M+4 and the half-spacing positions in the MS1 scans around the apex (the
+    /// nearest one and two either side), at the calibrated MS1 m/z (`extract.ms1_calibrate`,
+    /// the surface under `"surface"`) within twice `extract.prec_tol_ppm` (at least 10 ppm),
+    /// and writes the evidence to psms_extracted v7; the features stage derives the envelope's
+    /// agreement with the averagine envelope over five isotopes (`ms1e_env_r2`), the isotopes
+    /// found in a row from M0 (`ms1e_env_n`), the M-1 share (`ms1e_m1_share`), the share at
+    /// the half-spacing positions (`ms1e_half_share`, a species of twice the charge), the
+    /// spacing error of the isotopes found (`ms1e_spacing_ppm`), the monoisotopic m/z error
+    /// after the calibration (`ms1e_mono_ppm`, signed, and `ms1e_mono_ppm_abs`), the observed
+    /// envelope's mean isotope index against averagine (`ms1e_ibar_dev`) and, under
+    /// `extract.q1_fragments`, the fitted Q1 centre against the centre the observed envelope
+    /// predicts (`ms1e_q1_agree`, steps; 0 without the decisions), appended after every other
+    /// column of the `extended` set. Refused on spectra that carry 1/K0. Default false.
+    /// Benchmark-gated (docs/10_features.md). Omitted from the canonical configuration at
+    /// its default.
+    #[serde(skip_serializing_if = "is_false")]
+    pub ms1_envelope: bool,
 }
 impl Default for FeaturesConfig {
     fn default() -> Self {
@@ -3030,6 +3054,7 @@ impl Default for FeaturesConfig {
             im_features: ImFeatures::Off,
             q1_features: false,
             q1_fragment_features: false,
+            ms1_envelope: false,
         }
     }
 }
@@ -3430,6 +3455,49 @@ pub struct QuantConfig {
     /// canonical configuration at its default.
     #[serde(skip_serializing_if = "is_false")]
     pub fragment_detail: bool,
+    /// Scanning-quadrupole spectra (SCIEX ZT Scan DIA): quantify from the per-fragment Q1
+    /// decisions of `extract.q1_fragments` (which it needs; psms_extracted v6). Every
+    /// fragment trace of an accepted candidate is first collapsed to one value per cycle:
+    /// the steps of a cycle (the interleaved samples of the windows that cover the
+    /// precursor) are combined as the least-squares amplitude `sum(w x) / sum(w^2)` under
+    /// the weights `w` of `q1_step_weights` (the calibrated isotope-envelope transmission at
+    /// the row's fitted Q1 centre and width, by default), at the mean retention time of the
+    /// cycle. On those cycle traces the fragments that do not belong (interfered or absent)
+    /// are left out of the quantity when at least `q1_min_belonging` fragments belong: out of
+    /// the profile that centres the window, out of the top-N ranking and out of the pattern
+    /// fit in that run (the pattern set and its scale stay those of the experiment). With
+    /// fewer, the candidate keeps every fragment (`q1_quant = fallback` in peptide_quant v4).
+    /// The fixed window then counts cycles, not steps. Reads the run's `psms_extracted` (its
+    /// report records the Q1 model) and its spectra_ms2 v3 (step and cycle of each sample):
+    /// `run` and `run-experiment` pass them, `mumdia quant` takes `--psms-extracted` and
+    /// `--spectra-ms2`. Refused with `fragment_selection = cross_run` (its weights would read
+    /// a left-out fragment as zero). Default false. Benchmark-gated: no known-ratio ZT Scan
+    /// data has been measured (docs/12, "Quantification from the fragments that belong").
+    /// Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_false")]
+    pub q1_fragments: bool,
+    /// `q1_fragments`: the fewest fragments that belong for the quantity to be restricted to
+    /// them; a candidate with fewer keeps every fragment, on the same cycle traces. At least 1.
+    /// Default 3 (75.6% of the accepted targets on the ZT Scan K562 run, 0.8% of the decoys).
+    /// Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_default_q1_min_belonging")]
+    pub q1_min_belonging: usize,
+    /// `q1_fragments`: how the steps of a cycle are weighted when they are collapsed.
+    /// `transmission` (default): the expected Q1 profile of the fragment (the calibrated
+    /// trapezoid transmission summed over the precursor's isotopes) at the row's fitted
+    /// centre and width; `uniform`: every step alike (the mean of the cycle's steps). Omitted
+    /// from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "Q1StepWeights::is_transmission")]
+    pub q1_step_weights: Q1StepWeights,
+    /// `q1_fragments`: how a cycle trace is integrated over the fixed window. `trapezoid`
+    /// (default): the trapezoid rule over the window's cycles, as every other trace.
+    /// `elution_fit`: one Gaussian elution profile per candidate and run, fitted (a weighted
+    /// parabola of the log intensity) to the summed window samples of the fragments it
+    /// quantifies, and each fragment's area its least-squares amplitude under that profile
+    /// times the profile's area; the trapezoid where the fit fails. Needs the scan form of the
+    /// fixed window. Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "Q1Integration::is_trapezoid")]
+    pub q1_integration: Q1Integration,
     /// Which keys of the quantification recipe the configuration file set. Not part of the
     /// configuration: [`Config::from_json`] fills it, and [`Config::resolve_quant_recipe`]
     /// reads it to tell a default that does not fit the rest of the configuration (replaced,
@@ -3737,6 +3805,51 @@ impl BaselineSource {
         *self == BaselineSource::Run
     }
 }
+
+/// The default of [`QuantConfig::q1_min_belonging`].
+pub const Q1_MIN_BELONGING: usize = 3;
+
+fn is_default_q1_min_belonging(v: &usize) -> bool {
+    *v == Q1_MIN_BELONGING
+}
+
+/// How the steps of a cycle are weighted when `quant.q1_fragments` collapses them. See
+/// [`QuantConfig::q1_step_weights`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Q1StepWeights {
+    /// The fragment's expected Q1 profile at the row's fitted centre and width (default).
+    #[default]
+    Transmission,
+    /// Every step alike.
+    Uniform,
+}
+
+impl Q1StepWeights {
+    /// The default, which the canonical configuration omits.
+    pub fn is_transmission(&self) -> bool {
+        *self == Q1StepWeights::Transmission
+    }
+}
+
+/// How a cycle trace of `quant.q1_fragments` is integrated. See
+/// [`QuantConfig::q1_integration`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Q1Integration {
+    /// The trapezoid rule over the window's cycles (default).
+    #[default]
+    Trapezoid,
+    /// A Gaussian elution profile fitted per candidate and run.
+    ElutionFit,
+}
+
+impl Q1Integration {
+    /// The default, which the canonical configuration omits.
+    pub fn is_trapezoid(&self) -> bool {
+        *self == Q1Integration::Trapezoid
+    }
+}
 impl Default for QuantConfig {
     fn default() -> Self {
         Self {
@@ -3768,6 +3881,10 @@ impl Default for QuantConfig {
             normalisation_rank: None,
             window_centre: WindowCentre::Profile,
             fragment_detail: false,
+            q1_fragments: false,
+            q1_min_belonging: 3, // Q1_MIN_BELONGING
+            q1_step_weights: Q1StepWeights::Transmission,
+            q1_integration: Q1Integration::Trapezoid,
             explicit: QuantExplicit::default(),
             resolved: Vec::new(),
         }
@@ -5575,6 +5692,48 @@ impl Config {
                 )));
             }
         }
+        let q = &self.quant;
+        if q.q1_fragments {
+            if !self.extract.q1_fragments {
+                return Err(Invalid(
+                    "quant.q1_fragments quantifies from the per-fragment Q1 decisions that \
+                     extract.q1_fragments writes; set it as well"
+                        .into(),
+                ));
+            }
+            if q.fragment_selection == FragmentSelection::CrossRun {
+                return Err(Invalid(
+                    "quant.q1_fragments leaves out the fragments that do not belong, and the \
+                     cross_run weights would read a left-out fragment as an area of zero; use \
+                     pattern_fit (the default), pattern_profile, predicted or observed_area"
+                        .into(),
+                ));
+            }
+            if q.q1_min_belonging == 0 {
+                return Err(Invalid(
+                    "quant.q1_min_belonging must be >= 1: a candidate is restricted to the \
+                     fragments that belong only when that many do"
+                        .into(),
+                ));
+            }
+            if q.q1_integration == Q1Integration::ElutionFit && !scan_window {
+                return Err(Invalid(
+                    "quant.q1_integration = elution_fit fits the cycles of the fixed scan \
+                     window, so it needs quant.fixed_scan_halfwidth > 0, \
+                     quant.fixed_window_s = 0 and quant.fixed_scan_halfwidth_scale = 0."
+                        .into(),
+                ));
+            }
+        } else if q.q1_min_belonging != Q1_MIN_BELONGING
+            || !q.q1_step_weights.is_transmission()
+            || !q.q1_integration.is_trapezoid()
+        {
+            return Err(Invalid(
+                "quant.q1_min_belonging, quant.q1_step_weights and quant.q1_integration act \
+                 only under quant.q1_fragments; set it as well"
+                    .into(),
+            ));
+        }
         if scale > 0.0 && self.quant.baseline_source != BaselineSource::Experiment {
             return Err(Invalid(
                 "quant.fixed_scan_halfwidth_scale needs quant.baseline_source = experiment: \
@@ -6089,6 +6248,13 @@ impl Config {
                         .into(),
                 ));
             }
+        }
+        if self.features.ms1_envelope && self.groups.window_groups > 1 {
+            return Err(Invalid(
+                "features.ms1_envelope reads its evidence in the extract of an ungrouped run; \
+                 it is not supported with groups.window_groups > 1"
+                    .into(),
+            ));
         }
         if self.features.q1_fragment_features && !ex.q1_fragments {
             return Err(Invalid(
@@ -7776,6 +7942,70 @@ mod tests {
                 "apex_refine_intensity":true},"retrace":{"q1_repick":true}}"#,
         ] {
             assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
+        }
+    }
+
+    /// The phase-3 keys of the ZT Scan plan (`quant.q1_*`, `features.ms1_envelope`) are
+    /// omitted at their defaults, part of the identity when set, and refused without what
+    /// they read or with what they cannot combine with; extract's hidden switch never reaches
+    /// the configuration.
+    #[test]
+    fn the_q1_quant_and_ms1_envelope_keys_leave_the_default_config_hash_alone() {
+        assert_eq!(QuantConfig::default().q1_min_belonging, Q1_MIN_BELONGING);
+        let canon = Config::default().canonical_json();
+        for key in [
+            "q1_min_belonging",
+            "q1_step_weights",
+            "q1_integration",
+            "ms1_envelope",
+        ] {
+            assert!(!canon.contains(key), "{key}: {canon}");
+        }
+        let base = r#""rt_im_train":{"q1_calibrate":true},"extract":{"q1_fragments":true}"#;
+        let on = Config::from_json(&format!(
+            r#"{{{base},"quant":{{"q1_fragments":true,"q1_min_belonging":4,
+                "q1_step_weights":"uniform","q1_integration":"elution_fit"}},
+                "features":{{"ms1_envelope":true}}}}"#
+        ))
+        .unwrap();
+        assert_eq!(on.quant.q1_min_belonging, 4);
+        assert_eq!(on.quant.q1_step_weights, Q1StepWeights::Uniform);
+        assert_eq!(on.quant.q1_integration, Q1Integration::ElutionFit);
+        let c = on.canonical_json();
+        for key in [
+            r#""q1_min_belonging":4"#,
+            r#""q1_step_weights":"uniform""#,
+            r#""q1_integration":"elution_fit""#,
+            r#""ms1_envelope":true"#,
+        ] {
+            assert!(c.contains(key), "{key}: {c}");
+        }
+        // The quant key alone keeps the defaults of its three companions out.
+        let q =
+            Config::from_json(&format!(r#"{{{base},"quant":{{"q1_fragments":true}}}}"#)).unwrap();
+        let qc = q.canonical_json();
+        assert!(!qc.contains("q1_min_belonging") && !qc.contains("q1_integration"));
+        let mut hidden = on.clone();
+        hidden.extract.ms1_envelope = true;
+        assert_eq!(hidden.canonical_json(), c);
+        assert!(Config::from_json(r#"{"features":{"ms1_envelope":true}}"#).is_ok());
+        for bad in [
+            r#"{"quant":{"q1_fragments":true}}"#.to_string(),
+            format!(
+                r#"{{{base},"quant":{{"q1_fragments":true,"fragment_selection":"cross_run"}}}}"#
+            ),
+            format!(r#"{{{base},"quant":{{"q1_fragments":true,"q1_min_belonging":0}}}}"#),
+            format!(
+                r#"{{{base},"quant":{{"q1_fragments":true,"q1_integration":"elution_fit",
+                    "fragment_selection":"predicted","window_centre":"apex",
+                    "fixed_scan_halfwidth":0,"fixed_window_s":5.0}}}}"#
+            ),
+            r#"{"quant":{"q1_min_belonging":4}}"#.to_string(),
+            r#"{"quant":{"q1_step_weights":"uniform"}}"#.to_string(),
+            r#"{"quant":{"q1_integration":"elution_fit"}}"#.to_string(),
+            r#"{"features":{"ms1_envelope":true},"groups":{"window_groups":2}}"#.to_string(),
+        ] {
+            assert!(Config::from_json(&bad).is_err(), "{bad} must be refused");
         }
     }
 

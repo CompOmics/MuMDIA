@@ -500,6 +500,13 @@ impl CandQ1 {
             .map(|(i, wi)| wi * transmission(self.sp * (i as f64 - fr.ibar) - u, h, e))
             .sum()
     }
+
+    /// [`CandQ1::expected_at`] at the model's own step: the transmission weight
+    /// `quant.q1_fragments` gives fragment `f` in the step of target `t`, at the row's fitted
+    /// centre `mu` (steps) and width scale `omega`.
+    pub(crate) fn expected(&self, m: &Q1FragModel, f: usize, t: f64, mu: f64, omega: f64) -> f64 {
+        self.expected_at(m, f, t, mu, m.step_mz, omega)
+    }
 }
 
 /// A candidate's RT x step patch: `y[(f * cycles + c) * ns + s]`.

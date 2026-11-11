@@ -582,6 +582,15 @@ enum Cmd {
         /// quant.
         #[arg(long, num_args = 1..)]
         cross_run_from: Vec<String>,
+        /// `quant.q1_fragments`: the run's psms_extracted v6 (`extract.q1_fragments`), whose
+        /// per-fragment Q1 decisions select the fragments and whose report records the Q1
+        /// model. Required with the key on, read only then.
+        #[arg(long)]
+        psms_extracted: Option<String>,
+        /// `quant.q1_fragments`: the run's spectra_ms2 v3 (the Q1 step and cycle of every
+        /// sample). Required with the key on, read only then.
+        #[arg(long)]
+        spectra_ms2: Option<String>,
         #[arg(long)]
         config: Option<String>,
     },
@@ -2111,6 +2120,8 @@ fn real_main() -> Result<()> {
                 ext_cfg.q1_model = Some(stages::q1frag::read_model(cal)?);
                 ext_cfg.q1_repick = cfg.retrace.q1_repick;
             }
+            // `features.ms1_envelope`: extract reads the MS1 isotope-envelope evidence.
+            ext_cfg.ms1_envelope = cfg.features.ms1_envelope;
             stages::extract::run(stages::extract::ExtractParams {
                 precursor_span: None,
                 fragment_offset,
@@ -2667,10 +2678,30 @@ fn real_main() -> Result<()> {
             out_quant_fragments,
             export_cross_run,
             cross_run_from,
+            psms_extracted,
+            spectra_ms2,
             config,
         } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            let q1 = if cfg.quant.q1_fragments {
+                match (&psms_extracted, &spectra_ms2) {
+                    (Some(pe), Some(sp)) => Some(stages::q1quant::Q1QuantInputs {
+                        psms_extracted: pe,
+                        spectra_ms2: sp,
+                    }),
+                    _ => anyhow::bail!(
+                        "quant.q1_fragments needs --psms-extracted (the run's psms_extracted                          v6) and --spectra-ms2 (its spectra_ms2 v3)"
+                    ),
+                }
+            } else {
+                if psms_extracted.is_some() || spectra_ms2.is_some() {
+                    tracing::warn!(
+                        "quant: --psms-extracted and --spectra-ms2 are read only under                          quant.q1_fragments, which this configuration leaves off"
+                    );
+                }
+                None
+            };
             let cross_run = if cross_run_from.is_empty() {
                 None
             } else {
@@ -2710,6 +2741,7 @@ fn real_main() -> Result<()> {
                 cross_run: cross_run.as_ref(),
                 export_cross_run,
                 first_pass_ids: None,
+                q1,
             })?;
         }
         Cmd::QuantLfq {

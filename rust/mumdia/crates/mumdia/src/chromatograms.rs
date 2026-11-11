@@ -1440,6 +1440,7 @@ mod tests {
                 cross_run: None,
                 export_cross_run: false,
                 first_pass_ids: None,
+                q1: None,
             })
             .unwrap();
             println!(

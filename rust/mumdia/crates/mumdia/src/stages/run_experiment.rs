@@ -2768,6 +2768,24 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // it applies, or `baseline_source = experiment`), a second export pass subtracts the fitted
     // background and writes `fragment_quant_background.parquet`, and the pattern dispersion is
     // fitted on those tables: the dispersion of the samples the rule then fits.
+    // `quant.q1_fragments`: each run's extracted rows, whose chromatograms are the ones
+    // quantified (the second pass's when it ran), and its spectra, for every quant pass.
+    let q1_extracted: Vec<String> = (0..n_runs)
+        .map(|i| match &second {
+            Some(sp) => sp.psms_extracted[i].clone(),
+            None => format!("{}/psms_extracted.parquet", d(&names[i])),
+        })
+        .collect();
+    let q1_spectra: Vec<String> = (0..n_runs)
+        .map(|i| format!("{}/spectra/spectra_ms2.parquet", d(&names[i])))
+        .collect();
+    let q1_of = |i: usize| {
+        qcfg.q1_fragments
+            .then(|| crate::stages::q1quant::Q1QuantInputs {
+                psms_extracted: &q1_extracted[i],
+                spectra_ms2: &q1_spectra[i],
+            })
+    };
     let mut background_tables: Option<Vec<(String, mumdia_io::report::Written)>> = None;
     let cross_run = if qcfg.needs_cross_run_fit() {
         let frag_tables = quant_plan.map_pooled(&run_idx, |&i| {
@@ -2786,6 +2804,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 cross_run: None,
                 export_cross_run: true,
                 first_pass_ids: None,
+                q1: q1_of(i),
             })?;
             for n in ["peptide_quant", "protein_group_quant"] {
                 for path in [tmp(n), format!("{}.report.json", tmp(n))] {
@@ -2819,6 +2838,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                     cross_run: Some(&bg_only),
                     export_cross_run: true,
                     first_pass_ids: None,
+                    q1: q1_of(i),
                 })?;
                 for n in ["peptide_quant", "protein_group_quant"] {
                     for path in [tmp(n), format!("{}.report.json", tmp(n))] {
@@ -2897,6 +2917,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             cross_run: cross_run.as_ref().map(|(fit, _)| fit),
             export_cross_run: false,
             first_pass_ids: first_pass_ids.as_ref().map(|v| &v[i]),
+            q1: q1_of(i),
         })?;
         Ok((pq, gq, qf, written))
     })?;
