@@ -3366,6 +3366,55 @@ PEPTIDEK
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The ZT Scan search space the Search screen sets with the ZT Scan recipe
+    /// (docs/37_ztscan.md, section 11) reaches the prediction as the arguments the measured
+    /// library was built with, and its accessions (1, 4, 35) reach both the importer and the
+    /// decoy prediction, so no N-terminally acetylated precursor is dropped as unmapped.
+    #[test]
+    fn the_ztscan_search_space_reaches_the_prediction_and_both_imports() {
+        let mut r = a_request("k562.fasta");
+        r.min_pep_len = 6;
+        r.max_pep_len = 40;
+        r.min_charge = 1;
+        r.max_charge = 4;
+        r.max_variable_mods = 2;
+        r.min_pr_mz = Some(392.0);
+        r.max_pr_mz = Some(901.0);
+        r.fixed_mods = vec![site("Carbamidomethyl", 'C')];
+        r.variable_mods = vec![site("Oxidation", 'M'), terminal("Acetyl", "protein_n_term")];
+        let plan = ModPlan::of(&r).unwrap();
+        let args = predict_args(&r, &plan, Path::new("out/lib"))
+            .unwrap()
+            .join(" ");
+        for want in [
+            "--cut K*,R*",
+            "--met-excision",
+            "--missed-cleavages 1",
+            "--min-pep-len 6",
+            "--max-pep-len 40",
+            "--min-pr-charge 1",
+            "--max-pr-charge 4",
+            "--min-pr-mz 392",
+            "--max-pr-mz 901",
+            "--unimod4",
+            "--var-mods 2",
+            "--var-mod UniMod:1,42.010565,*n",
+            "--var-mod UniMod:35,15.994915,M",
+        ] {
+            assert!(args.contains(want), "{want} not in {args}");
+        }
+        let c = a_conversion(build_keep_unimod(&plan));
+        let steps = conversion_steps(&c, Path::new("/cache/lib0/lib.parquet"));
+        assert_eq!(
+            steps[0].1[steps[0].1.len() - 2..],
+            ["--keep-unimod", "1,4,35"]
+        );
+        assert_eq!(
+            steps[2].1[steps[2].1.len() - 2..],
+            ["--keep-unimod", "1,4,35"]
+        );
+    }
+
     #[test]
     fn the_parquet_search_never_matches_mumdias_own_output_tables() {
         // The bug: an unanchored `starts_with("lib")` matched the pipeline's own

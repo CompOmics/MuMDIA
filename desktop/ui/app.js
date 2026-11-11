@@ -1664,6 +1664,7 @@ function ztscanRecipeOn() {
 function renderZtscanNote() {
   const refused = ztscanFiles();
   show($("ztscan-note"), refused.length > 0);
+  renderZtscanModsNote();
   if (!refused.length) {
     syncZtscanLibrary();
     return;
@@ -1717,13 +1718,38 @@ function renderZtscanNote() {
   else if (!state.ztscan.recipeTouched) $("ztscan-recipe").checked = true;
   $("ztscan-recipe-note").textContent = allowed
     ? "Measured on one ZT Scan acquisition (K562 on a ZenoTOF 8600): with its library " +
-      "settings, about 10% more precursors than the half-width alone, a measured false " +
+      "settings, about 9% more precursors than the half-width alone, a measured false " +
       "discovery proportion of about 1.2% at a reported 1% (1.4% with the half-width alone), " +
       "and under half the replicate CV of the default quantification; extraction and " +
       "rescoring take longer. Not yet validated on a second acquisition."
     : "The recipe's settings need every selected file to be a ZT Scan run; select only " +
       "those to use it.";
   syncZtscanLibrary();
+}
+
+// On ZT Scan the Q1 window passes a precursor's whole isotope envelope, so deamidation of N or
+// Q (+0.984 Da) is matched by the 13C isotope (+1.003 Da) of the unmodified peptide eluting with
+// it: measured on the K562 runs, half of the precursors a deamidation search reported were such
+// forms, at a decoy and entrapment FDP that looked valid, while its peptides and protein groups
+// fell (docs/37_ztscan.md, section 13). Said on the card, not refused.
+function ztscanDeamidationWarning() {
+  if (!ztscanFiles().length) return "";
+  const picked = [...state.mods.keys()]
+    .map(parseModKey)
+    .some((x) => x.name === "Deamidated" && (x.residue === "N" || x.residue === "Q"));
+  if (!picked) return "";
+  return (
+    "Deamidation of N or Q is selected. On ZT Scan the Q1 window passes the whole isotope " +
+    "envelope, so a deamidated form (+0.984 Da) is matched by the 13C isotope (+1.003 Da) of " +
+    "the unmodified peptide eluting with it: measured on one ZT Scan acquisition, half of the " +
+    "precursors such a search reported were these forms, while its peptides and protein groups " +
+    "fell, and neither the decoys nor an entrapment library detects it. Leave deamidation out " +
+    "of a ZT Scan search."
+  );
+}
+
+function renderZtscanModsNote() {
+  $("ztscan-mods-note").textContent = ztscanDeamidationWarning();
 }
 
 // The search space a library built from a FASTA takes under the ZT Scan recipe: the library
@@ -2393,6 +2419,7 @@ function modsChanged() {
   saveMods();
   renderMods();
   summariseMods();
+  renderZtscanModsNote();
   if (state.libSrc === "diann") refreshLibSrcNote();
   scheduleSpace();
 }

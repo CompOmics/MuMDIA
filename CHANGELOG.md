@@ -13,8 +13,8 @@ quadrupole sweeps the precursor range instead of stepping through fixed windows,
 `configs/examples/ztscan.json` with its guide, `docs/37_ztscan.md`: a calibration of the
 quadrupole's window, a decision per fragment on whether its signal belongs to the candidate
 along the sweep, an apex re-pick in retention time and quadrupole position, a quadrupole term
-in shadow demotion, feature families for the classifier, the sensitivity rescore and a
-quantification window counted in quadrupole cycles. The guide also gives the library settings
+in shadow demotion, feature families for the classifier and a quantification window counted
+in quadrupole cycles. The guide also gives the library settings
 measured for these runs. The desktop application recognises ZT Scan files when they are added,
 fills in the half-width, ticks the recipe for them and gives a library it builds from a FASTA
 the ZT Scan search space. An mzML whose MS2 spectra name an isolation target without window
@@ -369,29 +369,38 @@ than a number. Both are recorded in every run's `manifest.json`.
   library built from a FASTA, whichever predictor builds it, the size estimate and the
   library cache key follow them, and a note under the checkbox says what was set. When the
   recipe goes off they are taken back, except a value the user edited since; the two
-  modifications are added to the user's choice and never saved as their preference.
+  modifications are added to the user's choice and never saved as their preference. The
+  library build passes `--keep-unimod 1,4,35` to both the import and the decoy prediction for
+  that selection, so no N-terminally acetylated precursor is dropped. When deamidation of N or
+  Q is selected for a ZT Scan run, the card says why to leave it out (docs/37_ztscan.md,
+  section 13).
 - **A ZT Scan recipe and guide (`configs/examples/ztscan.json`, docs/37_ztscan.md, #309).** The
   imported-library recipe plus the keys that measured positive on the K562 runs:
   `convert.isolation_half_width` 1.9, `rt_im_train.q1_calibrate`, `extract.q1_fragments`,
   `features.q1_fragment_features`, `retrace.q1_repick`, `rescore.shadow_q1` and
-  `quant.q1_cycle_halfwidth` 4. Measured on REP01 with four NN seeds: +3.0% precursors and
-  +3.2% human precursors at a matched entrapment FDP, whose value at a reported 1% falls from
-  1.39% to 1.22%; replicate CV 0.102 against 0.273. The guide routes every layer to its
-  mechanism, records what each measured, the gate on the fragments that belong that was
-  measured and not added (it removes 11-26% of the accepted precursors, mostly real ones),
-  where time and memory go, the refusals and what is open: a second acquisition, which needs a
-  vendor-licence decision, and known-ratio data. No default changes. As released, the recipe
-  also sets the feature families of #311 and #312 and the sensitivity rescore
-  (`rescore.folds` 5, `rescore.train_margin_frac` 0.75, `rescore.seeds` 3), and the guide
-  gains the library settings for these runs (section 11: charges 1-4 and lengths 6-40 with
-  protein N-terminal acetylation and two variable modifications gave +3.5% precursors and
-  +4.1% human precursors at a matched entrapment FDP; two missed cleavages -1.0%, a tighter
-  fragment tolerance -1.4% to -2.6%, and shadow demotion off raised the measured FDP from
-  1.22% to 1.44%) and the recipe as released, measured (section 12): with that library, four
-  NN seeds, 106,659 precursors on the human library and 104,129 human precursors at a combined
-  entrapment FDP of 1.22% (102,158 at 1.0%, 1.17-1.24% at a reported 1%), the sensitivity
-  rescore +0.8% of them beyond the seed spread at 2-3x the rescore time; the three runs as one
-  experiment 120,892 precursors, 116,827 per run on average, replicate CV 0.104.
+  `quant.q1_cycle_halfwidth` 4. Measured on REP01 with four NN seeds: +3.0% precursors and +3.2%
+  human precursors at a matched entrapment FDP, whose value at a reported 1% falls from 1.39% to
+  1.22%; replicate CV 0.102 against 0.273. The guide routes every layer to its mechanism,
+  records what each measured, the gate on the fragments that belong that was measured and not
+  added (it removes 11-26% of the accepted precursors, mostly real ones), where time and memory
+  go, the refusals and what is open: a second acquisition, which needs a vendor-licence
+  decision, and known-ratio data. No default changes. As released, the recipe also sets the
+  feature families of #311 and #312, and the guide gains the library settings for these runs
+  (section 11: charges 1-4 and lengths 6-40 with protein N-terminal acetylation and two variable
+  modifications gave +3.5% precursors and +4.1% human precursors at a matched entrapment FDP;
+  charge 5 added 158 precursors at an entrapment FDP of 11.5%, two missed cleavages -1.0%, a
+  tighter fragment tolerance -1.4% to -2.6%, and shadow demotion off raised the measured FDP
+  from 1.22% to 1.44%), why N/Q deamidation must be left out on ZT Scan (section 13: its +0.984
+  Da aliases the 13C isotope the Q1 window passes, so a deamidation search reported 179,509
+  precursors, half of them aliases of co-eluting unmodified peptides, at a decoy and entrapment
+  FDP that read as valid, with 11% fewer peptides and 7% fewer protein groups) and the recipe as
+  released, measured (section 12): with that library, four NN seeds, 105,788 precursors on the
+  human library and 103,327 human precursors at a combined entrapment FDP of 1.22% (100,971 at
+  1.0%, 1.15-1.18% at a reported 1%); the three runs as one experiment 119,932 precursors,
+  115,986 per run on average, replicate CV 0.104. The sensitivity rescore (`rescore.folds` 5,
+  `rescore.train_margin_frac` 0.75, `rescore.seeds` 3) adds 0.8% on top, beyond the seed spread,
+  for two to six times the rescore time, and is documented as an option for a final pass rather
+  than set.
 - **Three scanning-quadrupole feature families, opt-in (`features.q1_precursor`,
   `features.q1_multiscale`, `features.q1_deconvolved`, #311).** On a ZT Scan run under
   `extract.q1_fragments` (psms_extracted v8, appended last): the unfragmented precursor's
