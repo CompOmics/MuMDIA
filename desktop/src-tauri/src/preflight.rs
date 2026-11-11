@@ -254,12 +254,18 @@ pub fn disk_multi(inputs: &[String], out_dir: &str) -> Disk {
 /// cap discarded 78.6% of MS2 peaks and cost 60% of the peptides. The application
 /// has the file, so it can answer the question instead of asking a user to guess.
 pub fn peak_census(mzml: &str) -> Result<serde_json::Value, String> {
+    peak_census_of(mzml, 2000)
+}
+
+/// [`peak_census`] of the first `max_spectra` spectra of the file.
+pub fn peak_census_of(mzml: &str, max_spectra: usize) -> Result<serde_json::Value, String> {
     let (exe, _) = crate::engine::resolve()?;
     let mut cmd = crate::engine::command(&exe);
     // Every engine invocation gets the same environment; see `components::stamp_env`.
     crate::components::stamp_env(&mut cmd);
     let out = cmd
-        .args(["peak-census", "--mzml", mzml, "--max-spectra", "2000"])
+        .args(["peak-census", "--mzml", mzml, "--max-spectra"])
+        .arg(max_spectra.to_string())
         .output()
         .map_err(|e| format!("could not run the engine: {e}"))?;
     serde_json::from_slice(&out.stdout).map_err(|_| {

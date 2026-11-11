@@ -745,6 +745,112 @@ fn target_only_refusal(mzml: &str, t: &TargetOnly) -> anyhow::Error {
     )
 }
 
+/// The half-width [`IsolationCensus`] suggests for a scanning quadrupole, in steps of its
+/// sweep: a window five steps wide. The file names the quadrupole's position and not its
+/// window, so the window has to come from the method; the measured SCIEX ZT Scan DIA method
+/// isolates 3.8 m/z in steps of 0.761 m/z (five steps), and on its runs the half-widths
+/// 1.5, 1.9 and 2.3 m/z identified the same within one seed's noise (docs/37_ztscan.md).
+pub const SCANNING_HALF_WIDTH_STEPS: f64 = 2.5;
+
+/// What the isolation windows of a file's MS2 spectra say, read as `convert` reads them
+/// (`mumdia peak-census`, and through it the desktop's check of the selected files): how many
+/// spectra state their window's offsets, how many isolate nothing, and how many name a target
+/// and no offsets; for the last, whether `convert` refuses the file without
+/// `convert.isolation_half_width`, the layout of the targets, whether it is a scanning
+/// quadrupole (the rule the refusal names: at least 50 distinct targets repeating cycle after
+/// cycle in steps under 1.5 m/z) and the half-width to suggest ([`SCANNING_HALF_WIDTH_STEPS`]
+/// steps).
+#[derive(Default)]
+pub struct IsolationCensus {
+    ms2: usize,
+    with_offsets: usize,
+    no_isolation: usize,
+    target_only: TargetOnly,
+    /// `(target, retention time in s)` of the target-only spectra of the sample, for the
+    /// cycle time.
+    timed: Vec<(f64, f64)>,
+}
+
+impl IsolationCensus {
+    /// Count one MS2 spectrum (any other level is ignored).
+    pub fn record<S: SpectrumLike>(&mut self, spec: &S) {
+        if spec.ms_level() != 2 {
+            return;
+        }
+        self.ms2 += 1;
+        let iso = isolation_bounds(spec.precursor().map(|pr| &pr.isolation_window), None);
+        match iso {
+            Isolation::Window(..) | Isolation::Widened(..) => self.with_offsets += 1,
+            Isolation::AllIon => self.no_isolation += 1,
+            Isolation::TargetOnly(t) => {
+                self.target_only.record(spec.id(), t);
+                if self.timed.len() < TARGET_ONLY_SAMPLE {
+                    self.timed.push((t, spec.start_time() * 60.0));
+                }
+            }
+        }
+    }
+
+    /// The median time between two spectra of one target: the cycle of a sweep that
+    /// repeats. `None` with fewer than two spectra of any target.
+    fn cycle_s(&self) -> Option<f64> {
+        let mut by: Vec<(i64, f64)> = self
+            .timed
+            .iter()
+            .map(|&(t, rt)| ((t * 1e4).round() as i64, rt))
+            .collect();
+        by.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        let mut d: Vec<f64> = by
+            .windows(2)
+            .filter(|w| w[0].0 == w[1].0 && w[1].1 > w[0].1)
+            .map(|w| w[1].1 - w[0].1)
+            .collect();
+        if d.is_empty() {
+            return None;
+        }
+        d.sort_by(f64::total_cmp);
+        Some(d[d.len() / 2])
+    }
+
+    /// The census as JSON (the `isolation` block of `mumdia peak-census`).
+    pub fn to_json(&self) -> serde_json::Value {
+        let t = &self.target_only;
+        let refused = t.differ;
+        let (layout, scanning, suggested) = if t.n > 0 {
+            let l = target_layout(&t.sample);
+            let scanning = l.is_scanning_quadrupole();
+            // Rounded to 0.05 m/z: the suggestion is a method's half-width, not a fit.
+            let hw = (scanning && refused)
+                .then(|| (SCANNING_HALF_WIDTH_STEPS * l.median_step * 20.0).round() / 20.0);
+            (
+                json!({
+                    "distinct_targets": l.distinct,
+                    "lowest_target": l.lo,
+                    "highest_target": l.hi,
+                    "median_step": l.median_step,
+                    "spectra_per_target": l.repeats,
+                    "cycle_s": self.cycle_s(),
+                }),
+                scanning,
+                hw,
+            )
+        } else {
+            (serde_json::Value::Null, false, None)
+        };
+        json!({
+            "ms2_spectra": self.ms2,
+            "with_offsets": self.with_offsets,
+            "no_isolation": self.no_isolation,
+            "target_only": t.n,
+            "convert_refuses": refused,
+            "layout": layout,
+            "scanning_quadrupole": scanning,
+            "suggested_half_width": suggested,
+            "suggested_half_width_steps": suggested.map(|_| SCANNING_HALF_WIDTH_STEPS),
+        })
+    }
+}
+
 /// The order-dependent half of the conversion: the accumulators, the parquet
 /// writers, and the four folds whose values depend on what came before.
 struct Fold {
@@ -2947,6 +3053,82 @@ mod tests {
             "{msg}"
         );
         assert!(msg.contains("600 distinct targets"), "{msg}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The census of a file read as `mumdia peak-census` reads it (`IsolationCensus`).
+    fn census_of(path: &std::path::Path) -> serde_json::Value {
+        let reader = mzdata::MZReader::open_path(path).unwrap();
+        let mut c = IsolationCensus::default();
+        for spec in reader {
+            c.record(&spec);
+        }
+        c.to_json()
+    }
+
+    /// The isolation census says what convert would do with a file before a run does it: a
+    /// scanning quadrupole's target-only spectra are refused, with their layout, the cycle
+    /// time and a half-width of five steps; the same file with offsets needs nothing; a
+    /// target-only file of fixed windows is refused with no half-width suggested.
+    #[test]
+    fn the_isolation_census_recognises_a_scanning_quadrupole_and_suggests_a_half_width() {
+        let d = tmpdir("ztscan_census");
+        let (bare, explicit, fixed) = (
+            d.join("bare.mzML"),
+            d.join("explicit.mzML"),
+            d.join("fixed.mzML"),
+        );
+        let a = scanning_run(4, 120, None);
+        let b = scanning_run(4, 120, Some(1.9));
+        std::fs::write(&bare, mzml(a.len(), &a)).unwrap();
+        std::fs::write(&explicit, mzml(b.len(), &b)).unwrap();
+        let c = census_of(&bare);
+        assert_eq!(c["ms2_spectra"], 480);
+        assert_eq!(c["target_only"], 480);
+        assert_eq!(c["with_offsets"], 0);
+        assert_eq!(c["convert_refuses"], true);
+        assert_eq!(c["scanning_quadrupole"], true);
+        assert_eq!(c["layout"]["distinct_targets"], 120);
+        let step = c["layout"]["median_step"].as_f64().unwrap();
+        assert!((step - 0.7614).abs() < 1e-3, "{c}");
+        let cycle = c["layout"]["cycle_s"].as_f64().unwrap();
+        assert!((cycle - 1.002).abs() < 1e-3, "{c}");
+        assert_eq!(c["suggested_half_width"].as_f64(), Some(1.9));
+        assert_eq!(c["suggested_half_width_steps"].as_f64(), Some(2.5));
+
+        let c = census_of(&explicit);
+        assert_eq!(c["with_offsets"], 480);
+        assert_eq!(c["target_only"], 0);
+        assert_eq!(c["convert_refuses"], false);
+        assert_eq!(c["scanning_quadrupole"], false);
+        assert!(
+            c["layout"].is_null() && c["suggested_half_width"].is_null(),
+            "{c}"
+        );
+
+        // 24 fixed windows 25 m/z apart that lost their offsets: refused, nothing suggested.
+        let mut f = Vec::new();
+        let mut index = 0usize;
+        for cyc in 0..6 {
+            let rt = format!("{:.6}", 0.05 * cyc as f64);
+            for w in 0..24 {
+                let t = 412.5 + 25.0 * w as f64;
+                let iso = format!(
+                    r#"<cvParam cvRef="MS" accession="MS:1000827" name="isolation window target m/z" value="{t}"/>"#
+                );
+                f.push(
+                    spectrum(index, 2, &rt, &[150.0, 300.0], &[5.0, 6.0])
+                        .replace(FIXED_ISOLATION, &iso),
+                );
+                index += 1;
+            }
+        }
+        std::fs::write(&fixed, mzml(f.len(), &f)).unwrap();
+        let c = census_of(&fixed);
+        assert_eq!(c["convert_refuses"], true);
+        assert_eq!(c["scanning_quadrupole"], false);
+        assert_eq!(c["layout"]["distinct_targets"], 24);
+        assert!(c["suggested_half_width"].is_null(), "{c}");
         let _ = std::fs::remove_dir_all(&d);
     }
 

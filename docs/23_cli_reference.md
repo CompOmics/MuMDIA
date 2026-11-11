@@ -743,7 +743,7 @@ Options:
           `quant.q1_fragments`: the run's psms_extracted v6 (`extract.q1_fragments`), whose per-fragment Q1 decisions select the fragments and whose report records the Q1 model. Required with the key on, read only then
 
       --spectra-ms2 <SPECTRA_MS2>
-          `quant.q1_fragments`: the run's spectra_ms2 v3 (the Q1 step and cycle of every sample). Required with the key on, read only then
+          `quant.q1_fragments` / `quant.q1_cycle_halfwidth`: the run's spectra_ms2 (v3 records the Q1 step and cycle of every sample). Required with either key on, read only then
 
       --config <CONFIG>
 ```
@@ -1000,6 +1000,8 @@ Plus the 7 repeated flags removed above: see "Global flags".
 Peaks per MS2 spectrum for an mzML or a diaPASEF `.d`, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard.
 
 The pre-flight for a decision the documentation says must be made per acquisition. Reading it before setting a cap is the difference between bounding peak volume and deleting fragment evidence from most spectra. A diaPASEF `.d` is counted after the native reader's centroiding, which is what `convert` writes for it.
+
+For an mzML the `isolation` block says how `convert` reads the MS2 isolation windows of the spectra counted: with offsets, without isolation, or a target and no offsets. A scanning-quadrupole file of the last kind (SCIEX ZT Scan DIA) is refused without `convert.isolation_half_width`; the block names the layout of its targets and a half-width to start from (docs/37_ztscan.md).
 
 Usage: mumdia peak-census [OPTIONS] --mzml <MZML>
 

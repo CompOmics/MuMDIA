@@ -44,11 +44,13 @@ use mumdia_io::table::{ListF32, TableFile};
 
 use super::q1frag;
 
-/// What quant reads under `quant.q1_fragments` besides its usual inputs.
+/// What quant reads under `quant.q1_fragments` or `quant.q1_cycle_halfwidth` besides its
+/// usual inputs.
 #[derive(Clone, Copy, Debug)]
 pub struct Q1QuantInputs<'a> {
     /// The run's psms_extracted v6 (`extract.q1_fragments`); its report records the Q1 model.
-    pub psms_extracted: &'a str,
+    /// Needed under `quant.q1_fragments`, read only then.
+    pub psms_extracted: Option<&'a str>,
     /// The run's spectra_ms2 v3: the retention time, the window as read and the cycle of
     /// every MS2 spectrum.
     pub spectra_ms2: &'a str,
@@ -274,12 +276,20 @@ pub struct SweepScans {
 impl SweepScans {
     /// The sweep of a spectra_ms2 v3 table. Refused for a table without one.
     pub fn load(spectra_ms2: &str) -> Result<SweepScans> {
-        let sweep = crate::spectra::load_q1_sweep(spectra_ms2)?.ok_or_else(|| {
+        Self::try_load(spectra_ms2)?.ok_or_else(|| {
             anyhow::anyhow!(
                 "quant.q1_fragments reads the Q1 sweep spectra_ms2 v3 records (q1_cycle), and \
                  {spectra_ms2} has none: convert the run with convert.isolation_half_width"
             )
-        })?;
+        })
+    }
+
+    /// The sweep of a spectra_ms2 table, `None` for a table that records none (any version
+    /// but v3).
+    pub fn try_load(spectra_ms2: &str) -> Result<Option<SweepScans>> {
+        let Some(sweep) = crate::spectra::load_q1_sweep(spectra_ms2)? else {
+            return Ok(None);
+        };
         let t = TableFile::open(spectra_ms2)?;
         let (rt, target, lower, upper) = (
             t.f64("rt_seconds")?,
@@ -310,14 +320,14 @@ impl SweepScans {
             .filter(|d| *d > 0.0)
             .collect();
         let med = super::quant_pattern::median(&mut gaps);
-        Ok(SweepScans {
+        Ok(Some(SweepScans {
             cycle: order.iter().map(|&i| sweep.cycle[i]).collect(),
             target: pick(&target),
             lower: pick(&lower),
             upper: pick(&upper),
             rt: rt_s,
             tol: if med.is_finite() { 0.45 * med } else { 0.0 },
-        })
+        }))
     }
 
     /// A sweep of the given scans (tests).
@@ -372,6 +382,23 @@ impl SweepScans {
         best.map(|(_, k)| (self.cycle[k], self.target[k]))
     }
 
+    /// The cycle of the scan nearest `rt` (ties to the earlier), whatever its window, within
+    /// the sweep's matching tolerance. `None` when there is none.
+    pub fn cycle_at(&self, rt: f32) -> Option<u32> {
+        let x = rt as f64;
+        let j = self.rt.partition_point(|&r| r < x - self.tol);
+        let mut best: Option<(f64, usize)> = None;
+        let mut k = j;
+        while k < self.rt.len() && self.rt[k] <= x + self.tol {
+            let d = (self.rt[k] - x).abs();
+            if best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, k));
+            }
+            k += 1;
+        }
+        best.map(|(_, k)| self.cycle[k])
+    }
+
     /// [`SweepScans::locate`] for every point of `axis`, or `None` when a point is not
     /// found or the cycles do not run in order (a cycle that comes back after another).
     pub fn locate_axis(&self, axis: &[f32], pm: f64) -> Option<Vec<(u32, f64)>> {
@@ -384,6 +411,35 @@ impl SweepScans {
         }
         Some(v)
     }
+}
+
+/// `quant.q1_cycle_halfwidth`: the samples per Q1 cycle of a trace on `axis`, the median over
+/// its cycles of the count of its points in each (each point located by retention time,
+/// [`SweepScans::cycle_at`]); the cycles at the ends of the trace, which its retention-time
+/// window cuts, count like the others and the median sets them aside. `None` for an empty
+/// axis or when a point is not a scan of the sweep.
+pub fn samples_per_cycle(sweep: &SweepScans, axis: &[f32]) -> Option<f64> {
+    let mut counts: Vec<f64> = Vec::new();
+    let mut last: Option<u32> = None;
+    for &r in axis {
+        let c = sweep.cycle_at(r)?;
+        if last == Some(c) {
+            *counts.last_mut().expect("a cycle was counted") += 1.0;
+        } else {
+            counts.push(1.0);
+            last = Some(c);
+        }
+    }
+    if counts.is_empty() {
+        return None;
+    }
+    Some(super::quant_pattern::median(&mut counts))
+}
+
+/// `quant.q1_cycle_halfwidth`: the fixed window's half-width in samples of a trace with
+/// `per_cycle` samples per cycle, `cycles` cycles either side (at least one sample).
+pub fn cycle_halfwidth(cycles: usize, per_cycle: f64) -> usize {
+    ((cycles as f64 * per_cycle).round() as usize).max(1)
 }
 
 /// The candidate's fragments as the transmission weights read them: the decision's model of
@@ -637,6 +693,31 @@ mod tests {
         assert_eq!(collapse_trace(&located, &rt, &it, &w), (crt, cit));
     }
 
+    /// A trace over the covering scans holds five samples a cycle on a +-1.9 m/z window swept
+    /// in 0.7614 m/z steps; the cycles its retention-time window cuts at either end do not move
+    /// the median; a point between cycles is no scan's.
+    #[test]
+    fn samples_per_cycle_counts_a_trace_by_cycle() {
+        let (sw, meta) = sweep(6, 30);
+        let pm = 500.0 + 12.0 * 0.7614;
+        let mut axis: Vec<f32> = meta
+            .iter()
+            .filter(|&&(_, _, t)| (t - pm).abs() <= 1.9)
+            .map(|&(r, _, _)| r as f32)
+            .collect();
+        assert_eq!(axis.len(), 30);
+        assert_eq!(samples_per_cycle(&sw, &axis), Some(5.0));
+        // Cut to start inside the first cycle and end inside the last.
+        let cut = axis[3..axis.len() - 2].to_vec();
+        assert_eq!(samples_per_cycle(&sw, &cut), Some(5.0));
+        assert_eq!(cycle_halfwidth(3, 5.0), 15);
+        assert_eq!(cycle_halfwidth(2, 4.6), 9);
+        assert_eq!(cycle_halfwidth(1, 0.2), 1);
+        axis.push(106.5);
+        assert_eq!(samples_per_cycle(&sw, &axis), None);
+        assert_eq!(samples_per_cycle(&sw, &[]), None);
+    }
+
     #[test]
     fn an_axis_with_a_point_off_the_sweep_is_not_located() {
         let (sw, _) = sweep(3, 20);
@@ -888,8 +969,8 @@ mod run_tests {
             cross_run: None,
             export_cross_run: false,
             first_pass_ids: None,
-            q1: cfg.q1_fragments.then_some(Q1QuantInputs {
-                psms_extracted: &fx.psms,
+            q1: cfg.reads_q1_sweep().then_some(Q1QuantInputs {
+                psms_extracted: Some(&fx.psms),
                 spectra_ms2: &fx.spectra,
             }),
         })
@@ -990,5 +1071,106 @@ mod run_tests {
         })
         .unwrap_err();
         assert!(format!("{err:#}").contains("--psms-extracted"), "{err:#}");
+    }
+
+    /// `quant.q1_cycle_halfwidth`: the fixed window counts Q1 cycles. On interleaved traces
+    /// of five samples a cycle, 2 cycles quantify exactly as `fixed_scan_halfwidth` 10
+    /// samples, and the report says what was chosen; under `quant.q1_fragments`, whose traces
+    /// hold one value a cycle, 3 cycles are `fixed_scan_halfwidth` 3. Spectra without a sweep
+    /// keep `fixed_scan_halfwidth`, and the key without spectra is refused.
+    #[test]
+    fn the_cycle_window_counts_cycles() {
+        let fx = fixture("cyc");
+        let q = |t: &Table| t.opt_f64("quantity").unwrap();
+        let cyc = QuantConfig {
+            q1_cycle_halfwidth: 2,
+            ..QuantConfig::default()
+        };
+        let (tc, rep) = quant(&fx, &cyc, "cyc2");
+        let samples = QuantConfig {
+            fixed_scan_halfwidth: 10,
+            ..QuantConfig::default()
+        };
+        let (ts, reps) = quant(&fx, &samples, "s10");
+        assert_eq!(q(&tc), q(&ts));
+        let (td, _) = quant(&fx, &QuantConfig::default(), "s3");
+        assert_ne!(q(&tc), q(&td), "two cycles are wider than three samples");
+        let w = &rep["params"]["q1_cycle_window"];
+        assert_eq!(w["applied"], true);
+        assert_eq!(w["cycles"], 2);
+        assert_eq!(w["samples_per_cycle_median"], 5.0);
+        assert_eq!(w["halfwidth_median"], 10.0);
+        assert_eq!(w["fixed_scan_halfwidth_kept"], 0);
+        assert!(reps["params"]["q1_cycle_window"].is_null());
+        assert_eq!(rep["schema_version"], 2, "no column changes with the key");
+
+        // Collapsed traces: one value a cycle, so the key is the half-width itself.
+        let q1c = QuantConfig {
+            q1_fragments: true,
+            q1_cycle_halfwidth: 3,
+            ..QuantConfig::default()
+        };
+        let q1s = QuantConfig {
+            q1_fragments: true,
+            ..QuantConfig::default()
+        };
+        let (a, repa) = quant(&fx, &q1c, "q1c3");
+        let (b, _) = quant(&fx, &q1s, "q1s3");
+        assert_eq!(q(&a), q(&b));
+        assert_eq!(repa["params"]["q1_cycle_window"]["collapsed"], 2);
+
+        // Spectra that record no sweep: the configured samples apply.
+        let plain = path("cyc_plain_spectra.parquet");
+        write_table(
+            &plain,
+            vec![
+                Col::U32("scan_index".into(), vec![0, 1]),
+                Col::F64("rt_seconds".into(), vec![100.0, 101.0]),
+            ],
+        )
+        .unwrap();
+        let pep = path("cyc_plain_pep.parquet");
+        run(QuantParams {
+            psms_scored: &fx.scored,
+            chromatograms: &[ChromTable::whole(&fx.chrom)],
+            out_peptide: &pep,
+            out_protein: &path("cyc_plain_prot.parquet"),
+            out_fragment: None,
+            out_peak_bounds: None,
+            out_quant_fragments: None,
+            cfg: &cyc,
+            config_hash: "test",
+            cross_run: None,
+            export_cross_run: false,
+            first_pass_ids: None,
+            q1: Some(Q1QuantInputs {
+                psms_extracted: None,
+                spectra_ms2: &plain,
+            }),
+        })
+        .unwrap();
+        assert_eq!(q(&Table::read(&pep).unwrap()), q(&td));
+        let rp: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{pep}.report.json")).unwrap())
+                .unwrap();
+        assert_eq!(rp["params"]["q1_cycle_window"]["applied"], false);
+
+        let err = run(QuantParams {
+            psms_scored: &fx.scored,
+            chromatograms: &[ChromTable::whole(&fx.chrom)],
+            out_peptide: &path("cyc_need_pep.parquet"),
+            out_protein: &path("cyc_need_prot.parquet"),
+            out_fragment: None,
+            out_peak_bounds: None,
+            out_quant_fragments: None,
+            cfg: &cyc,
+            config_hash: "test",
+            cross_run: None,
+            export_cross_run: false,
+            first_pass_ids: None,
+            q1: None,
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("--spectra-ms2"), "{err:#}");
     }
 }

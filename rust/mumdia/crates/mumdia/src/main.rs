@@ -594,8 +594,8 @@ enum Cmd {
         /// model. Required with the key on, read only then.
         #[arg(long)]
         psms_extracted: Option<String>,
-        /// `quant.q1_fragments`: the run's spectra_ms2 v3 (the Q1 step and cycle of every
-        /// sample). Required with the key on, read only then.
+        /// `quant.q1_fragments` / `quant.q1_cycle_halfwidth`: the run's spectra_ms2 (v3 records
+        /// the Q1 step and cycle of every sample). Required with either key on, read only then.
         #[arg(long)]
         spectra_ms2: Option<String>,
         #[arg(long)]
@@ -812,6 +812,12 @@ enum Cmd {
     /// bounding peak volume and deleting fragment evidence from most spectra. A diaPASEF
     /// `.d` is counted after the native reader's centroiding, which is what `convert`
     /// writes for it.
+    ///
+    /// For an mzML the `isolation` block says how `convert` reads the MS2 isolation windows
+    /// of the spectra counted: with offsets, without isolation, or a target and no offsets.
+    /// A scanning-quadrupole file of the last kind (SCIEX ZT Scan DIA) is refused without
+    /// `convert.isolation_half_width`; the block names the layout of its targets and a
+    /// half-width to start from (docs/37_ztscan.md).
     PeakCensus {
         #[arg(long)]
         mzml: String,
@@ -1102,6 +1108,10 @@ fn peak_census(
     let mut counts: Vec<usize> = Vec::new();
     let mut profile = 0usize;
     let mut ms1 = 0usize;
+    // How convert would read each MS2 spectrum's isolation window, for an mzML: a scanning
+    // quadrupole's file that names targets and no offsets is refused without
+    // `convert.isolation_half_width`, and the census says so before a run starts.
+    let mut isolation = stages::convert::IsolationCensus::default();
     if native {
         (counts, ms1) = stages::convert::tdf_peak_counts(mzml, max_spectra, tdf)?;
     } else {
@@ -1112,6 +1122,7 @@ fn peak_census(
             if max_spectra > 0 && i >= max_spectra {
                 break;
             }
+            isolation.record(&spec);
             if spec.ms_level() != 2 {
                 if spec.ms_level() == 1 {
                     ms1 += 1;
@@ -1176,6 +1187,8 @@ fn peak_census(
     if native {
         // Which reader counted, so a census of a `.d` is not read as an msconvert one.
         out["reader"] = serde_json::json!(mumdia::instrument::READER_TIMSRUST);
+    } else {
+        out["isolation"] = isolation.to_json();
     }
     Ok(out)
 }
@@ -2121,11 +2134,13 @@ fn real_main() -> Result<()> {
             if ext_cfg.q1_fragments {
                 let cal = q1_cal.as_deref().ok_or_else(|| {
                     anyhow::anyhow!(
-                        "extract.q1_fragments needs the run's cal.json with its Q1 calibration:                          pass --q1-cal"
+                        "extract.q1_fragments needs the run's cal.json with its Q1 calibration: \
+                         pass --q1-cal"
                     )
                 })?;
                 ext_cfg.q1_model = Some(stages::q1frag::read_model(cal)?);
                 ext_cfg.q1_repick = cfg.retrace.q1_repick;
+                ext_cfg.q1_repick_peaks = cfg.retrace.q1_repick_peaks;
             }
             // `features.ms1_envelope`: extract reads the MS1 isotope-envelope evidence.
             ext_cfg.ms1_envelope = cfg.features.ms1_envelope;
@@ -2695,17 +2710,31 @@ fn real_main() -> Result<()> {
             let q1 = if cfg.quant.q1_fragments {
                 match (&psms_extracted, &spectra_ms2) {
                     (Some(pe), Some(sp)) => Some(stages::q1quant::Q1QuantInputs {
-                        psms_extracted: pe,
+                        psms_extracted: Some(pe),
                         spectra_ms2: sp,
                     }),
                     _ => anyhow::bail!(
-                        "quant.q1_fragments needs --psms-extracted (the run's psms_extracted                          v6) and --spectra-ms2 (its spectra_ms2 v3)"
+                        "quant.q1_fragments needs --psms-extracted (the run's psms_extracted \
+                         v6) and --spectra-ms2 (its spectra_ms2 v3)"
+                    ),
+                }
+            } else if cfg.quant.q1_cycle_halfwidth > 0 {
+                match &spectra_ms2 {
+                    Some(sp) => Some(stages::q1quant::Q1QuantInputs {
+                        psms_extracted: None,
+                        spectra_ms2: sp,
+                    }),
+                    None => anyhow::bail!(
+                        "quant.q1_cycle_halfwidth needs --spectra-ms2 (the run's spectra_ms2, \
+                         whose Q1 sweep gives each sample its cycle)"
                     ),
                 }
             } else {
                 if psms_extracted.is_some() || spectra_ms2.is_some() {
                     tracing::warn!(
-                        "quant: --psms-extracted and --spectra-ms2 are read only under                          quant.q1_fragments, which this configuration leaves off"
+                        "quant: --psms-extracted and --spectra-ms2 are read only under \
+                         quant.q1_fragments or quant.q1_cycle_halfwidth, which this \
+                         configuration leaves off"
                     );
                 }
                 None
@@ -2726,7 +2755,8 @@ fn real_main() -> Result<()> {
                 if !cross_run_pattern_from.is_empty() {
                     if !cfg.quant.fragment_selection.uses_pattern_fit() {
                         anyhow::bail!(
-                            "--cross-run-pattern-from refits the pattern dispersion, and                              quant.fragment_selection is not pattern_fit or pattern_profile"
+                            "--cross-run-pattern-from refits the pattern dispersion, and \
+                             quant.fragment_selection is not pattern_fit or pattern_profile"
                         );
                     }
                     fit.pattern = stages::quant_pattern::fit_pattern(&cross_run_pattern_from)?;

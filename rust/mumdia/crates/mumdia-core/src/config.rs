@@ -1630,6 +1630,12 @@ fn is_zero_f64(v: &f64) -> bool {
     *v == 0.0
 }
 
+/// A count left at 0 ("off"), which the canonical configuration omits for keys added after
+/// the configuration hash was frozen for their section.
+fn is_zero_usize(v: &usize) -> bool {
+    *v == 0
+}
+
 /// Heads `rt_im_train.multihead_calibration` uses when it is left to decide.
 ///
 /// DeepLC's own default for `MultiHeadRidgeCalibration`, and the value both measured
@@ -2218,6 +2224,10 @@ pub struct ExtractConfig {
     /// extract, where the Q1 patches are read). Never read from a configuration file.
     #[serde(skip)]
     pub q1_repick: bool,
+    /// `retrace.q1_repick_peaks`, handed to extract with `q1_repick`. Never read from a
+    /// configuration file.
+    #[serde(skip)]
+    pub q1_repick_peaks: usize,
     /// `features.ms1_envelope`, handed to extract by the same callers: extract reads the MS1
     /// isotope-envelope evidence that family derives its features from (psms_extracted v7,
     /// `stages::ms1env`). Never read from a configuration file.
@@ -2782,6 +2792,7 @@ impl Default for ExtractConfig {
             q1_fragments: false,
             q1_model: None,
             q1_repick: false,
+            q1_repick_peaks: Q1_REPICK_PEAKS,
             ms1_envelope: false,
             fixed_scan_window: 2,
             frag_tol_ppm: 20.0,
@@ -3500,6 +3511,27 @@ pub struct QuantConfig {
     /// fixed window. Omitted from the canonical configuration at its default.
     #[serde(skip_serializing_if = "Q1Integration::is_trapezoid")]
     pub q1_integration: Q1Integration,
+    /// Scanning-quadrupole spectra (SCIEX ZT Scan DIA, spectra_ms2 v3 written under
+    /// `convert.isolation_half_width`): the fixed scan window's half-width in Q1 cycles rather
+    /// than in samples. A ZT Scan trace interleaves the steps of every window that covers the
+    /// precursor, about five a cycle for a 3.8 m/z window swept in 0.76 m/z steps, so
+    /// `fixed_scan_halfwidth` 3 spans about 1.4 cycles of a peak 3-6 cycles wide. With this set,
+    /// each candidate's half-width in samples is this many cycles times its samples per cycle
+    /// (the median count of its trace's samples in one cycle, each located in the sweep by
+    /// retention time), and under `q1_fragments`, whose traces hold one value per cycle, this
+    /// many values. Everything that reads the scan window (the profile centre, the pattern fit,
+    /// the background flanks beyond it) reads that half-width. Applies only to a run whose
+    /// spectra record the sweep; on any other run `fixed_scan_halfwidth` applies, which the
+    /// quant report records. Needs the scan form of the fixed window (`fixed_scan_halfwidth >
+    /// 0`, `fixed_window_s = 0`); refused with `fixed_scan_halfwidth_scale`, which chooses each
+    /// candidate's half-width too. `run` and `run-experiment` pass the spectra; `mumdia quant`
+    /// takes `--spectra-ms2`. 0 (default) is off. Measured on the ZT Scan K562 three-run
+    /// experiment (docs/37_ztscan.md): median precursor CV 0.273 at the default window, 0.107 at
+    /// 3 cycles and 0.102 at 4, the identifications unchanged; no known-ratio ZT Scan data has
+    /// been measured, so whether the wider span adds interference bias is open.
+    /// Benchmark-gated. Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub q1_cycle_halfwidth: usize,
     /// Which keys of the quantification recipe the configuration file set. Not part of the
     /// configuration: [`Config::from_json`] fills it, and [`Config::resolve_quant_recipe`]
     /// reads it to tell a default that does not fit the rest of the configuration (replaced,
@@ -3727,6 +3759,13 @@ impl QuantConfig {
             || self.fixed_scan_halfwidth_scale > 0.0
     }
 
+    /// Whether quantification reads the run's Q1 sweep (spectra_ms2 v3): under
+    /// [`QuantConfig::q1_fragments`] or [`QuantConfig::q1_cycle_halfwidth`]. `run` and
+    /// `run-experiment` hand quant the spectra exactly then.
+    pub fn reads_q1_sweep(&self) -> bool {
+        self.q1_fragments || self.q1_cycle_halfwidth > 0
+    }
+
     /// Whether the cross-run MaxLFQ of `run-experiment` reads the normalised quantity
     /// ([`QuantConfig::normalisation_lfq`]), given that the normalisation ran.
     pub fn lfq_reads_normalised(&self) -> bool {
@@ -3887,6 +3926,7 @@ impl Default for QuantConfig {
             q1_min_belonging: 3, // Q1_MIN_BELONGING
             q1_step_weights: Q1StepWeights::Transmission,
             q1_integration: Q1Integration::Trapezoid,
+            q1_cycle_halfwidth: 0,
             explicit: QuantExplicit::default(),
             resolved: Vec::new(),
         }
@@ -4956,6 +4996,15 @@ pub struct RetraceConfig {
     /// (docs/09_extract.md, "Per-fragment Q1 decisions").
     #[serde(skip_serializing_if = "is_false")]
     pub q1_repick: bool,
+    /// `q1_repick`: how many peaks of the candidate's count profile it enumerates to compare
+    /// with the apex, strongest first by area (the apex's own peak among them is skipped).
+    /// Each alternative costs a full per-fragment decision, which is what makes the re-pick
+    /// expensive. 0 compares none: the apex then only moves to its own peak's 2D apex, the
+    /// cycle where its fragments that belong peak. Default 5 ([`Q1_REPICK_PEAKS`], the setting
+    /// `repick` was measured with). Needs `q1_repick`. Omitted from the canonical configuration
+    /// at its default (docs/37_ztscan.md, section 8).
+    #[serde(skip_serializing_if = "is_default_q1_repick_peaks")]
+    pub q1_repick_peaks: usize,
 }
 impl Default for RetraceConfig {
     fn default() -> Self {
@@ -4963,6 +5012,7 @@ impl Default for RetraceConfig {
             enabled: false,
             repick: false,
             q1_repick: false,
+            q1_repick_peaks: 5, // Q1_REPICK_PEAKS
             im_half_width: 0.015,
             ms1: true,
             apex_features: false,
@@ -4972,6 +5022,14 @@ impl Default for RetraceConfig {
 
 fn is_default_retrace_im_half_width(v: &f64) -> bool {
     *v == RetraceConfig::default().im_half_width
+}
+
+/// The count-profile peaks `retrace.q1_repick` enumerates by default
+/// ([`RetraceConfig::q1_repick_peaks`]).
+pub const Q1_REPICK_PEAKS: usize = 5;
+
+fn is_default_q1_repick_peaks(v: &usize) -> bool {
+    *v == Q1_REPICK_PEAKS
 }
 
 impl RetraceConfig {
@@ -5735,6 +5793,23 @@ impl Config {
                  only under quant.q1_fragments; set it as well"
                     .into(),
             ));
+        }
+        if q.q1_cycle_halfwidth > 0 {
+            if q.fixed_scan_halfwidth_scale > 0.0 {
+                return Err(Invalid(
+                    "quant.q1_cycle_halfwidth and quant.fixed_scan_halfwidth_scale each choose \
+                     the fixed window's half-width per candidate; set one of them"
+                        .into(),
+                ));
+            }
+            if q.fixed_scan_halfwidth == 0 || q.fixed_window_s > 0.0 {
+                return Err(Invalid(
+                    "quant.q1_cycle_halfwidth sets the half-width of the fixed scan window in \
+                     Q1 cycles, so it needs that window: quant.fixed_scan_halfwidth > 0 (the \
+                     half-width on runs without a Q1 sweep) and quant.fixed_window_s = 0"
+                        .into(),
+                ));
+            }
         }
         if scale > 0.0 && self.quant.baseline_source != BaselineSource::Experiment {
             return Err(Invalid(
@@ -6797,6 +6872,12 @@ impl Config {
                         .into(),
                 ));
             }
+        } else if r.q1_repick_peaks != Q1_REPICK_PEAKS {
+            return Err(Invalid(
+                "retrace.q1_repick_peaks sets how many peaks retrace.q1_repick compares; set \
+                 retrace.q1_repick as well"
+                    .into(),
+            ));
         }
         if !r.enabled {
             for (on, key) in [
@@ -7371,6 +7452,7 @@ mod tests {
             "configs/examples/diann-library.json",
             "configs/examples/fasta-peptdeep.json",
             "configs/examples/diapasef.json",
+            "configs/examples/ztscan.json",
             "configs/examples/prescreen-balanced.json",
             "configs/examples/prescreen-oxidation.json",
             "configs/examples/prescreen-components.json",
@@ -7389,7 +7471,7 @@ mod tests {
         }
         // In a full checkout every listed config must have been read.
         if examples_present {
-            assert_eq!(checked, 10, "a listed shipped config was not found");
+            assert_eq!(checked, 11, "a listed shipped config was not found");
         }
     }
 
@@ -8034,6 +8116,65 @@ mod tests {
             r#"{"convert":{"isolation_half_width":0}}"#,
             r#"{"convert":{"isolation_half_width":-1.9}}"#,
             r#"{"extract":{"max_footprint_gib":-1}}"#,
+        ] {
+            assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
+        }
+    }
+
+    /// `retrace.q1_repick_peaks` is omitted at its default (5), part of the identity when set,
+    /// handed to extract only with the re-pick, and refused without it.
+    #[test]
+    fn the_q1_repick_peaks_key_leaves_the_default_config_hash_alone() {
+        let d = Config::default();
+        assert_eq!(d.retrace.q1_repick_peaks, Q1_REPICK_PEAKS);
+        assert_eq!(d.extract.q1_repick_peaks, Q1_REPICK_PEAKS);
+        let canon = d.canonical_json();
+        assert!(!canon.contains("q1_repick_peaks"), "{canon}");
+        let base = r#""rt_im_train":{"q1_calibrate":true},"extract":{"q1_fragments":true}"#;
+        let five = Config::from_json(&format!(
+            r#"{{{base},"retrace":{{"q1_repick":true,"q1_repick_peaks":5}}}}"#
+        ))
+        .unwrap();
+        assert!(!five.canonical_json().contains("q1_repick_peaks"));
+        let none = Config::from_json(&format!(
+            r#"{{{base},"retrace":{{"q1_repick":true,"q1_repick_peaks":0}}}}"#
+        ))
+        .unwrap();
+        assert_eq!(none.retrace.q1_repick_peaks, 0);
+        assert!(none.canonical_json().contains(r#""q1_repick_peaks":0"#));
+        assert!(Config::from_json(r#"{"retrace":{"q1_repick_peaks":0}}"#).is_err());
+    }
+
+    /// `quant.q1_cycle_halfwidth` (phase 4 of the ZT Scan plan) is omitted at its default,
+    /// part of the identity when set, reads the sweep (`reads_q1_sweep`) without any other
+    /// key, and is refused without the scan form of the fixed window or with the scale that
+    /// also chooses a per-candidate half-width.
+    #[test]
+    fn the_q1_cycle_halfwidth_key_leaves_the_default_config_hash_alone() {
+        let d = Config::default();
+        assert_eq!(d.quant.q1_cycle_halfwidth, 0);
+        assert!(!d.quant.reads_q1_sweep());
+        let canon = d.canonical_json();
+        assert!(!canon.contains("q1_cycle_halfwidth"), "{canon}");
+        let zero = Config::from_json(r#"{"quant":{"q1_cycle_halfwidth":0}}"#).unwrap();
+        assert_eq!(zero.canonical_json(), canon);
+        let on = Config::from_json(r#"{"quant":{"q1_cycle_halfwidth":3}}"#).unwrap();
+        assert_eq!(on.quant.q1_cycle_halfwidth, 3);
+        assert!(on.quant.reads_q1_sweep());
+        assert!(on.canonical_json().contains(r#""q1_cycle_halfwidth":3"#));
+        // With the per-fragment quantification it counts that key's cycle values.
+        assert!(Config::from_json(
+            r#"{"rt_im_train":{"q1_calibrate":true},"extract":{"q1_fragments":true},
+                "quant":{"q1_fragments":true,"q1_cycle_halfwidth":4}}"#
+        )
+        .is_ok());
+        for bad in [
+            r#"{"quant":{"q1_cycle_halfwidth":3,"fixed_scan_halfwidth":0,
+                "fragment_selection":"predicted","window_centre":"apex"}}"#,
+            r#"{"quant":{"q1_cycle_halfwidth":3,"fixed_window_s":5.0,
+                "fragment_selection":"predicted","window_centre":"apex"}}"#,
+            r#"{"quant":{"q1_cycle_halfwidth":3,"fixed_scan_halfwidth_scale":2.5,
+                "baseline_subtract":true,"baseline_source":"experiment"}}"#,
         ] {
             assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
         }

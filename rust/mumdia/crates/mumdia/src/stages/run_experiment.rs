@@ -2780,9 +2780,9 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         .map(|i| format!("{}/spectra/spectra_ms2.parquet", d(&names[i])))
         .collect();
     let q1_of = |i: usize| {
-        qcfg.q1_fragments
+        qcfg.reads_q1_sweep()
             .then(|| crate::stages::q1quant::Q1QuantInputs {
-                psms_extracted: &q1_extracted[i],
+                psms_extracted: Some(q1_extracted[i].as_str()),
                 spectra_ms2: &q1_spectra[i],
             })
     };

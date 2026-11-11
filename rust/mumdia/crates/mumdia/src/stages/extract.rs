@@ -1737,10 +1737,6 @@ pub(crate) const Q1_MIN_OVERLAP: f64 = 1.5;
 /// Cycles on each side of the apex cycle the Q1 profile reads: the five cycles around it, as
 /// the window gates read the apex +-2 scans.
 const Q1_PROFILE_CYCLES: u32 = 2;
-/// Peaks of a candidate's count profile `retrace.q1_repick` compares beside extract's apex
-/// (the `enumerate_peaks` that `retain_top_peaks` writes; 5 is the setting `retrace.repick`
-/// was measured with).
-const Q1_REPICK_PEAKS: usize = 5;
 /// Fewest fragments that belong at the chosen peak for `retrace.q1_repick` to move the apex:
 /// a candidate with fewer has no 2D apex of its own to move to.
 const Q1_REPICK_MIN_BELONG: usize = 3;
@@ -4509,7 +4505,8 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     // `features.ms1_envelope` reads the MS1 of spectra without 1/K0 only.
     if p.cfg.ms1_envelope && has_im {
         anyhow::bail!(
-            "extract: features.ms1_envelope reads the MS1 isotope envelope of spectra without              1/K0, and these carry it (diaPASEF); unset it for them"
+            "extract: features.ms1_envelope reads the MS1 isotope envelope of spectra without \
+             1/K0, and these carry it (diaPASEF); unset it for them"
         );
     }
     // The per-fragment Q1 decision (`extract.q1_fragments`): the sweep spectra_ms2 v3
@@ -5635,8 +5632,14 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 (q1f_ctx.as_ref(), q1f_cand.as_ref(), apex_gi, q1f_0.as_ref())
             {
                 let count_prof: Vec<f32> = counts.iter().map(|&n| n as f32).collect();
-                let alts =
-                    crate::peaks::enumerate_peaks(&count_prof, Q1_REPICK_PEAKS, 1.0 / 3.0, 0.1);
+                // `retrace.q1_repick_peaks` peaks of the count profile (the `enumerate_peaks`
+                // that `retain_top_peaks` writes; 0 compares none).
+                let alts = crate::peaks::enumerate_peaks(
+                    &count_prof,
+                    p.cfg.q1_repick_peaks,
+                    1.0 / 3.0,
+                    0.1,
+                );
                 let mut best_score = q1frag::repick_score(&own.0, &own.1, cand);
                 let mut best: Option<Q1fAt> = None;
                 for pk in &alts {
@@ -6622,7 +6625,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                         "profile_cycles": 2 * q1frag::PROFILE_CYCLES + 1,
                         "margin_steps": q1frag::MARGIN_STEPS,
                         "q1_repick": p.cfg.q1_repick,
-                        "repick_peaks": Q1_REPICK_PEAKS,
+                        "repick_peaks": p.cfg.q1_repick_peaks,
                     }),
                 );
             }

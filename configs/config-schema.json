@@ -4202,6 +4202,21 @@
       ]
     },
     {
+      "path": "quant.q1_cycle_halfwidth",
+      "name": "q1_cycle_halfwidth",
+      "section": "quant",
+      "rust_type": "usize",
+      "kind": "integer",
+      "optional": false,
+      "default": 0,
+      "default_text": "0",
+      "help": "Scanning-quadrupole spectra (SCIEX ZT Scan DIA, spectra_ms2 v3 written under `convert.isolation_half_width`): the fixed scan window's half-width in Q1 cycles rather than in samples. A ZT Scan trace interleaves the steps of every window that covers the precursor, about five a cycle for a 3.8 m/z window swept in 0.76 m/z steps, so `fixed_scan_halfwidth` 3 spans about 1.4 cycles of a peak 3-6 cycles wide. With this set, each candidate's half-width in samples is this many cycles times its samples per cycle (the median count of its trace's samples in one cycle, each located in the sweep by retention time), and under `q1_fragments`, whose traces hold one value per cycle, this many values. Everything that reads the scan window (the profile centre, the pattern fit, the background flanks beyond it) reads that half-width. Applies only to a run whose spectra record the sweep; on any other run `fixed_scan_halfwidth` applies, which the quant report records. Needs the scan form of the fixed window (`fixed_scan_halfwidth > 0`, `fixed_window_s = 0`); refused with `fixed_scan_halfwidth_scale`, which chooses each candidate's half-width too. `run` and `run-experiment` pass the spectra; `mumdia quant` takes `--spectra-ms2`. 0 (default) is off. Measured on the ZT Scan K562 three-run experiment (docs/37_ztscan.md): median precursor CV 0.273 at the default window, 0.107 at 3 cycles and 0.102 at 4, the identifications unchanged; no known-ratio ZT Scan data has been measured, so whether the wider span adds interference bias is open. Benchmark-gated. Omitted from the canonical configuration at its default.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "QuantConfig"
+    },
+    {
       "path": "mbr.strategy",
       "name": "strategy",
       "section": "mbr",
@@ -4649,6 +4664,19 @@
       "gates": [
         "benchmark-gated"
       ],
+      "source_struct": "RetraceConfig"
+    },
+    {
+      "path": "retrace.q1_repick_peaks",
+      "name": "q1_repick_peaks",
+      "section": "retrace",
+      "rust_type": "usize",
+      "kind": "integer",
+      "optional": false,
+      "default": 5,
+      "default_text": "5",
+      "help": "`q1_repick`: how many peaks of the candidate's count profile it enumerates to compare with the apex, strongest first by area (the apex's own peak among them is skipped). Each alternative costs a full per-fragment decision, which is what makes the re-pick expensive. 0 compares none: the apex then only moves to its own peak's 2D apex, the cycle where its fragments that belong peak. Default 5 (`Q1_REPICK_PEAKS`, the setting `repick` was measured with). Needs `q1_repick`. Omitted from the canonical configuration at its default (docs/37_ztscan.md, section 8).",
+      "gates": [],
       "source_struct": "RetraceConfig"
     },
     {

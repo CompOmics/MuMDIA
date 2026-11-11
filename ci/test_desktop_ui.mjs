@@ -139,6 +139,8 @@ function load() {
     "refreshNormOptions",
     "normOverrides",
     "searchProblems",
+    "refreshZtscanNote",
+    "ztscanOverrides",
   ];
   const exported = names.map((n) => `${n}: typeof ${n} === "undefined" ? undefined : ${n}`);
   const api = vm.runInContext(`${body}\n;({ ${exported.join(", ")} });`, ctx);
@@ -410,6 +412,97 @@ test("a normalisation choice hidden by Search each separately is not sent", () =
   state.picks.mzml = ["/d/a.mzML"];
   assert.deepEqual({ ...f.api.normOverrides() }, {});
   assert.ok(!blocked());
+});
+
+// The isolation census `scanning_probe` returns for a SCIEX ZT Scan DIA mzML.
+function ztProbe(path, over = {}) {
+  return {
+    path,
+    isolation: {
+      ms2_spectra: 1996,
+      with_offsets: 0,
+      no_isolation: 0,
+      target_only: 1996,
+      convert_refuses: true,
+      scanning_quadrupole: true,
+      suggested_half_width: 1.9,
+      suggested_half_width_steps: 2.5,
+      layout: {
+        distinct_targets: 663,
+        lowest_target: 394.256,
+        highest_target: 898.271,
+        median_step: 0.7614,
+        spectra_per_target: 3.01,
+        cycle_s: 1.0,
+      },
+      ...over,
+    },
+    error: null,
+  };
+}
+
+const RECIPE = {
+  "convert.isolation_half_width": 1.9,
+  "extract.q1_fragments": true,
+  "quant.q1_cycle_halfwidth": 4,
+};
+
+test("a ZT Scan mzML is explained, its half-width filled and the recipe offered", async () => {
+  const f = load();
+  const { state } = f.api;
+  f.answers.scanning_probe = ({ mzml }) => mzml.map((p) => ztProbe(p));
+  f.answers.ztscan_recipe = () => RECIPE;
+  state.picks.mzml = ["/d/REP01.mzML", "/d/REP02.mzML"];
+  await f.api.refreshZtscanNote();
+  assert.equal(f.el("ztscan-note").hidden, false);
+  assert.match(f.el("ztscan-body").textContent, /2 of the 2 selected files are a scanning-quadrupole/);
+  assert.match(f.el("ztscan-body").textContent, /663 positions from 394\.3 to 898\.3 m\/z/);
+  assert.equal(f.el("ztscan-hw").value, "1.9");
+  assert.equal(f.el("ztscan-recipe").disabled, false);
+  // The half-width alone without the recipe; with it, the recipe and the confirmed width.
+  assert.deepEqual({ ...f.api.ztscanOverrides() }, { "convert.isolation_half_width": 1.9 });
+  f.el("ztscan-recipe").checked = true;
+  // What the input listener records when the user types.
+  f.el("ztscan-hw").value = "2.1";
+  state.ztscan.hwTyped = true;
+  assert.deepEqual({ ...f.api.ztscanOverrides() }, { ...RECIPE, "convert.isolation_half_width": 2.1 });
+  // Each file is asked once, and a typed half-width survives the re-render.
+  const probes = () => f.calls.filter(([n]) => n === "scanning_probe").length;
+  assert.equal(probes(), 1);
+  await f.api.refreshZtscanNote();
+  assert.equal(probes(), 1);
+  assert.equal(f.el("ztscan-hw").value, "2.1");
+  // An empty half-width blocks the start.
+  f.el("ztscan-hw").value = "";
+  assert.ok([...f.api.searchProblems()].some((s) => /Q1 half-width/.test(s)));
+});
+
+test("the ZT Scan recipe is held back for a mixed selection, and other files need nothing", async () => {
+  const f = load();
+  const { state } = f.api;
+  f.answers.scanning_probe = ({ mzml }) =>
+    mzml.map((p) =>
+      p.includes("orbi")
+        ? ztProbe(p, { convert_refuses: false, scanning_quadrupole: false, target_only: 0 })
+        : ztProbe(p)
+    );
+  f.answers.ztscan_recipe = () => RECIPE;
+  // A ZT Scan file with an Orbitrap file and a vendor file: the half-width only, no recipe,
+  // and the vendor file is not probed.
+  state.picks.mzml = ["/d/REP01.mzML", "/d/orbi.mzML", "/d/run.raw"];
+  await f.api.refreshZtscanNote();
+  const asked = f.calls.filter(([n]) => n === "scanning_probe").flatMap(([, a]) => a.mzml);
+  assert.deepEqual([...asked], ["/d/REP01.mzML", "/d/orbi.mzML"]);
+  assert.equal(f.el("ztscan-note").hidden, false);
+  assert.equal(f.el("ztscan-recipe").disabled, true);
+  f.el("ztscan-recipe").checked = true;
+  assert.deepEqual({ ...f.api.ztscanOverrides() }, { "convert.isolation_half_width": 1.9 });
+  // Only files with offsets: nothing to say and nothing added.
+  state.picks.mzml = ["/d/orbi.mzML"];
+  await f.api.refreshZtscanNote();
+  assert.equal(f.el("ztscan-note").hidden, true);
+  assert.deepEqual({ ...f.api.ztscanOverrides() }, {});
+  assert.ok(![...f.api.searchProblems()].some((s) => /Q1 half-width/.test(s)));
 });
 
 let failed = 0;

@@ -322,6 +322,27 @@
         <div class="notice-title" id="raw-note-title">Vendor format</div>
         <p class="notice-body" id="raw-note-body"></p>
       </div>
+      <!-- Filled by refreshZtscanNote from the engine's isolation census of each selected
+           mzML (scanning_probe). -->
+      <div class="notice" id="ztscan-note" hidden>
+        <div class="notice-title" id="ztscan-title">SCIEX ZT Scan DIA</div>
+        <p class="notice-body" id="ztscan-body"></p>
+        <div class="grid2">
+          <div class="row">
+            <label for="ztscan-hw">Q1 half-width (m/z)</label>
+            <input type="number" id="ztscan-hw" step="0.05" min="0.05" max="50" />
+          </div>
+        </div>
+        <label class="check">
+          <input type="checkbox" id="ztscan-recipe" />
+          <span>
+            <b>Use the ZT Scan recipe</b>: per-fragment Q1 decisions, the two-dimensional
+            apex re-pick, the Q1 term of the shadow test and a quantification window counted
+            in Q1 cycles, on top of the chosen preset.
+            <span class="hint inline" id="ztscan-recipe-note"></span>
+          </span>
+        </label>
+      </div>
     </div>
 
     <div class="card">

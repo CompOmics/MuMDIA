@@ -21,3 +21,4 @@ pub mod storage;
 pub mod thermo;
 pub mod vcruntime;
 pub mod viewer;
+pub mod ztscan;

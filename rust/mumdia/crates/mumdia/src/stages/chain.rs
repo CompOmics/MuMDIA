@@ -180,6 +180,7 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
     if cfg.extract.q1_fragments {
         ext_cfg.q1_model = Some(crate::stages::q1frag::read_model(&d("cal.json"))?);
         ext_cfg.q1_repick = cfg.retrace.q1_repick;
+        ext_cfg.q1_repick_peaks = cfg.retrace.q1_repick_peaks;
     }
     // `features.ms1_envelope`: extract reads the MS1 isotope-envelope evidence.
     ext_cfg.ms1_envelope = cfg.features.ms1_envelope;

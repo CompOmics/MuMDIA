@@ -2524,7 +2524,13 @@ fn q1_apply(
         );
     }
     let t0 = Instant::now();
-    let model = q1quant::model_of_report(inp.psms_extracted)?;
+    let psms_extracted = inp.psms_extracted.ok_or_else(|| {
+        anyhow!(
+            "quant.q1_fragments needs the run's psms_extracted \
+             (mumdia quant --psms-extracted ...)"
+        )
+    })?;
+    let model = q1quant::model_of_report(psms_extracted)?;
     let mut rank_of: HashMap<u32, i32> = HashMap::new();
     for (k, &c) in acc_cid.iter().enumerate() {
         rank_of
@@ -2536,7 +2542,7 @@ fn q1_apply(
         .iter()
         .map(|&c| (c, rank_of.get(&c).copied().unwrap_or(0)))
         .collect();
-    let rows = q1quant::load_rows(inp.psms_extracted, &wanted)?;
+    let rows = q1quant::load_rows(psms_extracted, &wanted)?;
     if !mumdia_io::table::column_names(&p.chromatograms[0].path)?
         .iter()
         .any(|c| c == "frag_mz")
@@ -2676,6 +2682,108 @@ fn q1_apply(
             scans,
         },
     ))
+}
+
+/// What `quant.q1_cycle_halfwidth` chose ([`q1_cycle_window`]).
+struct CycleWindow {
+    /// Per candidate of the index: its half-width in samples, `None` where
+    /// `fixed_scan_halfwidth` applies (no sweep, no trace, or a sample off the sweep).
+    half: Vec<Option<usize>>,
+    /// The quant report's `q1_cycle_window` block.
+    stats: serde_json::Value,
+}
+
+/// `quant.q1_cycle_halfwidth`: each candidate's fixed-window half-width in samples, the key's
+/// cycles times its samples per cycle ([`q1quant::samples_per_cycle`] on the axis of its first
+/// row with a trace), or the key itself for a candidate whose traces `quant.q1_fragments`
+/// collapsed to one value per cycle. A run whose spectra record no Q1 sweep keeps
+/// `fixed_scan_halfwidth` for every candidate, which the report says.
+fn q1_cycle_window(
+    p: &QuantParams,
+    store: &ChromStore,
+    index: &CandIndex,
+    q1a: Option<&Q1Applied>,
+) -> Result<CycleWindow> {
+    let k = p.cfg.q1_cycle_halfwidth;
+    let spectra = p.q1.map(|q| q.spectra_ms2).ok_or_else(|| {
+        anyhow!(
+            "quant.q1_cycle_halfwidth reads the run's Q1 sweep from its spectra_ms2 \
+             (mumdia quant --spectra-ms2 ...)"
+        )
+    })?;
+    let t0 = Instant::now();
+    let Some(sweep) = q1quant::SweepScans::try_load(spectra)? else {
+        info!(
+            spectra_ms2 = spectra,
+            fixed_scan_halfwidth = p.cfg.fixed_scan_halfwidth,
+            "quant: quant.q1_cycle_halfwidth: the spectra record no Q1 sweep, so the fixed \
+             window keeps fixed_scan_halfwidth samples"
+        );
+        return Ok(CycleWindow {
+            half: vec![None; index.len()],
+            stats: json!({
+                "cycles": k,
+                "spectra_ms2": spectra,
+                "applied": false,
+                "reason": "the spectra record no Q1 sweep",
+            }),
+        });
+    };
+    // Per candidate: (half-width, samples per cycle where it was measured, collapsed).
+    let per: Vec<(Option<usize>, Option<f64>, bool)> = (0..index.len())
+        .into_par_iter()
+        .map(|ci| {
+            let collapsed = q1a.is_some_and(|a| a.status[ci] != Q1Status::Uncollapsed);
+            if collapsed {
+                return (Some(k), None, true);
+            }
+            let axis = index
+                .rows_of(ci)
+                .iter()
+                .map(|&i| store.axis_id[i])
+                .find(|&a| a != NO_AXIS);
+            match axis.and_then(|a| q1quant::samples_per_cycle(&sweep, store.axis(a))) {
+                Some(spc) => (Some(q1quant::cycle_halfwidth(k, spc)), Some(spc), false),
+                None => (None, None, false),
+            }
+        })
+        .collect();
+    let mut spc: Vec<f64> = per.iter().filter_map(|x| x.1).collect();
+    let mut halves: Vec<f64> = per.iter().filter_map(|x| x.0.map(|h| h as f64)).collect();
+    let collapsed = per.iter().filter(|x| x.2).count();
+    let unlocated = per.iter().filter(|x| x.0.is_none()).count();
+    let (h_min, h_max) = halves
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &h| {
+            (a.min(h), b.max(h))
+        });
+    let stats = json!({
+        "cycles": k,
+        "spectra_ms2": spectra,
+        "applied": true,
+        "candidates": index.len(),
+        "collapsed": collapsed,
+        "measured": spc.len(),
+        "fixed_scan_halfwidth_kept": unlocated,
+        "samples_per_cycle_median": finite_option(quant_pattern::median(&mut spc)),
+        "halfwidth_min": finite_option(h_min),
+        "halfwidth_median": finite_option(quant_pattern::median(&mut halves)),
+        "halfwidth_max": finite_option(h_max),
+    });
+    info!(
+        cycles = k,
+        candidates = index.len(),
+        collapsed,
+        fixed_scan_halfwidth_kept = unlocated,
+        samples_per_cycle_median = stats["samples_per_cycle_median"].as_f64(),
+        halfwidth_median = stats["halfwidth_median"].as_f64(),
+        elapsed_ms = t0.elapsed().as_millis() as u64,
+        "quant: fixed window in Q1 cycles (quant.q1_cycle_halfwidth)"
+    );
+    Ok(CycleWindow {
+        half: per.into_iter().map(|x| x.0).collect(),
+        stats,
+    })
 }
 
 /// The quant outputs as written and reported: row count and report content hash of each.
@@ -3052,6 +3160,13 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         (store, index, None)
     };
     let q1_elution = q1a.is_some() && p.cfg.q1_integration == Q1Integration::ElutionFit;
+    // `quant.q1_cycle_halfwidth`: each candidate's fixed-window half-width in samples, from its
+    // samples per Q1 cycle. `None` with the key off.
+    let cycle_win: Option<CycleWindow> = if p.cfg.q1_cycle_halfwidth > 0 {
+        Some(q1_cycle_window(&p, &store, &index, q1a.as_ref())?)
+    } else {
+        None
+    };
     {
         let mut parts = store.mem_parts();
         parts.push((
@@ -3290,9 +3405,12 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             let mut fhi = f64::NEG_INFINITY;
             // The candidate's own halfwidth under `fixed_scan_halfwidth_scale`, which
             // validation confines to the scan form of the window.
+            // Under `quant.q1_cycle_halfwidth`, the candidate's half-width from its samples per
+            // Q1 cycle (validation refuses it with the scale).
             let half = halfwidths
                 .and_then(|m| m.get(&c))
                 .copied()
+                .or_else(|| cycle_win.as_ref().and_then(|w| w.half[ci]))
                 .unwrap_or(p.cfg.fixed_scan_halfwidth);
             // Export only: each fragment's window samples, for the correlations, and the
             // candidate's summed trace around the apex, for its peak HWHM.
@@ -4179,6 +4297,10 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         // only when there were any, so every other report keeps its bytes.
         if !p.cfg.resolved.is_empty() {
             params.insert("recipe_resolved".to_string(), json!(p.cfg.resolved));
+        }
+        // `quant.q1_cycle_halfwidth`, only then, so every other report keeps its bytes.
+        if let Some(w) = &cycle_win {
+            params.insert("q1_cycle_window".to_string(), w.stats.clone());
         }
         // `quant.q1_fragments`, only then, so every other report keeps its bytes.
         if let (Some(a), Some(inp)) = (&q1a, p.q1) {
