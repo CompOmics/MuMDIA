@@ -12,11 +12,15 @@
 //! This module turns every trace into one value per cycle, with the calibrated Q1 model of
 //! `extract.q1_fragments` (recorded in the psms_extracted report): each step `s` of a cycle
 //! gets the weight `w_s`, the fragment's expected Q1 profile (the trapezoid transmission
-//! summed over the precursor's isotopes, `q1frag::CandQ1`) at the step's target and the row's
-//! fitted Q1 centre and width (`q1f_centre`, `q1f_width`), and the cycle's value is the
-//! least-squares amplitude `sum(w x) / sum(w^2)` at the mean retention time of the cycle's
-//! samples (`quant.q1_step_weights = uniform`: `w = 1`, the mean). Which step and cycle each
-//! sample is comes from spectra_ms2 v3 (`q1_cycle`, the window as read).
+//! summed over the precursor's isotopes, `q1frag::CandQ1`) at the step's target and the
+//! precursor's calibrated expected centre, and the cycle's value is the least-squares
+//! amplitude `sum(w x) / sum(w^2)` at the mean retention time of the cycle's samples
+//! (`quant.q1_step_weights = uniform`: `w = 1`, the mean). The expected centre is the run's
+//! calibration (its offset at the precursor m/z and the isotope envelope), not the row's own
+//! fitted centre (`q1f_centre`): weights at the fitted centre carry its fit noise into each
+//! run's value, and on the K562 runs raised the median replicate CV from 0.120 to 0.125.
+//! Which step and cycle each sample is comes from spectra_ms2 v3 (`q1_cycle`, the window as
+//! read).
 //!
 //! The decision of each fragment (`q1f_frag_class`, library order, which is the
 //! chromatograms' row order) then selects: when at least `quant.q1_min_belonging` fragments
@@ -89,9 +93,6 @@ pub struct CandRow {
     pub precursor_mz: f64,
     pub charge: i32,
     pub apex_rt: f64,
-    /// The fitted shared Q1 centre (steps, against the expected one) and width scale.
-    pub centre: f64,
-    pub width: f64,
     /// Per library fragment, in library order: 0 absent, 1 belongs, 2 interfered.
     pub class: Vec<f32>,
 }
@@ -146,8 +147,6 @@ pub fn load_rows(
     let t = TableFile::open(psms_extracted)?;
     for c in [
         "q1f_frag_class",
-        "q1f_centre",
-        "q1f_width",
         "peak_rank",
         "precursor_mz",
         "charge",
@@ -168,8 +167,6 @@ pub fn load_rows(
             "precursor_mz",
             "charge",
             "apex_rt",
-            "q1f_centre",
-            "q1f_width",
             "q1f_frag_class",
         ]),
         1 << 16,
@@ -195,12 +192,7 @@ pub fn load_rows(
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .context("psms_extracted.charge is not i32")?;
-            let (pm, apex, centre, width) = (
-                f64s("precursor_mz")?,
-                f64s("apex_rt")?,
-                f64s("q1f_centre")?,
-                f64s("q1f_width")?,
-            );
+            let (pm, apex) = (f64s("precursor_mz")?, f64s("apex_rt")?);
             let cls = ListF32::of(col("q1f_frag_class")?, "q1f_frag_class")?;
             for k in 0..b.num_rows() {
                 let c = cid.value(k);
@@ -213,8 +205,6 @@ pub fn load_rows(
                         precursor_mz: pm.value(k),
                         charge: z.value(k),
                         apex_rt: apex.value(k),
-                        centre: centre.value(k),
-                        width: width.value(k),
                         class: cls.row_slice(k, "q1f_frag_class")?.to_vec(),
                     },
                 );
@@ -445,30 +435,17 @@ pub fn collapse_trace(
     (out_rt, out_it)
 }
 
-/// The weight of a step of target `t` for fragment `f` of `cand` under `rule`, at the row's
-/// fitted centre and width.
+/// The weight of a step of target `t` for fragment `f` of `cand` under `rule`: its expected
+/// Q1 profile at the calibrated centre and width (`transmission`), or 1 (`uniform`).
 pub fn step_weight(
     rule: Q1StepWeights,
     m: &Q1FragModel,
     cand: &q1frag::CandQ1,
-    row: &CandRow,
     f: usize,
     t: f64,
 ) -> f64 {
     match rule {
-        Q1StepWeights::Transmission => {
-            let w = if row.width.is_finite() && row.width > 0.0 {
-                row.width
-            } else {
-                1.0
-            };
-            let mu = if row.centre.is_finite() {
-                row.centre
-            } else {
-                0.0
-            };
-            cand.expected(m, f, t, mu, w)
-        }
+        Q1StepWeights::Transmission => cand.expected(m, f, t, 0.0, 1.0),
         Q1StepWeights::Uniform => 1.0,
     }
 }
@@ -628,8 +605,6 @@ mod tests {
             precursor_mz: pm,
             charge: 2,
             apex_rt: 102.0,
-            centre: 0.3,
-            width: 1.0,
             class: vec![1.0],
         };
         let frags = vec![("y7".to_string(), 812.4)];
@@ -642,14 +617,13 @@ mod tests {
             if (t - pm).abs() <= 1.9 {
                 rt.push(r as f32);
                 it.push(
-                    (amp[c as usize]
-                        * step_weight(Q1StepWeights::Transmission, &m, &cand, &row, 0, t))
+                    (amp[c as usize] * step_weight(Q1StepWeights::Transmission, &m, &cand, 0, t))
                         as f32,
                 );
             }
         }
         let located = sw.locate_axis(&rt, pm).unwrap();
-        let w = |t: f64| step_weight(Q1StepWeights::Transmission, &m, &cand, &row, 0, t);
+        let w = |t: f64| step_weight(Q1StepWeights::Transmission, &m, &cand, 0, t);
         let (crt, cit) = collapse_trace(&located, &rt, &it, &w);
         assert_eq!(crt.len(), 5);
         for (c, (&a, &x)) in amp.iter().zip(&cit).enumerate() {
@@ -782,8 +756,6 @@ mod run_tests {
                 precursor_mz: pm,
                 charge: 2,
                 apex_rt: rt_of(4, s_mid),
-                centre: 0.0,
-                width: 1.0,
                 class: cls.to_vec(),
             };
             let fr: Vec<(String, f64)> = names
@@ -809,14 +781,8 @@ mod run_tests {
                 c_int.push(
                     grid.iter()
                         .map(|&(c, s)| {
-                            let w = step_weight(
-                                Q1StepWeights::Transmission,
-                                &m,
-                                &cand,
-                                &row,
-                                f,
-                                target(s),
-                            );
+                            let w =
+                                step_weight(Q1StepWeights::Transmission, &m, &cand, f, target(s));
                             let own = 100.0 * pred[f] as f64 * G[c as usize] * w;
                             let interfered = if cls[f] == 2.0 { 5000.0 } else { 0.0 };
                             (own + interfered) as f32

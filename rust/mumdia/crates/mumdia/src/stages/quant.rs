@@ -2589,7 +2589,7 @@ fn q1_apply(
                     if a == NO_AXIS {
                         return (Vec::new(), Vec::new());
                     }
-                    let w = |t: f64| q1quant::step_weight(rule, &model, &cand, row, k, t);
+                    let w = |t: f64| q1quant::step_weight(rule, &model, &cand, k, t);
                     q1quant::collapse_trace(&located[&a], store.rt(i), store.inten(i), &w)
                 })
                 .collect();

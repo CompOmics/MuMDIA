@@ -3461,8 +3461,8 @@ pub struct QuantConfig {
     /// the steps of a cycle (the interleaved samples of the windows that cover the
     /// precursor) are combined as the least-squares amplitude `sum(w x) / sum(w^2)` under
     /// the weights `w` of `q1_step_weights` (the calibrated isotope-envelope transmission at
-    /// the row's fitted Q1 centre and width, by default), at the mean retention time of the
-    /// cycle. On those cycle traces the fragments that do not belong (interfered or absent)
+    /// the precursor's calibrated expected Q1 centre, by default), at the mean retention time of
+    /// the cycle. On those cycle traces the fragments that do not belong (interfered or absent)
     /// are left out of the quantity when at least `q1_min_belonging` fragments belong: out of
     /// the profile that centres the window, out of the top-N ranking and out of the pattern
     /// fit in that run (the pattern set and its scale stay those of the experiment). With
@@ -3484,9 +3484,11 @@ pub struct QuantConfig {
     pub q1_min_belonging: usize,
     /// `q1_fragments`: how the steps of a cycle are weighted when they are collapsed.
     /// `transmission` (default): the expected Q1 profile of the fragment (the calibrated
-    /// trapezoid transmission summed over the precursor's isotopes) at the row's fitted
-    /// centre and width; `uniform`: every step alike (the mean of the cycle's steps). Omitted
-    /// from the canonical configuration at its default.
+    /// trapezoid transmission summed over the precursor's isotopes) at its calibrated expected
+    /// centre and width (the row's own fitted centre carries its fit noise into each run's
+    /// value); `uniform`: every step alike (the mean of the cycle's steps). The two measured
+    /// the same replicate precision on the ZT Scan K562 runs. Omitted from the canonical
+    /// configuration at its default.
     #[serde(skip_serializing_if = "Q1StepWeights::is_transmission")]
     pub q1_step_weights: Q1StepWeights,
     /// `q1_fragments`: how a cycle trace is integrated over the fixed window. `trapezoid`
@@ -3818,7 +3820,7 @@ fn is_default_q1_min_belonging(v: &usize) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Q1StepWeights {
-    /// The fragment's expected Q1 profile at the row's fitted centre and width (default).
+    /// The fragment's expected Q1 profile at the calibrated expected centre (default).
     #[default]
     Transmission,
     /// Every step alike.
