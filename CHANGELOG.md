@@ -357,7 +357,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   of the chosen preset when every selected file is a ZT Scan run; a search with such a file and
   no half-width is not started, and the recipe is refused with bands.
 - **The desktop application ticks the ZT Scan recipe for ZT Scan files and gives their library
-  the ZT Scan search space (#PRNUM).** The recipe checkbox of the SCIEX ZT Scan DIA card is
+  the ZT Scan search space (#313).** The recipe checkbox of the SCIEX ZT Scan DIA card is
   ticked whenever every selected file is a ZT Scan run, until the user ticks or clears it: such
   a file cannot be searched without the half-width, and the recipe is the best measured
   configuration for it (a decision taken for this release; the card, and so the checkbox, never
