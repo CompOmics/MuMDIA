@@ -270,6 +270,40 @@ than a number. Both are recorded in every run's `manifest.json`.
   gave +0.46% precursors (mean of four NN seeds, 97,317 -> 97,765) and +0.19% human precursors
   on an entrapment library at a combined FDP of 1.40% against 1.39% (docs/09_extract.md, section
   11). Recorded in the extract report when set.
+- **Quantification of ZT Scan DIA traces by Q1 cycle, from the fragments that belong, opt-in
+  (`quant.q1_fragments`).** A ZT Scan trace interleaves about five Q1 steps per cycle, 1.3 ms
+  apart, so the trapezoid weighed the edge steps and the fixed window of seven samples spanned
+  about 1.4 cycles. Under the key, quant collapses every fragment trace of an accepted
+  candidate to one value per cycle (the least-squares amplitude of the cycle's steps under the
+  calibrated isotope-envelope transmission, `quant.q1_step_weights`, or their mean), and leaves
+  the fragments that do not belong (`extract.q1_fragments`, which it needs) out of the window
+  centre, the top-N ranking and the pattern fit when at least `quant.q1_min_belonging` (3)
+  belong; `quant.q1_integration = elution_fit` integrates under a fitted Gaussian elution
+  profile instead of the trapezoid. peptide_quant v4 records each row's outcome (`q1_quant`).
+  `run` and `run-experiment` pass the run's psms_extracted and spectra; `mumdia quant` takes
+  `--psms-extracted` and `--spectra-ms2`. On three K562 replicates (second pass, the phase-2
+  keys, the same identifications in every arm) the median replicate CV of the normalised
+  precursor quantity fell from 0.273 to 0.120 and that of the MaxLFQ proteins from 0.111 to
+  0.054, at unchanged completeness; collapsing without leaving fragments out gave 0.106, a
+  window of 15 interleaved samples without the key 0.107, and the elution fit 0.133. The gain
+  is the retention-time span; whether leaving out interfered fragments removes ratio bias needs
+  known-ratio ZT Scan data, which could not be converted, so every key stays off
+  (docs/12_quant_lfq_align_mbr_report_audit.md, "Quantification from the fragments that
+  belong").
+- **The MS1 isotope-envelope feature family, opt-in (`features.ms1_envelope`).** Extract reads
+  the precursor's isotopes M-1 to M+4 and the half-spacing positions in the five MS1 scans
+  around the apex at the calibrated MS1 m/z (psms_extracted v7), and the features stage derives
+  nine `ms1e_*` features: the envelope's agreement with averagine, the isotopes found in a row,
+  the M-1 and half-spacing shares, the isotope spacing error, the monoisotopic m/z error after
+  calibration, the mean isotope index against averagine and, under `extract.q1_fragments`, the
+  fitted Q1 centre against the centre the observed envelope predicts; appended last under
+  `extended`, the schema id changing only with it on. Refused on 1/K0 spectra and grouped runs.
+  On the ZenoTOF 8600 K562 run, with the phase-2 keys, it changed nothing beyond the seed
+  spread (four NN seeds: +0.01% human precursors at a matched entrapment FDP, +0.05% precursors
+  on the human library), so it stays off (docs/10_features.md, "ms1_envelope").
+- **`mumdia quant --cross-run-pattern-from`.** Refits the pattern dispersion on the given tables
+  (the background-subtracted exports), which is what `run-experiment` does, so a quantification
+  repeated with `mumdia quant` on an experiment's scored tables reproduces the experiment's.
 
 ### Fixed
 

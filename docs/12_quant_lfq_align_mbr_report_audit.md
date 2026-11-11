@@ -1104,7 +1104,71 @@ takes `--psms-extracted` and `--spectra-ms2`. Refused without `extract.q1_fragme
 and, for `elution_fit`, without the scan form of the fixed window. Off, quant reads nothing
 more and every artifact keeps its bytes.
 
-MEASURED_Q1QUANT
+**Measured (2026-11-11), replicate precision only.** No ZT Scan data with known ratios could be
+converted (the vendor-licence decision is open, docs/04_convert.md), so the known-ratio gate is
+open and nothing here measures accuracy. The three K562 ZT Scan runs (REP01-03, ZenoTOF 8600,
+100 ng, 15 min) searched as one `run-experiment` with the second pass, the phase-2 keys
+(`extract.q1_fragments`, `features.q1_fragment_features`, `retrace.q1_repick`,
+`rescore.shadow_q1`) and one NN seed; every quant arm repeats the quantification on that
+experiment's scored tables with `mumdia quant` in the sequence `run-experiment` runs (pass 1,
+the background export, the final quant with `--cross-run-pattern-from`, `quant-normalise`,
+the cross-run MaxLFQ), which reproduces the experiment's own tables exactly, so every arm has
+the same identifications. CV is the sample standard deviation over the mean of a precursor's
+three `quantity_normalised` values, over the precursors (peptidoform and charge) quantified in
+all three runs; the protein CV is that of the cross-run MaxLFQ. The base arm is the experiment
+without the phase-2 keys (its own identifications).
+
+| identifications, quant | median precursor CV | CV < 20% | median protein CV |
+|---|---|---|---|
+| base, default recipe | 0.319 | 25.3% | 0.133 |
+| phase-2 keys, default recipe | 0.273 | 34.6% | 0.111 |
+| + `quant.q1_fragments` | **0.120** | 73.4% | **0.054** |
+| + `q1_fragments`, `q1_step_weights = uniform` | 0.120 | 73.3% | 0.054 |
+| + `q1_fragments`, weights at the row's fitted centre (first implementation) | 0.125 | 71.3% | 0.057 |
+| + `q1_fragments`, `q1_integration = elution_fit` | 0.133 | 68.5% | 0.061 |
+| + `q1_fragments`, `q1_min_belonging` 5 | 0.115 | 77.0% | 0.051 |
+| + `q1_fragments`, no restriction (`q1_min_belonging` 1000: collapse only) | 0.106 | 82.4% | 0.047 |
+| + `q1_fragments`, `fixed_scan_halfwidth` 2 / 4 (cycles) | 0.125 / 0.117 | | 0.056 / 0.053 |
+| + collapse only, `fixed_scan_halfwidth` 4 | 0.102 | 84.3% | 0.045 |
+| + `q1_fragments`, `pattern_profile` / `predicted` top 3 | 0.117 / 0.113 | | 0.053 / 0.050 |
+| no `q1_fragments`, `fixed_scan_halfwidth` 10 / 15 / 20 (samples) | 0.116 / 0.107 / 0.102 | | 0.051 / 0.047 / 0.045 |
+
+On the 95,603 precursors quantified in all three runs in every arm, the base, phase-2,
+`q1_fragments` and collapse-only arms measure 0.317, 0.269, 0.116 and 0.104 (proteins, 8,445:
+0.130, 0.107, 0.052 and 0.045). Every arm on the phase-2 identifications quantifies the same
+precursors in 3 of 3 runs (103,002 of 113,299, 90.9%; `q1_fragments` leaves 1 to 3 per run
+unquantified, `no_belonging_pattern_fragments`).
+
+What the table says:
+
+- **The gain is the retention-time span, not the Q1 model.** The default window of 7
+  interleaved samples spans about 1.4 cycles; anything that integrates three to four cycles
+  either side halves the CV. The cycle traces do it by construction, and a wider window in
+  samples on the traces as extracted does it as well: at matched span the collapse alone and
+  the wide window measure the same (0.106 against 0.107 at three cycles, 0.102 and 0.102 at
+  four).
+- **Leaving out the fragments that do not belong costs precision** (0.106 to 0.120; 0.115 with
+  `q1_min_belonging` 5, which restricts fewer candidates). That is what a rule against
+  interference bias trades ([Fragment selection under
+  interference](#fragment-selection-under-interference)): replicates of one sample carry the
+  same interference in every run, so it adds no replicate variance, and removing it can only
+  show on known ratios.
+- **The transmission weights at the calibrated centre equal uniform weights** in precision;
+  weights at the row's own fitted Q1 centre (the first implementation) added its fit noise.
+- **The Gaussian elution fit costs precision** against the trapezoid over the cycles (0.120 to
+  0.133), with 3 to 6 cycles across a peak; it gave way to the trapezoid for 6% of the
+  candidates.
+
+On the entrapment run (human + yeast + E. coli library, one run, the phase-2 keys; `quant` on
+its scored table with the single-run fallback to `predicted` top 3), every accepted precursor
+is quantified, human (97,115) and entrapment (331) alike, under the default and under
+`q1_fragments`; 25% of the human and 71% of the entrapment precursors fall back (fewer than
+three fragments belong), and the median log10 quantity of the entrapment precursors lies 0.32
+below the human one under `q1_fragments` against 0.48 under the default.
+
+Cost: the collapse adds about 1.4 s to a run's quant (2.4 s against 1.0 s per pass, 16
+threads), mostly reading the spectra's sweep and the decisions. All four keys stay off: no
+known-ratio measurement and no second acquisition.
 
 ### quant-lfq (`quant.rs:657`, `run_lfq_combine`)
 

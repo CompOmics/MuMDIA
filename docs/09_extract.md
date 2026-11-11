@@ -163,6 +163,8 @@ production schema stays byte-identical):
 - `q1_profile` -> v5: `q1_corr`, `q1_offset`, `q1_frag_sd`, `q1_bin_frac` (F64, section 10).
 - `q1_fragments` -> v6: the `q1f_*` summary and the `q1f_frag_*` per-fragment lists of the
   Q1 decision (section 12).
+- `features.ms1_envelope` -> v7: the MS1 isotope-envelope evidence, 16 F64 columns
+  `ms1e_*` (section 13).
 
 The three soft-competition columns are all derived from the per-candidate
 `Contested` accumulator (`extract.rs:130`), whose fields are `won`/`lost`
@@ -1324,6 +1326,37 @@ against 0.77).
 All four keys stay off and benchmark-gated: one acquisition, and CLAUDE.md asks for a second
 one (docs/04_convert.md, "SCIEX ZT Scan DIA") before any default changes.
 
+The decisions are also read by quantification: `quant.q1_fragments` collapses every trace
+to one value per cycle under the calibrated transmission and leaves the fragments that do not
+belong out of the quantity (docs/12, "Quantification from the fragments that belong").
+
+### 13. MS1 isotope-envelope evidence (`features.ms1_envelope`, default off)
+
+Under `features.ms1_envelope` (`ExtractConfig::ms1_envelope`, which `run`, `run-experiment`
+and `mumdia extract` set from that key, never read from a configuration file), every row,
+rank 0 and promoted alike, reads the precursor's MS1 envelope at its own apex
+(`stages/ms1env.rs`, `read`): in the MS1 scan nearest the apex and two either side, the peak
+nearest each of M-1, M0 .. M+4 and the half-spacing positions above M0 and M+1, at the m/z the
+MS1 calibration reads each scan at (`ExtractConfig::ms1_shift` at the scan's retention time:
+the surface under `extract.ms1_calibrate = "surface"`, else the one offset), within twice
+`extract.prec_tol_ppm` and at least 10 ppm (`ms1env::search_tol`). It writes psms_extracted
+v7, the table of v2, v5 or v6 plus, appended last (F64):
+
+| column | meaning |
+|---|---|
+| `ms1e_i_m1`, `ms1e_i_0` .. `ms1e_i_4` | summed intensity over the scans of the nearest peak of M-1, M0 .. M+4 |
+| `ms1e_ppm_m1`, `ms1e_ppm_0` .. `ms1e_ppm_4` | their intensity-weighted ppm error against the calibrated m/z; NaN where none was found |
+| `ms1e_i_half` | summed intensity at the half-spacing positions above M0 and M+1 |
+| `ms1e_scans` | MS1 scans read (5, fewer at the run's ends) |
+| `ms1e_tol_ppm` | the search tolerance |
+| `ms1e_q1_agree` | under `extract.q1_fragments`, for a row whose decision has a fit: the fitted Q1 centre (`q1f_centre`, steps) less the centre the observed envelope predicts, `mu + sp (ibar_averagine - ibar_observed) / step`; NaN otherwise |
+
+The features stage derives the nine `ms1e_*` features from it (docs/10_features.md,
+"ms1_envelope"). Refused on spectra that carry 1/K0 (extract) and with
+`groups.window_groups > 1` (validation). The report records `params.ms1_envelope` (tolerance,
+scans, isotopes). Off, nothing is read and the table, its report and every later artifact
+keep their bytes.
+
 ## Key types and functions
 
 | Name | file:line | What it does |
@@ -1444,6 +1477,7 @@ here for one index.
 | `rt_im_train.q1_calibrate` (default false, scanning quadrupole only) | none; a `q1_calibration` block in `cal.json` (docs/08 section 4h), with `fragment_decision` under `extract.q1_fragments` | diagnostic: every other artifact unchanged (scored table byte-identical on ZT Scan REP01) |
 | `extract.q1_fragments` + `features.q1_fragment_features` (default false, scanning quadrupole only) | psms_extracted v6: the `q1f_*` summary (F64) and four `q1f_frag_*` per-fragment lists; eight features (section 12) | ZT Scan REP01: +1.45% precursors (four NN seeds, beyond the seed range), +1.26% human precursors at a matched entrapment FDP, combined FDP at 1% 1.31% against 1.39%; one acquisition |
 | `retrace.q1_repick` (default false, needs `extract.q1_fragments`) | `q1f_apex_moved_s`; moves the rank-0 apex to the 2D apex of the fragments that belong (section 12) | ZT Scan REP01, on top of the decision: +2.96% precursors, +2.92% human precursors at a matched FDP (four NN seeds); 60% of the accepted targets' apexes move, by one cycle; extract +40-75% |
+| `features.ms1_envelope` (default false) | psms_extracted v7: 16 F64 cols `ms1e_*`; nine features (section 13) | ZT Scan REP01, four NN seeds: human precursors at a matched entrapment FDP +0.01%, precursors on the human library +0.05%, both inside the seed range; label-blind (decoy against low-target KS at most 0.005); keep off |
 | `rescore.shadow_q1` (default false, needs `extract.q1_fragments`) | none; the shadow test co-isolates by m/z and counts shared fragments by their Q1 centre (docs/11) | ZT Scan REP01: no count change (inside the seed range), fewer entrapment precursors at 1%; with the other three keys +3.02% precursors, +3.17% at a matched FDP, measured FDP at 1% 1.22% against 1.39%, +2.3% in a three-run experiment |
 | `extract.ms1_calibrate = "surface"` (default `true`) | none; MS1 reads at a per-m/z, per-retention-time offset (section 11) | ZT Scan REP01: +0.2% precursors, +0.2% human precursors on an entrapment library at a combined FDP of 1.39% (one seed); with `prec_tol_auto` and `q1_calibrate` +0.46% (four NN seeds), +0.19% at 1.40% against 1.39%; one acquisition |
 | `extract.prec_tol_auto` (default false) | none; sets `prec_tol_ppm` from the calibrated MS1 residuals (section 11) | ZT Scan REP01: 7.1-7.4 ppm, +0.45% precursors, -0.1% human precursors on the entrapment library at 1.37% (one seed); one acquisition |

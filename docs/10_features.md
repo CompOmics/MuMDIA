@@ -758,6 +758,57 @@ Scan run with `extract.q1_fragments`: +1.45% precursors (mean of four NN seeds, 
 seed range), +1.26% human precursors on an entrapment library at the base arm's measured FDP;
 with `retrace.q1_repick` +2.96%.
 
+### ms1_envelope (9; `features.ms1_envelope`)
+
+In the battery only when `features.ms1_envelope` is on (`false` by default), appended after
+every other column of the `extended` set, after both Q1 families when they are on
+(`MS1E_FEATURES`, `stages/ms1env.rs`); `minimal` and `rich` ignore the switch. The `ms1`
+family reads the precursor at the apex alone: three isotopes and M-1, each the summed
+intensity within `extract.prec_tol_ppm` in the nearest MS1 scan, and no m/z, so an
+interfering peak inside the tolerance counts as the precursor's. This family reads, in the
+MS1 scans around the apex (the nearest one and two either side), the peak NEAREST each of the
+isotopes M-1 to M+4 and the half-spacing positions above M0 and M+1, at the calibrated MS1 m/z
+of each scan (`extract.ms1_calibrate`, the per-m/z and per-retention-time surface under
+`"surface"`), within twice `extract.prec_tol_ppm` and at least 10 ppm, so the m/z error is
+measured rather than cut at the tolerance. Extract writes that evidence to psms_extracted v7
+(docs/09_extract.md, section 13; `ExtractConfig::ms1_envelope`, which `run`,
+`run-experiment` and `mumdia extract` set from this key), and the features stage derives:
+
+| feature | meaning |
+|---|---|
+| `ms1e_env_r2` | the share of the observed M0..M+4 envelope (summed over the scans) the averagine envelope explains, `1 - |o - a e|^2 / |o|^2` at the least-squares scale `a >= 0`; 0 without signal |
+| `ms1e_env_n` | isotopes found in a row from M0 (0 to 5) |
+| `ms1e_m1_share` | M-1 against M-1 plus M0: another envelope one spacing below, or a monoisotopic peak assigned too high |
+| `ms1e_half_share` | the half-spacing positions against them plus M0 and M+1: a species of twice the charge, or a charge assigned too low |
+| `ms1e_spacing_ppm` | the intensity-weighted mean of `|ppm(k + 1) - ppm(k)|` over consecutive isotopes found among M0..M+4, the deviation of their spacing from `1.00335 / z` in ppm of the precursor m/z; 10 without a pair |
+| `ms1e_mono_ppm` | the M0 error after the calibration, intensity-weighted over the scans, signed; 0 when M0 is not found |
+| `ms1e_mono_ppm_abs` | its absolute value; 10 when M0 is not found |
+| `ms1e_ibar_dev` | the observed envelope's mean isotope index over M0..M+4 against the averagine one |
+| `ms1e_q1_agree` | under `extract.q1_fragments`, the distance in Q1 steps between the fitted Q1 centre of the candidate's fragments (`q1f_centre`) and the centre its OBSERVED MS1 envelope predicts, `|mu + sp (ibar_averagine - ibar_observed) / step|`; 0 without a fit or without the decisions |
+
+The envelope model is the Poisson averagine envelope (the shared
+`constants::averagine_isotopes`), not the peptide's own composition. No existing feature reads
+an MS1 m/z: `precursor_mass_error_ppm` was left out of `mass_accuracy` for want of one. The
+overlap with the `ms1` family is `ms1e_env_r2` and `ms1e_m1_share` against
+`ms1_isotope_cosine_apex` and `iso_minus_one_fraction`, which this family reads over five scans,
+five isotopes and the nearest peak rather than the apex scan's summed window. Refused on
+spectra with 1/K0 and with `groups.window_groups > 1`. The schema id changes only with the
+family on. Every value is read from the spectra and the library; nothing reads a label.
+
+Measured on ZT Scan REP01 (ZenoTOF 8600 K562, the phase-2 keys on in every arm, four NN seeds
+per arm, one binary and one host per library): with the family, human precursors at the base
+arm's measured entrapment FDP (1.22%) +0.01% (97,236 against 97,225; seed ranges 96,987-97,518
+and 96,992-97,540), precursors on the human library +0.05% (99,855 against 99,804; 99,635-100,068
+and 99,661-100,034), combined FDP at a reported 1% 1.25% against 1.22%; with
+`extract.ms1_calibrate = "surface"` under it -0.26% and +0.19%, the surface alone -0.19% and
+-0.33%. Within the seed spread everywhere: the family adds nothing the classifier did not
+have. Among the rows whose untrained `prelim_score` is below the decoys' median, the
+Kolmogorov-Smirnov statistic of decoys against targets is 0.0007-0.0050 for every `ms1e_*`
+feature (0.0005-0.0054 for `n_matched_fragments`, `frag_corr`, `log_apex_intensity`,
+`coelution_mean`, `rt_error_abs`), while the accepted targets differ (`ms1e_env_r2` median 0.60
+against 0.26, `ms1e_mono_ppm_abs` 3.5 against 7.9 ppm, `ms1e_q1_agree` 0.42 against 3.2 steps).
+Extract +0.6% wall on the entrapment library. Off by default.
+
 ## The Percolator PIN (`write_pin`, `features.rs:1537`)
 
 Streamed row-by-row through a `BufWriter` (not materialized as one String).
@@ -875,6 +926,7 @@ variant no longer exists).
 | `chrom_loaders` | 3 | chromatogram decode threads in the main pass, an upper bound that `--threads` and the chunk count also cap (see "The chunked pass" below); changes time and memory only, never a value or a byte of the features table |
 | `q1_features` | false | the `q1_profile` family of scanning-quadrupole spectra, which needs `extract.q1_profile`; appended last under `extended`. Omitted from the canonical configuration at its default |
 | `q1_fragment_features` | false | the `q1_fragments` family (eight `q1f_*` features of the per-fragment Q1 decision), which needs `extract.q1_fragments`; appended last under `extended`, after `q1_profile`. Omitted from the canonical configuration at its default |
+| `ms1_envelope` | false | the `ms1_envelope` family (nine `ms1e_*` features of the MS1 isotope envelope around the apex), whose evidence extract reads under the same key (psms_extracted v7); appended last under `extended`, after the Q1 families. Refused on 1/K0 spectra and grouped runs. Omitted from the canonical configuration at its default |
 | `im_features` | `off` | the `ion_mobility` family (`off`, `on`, `auto` = on when the spectra carry 1/K0). `run` and `run-experiment` resolve it once (`Config::resolve_im_features`) and hand every stage `on` or `off`; a standalone `mumdia features` resolves `auto` from the reader extract recorded in the chromatograms report. On a 4D run it also makes extract write the chromatograms' per-point 1/K0 (v3/v4). Omitted from the canonical configuration at its default |
 
 Note that the fragment tolerance used inside `mass_accuracy` is a hardcoded
