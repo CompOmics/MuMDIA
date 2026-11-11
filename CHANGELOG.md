@@ -7,6 +7,23 @@ All notable changes to MuMDIA are recorded here. The format follows
 `0.1.0` is the first tagged release of the Rust engine. The superseded
 Python implementation remains available at the tag `legacy-python-v1`.
 
+`0.12.0` is a minor release: it reads a new kind of data. SCIEX ZT Scan DIA runs, in which the
+quadrupole sweeps the precursor range instead of stepping through fixed windows, are read with
+`convert.isolation_half_width`, and an opt-in model of the sweep is delivered through the recipe
+`configs/examples/ztscan.json` with its guide, `docs/37_ztscan.md`: a calibration of the
+quadrupole's window, a decision per fragment on whether its signal belongs to the candidate
+along the sweep, an apex re-pick in retention time and quadrupole position, a quadrupole term
+in shadow demotion, feature families for the classifier, the sensitivity rescore and a
+quantification window counted in quadrupole cycles. The guide also gives the library settings
+measured for these runs. The desktop application recognises ZT Scan files when they are added,
+fills in the half-width, ticks the recipe for them and gives a library it builds from a FASTA
+the ZT Scan search space. An mzML whose MS2 spectra name an isolation target without window
+offsets is now refused, with the key that reads it, instead of being read as a single
+all-ion window; extract refuses an extraction whose estimated footprint exceeds the machine's memory;
+and the instrument is read from the instrument configuration of the mzML header. Every ZT Scan
+key is off by default, so every other search finds and quantifies what it found and
+quantified with `0.11.1`.
+
 `0.11.1` is a patch release that ships what `0.11.0` should have shipped. `0.11.0` was
 tagged but produced no binaries, because a new SQLite advisory failed the release gate.
 `0.11.1` patches the SQLite the engine uses to read timsTOF data and contains everything in
@@ -172,11 +189,11 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
-## [Unreleased]
+## [0.12.0] - 2026-11-11
 
 ### Added
 
-- **`convert.isolation_half_width` reads SCIEX ZT Scan DIA.** The SCIEX MS Data Converter
+- **`convert.isolation_half_width` reads SCIEX ZT Scan DIA (#304).** The SCIEX MS Data Converter
   writes every Q1 bin of a ZT Scan DIA (scanning-quadrupole) run as an MS2 spectrum that names
   its target m/z and no window offsets. With the key set to half the method's Q1 window (1.9
   m/z for 3.8), each such spectrum is read as `[target - h, target + h]`, in the f32
@@ -185,7 +202,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   overlapping windows and 97,401 precursors at 1% (97,171 from such a rewrite). Unset by
   default and then omitted from the canonical configuration; recorded in the spectra reports
   when set (docs/04_convert.md, "SCIEX ZT Scan DIA").
-- **A footprint guard in extract (`extract.max_footprint_gib`).** Before anything is probed,
+- **A footprint guard in extract (`extract.max_footprint_gib`, #304).** Before anything is probed,
   extract estimates the fragment-peak matches its hit store will hold at once, from a counted
   sample of peaks against fragments for every window, and refuses an extraction that passes
   the ceiling, naming an all-ion layout when one window holds the run. Unset is `auto`, the
@@ -195,7 +212,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   7,226 GiB for a ZT Scan run read as one all-ion window (docs/09_extract.md, "The footprint
   guard"). Not part of the canonical configuration.
 
-- **A model of the quadrupole sweep for scanning-quadrupole spectra, opt-in.** For SCIEX ZT
+- **A model of the quadrupole sweep for scanning-quadrupole spectra, opt-in (#305).** For SCIEX ZT
   Scan DIA read with `convert.isolation_half_width`, where every Q1 bin is a window of its own:
   `extract.q1_cycles` sums a candidate's bins of one cycle into one chromatogram point at the bin
   nearest its precursor; `extract.q1_profile` writes the Q1-profile evidence of every accepted
@@ -208,14 +225,14 @@ than a number. Both are recorded in every run's `manifest.json`.
   the profile features gained 0.4% precursors (four NN seeds), and 0.1% human precursors on an
   entrapment library at a combined FDP of 1.32% against 1.39%, while summing the bins lost
   about 14%, so all of them stay off (docs/09_extract.md, section 10).
-- **spectra_ms2 v3: the Q1 sweep of a scanning-quadrupole run.** When
+- **spectra_ms2 v3: the Q1 sweep of a scanning-quadrupole run (#306).** When
   `convert.isolation_half_width` widens the spectra of a SCIEX ZT Scan DIA run, convert records
   each MS2 spectrum's cycle and its step in the cycle (`q1_cycle`, `q1_step`, appended last);
   the window columns stay as read. Every other source, and a file that carries its offsets
   whatever the key, is written byte for byte as before (v1 or v2). On a ZenoTOF 8600 K562 run:
   3,238 cycles of 663 steps, every step with one target in every cycle. Readers select columns
   by name; `spectra::load_q1_sweep` reads the two (docs/04_convert.md, `spectra_ms2.parquet`).
-- **`rt_im_train.q1_calibrate`: the Q1 calibration of scanning-quadrupole spectra, opt-in.**
+- **`rt_im_train.q1_calibrate`: the Q1 calibration of scanning-quadrupole spectra, opt-in (#306).**
   From the confident seed PSMs, each strong fragment's Q1 centre over the steps around its
   elution apex against the centre of the quadrupole's transmission summed over the precursor's
   isotopes (Poisson-averagine abundance times the chance the fragment stays monoisotopic); the
@@ -229,7 +246,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   within 0.57 m/z of its centre and nothing beyond 4.56 m/z (docs/08_rt_im_train.md, section
   4h). Off by default and omitted from the canonical configuration.
 - **Per-fragment Q1 decisions for scanning-quadrupole spectra, opt-in
-  (`extract.q1_fragments`).** For every library fragment of every accepted row of a SCIEX ZT
+  (`extract.q1_fragments`, #307).** For every library fragment of every accepted row of a SCIEX ZT
   Scan DIA run, extract reads an RT x step patch (the seven cycles around the apex, the steps
   the calibrated Q1 window reaches plus two either side, every step kept apart), fits one Q1
   centre and width shared by the fragments, and calls each fragment `belongs`, `interfered`
@@ -239,16 +256,16 @@ than a number. Both are recorded in every run's `manifest.json`.
   a summary (`q1f_*`) and the per-fragment classes, offsets, residuals and 2D correlations
   (`q1f_frag_*` lists in library order). Needs `rt_im_train.q1_calibrate` and spectra_ms2 v3;
   `mumdia extract` takes the calibration as `--q1-cal` (docs/09_extract.md, section 12).
-- **`features.q1_fragment_features`, opt-in**: eight features from the decision (fragments
+- **`features.q1_fragment_features`, opt-in (#307)**: eight features from the decision (fragments
   that belong and their predicted-intensity share, the interfered intensity share, the
   median and spread of the fragments' Q1 offsets, the 2D correlation of the fragments that
   belong, the shared fit's residual and centre), appended last under `extended`; the
   feature schema id changes only with it on (docs/10_features.md).
-- **`retrace.q1_repick`, opt-in**: the ZT Scan analogue of `retrace.repick`, run inside
+- **`retrace.q1_repick`, opt-in (#307)**: the ZT Scan analogue of `retrace.repick`, run inside
   extract: the apex moves to the 2D apex (cycle, and the step nearest the fitted Q1 centre) of
   the peak whose fragments that belong agree best with the library, among extract's apex and
   the next peaks of its count profile, when at least three belong there.
-- **`rescore.shadow_q1`, opt-in**: the shadow test on a sweep co-isolates by precursor m/z
+- **`rescore.shadow_q1`, opt-in (#307)**: the shadow test on a sweep co-isolates by precursor m/z
   (closer than twice the calibrated window's reach) and counts each shared fragment by where
   its Q1 signal sits: nothing when absent or centred on the candidate, all of it when centred
   on the lender or when Q1 cannot separate the two, the two-component split in between
@@ -258,20 +275,20 @@ than a number. Both are recorded in every run's `manifest.json`.
   in a three-run experiment; the decision with its features +1.5%, the re-pick +1.5 points on
   top, the shadow term nothing beyond the seed spread. Every key is off by default and
   omitted from the canonical configuration, so every other search is byte-identical.
-- **`extract.ms1_calibrate = "surface"` and `extract.prec_tol_auto`, opt-in.** The surface fits
-  the seed anchors' MS1 error as an additive smooth function of precursor m/z and retention time
-  and centres every MS1 read on the offset at its own m/z and retention time; `prec_tol_auto`
-  sets `extract.prec_tol_ppm` to three robust standard deviations of the calibrated residuals
-  (1-15 ppm). `true` and `false` keep their meaning and the configuration hash. On the ZenoTOF
-  run the MS1 error was +2.84 ppm with a robust SD of 2.67 ppm, drifting by about 1 ppm over
-  the gradient and 0.8 ppm over m/z; the surface removed the drift (2.61 ppm) and the tolerance
-  came out at 7.2 ppm, against the 3 ppm default that holds two thirds of the anchors' MS1 peaks
-  there (an Orbitrap AIF run: 0.93 -> 0.80 ppm, 2.2 ppm). Together with the Q1 calibration they
-  gave +0.46% precursors (mean of four NN seeds, 97,317 -> 97,765) and +0.19% human precursors
-  on an entrapment library at a combined FDP of 1.40% against 1.39% (docs/09_extract.md, section
-  11). Recorded in the extract report when set.
+- **`extract.ms1_calibrate = "surface"` and `extract.prec_tol_auto`, opt-in (#306).** The
+  surface fits the seed anchors' MS1 error as an additive smooth function of precursor m/z and
+  retention time and centres every MS1 read on the offset at its own m/z and retention time;
+  `prec_tol_auto` sets `extract.prec_tol_ppm` to three robust standard deviations of the
+  calibrated residuals (1-15 ppm). `true` and `false` keep their meaning and the configuration
+  hash. On the ZenoTOF run the MS1 error was +2.84 ppm with a robust SD of 2.67 ppm, drifting by
+  about 1 ppm over the gradient and 0.8 ppm over m/z; the surface removed the drift (2.61 ppm)
+  and the tolerance came out at 7.2 ppm, against the 3 ppm default that holds two thirds of the
+  anchors' MS1 peaks there (an Orbitrap AIF run: 0.93 -> 0.80 ppm, 2.2 ppm). Together with the
+  Q1 calibration they gave +0.46% precursors (mean of four NN seeds, 97,317 -> 97,765) and
+  +0.19% human precursors on an entrapment library at a combined FDP of 1.40% against 1.39%
+  (docs/09_extract.md, section 11). Recorded in the extract report when set.
 - **Quantification of ZT Scan DIA traces by Q1 cycle, from the fragments that belong, opt-in
-  (`quant.q1_fragments`).** A ZT Scan trace interleaves about five Q1 steps per cycle, 1.3 ms
+  (`quant.q1_fragments`, #308).** A ZT Scan trace interleaves about five Q1 steps per cycle, 1.3 ms
   apart, so the trapezoid weighed the edge steps and the fixed window of seven samples spanned
   about 1.4 cycles. Under the key, quant collapses every fragment trace of an accepted
   candidate to one value per cycle (the least-squares amplitude of the cycle's steps under the
@@ -290,7 +307,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   known-ratio ZT Scan data, which could not be converted, so every key stays off
   (docs/12_quant_lfq_align_mbr_report_audit.md, "Quantification from the fragments that
   belong").
-- **The MS1 isotope-envelope feature family, opt-in (`features.ms1_envelope`).** Extract reads
+- **The MS1 isotope-envelope feature family, opt-in (`features.ms1_envelope`, #308).** Extract reads
   the precursor's isotopes M-1 to M+4 and the half-spacing positions in the five MS1 scans
   around the apex at the calibrated MS1 m/z (psms_extracted v7), and the features stage derives
   nine `ms1e_*` features: the envelope's agreement with averagine, the isotopes found in a row,
@@ -301,10 +318,11 @@ than a number. Both are recorded in every run's `manifest.json`.
   On the ZenoTOF 8600 K562 run, with the phase-2 keys, it changed nothing beyond the seed
   spread (four NN seeds: +0.01% human precursors at a matched entrapment FDP, +0.05% precursors
   on the human library), so it stays off (docs/10_features.md, "ms1_envelope").
-- **`mumdia quant --cross-run-pattern-from`.** Refits the pattern dispersion on the given tables
-  (the background-subtracted exports), which is what `run-experiment` does, so a quantification
-  repeated with `mumdia quant` on an experiment's scored tables reproduces the experiment's.
-- **The quantification window in Q1 cycles, opt-in (`quant.q1_cycle_halfwidth`).** On spectra
+- **`mumdia quant --cross-run-pattern-from` (#308).** Refits the pattern dispersion on the given
+  tables (the background-subtracted exports), which is what `run-experiment` does, so a
+  quantification repeated with `mumdia quant` on an experiment's scored tables reproduces the
+  experiment's.
+- **The quantification window in Q1 cycles, opt-in (`quant.q1_cycle_halfwidth`, #309).** On spectra
   that record a scanning quadrupole's sweep (spectra_ms2 v3), the fixed window's half-width is
   the key's cycles times each candidate's samples per cycle (the median count of its trace's
   samples in one cycle, located in the sweep by retention time), or the key itself on the cycle
@@ -317,7 +335,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   scan form of the fixed window and with `fixed_scan_halfwidth_scale`; `run` and
   `run-experiment` pass the spectra, `mumdia quant` takes `--spectra-ms2`. Whether the wider
   span adds interference bias needs known-ratio ZT Scan data (docs/37_ztscan.md, section 6).
-- **`retrace.q1_repick_peaks`, a bound on the peaks the ZT Scan re-pick compares, opt-in.**
+- **`retrace.q1_repick_peaks`, a bound on the peaks the ZT Scan re-pick compares, opt-in (#309).**
   `retrace.q1_repick` decides every count-profile peak it compares in full, which is most of
   the extraction time it adds. The key (default 5, the setting it was measured with) bounds
   them, strongest first; 0 only moves the apex to its own peak's 2D apex. Measured on the
@@ -325,20 +343,34 @@ than a number. Both are recorded in every run's `manifest.json`.
   fewer human precursors at a matched entrapment FDP and 0.50% fewer on the human library; at
   0, 37% less for 1.2% and 1.1% fewer. Omitted from the canonical configuration at its default
   (docs/37_ztscan.md, section 8).
-- **`mumdia peak-census` says how convert reads each MS2 isolation window.** For an mzML the
+- **`mumdia peak-census` says how convert reads each MS2 isolation window (#309).** For an mzML the
   census now carries an `isolation` block: spectra with offsets, without isolation and with a
   target and no offsets; whether `convert` refuses the file without
   `convert.isolation_half_width`, the targets' layout (count, range, step, cycle time) and, for
   a scanning quadrupole such as SCIEX ZT Scan DIA, a half-width to start from (five steps: 1.9
   m/z for the 0.7614 m/z steps of the measured method), by the rule `convert` refuses with
   (docs/37_ztscan.md, section 2).
-- **The desktop application recognises SCIEX ZT Scan DIA files.** Every selected mzML is checked
-  with the engine's isolation census when it is added. A file `convert` would refuse for want of
-  a Q1 half-width gets a card on the Search screen that says what the file is and why, fills in
-  the suggested half-width (a typed value is kept) and offers the ZT Scan recipe on top of the
-  chosen preset when every selected file is a ZT Scan run; a search with such a file and no
-  half-width is not started, and the recipe is refused with bands.
-- **A ZT Scan recipe and guide (`configs/examples/ztscan.json`, docs/37_ztscan.md).** The
+- **The desktop application recognises SCIEX ZT Scan DIA files (#309).** Every selected mzML is
+  checked with the engine's isolation census when it is added. A file `convert` would refuse for
+  want of a Q1 half-width gets a card on the Search screen that says what the file is and why,
+  fills in the suggested half-width (a typed value is kept) and offers the ZT Scan recipe on top
+  of the chosen preset when every selected file is a ZT Scan run; a search with such a file and
+  no half-width is not started, and the recipe is refused with bands.
+- **The desktop application ticks the ZT Scan recipe for ZT Scan files and gives their library
+  the ZT Scan search space (#PRNUM).** The recipe checkbox of the SCIEX ZT Scan DIA card is
+  ticked whenever every selected file is a ZT Scan run, until the user ticks or clears it: such
+  a file cannot be searched without the half-width, and the recipe is the best measured
+  configuration for it (a decision taken for this release; the card, and so the checkbox, never
+  appears for any other file). While the recipe is on, the Search space card holds the library
+  settings measured for these runs (docs/37_ztscan.md, section 11): charges 1 to 4, lengths 6
+  to 40, methionine oxidation and protein N-terminal acetylation as variable modifications, at
+  most two a peptide, and precursors inside the range the files sweep (the lowest target minus
+  the half-width to the highest plus it, rounded outward, following the half-width), so a
+  library built from a FASTA, by DIA-NN or the built-in predictors, the size estimate and the
+  library cache key follow them, and a note under the checkbox says what was set. When the
+  recipe goes off they are taken back, except a value the user edited since; the two
+  modifications are added to the user's choice and never saved as their preference.
+- **A ZT Scan recipe and guide (`configs/examples/ztscan.json`, docs/37_ztscan.md, #309).** The
   imported-library recipe plus the keys that measured positive on the K562 runs:
   `convert.isolation_half_width` 1.9, `rt_im_train.q1_calibrate`, `extract.q1_fragments`,
   `features.q1_fragment_features`, `retrace.q1_repick`, `rescore.shadow_q1` and
@@ -348,9 +380,20 @@ than a number. Both are recorded in every run's `manifest.json`.
   mechanism, records what each measured, the gate on the fragments that belong that was
   measured and not added (it removes 11-26% of the accepted precursors, mostly real ones),
   where time and memory go, the refusals and what is open: a second acquisition, which needs a
-  vendor-licence decision, and known-ratio data. No default changes.
+  vendor-licence decision, and known-ratio data. No default changes. As released, the recipe
+  also sets the feature families of #311 and #312 and the sensitivity rescore
+  (`rescore.folds` 5, `rescore.train_margin_frac` 0.75, `rescore.seeds` 3), and the guide
+  gains the library settings for these runs (section 11: charges 1-4 and lengths 6-40 with
+  protein N-terminal acetylation and two variable modifications gave +3.5% precursors and
+  +4.1% human precursors at a matched entrapment FDP; two missed cleavages -1.0%, a tighter
+  fragment tolerance -1.4% to -2.6%, and shadow demotion off raised the measured FDP from
+  1.22% to 1.44%) and the recipe as released, measured (section 12): with that library, four
+  NN seeds, 106,659 precursors on the human library and 104,129 human precursors at a combined
+  entrapment FDP of 1.22% (102,158 at 1.0%, 1.17-1.24% at a reported 1%), the sensitivity
+  rescore +0.8% of them beyond the seed spread at 2-3x the rescore time; the three runs as one
+  experiment 120,892 precursors, 116,827 per run on average, replicate CV 0.104.
 - **Three scanning-quadrupole feature families, opt-in (`features.q1_precursor`,
-  `features.q1_multiscale`, `features.q1_deconvolved`).** On a ZT Scan run under
+  `features.q1_multiscale`, `features.q1_deconvolved`, #311).** On a ZT Scan run under
   `extract.q1_fragments` (psms_extracted v8, appended last): the unfragmented precursor's
   isotopes read in the MS2 steps of the decision's patch, each at its own Q1 position (eight
   `q1p_*` features: presence, intensity share, the isotopes' Q1 shift and residual, the
@@ -366,7 +409,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   1.25-1.31%. The deconvolved evidence carries most of it; the three are added to
   `configs/examples/ztscan.json` (docs/37_ztscan.md, section 10).
 - **Q1-deconvolved evidence in the seed and in extract, opt-in (`search_seed.q1_deconvolved`,
-  `extract.q1_deconvolved`).** Every MS2 peak of a ZT Scan run is given the Q1 centroid of its
+  `extract.q1_deconvolved`, #311).** Every MS2 peak of a ZT Scan run is given the Q1 centroid of its
   trace along the sweep (`stages::q1dec`: mutual-nearest peaks of adjacent steps of one cycle,
   split at valleys; about 6 s and one byte a peak, never written), and the seed or extract counts
   a peak for a candidate only near the candidate's expected Q1 centre (the seed within two steps
@@ -376,7 +419,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   -8.4% at 2 steps, -38% (both); a real fragment's trace merges with other ions of its m/z, so a
   hard count removes real evidence with the interference. Kept off and out of the recipe
   (docs/09_extract.md, section 14).
-- **A Q1-consistency feature family for ZT Scan DIA, opt-in (`features.q1_consistency`).**
+- **A Q1-consistency feature family for ZT Scan DIA, opt-in (`features.q1_consistency`, #312).**
   The per-fragment Q1 decisions of `extract.q1_fragments` read against each fragment's
   expected Q1 centre rather than the centre the candidate's fragments share, which an
   interferer can pull away so that none belongs: sixteen `q1c_*` columns appended last under
@@ -394,7 +437,7 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
-- **An MS2 spectrum with an isolation target and no offsets is no longer read as all-ion.**
+- **An MS2 spectrum with an isolation target and no offsets is no longer read as all-ion (#304).**
   convert used to give such a spectrum the window 0 to 1e6 m/z, so a ZT Scan DIA run became one
   isolation window holding every spectrum, and extract grew past 521 GB before it was killed. A
   file whose target-only spectra name more than one target is now refused, once 10,000 of them
@@ -402,7 +445,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   many distinct targets repeating every cycle in steps finer than any window) and the key that
   reads it. A file in which they all name one target keeps the all-ion reading, with a warning.
   Every file with offsets converts byte-identically (checked on an Orbitrap DIA mzML).
-- **The instrument is read from the instrument configuration.** The header parser took the
+- **The instrument is read from the instrument configuration (#304).** The header parser took the
   first parameter of the whole parameter group list, which on a SCIEX MS Data Converter file is
   one of 1,328 spectrum groups, so a ZenoTOF 8600 read as "MS1 spectrum (MS:1000579)". The model
   now comes from the configurations and the groups they refer to, spectrum-level terms are
@@ -412,9 +455,9 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Security
 
-- **rustix 1.1.6** (RUSTSEC-2026-0486: rustix 1.1.4's xattr functions mark unwritten bytes as
-  initialised when given a zero-length buffer). Lockfile only; rustix is not in the engine's
-  default build graph.
+- **rustix 1.1.6 (#311, #312)** (RUSTSEC-2026-0486: rustix 1.1.4's xattr functions mark
+  unwritten bytes as initialised when given a zero-length buffer). Lockfile only; rustix is not
+  in the engine's default build graph.
 
 ## [0.11.1] - 2026-11-10
 

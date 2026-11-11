@@ -8,7 +8,8 @@ search, section 3 the opt-in model of the sweep layer by layer, section 4 how to
 section 5 what was measured, section 6 the quantification window in Q1 cycles, section 7 the
 gate on the fragments that belong that was measured and not added, section 8 where time and
 memory go, section 9 what is refused, section 10 the unfragmented precursor, multi-scale Q1
-scores and Q1-deconvolved evidence, and section 11 what is open. Reading a ZT Scan file
+scores and Q1-deconvolved evidence, section 11 the library, section 12 the recipe as released,
+measured, and section 13 what is open. Reading a ZT Scan file
 needs one key (`convert.isolation_half_width`); everything that models the sweep is off by
 default, and `configs/examples/ztscan.json` is the recipe that turns on what measured
 positive. The mechanisms each have a canonical section elsewhere (docs/04, 08, 09, 10, 11 and
@@ -20,7 +21,7 @@ scanned 392-900 m/z and predicted decoys, and the same library extended with yea
 coli entries for entrapment (r = 0.397, combined FDP = N_E (1 + 1/r) / (N_H + N_E)). That is
 why no default changes: CLAUDE.md asks for a second acquisition, and the ZenoTOF ZT Scan
 files of the benchmark collection are vendor files whose conversion with isolation targets
-is a licence decision (section 11).
+is a licence decision (section 13).
 
 ## 1. What a ZT Scan run is
 
@@ -88,8 +89,16 @@ and cycle from the census), why it
 cannot be read without the half-width, an input filled with the suggestion (a value the user
 types is kept), and a checkbox for the ZT Scan recipe on top of the chosen preset, enabled only
 when every selected file is a scanning-quadrupole run, because the recipe's keys refuse
-spectra without a sweep. A search with such a file and no half-width is not started; the
-recipe is refused with bands, which `rt_im_train.q1_calibrate` refuses.
+spectra without a sweep. The checkbox is ticked whenever it is enabled, until the user ticks or
+clears it: a ZT Scan file cannot be searched without the half-width, and the recipe is the best
+measured configuration for it (section 12); it never appears for any other file. While the
+recipe is on, the Search space card holds the library settings of section 11 (charges 1-4,
+lengths 6-40, methionine oxidation and protein N-terminal acetylation as variable
+modifications, at most two a peptide, and precursors inside the swept range, which follows the
+half-width), so a library built from a FASTA, the size estimate and the library cache key follow
+them; when it goes off they are taken back, except a value the user edited since. A search with
+such a file and no half-width is not started; the recipe is refused with bands, which
+`rt_im_train.q1_calibrate` refuses.
 
 ## 3. The model of the sweep, layer by layer
 
@@ -117,6 +126,8 @@ every other search is byte-identical. Measured on REP01 with four NN seeds per a
 | the three together | (the three keys) | section 10 below | +0.76% precursors, +1.38% human precursors at matched FDP, beyond the seed spread on both libraries | |
 | count only Q1-consistent peaks in the seed, in extract | `search_seed.q1_deconvolved`, `extract.q1_deconvolved` | docs/07, docs/09 section 14 | -2.5% (seed), -25.6% (extract), -38% (both) | no |
 | score each fragment's Q1 centre against its expected one | `features.q1_consistency` | docs/10, "q1_consistency" | on top of the four: +2.97% human precursors at the measured FDP and +2.48% precursors on the human library (the family alone, its columns kept out of the rescore prefilter: +2.28% and +1.85%) | yes |
+| the library's search space: charges 1-4, lengths 6-40, protein N-terminal acetylation, two variable modifications | the library build (`digest.*`, `peptidoforms.*`, or the predictor of an imported library) | section 11 below | +3.47% precursors, +4.09% human precursors at matched FDP, the measured FDP 1.18% against 1.22%; two missed cleavages -1.0% | the desktop sets it with the recipe |
+| the sensitivity rescore | `rescore.folds` 5, `rescore.train_margin_frac` 0.75, `rescore.seeds` 3 | docs/28, section 21; section 11 below | on the section 11 library +1.24% / +0.57% at matched FDP, about 2x the rescore time; section 12 has it in the released recipe | yes |
 
 The four decision keys of the recipe are the phase-2 set, measured together: +3.0%
 precursors on the human library and +3.2% human precursors on the entrapment library at the
@@ -152,14 +163,17 @@ mumdia run --lib-precursors lib/lib_precursors.parquet --lib-fragments lib/lib_f
 
 - Change `convert.isolation_half_width` to half of your method's Q1 window (`mumdia
   peak-census` suggests one, section 2).
-- Restrict the library to the precursor range the method scanned (here 392-900 m/z); the
-  sweep covers nothing outside it.
+- Build the library with the settings of section 11: charges 1-4, lengths 6-40, methionine
+  oxidation and protein N-terminal acetylation, at most two variable modifications, and the
+  precursor range the method scanned (here 392-900 m/z; the sweep covers nothing outside it).
+  The desktop application sets them when the recipe is on.
 - Uncapped peaks (the default `--top-peaks-ms2 0`): ZT Scan spectra hold about 800 peaks
   each (p25 545, p95 1,078 at the start of the run).
-- Expect about 20 min and 40 GB for one run with the human library on 32 threads, and about
-  51 min and 78 GB for the three runs as one experiment, the peak from the concurrent
-  second-pass extracts (sections 8 and 10.7; the recipe before the feature families of section
-  10 took 18.5 min and 35 GB on the same host).
+- Expect about 31 min and 43 GB for one run with the section 11 library on 64 threads, and
+  about 90 min and 109 GB for the three runs as one experiment, the peak from the concurrent
+  second-pass extracts (section 12; on the base library the recipe before the feature
+  families took 18.5 min and 35 GB on 32 threads, with the three families of section 10 20 min
+  and 40 GB, section 10.7). The sensitivity rescore is 2-3x the rescore time, 8-14% of a run.
 - The recipe is refused with `groups.window_groups > 1` (the Q1 calibration needs the whole
   sweep), so a machine too small for one run cannot band it; the base reading
   (`isolation_half_width` alone) can be banded.
@@ -703,9 +717,137 @@ their features are label-blind. So `configs/examples/ztscan.json` sets `features
 carry most of it: leaving the multi-scale family out costs 0.34% on the entrapment library, and
 the set was measured as a whole. The keys that count only Q1-consistent peaks
 (`search_seed.q1_deconvolved`, `extract.q1_deconvolved`) lose identifications at every
-tolerance and stay off and out of the recipe. No default changes (section 11).
+tolerance and stay off and out of the recipe. No default changes (section 13).
 
-## 11. Open items
+## 11. The library for a ZT Scan search
+
+The library sets the search space before any key of the sweep model acts, and on these runs
+its settings moved the identifications as much as the four decision keys of the recipe together. Each library below is the
+base library's recipe (section 4: a predicted library of the same FASTA restricted to the swept
+392-900 m/z, with predicted reversed decoys, in a human and an entrapment version) with one
+setting changed, then the positive ones together. REP01 with the recipe of section 4 as it stood
+before the feature families of sections 5 and 10 were added, two or four NN seeds per arm (seeds
+1-3 rescore the run's competed table), the human library on horntail and the entrapment library
+on dementor, 64 threads each, every arm of a library on one host. Matched FDP: the human
+precursors where the arm's combined entrapment FDP reaches the base arm's mean at a reported 1%
+on that host (1.22%), interpolated along the `precursor_q` thresholds.
+
+| library (what differs from the base) | human library: precursors at 1%, mean (range, seeds) | vs base | entrapment: human precursors at the matched FDP, mean (range, seeds) | vs base | combined FDP at a reported 1% |
+|---|---|---|---|---|---|
+| base: one missed cleavage, lengths 7-30, charges 2-4, Met oxidation, one variable modification | 99,605 (99,331-99,817, 4) | | 97,213 (97,005-97,539, 4) | | 1.22% |
+| two missed cleavages | 98,568 (98,449-98,688, 2) | -1.04% | 96,098 (96,071-96,126, 2) | -1.15% | 1.25% |
+| charges 1-5 | 101,596 (101,206-102,154, 4) | +2.00% | 99,058 (98,782-99,334, 2) | +1.90% | 1.16% |
+| lengths 6-40 | 100,454 (100,314-100,533, 4) | +0.85% | | | |
+| protein N-terminal acetylation, two variable modifications | 100,711 (100,462-100,956, 4) | +1.11% | 98,334 (98,142-98,527, 2) | +1.15% | 1.20% |
+| **charges 1-4, lengths 6-40, Met oxidation and protein N-terminal acetylation, two variable modifications** | **103,058 (102,890-103,227, 2)** | **+3.47%** | **101,193 (101,165-101,222, 2)** | **+4.09%** | 1.18% |
+| the same library, sensitivity rescore (`folds` 5, `train_margin_frac` 0.75, `seeds` 3) | 104,335 (104,163-104,454, 4) | +4.75% | 101,769 (101,642-101,959, 4) | +4.69% | 1.22% |
+| the base library, sensitivity rescore | 100,320 (100,253-100,455, 4) | +0.72% | 97,910 (97,439-98,144, 4) | +0.72% | 1.21% |
+
+What each setting does:
+
+- **Charges 1 to 4.** Singly charged precursors are real on these runs: the charge 1-5 library
+  accepted 1,395 of them at 1% and the combined library 1,719. Charge 5 is not worth its share
+  of the search space: 158 accepted precursors (0.16% of the arm's), so the combined library
+  stops at 4.
+- **Lengths 6 to 40** add 0.85%, **protein N-terminal acetylation with two variable
+  modifications** 1.1% on both libraries. Together with charge 1 they give +3.5% precursors on
+  the human library and +4.1% human precursors at the matched entrapment FDP, beyond the seed
+  spread on both, with the measured FDP at a reported 1% at 1.18% against 1.22%: the larger
+  search space did not loosen the reported 1%.
+- **Two missed cleavages lose** 1.0% and 1.2%, at a higher measured FDP (1.25%): the
+  candidates they add cost more than they bring.
+- **The sensitivity rescore** (`rescore.folds` 5, `rescore.train_margin_frac` 0.75,
+  `rescore.seeds` 3) adds 0.7% on the base library and, on the combined library, 1.2% on the
+  human library and 0.6% at the matched entrapment FDP, at a measured FDP of 1.22% against
+  1.18%; at a combined FDP of 1.0% it is +0.4% (99,800 against 99,387). It costs rescore time,
+  not extraction: 291-316 s against 149-159 s on horntail and 298-350 s against 155-163 s on
+  dementor for the single run, about 2x the rescore and 8% of the run, because every one of
+  five folds trains three networks. Section 12 has its share in the released recipe.
+
+Measured and rejected on the same base (two NN seeds each, the human library and the entrapment
+library at the matched FDP):
+
+| change | human library, vs base | entrapment at the matched FDP, vs base | combined FDP at a reported 1% |
+|---|---|---|---|
+| a tighter fragment tolerance (`search_seed.frag_tol_mad_k` 3: an effective 11.6 ppm against 20.1) | -1.40% | -2.62% (-2.55% at a combined FDP of 1.0%) | 1.25% |
+| shadow demotion off (`rescore.shadow_min_shared` 0, `rescore.shadow_q1` removed) | -0.83% | -2.94% | **1.44%** |
+| `rescore.shadow_min_shared` 2 (the default 3) | -1.55% | -1.27% | 1.18% |
+| `rescore.shadow_rt_s` 6 (the default 3) | -0.72% | -0.22% | 1.16% |
+| `rescore.shadow_ppm` 20 (the default 10) | -0.22% | -0.18% | 1.24% |
+| the extraction gate at 0, 0.4 or 0.5 (`extract.gate_min_score`, the recipe 0.6) | -0.59% to +0.15% | -0.62% to +0.04% | 1.22-1.28% |
+| `rt_im_train.rt_window_multiplier` 1.0 or 2.0 (the recipe 1.5) | -0.26% / -0.19% | -0.40% / -0.19% | 1.24% / 1.22% |
+| the rescore prefilter off (`rescore.prefilter_keep_decoys` 0) | -0.42% | +0.07% | 1.23% |
+
+`frag_tol_mad_k` 3 narrows the fragment tolerance the seed learns and loses on both libraries,
+so the default stays. Shadow demotion is what holds the measured FDP
+near the reported 1% on these runs (1.22% with it, 1.44% without), so it stays on, at its
+defaults.
+
+**How to build it.** For a library predicted from a FASTA, the settings are the digest and
+peptidoform keys of the engine (`digest.missed_cleavages` 1, `digest.min_len` 6,
+`digest.max_len` 40, `peptidoforms.charge_min` 1, `peptidoforms.charge_max` 4, Oxidation on M
+and Acetyl on the protein N-terminus in `peptidoforms.variable_mods`,
+`peptidoforms.max_variable_mods` 2, and `peptidoforms.precursor_mz_min` / `_max` at the swept
+range), or the same settings in the predictor that builds an imported library. The desktop
+application sets them in its Search space card whenever the ZT Scan recipe is on (section 2),
+with the precursor range taken from the files' census: the lowest target minus the half-width
+to the highest plus it, rounded outward to whole m/z (392 to 901 m/z for the K562 method). The
+recipe file itself does not set them, because an imported library's search space is decided
+when it is built.
+
+## 12. The recipe as released, measured
+
+`configs/examples/ztscan.json` as released in 0.12.0 is the recipe of section 4 with the four
+feature families (`features.q1_precursor`, `features.q1_multiscale`, `features.q1_deconvolved`,
+section 10; `features.q1_consistency`, section 5) and the sensitivity rescore (`rescore.folds`
+5, `rescore.train_margin_frac` 0.75, `rescore.seeds` 3, section 11). Measured with the 0.12.0
+release build on REP01 and the library of section 11 (charges 1-4, lengths 6-40, methionine
+oxidation and protein N-terminal acetylation, at most two variable modifications, 392-900 m/z),
+the shipped file unchanged but for its scripts directory, its `"auto"` interpreters resolved
+through `MUMDIA_PYTHON_DEEPLC` / `MUMDIA_PYTHON_RESCORE`, `MUMDIA_CACHE_DIR=off`, 64 threads: the
+human library on horntail, the entrapment library on hippogriff, four NN seeds (seeds 1-3
+rescore the run's competed table). "Without the sensitivity rescore" is the same competed table
+rescored with the three rescore keys removed, which is what the recipe without them writes for
+that run. Decoy fraction 0.0100 in every arm.
+
+| library | arm | precursors at 1%, mean (range) | peptides / protein groups, mean | human precursors at a combined FDP of 1.22%, mean (range) | at 1.0% | combined FDP at a reported 1% |
+|---|---|---|---|---|---|---|
+| human | the released recipe | **106,659 (106,476-106,933)** | 84,802 / 7,882 | | | |
+| human | without the sensitivity rescore | 105,788 (105,400-106,059) | 84,143 / 7,818 | | | |
+| entrapment | the released recipe | 104,339 (104,274-104,385) | 82,729 / 8,067 | **104,129 (103,852-104,368)** | **102,158 (101,939-102,386)** | 1.17-1.24% |
+| entrapment | without the sensitivity rescore | 103,129 (102,854-103,481) | 81,905 / 8,007 | 103,327 (103,084-103,551) | 100,971 (100,312-101,403) | 1.15-1.18% |
+
+The sensitivity rescore adds 0.82% precursors on the human library and 0.78% human precursors
+at a combined FDP of 1.22% (1.18% at 1.0%), beyond the seed spread on both libraries; it moves
+the measured FDP at a reported 1% from 1.15-1.18% to 1.17-1.24%, which is why counts are
+compared at a measured FDP. Its cost is the rescore: 295-324 s against 139-192 s on the human
+library, 386-410 s against 141-146 s on the entrapment library, of a run of 1,840 s and 1,802 s
+(43 GB at the peak, extract's).
+
+On the human library, on one host with one thread count, the steps that led to the released
+recipe: the recipe as first merged (section 4) on the base library 99,605 precursors (four
+seeds); the section 11 library 103,058 (two seeds, +3.5%); with the sensitivity rescore 104,335
+(+4.7%); with the four feature families as well, the released recipe, 106,659 (+7.1% against the
+first, +2.2% against the one before). The release build writes, for the human library, the
+competed table of the measurement build of #311 and #312 on another host of the same CPU class
+and thread count byte for byte, and the same four seeds' counts (106,476, 106,578, 106,648,
+106,933).
+
+The three runs as one experiment (REP01-03, pooled rescore, second pass, the human library, NN
+seed 0, dementor, 64 threads):
+
+| experiment | precursors | peptides | protein groups | per run on `run_psm_q` | first pass per run | median precursor / protein CV | complete in 3 of 3 | wall, peak |
+|---|---|---|---|---|---|---|---|---|
+| the released recipe | 120,892 | 95,970 | 9,332 | 116,894 / 116,933 / 116,655 | 107,427 / 107,730 / 108,011 | 0.104 / 0.046 | 91.2% | 90 min, 109 GB |
+
+Against the experiments of sections 5 and 11 on another host of the same CPU class (horntail,
+64 threads): the recipe as first merged on the base library 113,013 precursors, 90,739
+peptides, 9,027 protein groups and 109,028 / 109,185 / 109,093 per run; the section 11 library
+with the sensitivity rescore 118,385, 94,130, 9,230 and 114,249 / 114,362 / 114,373. The
+replicate CV is the one the 4-cycle window gives (section 6); the feature families change no
+trace. The peak is the concurrent second-pass extracts of the three runs (section 10.8).
+
+## 13. Open items
 
 - **A second acquisition, and known ratios.** Every number here is one ZenoTOF 8600 method on
   one sample. The benchmark collection holds the ZenoTOF 7600+ ZT Scan DIA arms of PXD070049
@@ -725,8 +867,9 @@ tolerance and stay off and out of the recipe. No default changes (section 11).
   removes ratio bias, and how much background the 4-cycle window adds, needs ZT Scan data with
   known ratios (the arms above).
 - **Calibration of the reported FDR.** With the four keys the measured entrapment FDP at a
-  reported precursor q of 1% is 1.22% (1.39% without them), and with the recipe as it is now
-  1.21-1.30% on another host (section 10.4); compare counts at a measured FDP.
+  reported precursor q of 1% is 1.22% (1.39% without them), with the three families of section
+  10 1.21-1.30% on another host (section 10.4), and with the recipe as released 1.17-1.24%
+  (section 12); compare counts at a measured FDP.
 - **The re-pick's cost** (section 8): `retrace.q1_repick_peaks` 2 takes 28% off extract for
   0.2-0.5% of the identifications; a cheaper statistic that ranks the alternatives without
   deciding them was not found.

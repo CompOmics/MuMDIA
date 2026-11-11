@@ -30,7 +30,10 @@
     "classifier": "nn_torch",
     "python": "auto",
     "strict": true,
-    "shadow_q1": true
+    "shadow_q1": true,
+    "folds": 5,
+    "train_margin_frac": 0.75,
+    "seeds": 3
   },
   "quant": {
     "q_filter": "run_psm_q",

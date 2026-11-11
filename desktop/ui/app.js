@@ -1716,10 +1716,11 @@ function renderZtscanNote() {
   if (!allowed) $("ztscan-recipe").checked = false;
   else if (!state.ztscan.recipeTouched) $("ztscan-recipe").checked = true;
   $("ztscan-recipe-note").textContent = allowed
-    ? "Measured on one ZT Scan acquisition: about 3% more precursors at a lower measured " +
-      "false discovery proportion, and about a third of the replicate CV of the default " +
-      "quantification, for roughly twice the extraction time. Not yet validated on a " +
-      "second acquisition."
+    ? "Measured on one ZT Scan acquisition (K562 on a ZenoTOF 8600): with its library " +
+      "settings, about 10% more precursors than the half-width alone, a measured false " +
+      "discovery proportion of about 1.2% at a reported 1% (1.4% with the half-width alone), " +
+      "and under half the replicate CV of the default quantification; extraction and " +
+      "rescoring take longer. Not yet validated on a second acquisition."
     : "The recipe's settings need every selected file to be a ZT Scan run; select only " +
       "those to use it.";
   syncZtscanLibrary();
