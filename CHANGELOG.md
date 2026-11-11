@@ -395,6 +395,12 @@ than a number. Both are recorded in every run's `manifest.json`.
   up to `<run>` (at most 16 MiB). The 17 other mzML layouts of the benchmark collection read as
   before.
 
+### Security
+
+- **rustix 1.1.6** (RUSTSEC-2026-0486: rustix 1.1.4's xattr functions mark unwritten bytes as
+  initialised when given a zero-length buffer). Lockfile only; rustix is not in the engine's
+  default build graph.
+
 ## [0.11.1] - 2026-11-10
 
 ### Changed
