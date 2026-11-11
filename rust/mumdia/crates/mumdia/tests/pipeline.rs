@@ -285,6 +285,7 @@ fn features_compete_rescore_run_on_crafted_input() {
         cfg: &cfg.features,
         config_hash: "test",
         imc_ref_w: false,
+        q1_tolerances: None,
     })
     .unwrap();
     // PIN header exists.
@@ -438,6 +439,7 @@ fn search_stages_return_the_hashes_of_the_files_they_wrote() {
         cfg: &cfg.features,
         config_hash: "test",
         imc_ref_w: false,
+        q1_tolerances: None,
     })
     .unwrap();
     assert_written(&wfeat, &feats);
@@ -504,6 +506,7 @@ fn downstream_bytes(psms: &str, chrom: &str, cfg: &Config, tag: &str) -> Vec<Vec
         cfg: &cfg.features,
         config_hash: "test",
         imc_ref_w: false,
+        q1_tolerances: None,
     })
     .unwrap();
     let competed = tmp(&format!("v2_{tag}_competed.parquet"));
@@ -784,6 +787,7 @@ fn features_chunking_is_value_preserving() {
                 cfg: &cfg.features,
                 config_hash: "test",
                 imc_ref_w: false,
+                q1_tolerances: None,
             },
             chunk_rows,
         )
@@ -2851,6 +2855,7 @@ fn a_trace_pad_widens_the_traces_and_nothing_the_scores_read() {
             cfg: &cfg.features,
             config_hash: "test",
             imc_ref_w: false,
+            q1_tolerances: None,
         })
         .unwrap();
         std::fs::read(&out).unwrap()

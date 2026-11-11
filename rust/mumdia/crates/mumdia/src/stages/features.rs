@@ -12,7 +12,7 @@ use std::time::Instant;
 use anyhow::{anyhow, Context as _, Result};
 use arrow::array::{Array, ArrayRef, Float32Array, Float64Array, StringArray, UInt32Array};
 use arrow::record_batch::RecordBatch;
-use mumdia_core::config::{FeatureSet, FeaturesConfig, ImFeatures};
+use mumdia_core::config::{FeatureSet, FeaturesConfig, ImFeatures, Q1FragTolerances};
 use mumdia_core::constants::{ppm_diff, PROTON};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
@@ -338,6 +338,12 @@ pub const Q1F_FEATURES: &[&str] = &[
 /// set (after [`Q1F_FEATURES`] when that is on).
 pub const MS1E_FEATURES: &[&str] = super::ms1env::FEATURES;
 
+/// The Q1-consistency family (`features.q1_consistency`, [`super::q1consist`]): the
+/// per-fragment Q1 decisions of psms_extracted v6 read against each fragment's expected Q1
+/// centre, appended after every other column of the `extended` set (after
+/// [`MS1E_FEATURES`] when that is on).
+pub const Q1C_FEATURES: &[&str] = super::q1consist::NAMES;
+
 /// The ordered active feature list for the configured set. `im` is the resolved
 /// `features.im_features`, with `imc_ref_w` when `retrace.apex_features` wrote it
 /// ([`ImFamily`]): under `extended` it appends the ion-mobility columns after the other
@@ -372,6 +378,19 @@ pub fn active_features_all(
     q1f: bool,
     ms1e: bool,
 ) -> Vec<String> {
+    active_features_q1c(set, im, q1, q1f, ms1e, false)
+}
+
+/// [`active_features_all`], with the Q1-consistency family ([`Q1C_FEATURES`]) appended last
+/// under `extended` when `q1c` (`features.q1_consistency`) is on.
+pub fn active_features_q1c(
+    set: FeatureSet,
+    im: impl Into<ImFamily>,
+    q1: bool,
+    q1f: bool,
+    ms1e: bool,
+    q1c: bool,
+) -> Vec<String> {
     let mut v: Vec<String> = MINIMAL_FEATURES.iter().map(|s| s.to_string()).collect();
     if matches!(set, FeatureSet::Rich | FeatureSet::Extended) {
         v.extend(RICH_EXTRA.iter().map(|s| s.to_string()));
@@ -399,6 +418,9 @@ pub fn active_features_all(
         if ms1e {
             v.extend(MS1E_FEATURES.iter().map(|s| s.to_string()));
         }
+        if q1c {
+            v.extend(Q1C_FEATURES.iter().map(|s| s.to_string()));
+        }
     }
     v
 }
@@ -407,12 +429,13 @@ pub fn active_features_all(
 /// that do (`has_im`) or do not carry 1/K0. An orchestrator resolves it once
 /// (`Config::resolve_im_features`), so `has_im` then changes nothing.
 pub fn active_features_for(cfg: &FeaturesConfig, has_im: bool) -> Vec<String> {
-    active_features_all(
+    active_features_q1c(
         cfg.set,
         cfg.im_features.on(has_im),
         cfg.q1_features,
         cfg.q1_fragment_features,
         cfg.ms1_envelope,
+        cfg.q1_consistency,
     )
 }
 
@@ -422,12 +445,13 @@ pub fn active_features_for(cfg: &FeaturesConfig, has_im: bool) -> Vec<String> {
 /// `retrace.enabled` and without the ion-mobility family).
 pub fn active_features_of(cfg: &mumdia_core::config::Config, has_im: bool) -> Vec<String> {
     let im = cfg.features.im_features.on(has_im);
-    active_features_all(
+    active_features_q1c(
         cfg.features.set,
         ImFamily::of(im, cfg.retrace.apex_features),
         cfg.features.q1_features,
         cfg.features.q1_fragment_features,
         cfg.features.ms1_envelope,
+        cfg.features.q1_consistency,
     )
 }
 
@@ -1391,6 +1415,10 @@ pub struct FeaturesParams<'a> {
     /// ion-mobility family: `retrace.apex_features` in a pass that retraced. Read only while
     /// the family is on; the column must then be in `psms`.
     pub imc_ref_w: bool,
+    /// The run's per-fragment Q1 decision tolerances (`cal.json`, `q1frag::read_model`),
+    /// which `features.q1_consistency` reads; `None` elsewhere. With the family on and none
+    /// given the stage is an error.
+    pub q1_tolerances: Option<Q1FragTolerances>,
 }
 
 /// Chromatogram rows resident at once in the chunked feature pass. At the ~200-point
@@ -2252,6 +2280,22 @@ col_ix!(
     ms1e_mono_ppm_abs,
     ms1e_ibar_dev,
     ms1e_q1_agree,
+    q1c_n,
+    q1c_n_corr,
+    q1c_pred_share,
+    q1c_obs_share,
+    q1c_entropy,
+    q1c_cosine,
+    q1c_top3,
+    q1c_entropy_corr,
+    q1c_soft_pred,
+    q1c_soft_obs,
+    q1c_soft_entropy,
+    q1c_n_tight,
+    q1c_n_loose,
+    q1c_corr2d_mean,
+    q1c_offset_wmean,
+    q1c_offset_top3,
 );
 
 /// Percolator-style PIN written row by row as the chunks are computed. Nothing in the
@@ -3565,6 +3609,39 @@ fn run_chunked(
     } else {
         Vec::new()
     };
+    // The Q1-consistency family (`features.q1_consistency`): the per-fragment Q1 decision
+    // lists of psms_extracted v6, one flat buffer each, and the run's decision tolerances.
+    // Only the extended set carries the family. An error without the lists or the
+    // tolerances, as for the other Q1 families.
+    type FlatList = (Vec<usize>, Vec<f32>);
+    let q1c_in: Option<(Q1FragTolerances, Vec<FlatList>)> =
+        if p.cfg.q1_consistency && matches!(p.cfg.set, FeatureSet::Extended) {
+            let tol = p.q1_tolerances.ok_or_else(|| {
+                anyhow!(
+                    "features: features.q1_consistency reads the per-fragment Q1 decisions \
+                     against the run's learned tolerances, and none were given; pass the \
+                     run's cal.json (mumdia features --q1-cal)"
+                )
+            })?;
+            let lists = super::q1consist::LISTS
+                .iter()
+                .map(|c| {
+                    if !ps.has_column(c) {
+                        anyhow::bail!(
+                            "features: features.q1_consistency is on, but {} has no {c} \
+                             column; extract writes the per-fragment Q1 decisions under \
+                             extract.q1_fragments",
+                            p.psms
+                        );
+                    }
+                    ps.list_f32_flat(c)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Some((tol, lists))
+        } else {
+            None
+        };
+    let q1c_mismatch = std::sync::atomic::AtomicUsize::new(0);
     let contested = ps
         .f64("contested_frac")
         .unwrap_or_else(|_| vec![0.0; ps.nrows]);
@@ -3745,12 +3822,13 @@ fn run_chunked(
     };
 
     let gradient = apex_rt.iter().cloned().fold(0.0f64, f64::max).max(1.0);
-    let cols_active = active_features_all(
+    let cols_active = active_features_q1c(
         p.cfg.set,
         im_fam,
         p.cfg.q1_features,
         p.cfg.q1_fragment_features,
         p.cfg.ms1_envelope,
+        p.cfg.q1_consistency,
     );
     let n = ps.nrows;
 
@@ -3811,6 +3889,13 @@ fn run_chunked(
     // `rows x n_ext` buffer now, filled by `par_chunks_mut` and addressed by offset;
     // the values, their order and their row assignment are unchanged.
     let n_ext = if extended { ext_names.len() } else { 0 };
+    // The Q1-consistency values ride at the tail of each row's extended buffer.
+    let n_q1c = if q1c_in.is_some() {
+        Q1C_FEATURES.len()
+    } else {
+        0
+    };
+    let n_buf = n_ext + n_q1c;
     // The feature -> column permutation, taken once instead of once per value per row.
     let ix = ColIx::new(&cols_active, &ext_names);
 
@@ -4010,6 +4095,30 @@ fn run_chunked(
                     global_bounds,
                 );
                 let peak = PeakTraces::new(&al, &pred, win);
+                if let Some((tol, lists)) = q1c_in.as_ref() {
+                    // Each fragment's observed intensity summed over the elution peak, in
+                    // the chromatogram rows' order, which is the library order of the lists.
+                    let obs_peak: Vec<f64> = al
+                        .traces_full
+                        .iter()
+                        .map(|t| t.get(win.0..=win.1).map_or(0.0, |s| s.iter().sum()))
+                        .collect();
+                    let row = |k: usize| -> &[f32] {
+                        let (o, v) = &lists[k];
+                        &v[o[i]..o[i + 1]]
+                    };
+                    let input = super::q1consist::Input {
+                        class: row(0),
+                        offset: row(1),
+                        corr2d: row(2),
+                        pred: &pred,
+                        obs: &obs_peak,
+                    };
+                    if !input.lengths_agree() {
+                        q1c_mismatch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    ext[n_ext..].copy_from_slice(&super::q1consist::values(&input, tol));
+                }
                 let ff = fragment_features(
                     &rows,
                     &al,
@@ -4066,7 +4175,7 @@ fn run_chunked(
                     }
                     // Truncating zip, exactly as the name/value zip in the assembly
                     // did: a family that returned fewer values leaves the tail at 0.0.
-                    for (dst, v) in ext.iter_mut().zip(extended_values(&ev, im_fam)) {
+                    for (dst, v) in ext[..n_ext].iter_mut().zip(extended_values(&ev, im_fam)) {
                         *dst = v;
                     }
                 }
@@ -4075,11 +4184,11 @@ fn run_chunked(
 
             let computing = Instant::now();
             let mut frag_feats: Vec<FragFeatures> = vec![FragFeatures::default(); rows_in_chunk];
-            let mut ext_vals: Vec<f64> = vec![0.0; rows_in_chunk * n_ext];
-            if n_ext > 0 {
+            let mut ext_vals: Vec<f64> = vec![0.0; rows_in_chunk * n_buf];
+            if n_buf > 0 {
                 frag_feats
                     .par_iter_mut()
-                    .zip(ext_vals.par_chunks_mut(n_ext))
+                    .zip(ext_vals.par_chunks_mut(n_buf))
                     .enumerate()
                     .for_each(|(r, (ff, ext))| *ff = per_psm(lo + r, ext));
             } else {
@@ -4204,7 +4313,7 @@ fn run_chunked(
                         // out to the family modules; written here under the fixed
                         // registry-order columns.
                         if n_ext > 0 {
-                            let row = &ext_vals[r * n_ext..(r + 1) * n_ext];
+                            let row = &ext_vals[r * n_buf..r * n_buf + n_ext];
                             for (c, v) in ix.ext.iter().zip(row) {
                                 put(*c, *v);
                             }
@@ -4241,6 +4350,25 @@ fn run_chunked(
                             put(ix.ms1e_mono_ppm_abs, ms1e_cols[6][i]);
                             put(ix.ms1e_ibar_dev, ms1e_cols[7][i]);
                             put(ix.ms1e_q1_agree, ms1e_cols[8][i]);
+                        }
+                        if n_q1c > 0 {
+                            let q = &ext_vals[r * n_buf + n_ext..(r + 1) * n_buf];
+                            put(ix.q1c_n, q[0]);
+                            put(ix.q1c_n_corr, q[1]);
+                            put(ix.q1c_pred_share, q[2]);
+                            put(ix.q1c_obs_share, q[3]);
+                            put(ix.q1c_entropy, q[4]);
+                            put(ix.q1c_cosine, q[5]);
+                            put(ix.q1c_top3, q[6]);
+                            put(ix.q1c_entropy_corr, q[7]);
+                            put(ix.q1c_soft_pred, q[8]);
+                            put(ix.q1c_soft_obs, q[9]);
+                            put(ix.q1c_soft_entropy, q[10]);
+                            put(ix.q1c_n_tight, q[11]);
+                            put(ix.q1c_n_loose, q[12]);
+                            put(ix.q1c_corr2d_mean, q[13]);
+                            put(ix.q1c_offset_wmean, q[14]);
+                            put(ix.q1c_offset_top3, q[15]);
                         }
 
                         pr[rl] = n_matched[i] as f64 * (0.5 + ff.frag_corr.max(0.0))
@@ -4347,6 +4475,14 @@ fn run_chunked(
     let rows = written.rows;
     drop(extra_lease);
     timers.log(pass_start.elapsed(), n_loaders, chunks.len());
+    let q1c_mismatched = q1c_mismatch.into_inner();
+    if q1c_mismatched > 0 {
+        tracing::warn!(
+            rows = q1c_mismatched,
+            "features: features.q1_consistency: rows whose Q1 decision lists do not have one \
+             entry per chromatogram fragment row read as having no decision"
+        );
+    }
 
     crate::memlog::report(
         "features chromatogram store",
@@ -6157,6 +6293,54 @@ mod tests {
         assert_ne!(feature_schema_id(&on), feature_schema_id(&off));
     }
 
+    /// The Q1-consistency family is appended last under the extended set only (after every
+    /// other optional family when they are on), each of its fields resolves to the column of
+    /// its own name in `Q1C_FEATURES` order, every column is written, and the schema id
+    /// changes only with it on.
+    #[test]
+    fn the_q1c_family_is_appended_last_and_only_when_asked() {
+        let off = active_features(FeatureSet::Extended, false);
+        let on = active_features_q1c(FeatureSet::Extended, false, false, false, false, true);
+        assert_eq!(on.len(), off.len() + Q1C_FEATURES.len());
+        assert_eq!(&on[..off.len()], &off[..]);
+        assert_eq!(&on[off.len()..], Q1C_FEATURES);
+        let all = active_features_q1c(FeatureSet::Extended, false, true, true, true, true);
+        let rest = active_features_all(FeatureSet::Extended, false, true, true, true);
+        assert_eq!(&all[..rest.len()], &rest[..]);
+        assert_eq!(&all[rest.len()..], Q1C_FEATURES);
+        for set in [FeatureSet::Minimal, FeatureSet::Rich] {
+            assert_eq!(
+                active_features_q1c(set, false, true, true, true, true),
+                active_features(set, false)
+            );
+        }
+        for cols in [&on, &all] {
+            let ix = ColIx::new(cols, &extended_name_refs(false));
+            let mut seen: Vec<usize> = ix
+                .named()
+                .into_iter()
+                .chain(ix.ext.iter().copied())
+                .flatten()
+                .collect();
+            seen.sort_unstable();
+            assert_eq!(seen, (0..cols.len()).collect::<Vec<_>>());
+            // The assembly writes the family's values in NAMES order through these fields.
+            let pairs = ix.named_pairs();
+            for (k, name) in Q1C_FEATURES.iter().enumerate() {
+                let got = pairs.iter().find(|(n, _)| n == name).and_then(|(_, c)| *c);
+                assert_eq!(got, Some(cols.len() - Q1C_FEATURES.len() + k), "{name}");
+            }
+        }
+        let mut cfg = FeaturesConfig {
+            set: FeatureSet::Extended,
+            ..FeaturesConfig::default()
+        };
+        assert_eq!(active_features_for(&cfg, false), off);
+        cfg.q1_consistency = true;
+        assert_eq!(active_features_for(&cfg, false), on);
+        assert_ne!(feature_schema_id(&on), feature_schema_id(&off));
+    }
+
     #[test]
     fn colix_covers_every_active_column() {
         for set in [FeatureSet::Minimal, FeatureSet::Rich, FeatureSet::Extended] {
@@ -7214,6 +7398,18 @@ mod tests {
     /// all, MS1 isotope XICs, b/y and multiply-charged fragment names, and several charge
     /// states per peptidoform.
     fn craft_extended_inputs(dir: &std::path::Path, n_cand: u32) -> (String, String) {
+        craft_extended_inputs_q1(dir, n_cand, false)
+    }
+
+    /// [`craft_extended_inputs`], with the per-fragment Q1 decision lists of psms_extracted
+    /// v6 (`q1f_frag_class`, `q1f_frag_offset`, `q1f_frag_corr2d`) when `q1_lists`: one entry
+    /// per chromatogram fragment row in their order, and three for a candidate without
+    /// chromatogram rows (a length the family must read as no decision).
+    fn craft_extended_inputs_q1(
+        dir: &std::path::Path,
+        n_cand: u32,
+        q1_lists: bool,
+    ) -> (String, String) {
         let psms = dir.join("psms_ext.parquet").to_string_lossy().to_string();
         let chrom = dir.join("chrom_ext.parquet").to_string_lossy().to_string();
         let (mut cid, mut base): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
@@ -7228,8 +7424,39 @@ mod tests {
         let (mut cfmz, mut cobsmz): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
         let mut cpint: Vec<f32> = Vec::new();
         let (mut crt, mut cint): (Vec<Vec<f32>>, Vec<Vec<f32>>) = (Vec::new(), Vec::new());
+        let mut qcls: Vec<Vec<f32>> = Vec::new();
+        let mut qoff: Vec<Vec<f32>> = Vec::new();
+        let mut qc2d: Vec<Vec<f32>> = Vec::new();
         for c in 0..n_cand {
             let apex = 100.0 + c as f64 * 7.0;
+            let nq = if c % 7 == 6 { 3 } else { 2 + (c % 4) as usize };
+            let sign = if c % 2 == 0 { 1.0f32 } else { -1.0 };
+            let cls: Vec<f32> = (0..nq)
+                .map(|f| [1.0, 2.0, 0.0, 1.0][(f + c as usize) % 4])
+                .collect();
+            qoff.push(
+                (0..nq)
+                    .map(|f| {
+                        if cls[f] == 0.0 {
+                            f32::NAN
+                        } else {
+                            sign * (f as f32 * 0.7 - 0.5)
+                        }
+                    })
+                    .collect(),
+            );
+            qc2d.push(
+                (0..nq)
+                    .map(|f| {
+                        if cls[f] == 0.0 {
+                            f32::NAN
+                        } else {
+                            0.3 + 0.2 * f as f32
+                        }
+                    })
+                    .collect(),
+            );
+            qcls.push(cls);
             cid.push(c);
             base.push(c / 3);
             apex_rt.push(apex);
@@ -7305,7 +7532,21 @@ mod tests {
                 Col::OptF64("ms1_iso1".into(), vec![Some(450.0); n]),
                 Col::OptF64("ms1_iso2".into(), vec![Some(120.0); n]),
                 Col::OptF64("ms1_isom1".into(), vec![Some(30.0); n]),
-            ],
+            ]
+            .into_iter()
+            .chain(
+                q1_lists
+                    .then(|| {
+                        [
+                            Col::ListF32("q1f_frag_class".into(), qcls),
+                            Col::ListF32("q1f_frag_offset".into(), qoff),
+                            Col::ListF32("q1f_frag_corr2d".into(), qc2d),
+                        ]
+                    })
+                    .into_iter()
+                    .flatten(),
+            )
+            .collect(),
         )
         .unwrap();
         mumdia_io::table::write_table(
@@ -7475,6 +7716,153 @@ mod tests {
         n32
     }
 
+    /// `features.q1_consistency` end to end: every row's `q1c_*` columns are
+    /// `q1consist::values` of that row's decision lists, its chromatogram rows' predictions
+    /// and each fragment's intensity summed over the elution peak the stage wrote, in
+    /// `Q1C_FEATURES` order; the rows whose lists do not match their chromatogram rows (and
+    /// the rows without chromatogram rows) read 0; the stage without tolerances is an error;
+    /// and the columns before the family are the ones the run without it writes.
+    #[test]
+    fn the_q1c_columns_are_the_family_of_each_rows_own_inputs() {
+        let dir = std::env::temp_dir().join(format!("mumdia_features_q1c_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (psms, chrom) = craft_extended_inputs_q1(&dir, 23, true);
+        let tol = Q1FragTolerances {
+            offset_steps: 1.0,
+            centre_steps: 0.7,
+            corr2d_min: 0.45,
+        };
+        let run_with = |q1c: bool, tolerances: Option<Q1FragTolerances>, tag: &str| {
+            let out = dir
+                .join(format!("feat_{tag}.parquet"))
+                .to_string_lossy()
+                .to_string();
+            let pin = dir
+                .join(format!("feat_{tag}.pin"))
+                .to_string_lossy()
+                .to_string();
+            let cfg = FeaturesConfig {
+                set: FeatureSet::Extended,
+                q1_consistency: q1c,
+                ..Default::default()
+            };
+            run(FeaturesParams {
+                psms: &psms,
+                chromatograms: &chrom,
+                seed: None,
+                out: &out,
+                out_pin: &pin,
+                cfg: &cfg,
+                config_hash: "t",
+                imc_ref_w: false,
+                q1_tolerances: tolerances,
+            })
+            .map(|_| out)
+        };
+        assert!(run_with(true, None, "none").is_err());
+        let on = run_with(true, Some(tol), "on").unwrap();
+        let off = run_with(false, None, "off").unwrap();
+
+        let fo = TableFile::open(&on).unwrap();
+        let ff = TableFile::open(&off).unwrap();
+        let names_on: Vec<String> = fo
+            .schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        let names_off: Vec<String> = ff
+            .schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(&names_on[..names_off.len()], &names_off[..]);
+        assert_eq!(&names_on[names_off.len()..], Q1C_FEATURES);
+        for c in &names_off {
+            if NON_FEATURE_COLUMNS.contains(&c.as_str()) && c != "prelim_score" {
+                continue;
+            }
+            if fo.schema.field_with_name(c).unwrap().data_type()
+                == &arrow::datatypes::DataType::Float32
+            {
+                assert_eq!(fo.f32(c).unwrap(), ff.f32(c).unwrap(), "{c}");
+            } else {
+                let (a, b) = (fo.f64(c).unwrap(), ff.f64(c).unwrap());
+                assert!(
+                    a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                    "{c}"
+                );
+            }
+        }
+
+        // The expected values from the inputs themselves.
+        let ps = TableFile::open(&psms).unwrap();
+        let lists: Vec<Vec<Vec<f32>>> = super::super::q1consist::LISTS
+            .iter()
+            .map(|c| ps.list_f32(c).unwrap())
+            .collect();
+        let pcid = ps.u32("candidate_id").unwrap();
+        let ch = TableFile::open(&chrom).unwrap();
+        let (ccid, cname) = (
+            ch.u32("candidate_id").unwrap(),
+            ch.str("frag_name").unwrap(),
+        );
+        let cpred = ch.f32("predicted_intensity").unwrap();
+        let (crt, cint) = (
+            ch.list_f32("rt").unwrap(),
+            ch.list_f32("intensity").unwrap(),
+        );
+        let ocid = fo.u32("candidate_id").unwrap();
+        let (elo, ehi) = (fo.f64("elution_lo").unwrap(), fo.f64("elution_hi").unwrap());
+        let got: Vec<Vec<f32>> = Q1C_FEATURES.iter().map(|c| fo.f32(c).unwrap()).collect();
+        let mut zero_rows = 0;
+        for r in 0..ocid.len() {
+            let c = ocid[r];
+            let i = pcid.iter().position(|&x| x == c).unwrap();
+            let frag: Vec<usize> = (0..ccid.len())
+                .filter(|&k| ccid[k] == c && !cname[k].starts_with("ms1_"))
+                .collect();
+            let pred: Vec<f64> = frag.iter().map(|&k| cpred[k] as f64).collect();
+            let obs: Vec<f64> = frag
+                .iter()
+                .map(|&k| {
+                    crt[k]
+                        .iter()
+                        .zip(&cint[k])
+                        .filter(|(t, _)| (**t as f64) >= elo[r] && (**t as f64) <= ehi[r])
+                        .map(|(_, v)| *v as f64)
+                        .sum()
+                })
+                .collect();
+            let input = super::super::q1consist::Input {
+                class: &lists[0][i],
+                offset: &lists[1][i],
+                corr2d: &lists[2][i],
+                pred: &pred,
+                obs: &obs,
+            };
+            let want = if frag.is_empty() {
+                vec![0.0; Q1C_FEATURES.len()]
+            } else {
+                super::super::q1consist::values(&input, &tol)
+            };
+            if want.iter().all(|x| *x == 0.0) {
+                zero_rows += 1;
+            }
+            for (k, name) in Q1C_FEATURES.iter().enumerate() {
+                let (g, w) = (got[k][r] as f64, want[k] as f32 as f64);
+                assert!(
+                    (g - w).abs() <= 1e-6 * w.abs().max(1.0),
+                    "row {r} {name}: {g} vs {w}"
+                );
+            }
+        }
+        // the three candidates without chromatogram rows read 0, and others do not
+        assert!(zero_rows >= 3 && zero_rows < ocid.len(), "{zero_rows}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn extended_features_match_the_pre_permutation_build() {
         // A GOLDEN, captured by running THIS fixture against commit 1ac1b44^ -- the last
@@ -7552,6 +7940,7 @@ mod tests {
                         cfg: &cfg,
                         config_hash: "test",
                         imc_ref_w: false,
+                        q1_tolerances: None,
                     },
                     chunk,
                 )
@@ -7971,6 +8360,7 @@ mod tests {
                         cfg: &cfg,
                         config_hash: "test",
                         imc_ref_w: false,
+                        q1_tolerances: None,
                     },
                     300,
                     usize::MAX,
@@ -8047,6 +8437,7 @@ mod tests {
                 cfg: &cfg,
                 config_hash: "test",
                 imc_ref_w: false,
+                q1_tolerances: None,
             })
             .unwrap()
         };
@@ -8187,6 +8578,7 @@ mod tests {
                     cfg: &cfg,
                     config_hash: "test",
                     imc_ref_w: false,
+                    q1_tolerances: None,
                 },
                 chunk_rows,
                 max_psm_rows,
@@ -8411,6 +8803,7 @@ mod tests {
                         cfg: &cfg,
                         config_hash: "test",
                         imc_ref_w: false,
+                        q1_tolerances: None,
                     },
                     chunk_rows,
                     max_psm_rows,
@@ -8467,6 +8860,7 @@ mod tests {
                     cfg: &cfg,
                     config_hash: "test",
                     imc_ref_w: false,
+                    q1_tolerances: None,
                 },
                 chunk_rows,
                 max_psm,
@@ -8784,6 +9178,7 @@ mod tests {
                     cfg: &cfg,
                     config_hash: "test",
                     imc_ref_w: false,
+                    q1_tolerances: None,
                 },
                 100,
                 usize::MAX,
@@ -8868,6 +9263,7 @@ mod tests {
                     cfg: &cfg,
                     config_hash: "test",
                     imc_ref_w: false,
+                    q1_tolerances: None,
                 },
                 4,
             )
@@ -8914,6 +9310,7 @@ mod tests {
                     cfg: &cfg,
                     config_hash: "test",
                     imc_ref_w: false,
+                    q1_tolerances: None,
                 },
                 4,
             );
@@ -8974,6 +9371,7 @@ mod tests {
             cfg: &cfg,
             config_hash: "test",
             imc_ref_w: false,
+            q1_tolerances: None,
         };
 
         run_chunked(

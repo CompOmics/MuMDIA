@@ -1345,6 +1345,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 config_hash: ch,
                 // A grouped run is never retraced (`Config::validate`).
                 imc_ref_w: false,
+                q1_tolerances: None,
             })?;
             Ok(BandExtract {
                 index: b.index,
@@ -1418,6 +1419,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                     cfg: &cfg.features,
                     config_hash: ch,
                     imc_ref_w: false,
+                    q1_tolerances: None,
                 },
                 bounds,
             )?;
