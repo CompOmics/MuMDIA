@@ -433,6 +433,19 @@ and the columns are not written, so the default schema stays byte-identical:
 | `gate_coelution` | Float32 | no | correlation | temporal co-elution score |
 | `gate_spectral_entropy` | Float32 | no | similarity | apex spectral-entropy similarity (sqrt) |
 
+Conditional columns of v7, appended last only under `features.ms1_envelope` (spectra without
+1/K0; docs/09_extract.md, section 13). The MS1 scan nearest the row's apex and two either side
+are read at the calibrated MS1 m/z, within twice `extract.prec_tol_ppm` and at least 10 ppm:
+
+| column | Arrow type | nullable | units | meaning |
+|---|---|---|---|---|
+| `ms1e_i_m1`, `ms1e_i_0` .. `ms1e_i_4` | Float64 | no | intensity | summed intensity over the scans of the peak nearest M-1, M0 .. M+4 |
+| `ms1e_ppm_m1`, `ms1e_ppm_0` .. `ms1e_ppm_4` | Float64 | no (NaN) | ppm | their intensity-weighted error against the calibrated m/z; NaN where none was found |
+| `ms1e_i_half` | Float64 | no | intensity | summed intensity of the peaks nearest the half-spacing positions above M0 and M+1 |
+| `ms1e_scans` | Float64 | no | count | MS1 scans read |
+| `ms1e_tol_ppm` | Float64 | no | ppm | the search tolerance |
+| `ms1e_q1_agree` | Float64 | no (NaN) | Q1 steps | under `extract.q1_fragments`, for a row whose decision has a fit: `q1f_centre` less the centre the observed envelope predicts; NaN otherwise |
+
 ### chromatograms (`extract.rs:1512-1526`)
 
 One row per predicted transition per accepted candidate, plus MS1 isotope XIC
@@ -946,6 +959,7 @@ pooled `q_value`, and `run_psm_q`, and does not select a run
 | `integration_lo_rt` | Float64 | yes | s | integration lower bound actually used |
 | `integration_hi_rt` | Float64 | yes | s | integration upper bound actually used |
 | `first_pass_id` | Boolean | no | - | v3 only: the precursor had a first-pass identification in this run (`run_psm_q <= mbr.q_anchor`); written by `run-experiment` after a second pass under `mbr.first_pass_flag` |
+| `q1_quant` | Utf8 | no | - | v4 only (`quant.q1_fragments`, appended last): `belonging` (the Q1-cycle traces of the fragments that belong), `fallback` (every fragment's cycle trace: fewer than `quant.q1_min_belonging` belong), `uncollapsed` (the traces as extracted) or `no_traces` |
 
 ### protein_group_quant (schema v2, `quant.rs:519-527`)
 

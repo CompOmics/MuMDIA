@@ -13,13 +13,14 @@ use anyhow::{anyhow, Context as _, Result};
 use arrow::array::{Array, Float32Array, StringArray, UInt32Array};
 use arrow::record_batch::RecordBatch;
 use mumdia_core::config::{
-    BaselineSource, FragmentSelection, NormalizeMethod, PeakWindowMode, QuantConfig, QuantQColumn,
-    RollupMethod, WindowCentre,
+    BaselineSource, FragmentSelection, NormalizeMethod, PeakWindowMode, Q1Integration, QuantConfig,
+    QuantQColumn, RollupMethod, WindowCentre,
 };
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
 use mumdia_io::table::{column_names, write_table, Col, ListF32, TableFile};
 
+use super::q1quant::{self, Q1QuantInputs, Q1Status};
 use super::quant_pattern::{self, PatternFit, PatternInput, PatternQuantity};
 use crate::chromatograms::{
     Decoder, Layout, TraceCols, INTENSITY, INTENSITY_TRIMMED, RT, RT_AXIS, TRACE_LEN, TRACE_OFFSET,
@@ -90,6 +91,10 @@ pub struct QuantParams<'a> {
     /// `peptide_quant` and writes it as v3 ([`artifact::peptide_quant`]); `None` writes v2,
     /// byte for byte.
     pub first_pass_ids: Option<&'a BTreeSet<u32>>,
+    /// `quant.q1_fragments`: the run's psms_extracted and spectra_ms2, which the collapse to
+    /// cycle traces and the fragment decisions are read from ([`q1quant`]). Needed with the
+    /// key on, read only then.
+    pub q1: Option<Q1QuantInputs<'a>>,
 }
 
 /// The `peptide_quant` v3 column that says whether the row's precursor had a first-pass
@@ -1142,6 +1147,9 @@ fn scan_window_at(len: usize, centre: usize, half: usize) -> Option<(usize, usiz
 /// under the pattern export the window's retention times for the spacing fit, and the
 /// counts behind the share of exactly-zero flank samples where that share is recorded.
 struct Applied {
+    /// `quant.q1_integration = elution_fit` under a fixed window: whether the candidate's
+    /// elution profile was fitted (`false`: the trapezoid applied). `None` otherwise.
+    elution_fitted: Option<bool>,
     lo_rt: f64,
     hi_rt: f64,
     apex: f64,
@@ -1232,6 +1240,20 @@ fn integrate_window(rt: &[f32], mut w: Vec<f32>, envelope: bool) -> f64 {
         w = center_envelope_1d(&w);
     }
     trapezoid(rt, &w)
+}
+
+/// `quant.q1_integration = elution_fit`: the area of window samples `w` under the
+/// candidate's fitted elution profile (`q1quant::elution_weights`), after the optional
+/// apex-outward envelope.
+fn elution_area(mut w: Vec<f32>, k: &[f64], envelope: bool) -> f64 {
+    if envelope {
+        w = center_envelope_1d(&w);
+    }
+    let mut a = 0.0f64;
+    for (x, kk) in w.iter().zip(k) {
+        a += *x as f64 * kk;
+    }
+    a
 }
 
 /// Mean of the raw samples in the `flank` samples either side of `[lo, hi)`; NaN without
@@ -2429,6 +2451,341 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
     run_hashed(p).map(|w| (w.peptide.rows, w.protein.rows))
 }
 
+/// What `quant.q1_fragments` did to the chromatogram store ([`q1_apply`]).
+struct Q1Applied {
+    /// Per row of the store it built: left out of the quantity (a fragment that does not
+    /// belong, of a candidate with at least `q1_min_belonging` that do).
+    masked: Vec<bool>,
+    /// Per candidate of its index.
+    status: Vec<Q1Status>,
+    masked_rows: u64,
+    /// Candidates kept as extracted: without a psms_extracted row, whose decision does not
+    /// match its chromatogram rows, with an axis point outside the sweep.
+    no_decision: u64,
+    mismatched: u64,
+    unlocated: u64,
+    model: mumdia_core::config::Q1FragModel,
+    scans: usize,
+}
+
+impl Q1Applied {
+    /// Candidate `ci`'s mask, `None` when none of its slots is masked.
+    fn mask_of(&self, index: &CandIndex, ci: usize) -> Option<Vec<bool>> {
+        let m: Vec<bool> = index.rows_of(ci).iter().map(|&i| self.masked[i]).collect();
+        m.iter().any(|&b| b).then_some(m)
+    }
+
+    /// Candidate `ci`'s areas with its masked slots NaN (not ranked), `None` when none is
+    /// masked.
+    fn masked_areas(&self, index: &CandIndex, ci: usize, areas: &[f64]) -> Option<Vec<f64>> {
+        let m = self.mask_of(index, ci)?;
+        Some(
+            index
+                .slots(ci)
+                .zip(m)
+                .map(|(s, k)| if k { f64::NAN } else { areas[s] })
+                .collect(),
+        )
+    }
+}
+
+/// Why [`q1_apply`] kept a candidate's traces as extracted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Q1Kept {
+    NoDecision,
+    Mismatched,
+    OffSweep,
+}
+
+/// `quant.q1_fragments`: the store with every trace collapsed to one value per Q1 cycle
+/// ([`q1quant::collapse_trace`], weighted by `quant.q1_step_weights`), the candidates in the
+/// same order and their rows in the same order, so the index of the new store lists them as
+/// `index` did; and per row whether it is left out of the quantity. A candidate keeps its
+/// traces as extracted when it has no psms_extracted row, when its decision does not list
+/// its chromatogram rows (count or names), or when an axis point is not a scan of the sweep
+/// that covers its precursor.
+fn q1_apply(
+    p: &QuantParams,
+    store: ChromStore,
+    index: CandIndex,
+    acc_cid: &[u32],
+    acc_rank: &[i32],
+) -> Result<(ChromStore, CandIndex, Q1Applied)> {
+    let inp = p.q1.ok_or_else(|| {
+        anyhow!(
+            "quant.q1_fragments needs the run's psms_extracted and spectra_ms2 \
+             (mumdia quant --psms-extracted ... --spectra-ms2 ...)"
+        )
+    })?;
+    if p.chromatograms.len() != 1 || !p.chromatograms[0].drop.is_empty() {
+        anyhow::bail!(
+            "quant.q1_fragments reads one whole chromatogram table, and this quant was given a \
+             grouped run's band tables"
+        );
+    }
+    let t0 = Instant::now();
+    let psms_extracted = inp.psms_extracted.ok_or_else(|| {
+        anyhow!(
+            "quant.q1_fragments needs the run's psms_extracted \
+             (mumdia quant --psms-extracted ...)"
+        )
+    })?;
+    let model = q1quant::model_of_report(psms_extracted)?;
+    let mut rank_of: HashMap<u32, i32> = HashMap::new();
+    for (k, &c) in acc_cid.iter().enumerate() {
+        rank_of
+            .entry(c)
+            .or_insert(acc_rank.get(k).copied().unwrap_or(0));
+    }
+    let wanted: HashMap<u32, i32> = index
+        .cids
+        .iter()
+        .map(|&c| (c, rank_of.get(&c).copied().unwrap_or(0)))
+        .collect();
+    let rows = q1quant::load_rows(psms_extracted, &wanted)?;
+    if !mumdia_io::table::column_names(&p.chromatograms[0].path)?
+        .iter()
+        .any(|c| c == "frag_mz")
+    {
+        anyhow::bail!(
+            "quant.q1_fragments weighs each fragment's steps by its isotope-conditional \
+             transmission, which needs the fragment m/z, and {} has no frag_mz column",
+            p.chromatograms[0].path
+        );
+    }
+    let fmz = q1quant::load_fragment_mz(&p.chromatograms[0].path, &wanted)?;
+    let sweep = q1quant::SweepScans::load(inp.spectra_ms2)?;
+    let rule = p.cfg.q1_step_weights;
+    let min_belong = p.cfg.q1_min_belonging;
+    type Traces = Vec<(Vec<f32>, Vec<f32>)>;
+    type Collapsed = Result<(Traces, Vec<bool>, Q1Status), Q1Kept>;
+    let per: Vec<Collapsed> = (0..index.len())
+        .into_par_iter()
+        .map(|ci| {
+            let c = index.cids[ci];
+            let rws = index.rows_of(ci);
+            let (Some(row), Some(fr)) = (rows.get(&c), fmz.get(&c)) else {
+                return Err(Q1Kept::NoDecision);
+            };
+            if fr.len() != rws.len()
+                || row.class.len() != rws.len()
+                || fr.iter().zip(rws).any(|(f, &i)| f.0 != store.name(i))
+            {
+                return Err(Q1Kept::Mismatched);
+            }
+            let cand = q1quant::cand_model(&model, row, fr);
+            let mut located: BTreeMap<u32, Vec<(u32, f64)>> = BTreeMap::new();
+            for &i in rws {
+                let a = store.axis_id[i];
+                if a == NO_AXIS || located.contains_key(&a) {
+                    continue;
+                }
+                match sweep.locate_axis(store.axis(a), row.precursor_mz) {
+                    Some(v) => {
+                        located.insert(a, v);
+                    }
+                    None => return Err(Q1Kept::OffSweep),
+                }
+            }
+            let traces: Traces = rws
+                .iter()
+                .enumerate()
+                .map(|(k, &i)| {
+                    let a = store.axis_id[i];
+                    if a == NO_AXIS {
+                        return (Vec::new(), Vec::new());
+                    }
+                    let w = |t: f64| q1quant::step_weight(rule, &model, &cand, k, t);
+                    q1quant::collapse_trace(&located[&a], store.rt(i), store.inten(i), &w)
+                })
+                .collect();
+            let restrict = row.n_belong() >= min_belong;
+            let mask: Vec<bool> = row
+                .class
+                .iter()
+                .map(|&cl| restrict && cl as u8 != super::q1frag::BELONGS)
+                .collect();
+            let status = if restrict {
+                Q1Status::Belonging
+            } else {
+                Q1Status::Fallback
+            };
+            Ok((traces, mask, status))
+        })
+        .collect();
+    let mut out = ChromStore::new();
+    let mut masked: Vec<bool> = Vec::with_capacity(store.nrows());
+    let mut status: Vec<Q1Status> = Vec::with_capacity(index.len());
+    let (mut no_decision, mut mismatched, mut unlocated) = (0u64, 0u64, 0u64);
+    for (ci, r) in per.iter().enumerate() {
+        let c = index.cids[ci];
+        let rws = index.rows_of(ci);
+        match r {
+            Ok((traces, mask, st)) => {
+                for (k, &i) in rws.iter().enumerate() {
+                    out.push(c, store.name(i), store.pred[i], &traces[k].0, &traces[k].1)?;
+                    masked.push(mask[k]);
+                }
+                status.push(*st);
+            }
+            Err(why) => {
+                for &i in rws {
+                    out.push(c, store.name(i), store.pred[i], store.rt(i), store.inten(i))?;
+                    masked.push(false);
+                }
+                status.push(Q1Status::Uncollapsed);
+                match why {
+                    Q1Kept::NoDecision => no_decision += 1,
+                    Q1Kept::Mismatched => mismatched += 1,
+                    Q1Kept::OffSweep => unlocated += 1,
+                }
+            }
+        }
+    }
+    drop(per);
+    let new_index = CandIndex::build(&out);
+    if new_index.cids != index.cids {
+        anyhow::bail!("quant.q1_fragments: the collapsed store lists other candidates");
+    }
+    let masked_rows = masked.iter().filter(|&&b| b).count() as u64;
+    let kept = no_decision + mismatched + unlocated;
+    if kept > 0 {
+        warn!(
+            no_decision,
+            mismatched_rows = mismatched,
+            off_sweep = unlocated,
+            "quant: q1_fragments kept some candidates' traces as extracted"
+        );
+    }
+    info!(
+        candidates = index.len(),
+        belonging = status.iter().filter(|&&s| s == Q1Status::Belonging).count(),
+        fallback = status.iter().filter(|&&s| s == Q1Status::Fallback).count(),
+        kept_as_extracted = kept,
+        masked_fragments = masked_rows,
+        sweep_scans = sweep.len(),
+        elapsed_ms = t0.elapsed().as_millis() as u64,
+        "quant: traces collapsed to Q1 cycles (quant.q1_fragments)"
+    );
+    let scans = sweep.len();
+    Ok((
+        out,
+        new_index,
+        Q1Applied {
+            masked,
+            status,
+            masked_rows,
+            no_decision,
+            mismatched,
+            unlocated,
+            model,
+            scans,
+        },
+    ))
+}
+
+/// What `quant.q1_cycle_halfwidth` chose ([`q1_cycle_window`]).
+struct CycleWindow {
+    /// Per candidate of the index: its half-width in samples, `None` where
+    /// `fixed_scan_halfwidth` applies (no sweep, no trace, or a sample off the sweep).
+    half: Vec<Option<usize>>,
+    /// The quant report's `q1_cycle_window` block.
+    stats: serde_json::Value,
+}
+
+/// `quant.q1_cycle_halfwidth`: each candidate's fixed-window half-width in samples, the key's
+/// cycles times its samples per cycle ([`q1quant::samples_per_cycle`] on the axis of its first
+/// row with a trace), or the key itself for a candidate whose traces `quant.q1_fragments`
+/// collapsed to one value per cycle. A run whose spectra record no Q1 sweep keeps
+/// `fixed_scan_halfwidth` for every candidate, which the report says.
+fn q1_cycle_window(
+    p: &QuantParams,
+    store: &ChromStore,
+    index: &CandIndex,
+    q1a: Option<&Q1Applied>,
+) -> Result<CycleWindow> {
+    let k = p.cfg.q1_cycle_halfwidth;
+    let spectra = p.q1.map(|q| q.spectra_ms2).ok_or_else(|| {
+        anyhow!(
+            "quant.q1_cycle_halfwidth reads the run's Q1 sweep from its spectra_ms2 \
+             (mumdia quant --spectra-ms2 ...)"
+        )
+    })?;
+    let t0 = Instant::now();
+    let Some(sweep) = q1quant::SweepScans::try_load(spectra)? else {
+        info!(
+            spectra_ms2 = spectra,
+            fixed_scan_halfwidth = p.cfg.fixed_scan_halfwidth,
+            "quant: quant.q1_cycle_halfwidth: the spectra record no Q1 sweep, so the fixed \
+             window keeps fixed_scan_halfwidth samples"
+        );
+        return Ok(CycleWindow {
+            half: vec![None; index.len()],
+            stats: json!({
+                "cycles": k,
+                "spectra_ms2": spectra,
+                "applied": false,
+                "reason": "the spectra record no Q1 sweep",
+            }),
+        });
+    };
+    // Per candidate: (half-width, samples per cycle where it was measured, collapsed).
+    let per: Vec<(Option<usize>, Option<f64>, bool)> = (0..index.len())
+        .into_par_iter()
+        .map(|ci| {
+            let collapsed = q1a.is_some_and(|a| a.status[ci] != Q1Status::Uncollapsed);
+            if collapsed {
+                return (Some(k), None, true);
+            }
+            let axis = index
+                .rows_of(ci)
+                .iter()
+                .map(|&i| store.axis_id[i])
+                .find(|&a| a != NO_AXIS);
+            match axis.and_then(|a| q1quant::samples_per_cycle(&sweep, store.axis(a))) {
+                Some(spc) => (Some(q1quant::cycle_halfwidth(k, spc)), Some(spc), false),
+                None => (None, None, false),
+            }
+        })
+        .collect();
+    let mut spc: Vec<f64> = per.iter().filter_map(|x| x.1).collect();
+    let mut halves: Vec<f64> = per.iter().filter_map(|x| x.0.map(|h| h as f64)).collect();
+    let collapsed = per.iter().filter(|x| x.2).count();
+    let unlocated = per.iter().filter(|x| x.0.is_none()).count();
+    let (h_min, h_max) = halves
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &h| {
+            (a.min(h), b.max(h))
+        });
+    let stats = json!({
+        "cycles": k,
+        "spectra_ms2": spectra,
+        "applied": true,
+        "candidates": index.len(),
+        "collapsed": collapsed,
+        "measured": spc.len(),
+        "fixed_scan_halfwidth_kept": unlocated,
+        "samples_per_cycle_median": finite_option(quant_pattern::median(&mut spc)),
+        "halfwidth_min": finite_option(h_min),
+        "halfwidth_median": finite_option(quant_pattern::median(&mut halves)),
+        "halfwidth_max": finite_option(h_max),
+    });
+    info!(
+        cycles = k,
+        candidates = index.len(),
+        collapsed,
+        fixed_scan_halfwidth_kept = unlocated,
+        samples_per_cycle_median = stats["samples_per_cycle_median"].as_f64(),
+        halfwidth_median = stats["halfwidth_median"].as_f64(),
+        elapsed_ms = t0.elapsed().as_millis() as u64,
+        "quant: fixed window in Q1 cycles (quant.q1_cycle_halfwidth)"
+    );
+    Ok(CycleWindow {
+        half: per.into_iter().map(|x| x.0).collect(),
+        stats,
+    })
+}
+
 /// The quant outputs as written and reported: row count and report content hash of each.
 #[derive(Clone, Debug)]
 pub struct QuantWritten {
@@ -2555,6 +2912,13 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     let pg = FlatStr::read_rows(&ps, "protein_group", &accepted)?;
     let base = ps.u32_rows("base_peptide_id", &accepted)?;
     let acc_cid: Vec<u32> = accepted.iter().map(|&i| cid[i]).collect();
+    // `quant.q1_fragments` joins each accepted row's psms_extracted row on its candidate and
+    // the peak it selected (`selected_peak_rank`, 0 in a table without the column).
+    let acc_rank: Vec<i32> = if p.cfg.q1_fragments && ps.has_column("selected_peak_rank") {
+        ps.i32_rows("selected_peak_rank", &accepted)?
+    } else {
+        Vec::new()
+    };
     drop(accepted);
 
     // Chromatograms, grouped by candidate, for the candidates quant actually uses.
@@ -2786,6 +3150,23 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             }
         }
     }
+    // `quant.q1_fragments` (`stages::q1quant`): every trace collapsed to one value per Q1
+    // cycle, and the fragments that do not belong masked where enough do. The store and its
+    // index are replaced; every phase below reads them as it reads any store.
+    let (store, index, q1a) = if p.cfg.q1_fragments {
+        let (s, i, a) = q1_apply(&p, store, index, &acc_cid, &acc_rank)?;
+        (s, i, Some(a))
+    } else {
+        (store, index, None)
+    };
+    let q1_elution = q1a.is_some() && p.cfg.q1_integration == Q1Integration::ElutionFit;
+    // `quant.q1_cycle_halfwidth`: each candidate's fixed-window half-width in samples, from its
+    // samples per Q1 cycle. `None` with the key off.
+    let cycle_win: Option<CycleWindow> = if p.cfg.q1_cycle_halfwidth > 0 {
+        Some(q1_cycle_window(&p, &store, &index, q1a.as_ref())?)
+    } else {
+        None
+    };
     {
         let mut parts = store.mem_parts();
         parts.push((
@@ -2980,6 +3361,9 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         .map(|(ci, (out, cout, fout, hout, pout, oout, bout))| {
             let c = index.cids[ci];
             let rows = index.rows_of(ci);
+            // `quant.q1_fragments`: the candidate's slots left out of this run's quantity,
+            // `None` when none is.
+            let cmask: Option<Vec<bool>> = q1a.as_ref().and_then(|a| a.mask_of(&index, ci));
             let (lo_rt, hi_rt, integration_apex) = if !p.cfg.bound_peak {
                 // A fixed window needs only an apex to centre on, not the descent walk,
                 // so take the identification apex directly. Previously this branch
@@ -3021,9 +3405,12 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             let mut fhi = f64::NEG_INFINITY;
             // The candidate's own halfwidth under `fixed_scan_halfwidth_scale`, which
             // validation confines to the scan form of the window.
+            // Under `quant.q1_cycle_halfwidth`, the candidate's half-width from its samples per
+            // Q1 cycle (validation refuses it with the scale).
             let half = halfwidths
                 .and_then(|m| m.get(&c))
                 .copied()
+                .or_else(|| cycle_win.as_ref().and_then(|w| w.half[ci]))
                 .unwrap_or(p.cfg.fixed_scan_halfwidth);
             // Export only: each fragment's window samples, for the correlations, and the
             // candidate's summed trace around the apex, for its peak HWHM.
@@ -3053,8 +3440,22 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                 cand_axis.map(|a| nearest_index(store.axis(a), integration_apex, store.rt_sorted));
             let shift: isize = match (cand_axis, cand_k) {
                 (Some(a), Some(k)) if profile_centre => {
+                    // A masked slot (`quant.q1_fragments`) does not place the window.
+                    let preds = &index.slot_pred[index.slots(ci)];
+                    let masked_preds: Vec<f32> = match &cmask {
+                        Some(m) => preds
+                            .iter()
+                            .zip(m)
+                            .map(|(&v, &k)| if k { f32::NAN } else { v })
+                            .collect(),
+                        None => Vec::new(),
+                    };
                     let slots = quant_pattern::top_predicted_slots(
-                        &index.slot_pred[index.slots(ci)],
+                        if cmask.is_some() {
+                            &masked_preds
+                        } else {
+                            preds
+                        },
                         quant_pattern::PROFILE_FRAGMENTS,
                     );
                     let mut prof = [0.0f64; 2 * quant_pattern::PROFILE_SPAN + 1];
@@ -3083,6 +3484,55 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             let centre_on = |k: usize, len: usize| -> usize {
                 (k as isize + shift).clamp(0, len.saturating_sub(1) as isize) as usize
             };
+            // `quant.q1_integration = elution_fit`: the integration weights of the window on
+            // the candidate's axis, from the summed samples of the fragments it quantifies (less
+            // the experiment background where one applies). `None` where the fit gives way, and
+            // the trapezoid applies.
+            let elution: Option<(u32, usize, usize, Vec<f64>)> = if q1_elution && fixed {
+                rows.iter()
+                    .map(|&i| store.axis_id[i])
+                    .find(|&a| a != NO_AXIS)
+                    .and_then(|a| {
+                        let ax = store.axis(a);
+                        let k = match (cand_axis, cand_k) {
+                            (Some(ca), Some(k)) if ca == a => k,
+                            _ => nearest_index(ax, integration_apex, store.rt_sorted),
+                        };
+                        let (lo, hi) = if profile_centre {
+                            scan_window_at(ax.len(), centre_on(k, ax.len()), half)?
+                        } else {
+                            fixed_window_indices(
+                                ax,
+                                integration_apex,
+                                half,
+                                p.cfg.fixed_window_s,
+                                store.rt_sorted,
+                            )?
+                        };
+                        let mut y = vec![0.0f64; hi - lo];
+                        for (slot, &i) in rows.iter().enumerate() {
+                            if store.axis_id[i] != a || cmask.as_ref().is_some_and(|m| m[slot]) {
+                                continue;
+                            }
+                            let it = store.inten(i);
+                            let b = pooled_bg
+                                .and_then(|m| m.get(&c))
+                                .and_then(|f| f.get(store.name(i)))
+                                .map_or(0.0, |&b| b as f32);
+                            for (j, yj) in y.iter_mut().enumerate() {
+                                let v = it[lo + j];
+                                if v.is_finite() {
+                                    *yj += (v - b).max(0.0) as f64;
+                                }
+                            }
+                        }
+                        let rtw: Vec<f64> = ax[lo..hi].iter().map(|&r| r as f64).collect();
+                        q1quant::elution_weights(&rtw, &y).map(|k| (a, lo, hi, k))
+                    })
+            } else {
+                None
+            };
+            let elution_tried = q1_elution && fixed;
             for (slot, &i) in rows.iter().enumerate() {
                 let rt = store.rt(i);
                 let it = store.inten(i);
@@ -3169,7 +3619,14 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                                     }),
                                 };
                             }
-                            integrate_window(&rt[lo..hi], w, p.cfg.interference_envelope)
+                            match &elution {
+                                Some((a, elo, ehi, k))
+                                    if store.axis_id[i] == *a && lo == *elo && hi == *ehi =>
+                                {
+                                    elution_area(w, k, p.cfg.interference_envelope)
+                                }
+                                _ => integrate_window(&rt[lo..hi], w, p.cfg.interference_envelope),
+                            }
                         }
                         None => {
                             if export {
@@ -3233,12 +3690,37 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                         window_rt = ax[lo..hi].to_vec();
                     }
                 }
+                // `quant.q1_integration = elution_fit`: the pattern window's integration
+                // weights, from the summed samples of the slots this run fits.
+                let pattern_k: Option<Vec<f64>> = if q1_elution {
+                    let mut y = vec![0.0f64; nt];
+                    for slot in 0..n {
+                        if cmask.as_ref().is_some_and(|m| m[slot]) {
+                            continue;
+                        }
+                        for (t, yt) in y.iter_mut().enumerate() {
+                            *yt += x[slot * nt + t];
+                        }
+                    }
+                    q1quant::elution_weights(&rtw, &y)
+                } else {
+                    None
+                };
                 if pattern_export {
-                    let tw = quant_pattern::trapezoid_weights(&rtw);
+                    let tw = match &pattern_k {
+                        Some(k) => k.clone(),
+                        None => quant_pattern::trapezoid_weights(&rtw),
+                    };
                     for (slot, &i) in rows.iter().enumerate() {
-                        pout[slot] =
-                            quant_pattern::weighted_area(&x[slot * nt..(slot + 1) * nt], &tw);
-                        oout[slot] = !store.rt(i).is_empty();
+                        // A masked slot is exported as unobserved and without an area here,
+                        // so it neither makes the fragment eligible nor enters the dispersion.
+                        let masked = cmask.as_ref().is_some_and(|m| m[slot]);
+                        pout[slot] = if masked {
+                            f64::NAN
+                        } else {
+                            quant_pattern::weighted_area(&x[slot * nt..(slot + 1) * nt], &tw)
+                        };
+                        oout[slot] = !store.rt(i).is_empty() && !masked;
                     }
                 }
                 if let Some(fit) = pattern_fit {
@@ -3253,6 +3735,8 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                             rt: &rtw,
                             pred: &index.slot_pred[index.slots(ci)],
                             eligible: &eligible,
+                            masked: cmask.as_deref().unwrap_or(&[]),
+                            weights: pattern_k.as_deref(),
                         },
                         fit.phi,
                         fit.phi_cell(),
@@ -3260,6 +3744,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                     ));
                 }
             }
+            let elution_fitted = elution_tried.then_some(elution.is_some());
             Applied {
                 lo_rt,
                 hi_rt,
@@ -3269,6 +3754,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                 pattern,
                 window_rt,
                 zero_counts,
+                elution_fitted,
             }
         })
         .collect();
@@ -3370,10 +3856,19 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     // Under `out_quant_fragments`: per selection, the candidate position, the rule that made
     // the quantity and the number of fragments it used. Empty otherwise.
     let mut detail_rules: Vec<(usize, DetailRule, usize)> = Vec::new();
+    // `quant.q1_fragments`: how each row was quantified (`q1_quant`, peptide_quant v4).
+    let mut q_q1: Vec<String> = Vec::new();
     // One pass over the accepted rows, in table order, which is the order the filter over
     // every row visited them in.
     for (k, &c) in acc_cid.iter().enumerate() {
         let ci = index.find(c);
+        if let Some(a) = &q1a {
+            q_q1.push(
+                ci.map_or(Q1Status::NoTraces, |ci| a.status[ci])
+                    .as_str()
+                    .to_string(),
+            );
+        }
         let (quantity, used, status) = match ci {
             None => select_fragment_areas(None, p.cfg.top_n_fragments, p.cfg.fragment_selection),
             Some(ci) => {
@@ -3400,9 +3895,16 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                     } else {
                         DetailRule::Ranked
                     };
+                    // A masked slot (`quant.q1_fragments`) is not ranked.
+                    let masked_areas: Option<Vec<f64>> = q1a
+                        .as_ref()
+                        .and_then(|a| a.masked_areas(&index, ci, &area_by_slot));
                     let q = weighted.unwrap_or_else(|| {
                         select_fragment_areas(
-                            Some((&area_by_slot[r.clone()], &index.slot_pred[r])),
+                            Some((
+                                masked_areas.as_deref().unwrap_or(&area_by_slot[r.clone()]),
+                                &index.slot_pred[r],
+                            )),
                             p.cfg.top_n_fragments,
                             p.cfg.fragment_selection,
                         )
@@ -3462,6 +3964,13 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     ];
     if let Some(v) = q_first {
         pep_cols.push(Col::Bool(FIRST_PASS_ID.into(), v));
+    }
+    let n_q1_rows: BTreeMap<String, u64> = q_q1.iter().fold(BTreeMap::new(), |mut m, s| {
+        *m.entry(s.clone()).or_default() += 1;
+        m
+    });
+    if q1a.is_some() {
+        pep_cols.push(Col::Str("q1_quant".into(), q_q1));
     }
     let n_pep = write_table(p.out_peptide, pep_cols)?;
 
@@ -3599,19 +4108,27 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             let names: Vec<&str> = r.clone().map(|s| store.name(index.rows[s])).collect();
             // The pattern rules fit only the fragments the experiment observed, exactly as
             // phase 2 handed them to the fit.
+            let cmask = q1a.as_ref().and_then(|a| a.mask_of(&index, ci));
             let eligible: Vec<bool> = match (rule, pattern_fit) {
                 (DetailRule::Pattern, Some(fit)) => {
                     let seen = fit.observed.get(&c);
                     names
                         .iter()
-                        .map(|nm| seen.is_some_and(|s| s.contains(*nm)))
+                        .enumerate()
+                        .map(|(k, nm)| {
+                            seen.is_some_and(|s| s.contains(*nm))
+                                && !cmask.as_ref().is_some_and(|m| m[k])
+                        })
                         .collect()
                 }
                 _ => vec![false; names.len()],
             };
+            let masked_areas = q1a
+                .as_ref()
+                .and_then(|a| a.masked_areas(&index, ci, &area_by_slot));
             let account = fragment_account(
                 &FragmentAccountInput {
-                    areas: &area_by_slot[r.clone()],
+                    areas: masked_areas.as_deref().unwrap_or(&area_by_slot[r.clone()]),
                     preds: &index.slot_pred[r.clone()],
                     names: &names,
                     weights: weights.and_then(|fw| fw.get(&c)),
@@ -3781,6 +4298,47 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         if !p.cfg.resolved.is_empty() {
             params.insert("recipe_resolved".to_string(), json!(p.cfg.resolved));
         }
+        // `quant.q1_cycle_halfwidth`, only then, so every other report keeps its bytes.
+        if let Some(w) = &cycle_win {
+            params.insert("q1_cycle_window".to_string(), w.stats.clone());
+        }
+        // `quant.q1_fragments`, only then, so every other report keeps its bytes.
+        if let (Some(a), Some(inp)) = (&q1a, p.q1) {
+            let elution: Vec<Option<bool>> = applied.iter().map(|x| x.elution_fitted).collect();
+            let pattern_fallbacks = applied
+                .iter()
+                .filter(|x| {
+                    x.pattern
+                        .is_some_and(|q| q.2 == "no_belonging_pattern_fragments")
+                })
+                .count();
+            params.insert(
+                "q1_fragments".to_string(),
+                json!({
+                    "psms_extracted": inp.psms_extracted,
+                    "spectra_ms2": inp.spectra_ms2,
+                    "min_belonging": p.cfg.q1_min_belonging,
+                    "step_weights": format!("{:?}", p.cfg.q1_step_weights),
+                    "integration": format!("{:?}", p.cfg.q1_integration),
+                    "step_mz": a.model.step_mz,
+                    "half_width_mz": a.model.half_width_mz,
+                    "edge_width_mz": a.model.edge_width_mz,
+                    "sweep_scans": a.scans,
+                    "candidates": {
+                        "belonging": a.status.iter().filter(|&&s| s == Q1Status::Belonging).count(),
+                        "fallback": a.status.iter().filter(|&&s| s == Q1Status::Fallback).count(),
+                        "uncollapsed_no_decision": a.no_decision,
+                        "uncollapsed_mismatched_rows": a.mismatched,
+                        "uncollapsed_off_sweep": a.unlocated,
+                    },
+                    "masked_fragments": a.masked_rows,
+                    "rows": n_q1_rows,
+                    "elution_fitted": elution.iter().filter(|&&e| e == Some(true)).count(),
+                    "elution_trapezoid": elution.iter().filter(|&&e| e == Some(false)).count(),
+                    "pattern_no_belonging": pattern_fallbacks,
+                }),
+            );
+        }
     }
     if !whole_table {
         if let Some(params) = report_params.as_object_mut() {
@@ -3804,7 +4362,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     for (path, schema, rows, table_stats) in [
         (
             p.out_peptide,
-            artifact::peptide_quant(p.first_pass_ids.is_some()),
+            artifact::peptide_quant_q1(p.first_pass_ids.is_some(), q1a.is_some()),
             n_pep,
             &pep_stats,
         ),
@@ -5245,6 +5803,7 @@ mod tests {
                 cross_run: None,
                 export_cross_run: false,
                 first_pass_ids: ids,
+                q1: None,
             })
             .unwrap();
             (pep, prot)
@@ -5371,6 +5930,7 @@ mod tests {
             cross_run: None,
             export_cross_run: false,
             first_pass_ids: None,
+            q1: None,
         })
         .unwrap();
         assert_eq!(rows, (4, 3));
@@ -5640,6 +6200,7 @@ mod tests {
             cross_run: None,
             export_cross_run: false,
             first_pass_ids: None,
+            q1: None,
         })
         .unwrap();
         assert_eq!(rows, (1, 1));
@@ -5678,6 +6239,7 @@ mod tests {
                 cross_run: None,
                 export_cross_run: false,
                 first_pass_ids: None,
+                q1: None,
             })
             .unwrap();
             let pq = Table::read(&peptide).unwrap();
@@ -5781,6 +6343,7 @@ mod tests {
             cross_run: fit,
             export_cross_run: export,
             first_pass_ids: None,
+            q1: None,
         })
         .unwrap();
         out
@@ -6062,6 +6625,7 @@ mod tests {
                 cross_run: fit,
                 export_cross_run: false,
                 first_pass_ids: None,
+                q1: None,
             })
             .unwrap();
             assert_eq!(w.quant_fragments.is_some(), with);
@@ -6395,6 +6959,7 @@ mod tests {
             cross_run: None,
             export_cross_run: false,
             first_pass_ids: None,
+            q1: None,
         })
         .unwrap();
         assert_eq!(rows.0, 2, "both identifications must be reported");
@@ -6436,6 +7001,7 @@ mod tests {
             cross_run: None,
             export_cross_run: false,
             first_pass_ids: None,
+            q1: None,
         })
         .unwrap_err()
         .to_string();
@@ -6877,6 +7443,7 @@ mod tests {
             cross_run: None,
             export_cross_run: false,
             first_pass_ids: None,
+            q1: None,
         })
         .unwrap();
         assert_eq!(rows, (3, 2));
@@ -7008,6 +7575,7 @@ mod tests {
                 cross_run: None,
                 export_cross_run: false,
                 first_pass_ids: None,
+                q1: None,
             })
             .unwrap();
             let pq = Table::read(&peptide).unwrap();
@@ -7892,6 +8460,7 @@ mod tests {
             cross_run: None,
             export_cross_run: false,
             first_pass_ids: None,
+            q1: None,
         })
     }
 
@@ -8098,6 +8667,7 @@ mod tests {
                 cross_run: None,
                 export_cross_run: false,
                 first_pass_ids: None,
+                q1: None,
             })?;
             let mut report: serde_json::Value =
                 mumdia_io::json::read_json(&format!("{pep}.report.json")).unwrap();
@@ -8225,6 +8795,7 @@ mod tests {
                 cross_run: None,
                 export_cross_run: false,
                 first_pass_ids: None,
+                q1: None,
             })
             .unwrap();
             [pep, prot, frag, pb]
@@ -8365,6 +8936,7 @@ mod tests {
                     cross_run: None,
                     export_cross_run: false,
                     first_pass_ids: None,
+                    q1: None,
                 })
                 .unwrap();
                 files.extend([pep, prot, frag].iter().map(|p| std::fs::read(p).unwrap()));
@@ -8562,6 +9134,7 @@ mod tests {
                 cross_run: None,
                 export_cross_run: false,
                 first_pass_ids: None,
+                q1: None,
             })
             .unwrap();
             // The quantities as well, so a failure says which column moved rather than
@@ -9472,6 +10045,7 @@ mod pattern_tests {
             cross_run: fit,
             export_cross_run: fragment.is_some(),
             first_pass_ids: None,
+            q1: None,
         })
         .unwrap();
         pep
@@ -9797,6 +10371,7 @@ mod pattern_tests {
             cross_run: Some(&fit),
             export_cross_run: false,
             first_pass_ids: None,
+            q1: None,
         })
         .unwrap();
         assert_eq!(

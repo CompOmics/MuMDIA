@@ -313,11 +313,65 @@ pub const RICH_EXTRA: &[&str] = &[
     "shadow_frac",
 ];
 
+/// The Q1-profile family of scanning-quadrupole spectra (`features.q1_features`): the
+/// psms_extracted v5 columns of the same names (`extract.q1_profile`), appended after every
+/// other column of the `extended` set.
+pub const Q1_FEATURES: &[&str] = &["q1_corr", "q1_offset", "q1_frag_sd", "q1_bin_frac"];
+
+/// The per-fragment Q1 decision family of scanning-quadrupole spectra
+/// (`features.q1_fragment_features`): the psms_extracted v6 columns of the same names
+/// (`extract.q1_fragments`), appended after every other column of the `extended` set (after
+/// [`Q1_FEATURES`] when both are on).
+pub const Q1F_FEATURES: &[&str] = &[
+    "q1f_n_belong",
+    "q1f_belong_share",
+    "q1f_interfered_share",
+    "q1f_offset_median",
+    "q1f_offset_mad",
+    "q1f_corr2d",
+    "q1f_fit_resid",
+    "q1f_centre",
+];
+
+/// The MS1 isotope-envelope family (`features.ms1_envelope`, [`super::ms1env`]), derived
+/// from the psms_extracted v7 evidence, appended after every other column of the `extended`
+/// set (after [`Q1F_FEATURES`] when that is on).
+pub const MS1E_FEATURES: &[&str] = super::ms1env::FEATURES;
+
 /// The ordered active feature list for the configured set. `im` is the resolved
 /// `features.im_features`, with `imc_ref_w` when `retrace.apex_features` wrote it
 /// ([`ImFamily`]): under `extended` it appends the ion-mobility columns after the other
 /// families (`families`); the smaller sets have no family battery and ignore it.
 pub fn active_features(set: FeatureSet, im: impl Into<ImFamily>) -> Vec<String> {
+    active_features_with(set, im, false)
+}
+
+/// [`active_features`], with the Q1-profile family ([`Q1_FEATURES`]) appended last under
+/// `extended` when `q1` (`features.q1_features`) is on.
+pub fn active_features_with(set: FeatureSet, im: impl Into<ImFamily>, q1: bool) -> Vec<String> {
+    active_features_q1(set, im, q1, false)
+}
+
+/// [`active_features_with`], with the per-fragment Q1 decision family ([`Q1F_FEATURES`])
+/// appended after it under `extended` when `q1f` (`features.q1_fragment_features`) is on.
+pub fn active_features_q1(
+    set: FeatureSet,
+    im: impl Into<ImFamily>,
+    q1: bool,
+    q1f: bool,
+) -> Vec<String> {
+    active_features_all(set, im, q1, q1f, false)
+}
+
+/// [`active_features_q1`], with the MS1 isotope-envelope family ([`MS1E_FEATURES`])
+/// appended last under `extended` when `ms1e` (`features.ms1_envelope`) is on.
+pub fn active_features_all(
+    set: FeatureSet,
+    im: impl Into<ImFamily>,
+    q1: bool,
+    q1f: bool,
+    ms1e: bool,
+) -> Vec<String> {
     let mut v: Vec<String> = MINIMAL_FEATURES.iter().map(|s| s.to_string()).collect();
     if matches!(set, FeatureSet::Rich | FeatureSet::Extended) {
         v.extend(RICH_EXTRA.iter().map(|s| s.to_string()));
@@ -336,6 +390,15 @@ pub fn active_features(set: FeatureSet, im: impl Into<ImFamily>) -> Vec<String> 
         v.push("n_charge_states".to_string());
         v.push("charge_multi_flag".to_string());
         v.push("cross_charge_intensity_log".to_string());
+        if q1 {
+            v.extend(Q1_FEATURES.iter().map(|s| s.to_string()));
+        }
+        if q1f {
+            v.extend(Q1F_FEATURES.iter().map(|s| s.to_string()));
+        }
+        if ms1e {
+            v.extend(MS1E_FEATURES.iter().map(|s| s.to_string()));
+        }
     }
     v
 }
@@ -344,7 +407,13 @@ pub fn active_features(set: FeatureSet, im: impl Into<ImFamily>) -> Vec<String> 
 /// that do (`has_im`) or do not carry 1/K0. An orchestrator resolves it once
 /// (`Config::resolve_im_features`), so `has_im` then changes nothing.
 pub fn active_features_for(cfg: &FeaturesConfig, has_im: bool) -> Vec<String> {
-    active_features(cfg.set, cfg.im_features.on(has_im))
+    active_features_all(
+        cfg.set,
+        cfg.im_features.on(has_im),
+        cfg.q1_features,
+        cfg.q1_fragment_features,
+        cfg.ms1_envelope,
+    )
 }
 
 /// The active feature list of a run's search pass, for the schema id an orchestrator
@@ -353,9 +422,12 @@ pub fn active_features_for(cfg: &FeaturesConfig, has_im: bool) -> Vec<String> {
 /// `retrace.enabled` and without the ion-mobility family).
 pub fn active_features_of(cfg: &mumdia_core::config::Config, has_im: bool) -> Vec<String> {
     let im = cfg.features.im_features.on(has_im);
-    active_features(
+    active_features_all(
         cfg.features.set,
         ImFamily::of(im, cfg.retrace.apex_features),
+        cfg.features.q1_features,
+        cfg.features.q1_fragment_features,
+        cfg.features.ms1_envelope,
     )
 }
 
@@ -2159,6 +2231,27 @@ col_ix!(
     n_charge_states,
     charge_multi_flag,
     cross_charge_intensity_log,
+    q1_corr,
+    q1_offset,
+    q1_frag_sd,
+    q1_bin_frac,
+    q1f_n_belong,
+    q1f_belong_share,
+    q1f_interfered_share,
+    q1f_offset_median,
+    q1f_offset_mad,
+    q1f_corr2d,
+    q1f_fit_resid,
+    q1f_centre,
+    ms1e_env_r2,
+    ms1e_env_n,
+    ms1e_m1_share,
+    ms1e_half_share,
+    ms1e_spacing_ppm,
+    ms1e_mono_ppm,
+    ms1e_mono_ppm_abs,
+    ms1e_ibar_dev,
+    ms1e_q1_agree,
 );
 
 /// Percolator-style PIN written row by row as the chunks are computed. Nothing in the
@@ -3397,6 +3490,81 @@ fn run_chunked(
     let pform = ps.str("peptidoform")?;
     let protein = ps.str("protein")?;
     let mz = ps.f64("precursor_mz")?;
+    // The Q1-profile family (`features.q1_features`) from psms_extracted v5. The switch comes
+    // from the configuration, as the schema id the orchestrator records does, so a table
+    // without the columns is an error rather than a column of zeros.
+    let q1_cols: Vec<Vec<f64>> = if p.cfg.q1_features {
+        Q1_FEATURES
+            .iter()
+            .map(|c| {
+                if !ps.has_column(c) {
+                    anyhow::bail!(
+                        "features: features.q1_features is on, but {} has no {c} column; \
+                         extract writes the Q1-profile columns under extract.q1_profile",
+                        p.psms
+                    );
+                }
+                ps.f64(c)
+            })
+            .collect::<Result<_>>()?
+    } else {
+        Vec::new()
+    };
+    // The per-fragment Q1 decision family (`features.q1_fragment_features`) from
+    // psms_extracted v6, the same way.
+    let q1f_cols: Vec<Vec<f64>> = if p.cfg.q1_fragment_features {
+        Q1F_FEATURES
+            .iter()
+            .map(|c| {
+                if !ps.has_column(c) {
+                    anyhow::bail!(
+                        "features: features.q1_fragment_features is on, but {} has no {c} \
+                         column; extract writes the per-fragment Q1 decision columns under \
+                         extract.q1_fragments",
+                        p.psms
+                    );
+                }
+                ps.f64(c)
+            })
+            .collect::<Result<_>>()?
+    } else {
+        Vec::new()
+    };
+    // The MS1 isotope-envelope family (`features.ms1_envelope`): its features per row, from
+    // the psms_extracted v7 evidence and the row's precursor m/z and charge
+    // (`ms1env::values`), one column per feature. An error without the evidence, as above.
+    let ms1e_cols: Vec<Vec<f64>> = if p.cfg.ms1_envelope {
+        let ev: Vec<Vec<f64>> = super::ms1env::EVIDENCE_COLUMNS
+            .iter()
+            .map(|c| {
+                if !ps.has_column(c) {
+                    anyhow::bail!(
+                        "features: features.ms1_envelope is on, but {} has no {c} column; \
+                         extract writes the MS1 isotope-envelope evidence under \
+                         features.ms1_envelope",
+                        p.psms
+                    );
+                }
+                ps.f64(c)
+            })
+            .collect::<Result<_>>()?;
+        let mut cols = vec![Vec::with_capacity(ps.nrows); MS1E_FEATURES.len()];
+        for i in 0..ps.nrows {
+            let mut e = [0.0f64; 16];
+            for (k, x) in e.iter_mut().enumerate() {
+                *x = ev[k][i];
+            }
+            for (col, v) in cols
+                .iter_mut()
+                .zip(super::ms1env::values(&e, mz[i], charge[i]))
+            {
+                col.push(v);
+            }
+        }
+        cols
+    } else {
+        Vec::new()
+    };
     let contested = ps
         .f64("contested_frac")
         .unwrap_or_else(|_| vec![0.0; ps.nrows]);
@@ -3577,7 +3745,13 @@ fn run_chunked(
     };
 
     let gradient = apex_rt.iter().cloned().fold(0.0f64, f64::max).max(1.0);
-    let cols_active = active_features(p.cfg.set, im_fam);
+    let cols_active = active_features_all(
+        p.cfg.set,
+        im_fam,
+        p.cfg.q1_features,
+        p.cfg.q1_fragment_features,
+        p.cfg.ms1_envelope,
+    );
     let n = ps.nrows;
 
     // --- Cross-candidate charge-state corroboration (Extended set) ---
@@ -4041,6 +4215,33 @@ fn run_chunked(
                         put(ix.n_charge_states, f_n_charge[i]);
                         put(ix.charge_multi_flag, f_charge_multi[i]);
                         put(ix.cross_charge_intensity_log, f_cross_charge_int[i]);
+                        if !q1_cols.is_empty() {
+                            put(ix.q1_corr, q1_cols[0][i]);
+                            put(ix.q1_offset, q1_cols[1][i]);
+                            put(ix.q1_frag_sd, q1_cols[2][i]);
+                            put(ix.q1_bin_frac, q1_cols[3][i]);
+                        }
+                        if !q1f_cols.is_empty() {
+                            put(ix.q1f_n_belong, q1f_cols[0][i]);
+                            put(ix.q1f_belong_share, q1f_cols[1][i]);
+                            put(ix.q1f_interfered_share, q1f_cols[2][i]);
+                            put(ix.q1f_offset_median, q1f_cols[3][i]);
+                            put(ix.q1f_offset_mad, q1f_cols[4][i]);
+                            put(ix.q1f_corr2d, q1f_cols[5][i]);
+                            put(ix.q1f_fit_resid, q1f_cols[6][i]);
+                            put(ix.q1f_centre, q1f_cols[7][i]);
+                        }
+                        if !ms1e_cols.is_empty() {
+                            put(ix.ms1e_env_r2, ms1e_cols[0][i]);
+                            put(ix.ms1e_env_n, ms1e_cols[1][i]);
+                            put(ix.ms1e_m1_share, ms1e_cols[2][i]);
+                            put(ix.ms1e_half_share, ms1e_cols[3][i]);
+                            put(ix.ms1e_spacing_ppm, ms1e_cols[4][i]);
+                            put(ix.ms1e_mono_ppm, ms1e_cols[5][i]);
+                            put(ix.ms1e_mono_ppm_abs, ms1e_cols[6][i]);
+                            put(ix.ms1e_ibar_dev, ms1e_cols[7][i]);
+                            put(ix.ms1e_q1_agree, ms1e_cols[8][i]);
+                        }
 
                         pr[rl] = n_matched[i] as f64 * (0.5 + ff.frag_corr.max(0.0))
                             + ff.coelution_mean.max(0.0)
@@ -5832,6 +6033,129 @@ mod tests {
     }
 
     // --- the feature -> column permutation ---
+
+    /// The Q1-profile family is the last four columns of the extended set when it is on,
+    /// nowhere otherwise, and every one of its columns is written.
+    #[test]
+    fn the_q1_family_is_appended_last_and_only_when_asked() {
+        let off = active_features(FeatureSet::Extended, false);
+        let on = active_features_with(FeatureSet::Extended, false, true);
+        assert_eq!(on.len(), off.len() + Q1_FEATURES.len());
+        assert_eq!(&on[..off.len()], &off[..]);
+        assert_eq!(&on[off.len()..], Q1_FEATURES);
+        for set in [FeatureSet::Minimal, FeatureSet::Rich] {
+            assert_eq!(
+                active_features_with(set, false, true),
+                active_features(set, false)
+            );
+        }
+        let ix = ColIx::new(&on, &extended_name_refs(false));
+        let mut seen: Vec<usize> = ix
+            .named()
+            .into_iter()
+            .chain(ix.ext.iter().copied())
+            .flatten()
+            .collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..on.len()).collect::<Vec<_>>());
+        let mut cfg = FeaturesConfig {
+            set: FeatureSet::Extended,
+            ..FeaturesConfig::default()
+        };
+        assert_eq!(active_features_for(&cfg, false), off);
+        cfg.q1_features = true;
+        assert_eq!(active_features_for(&cfg, false), on);
+    }
+
+    /// The per-fragment Q1 decision family is appended after the Q1-profile family (or
+    /// last on its own) under the extended set only, every column is written, and the
+    /// schema id changes only with it on.
+    #[test]
+    fn the_q1f_family_is_appended_last_and_only_when_asked() {
+        let off = active_features(FeatureSet::Extended, false);
+        let on = active_features_q1(FeatureSet::Extended, false, false, true);
+        assert_eq!(on.len(), off.len() + Q1F_FEATURES.len());
+        assert_eq!(&on[..off.len()], &off[..]);
+        assert_eq!(&on[off.len()..], Q1F_FEATURES);
+        let both = active_features_q1(FeatureSet::Extended, false, true, true);
+        assert_eq!(&both[off.len()..off.len() + Q1_FEATURES.len()], Q1_FEATURES);
+        assert_eq!(&both[off.len() + Q1_FEATURES.len()..], Q1F_FEATURES);
+        assert_eq!(
+            active_features_q1(FeatureSet::Extended, false, false, false),
+            off
+        );
+        for set in [FeatureSet::Minimal, FeatureSet::Rich] {
+            assert_eq!(
+                active_features_q1(set, false, true, true),
+                active_features(set, false)
+            );
+        }
+        for cols in [&on, &both] {
+            let ix = ColIx::new(cols, &extended_name_refs(false));
+            let mut seen: Vec<usize> = ix
+                .named()
+                .into_iter()
+                .chain(ix.ext.iter().copied())
+                .flatten()
+                .collect();
+            seen.sort_unstable();
+            assert_eq!(seen, (0..cols.len()).collect::<Vec<_>>());
+            for (name, i) in ix.named_pairs() {
+                if let Some(i) = i {
+                    assert_eq!(cols[i], name);
+                }
+            }
+        }
+        let mut cfg = FeaturesConfig {
+            set: FeatureSet::Extended,
+            ..FeaturesConfig::default()
+        };
+        assert_eq!(active_features_for(&cfg, false), off);
+        cfg.q1_fragment_features = true;
+        assert_eq!(active_features_for(&cfg, false), on);
+        assert_ne!(feature_schema_id(&on), feature_schema_id(&off));
+    }
+
+    /// The MS1 isotope-envelope family is appended last under the extended set only (after
+    /// both Q1 families when they are on), every column is written, and the schema id
+    /// changes only with it on.
+    #[test]
+    fn the_ms1e_family_is_appended_last_and_only_when_asked() {
+        let off = active_features(FeatureSet::Extended, false);
+        let on = active_features_all(FeatureSet::Extended, false, false, false, true);
+        assert_eq!(on.len(), off.len() + MS1E_FEATURES.len());
+        assert_eq!(&on[..off.len()], &off[..]);
+        assert_eq!(&on[off.len()..], MS1E_FEATURES);
+        let all = active_features_all(FeatureSet::Extended, false, true, true, true);
+        let q1_both = active_features_q1(FeatureSet::Extended, false, true, true);
+        assert_eq!(&all[..q1_both.len()], &q1_both[..]);
+        assert_eq!(&all[q1_both.len()..], MS1E_FEATURES);
+        for set in [FeatureSet::Minimal, FeatureSet::Rich] {
+            assert_eq!(
+                active_features_all(set, false, true, true, true),
+                active_features(set, false)
+            );
+        }
+        for cols in [&on, &all] {
+            let ix = ColIx::new(cols, &extended_name_refs(false));
+            let mut seen: Vec<usize> = ix
+                .named()
+                .into_iter()
+                .chain(ix.ext.iter().copied())
+                .flatten()
+                .collect();
+            seen.sort_unstable();
+            assert_eq!(seen, (0..cols.len()).collect::<Vec<_>>());
+        }
+        let mut cfg = FeaturesConfig {
+            set: FeatureSet::Extended,
+            ..FeaturesConfig::default()
+        };
+        assert_eq!(active_features_for(&cfg, false), off);
+        cfg.ms1_envelope = true;
+        assert_eq!(active_features_for(&cfg, false), on);
+        assert_ne!(feature_schema_id(&on), feature_schema_id(&off));
+    }
 
     #[test]
     fn colix_covers_every_active_column() {

@@ -87,6 +87,32 @@ pub const AMMONIA: f64 = 17.026_549_1;
 /// (AME2020 atomic masses); not copied from any proteomics implementation.
 pub const ISOTOPE_SPACING: f64 = 1.003_354_835;
 
+/// Expected heavy isotopes per dalton of peptide neutral mass in the Poisson-averagine
+/// isotope model (`lambda = AVERAGINE_LAMBDA_PER_DA * mass`): the MS1 isotope-envelope
+/// features and the precursor envelope of the Q1 calibration (`stages::q1cal`).
+pub const AVERAGINE_LAMBDA_PER_DA: f64 = 0.000_594;
+
+/// The Poisson-averagine abundances of the isotopes M+0 .. M+(n-1) of a peptide of neutral
+/// mass `mass` (Da), normalised to sum 1 over those `n`.
+pub fn averagine_isotopes(mass: f64, n: usize) -> Vec<f64> {
+    let lambda = (AVERAGINE_LAMBDA_PER_DA * mass).max(0.0);
+    let mut v = Vec::with_capacity(n);
+    let mut t = (-lambda).exp();
+    for k in 0..n {
+        if k > 0 {
+            t *= lambda / k as f64;
+        }
+        v.push(t);
+    }
+    let s: f64 = v.iter().sum();
+    if s > 0.0 {
+        for x in &mut v {
+            *x /= s;
+        }
+    }
+    v
+}
+
 /// Monoisotopic residue mass in Da for a standard amino acid, or `None` for
 /// residues MuMDIA treats as ambiguous (B, J, O, U, X, Z).
 pub fn residue_mass(aa: u8) -> Option<f64> {

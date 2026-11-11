@@ -462,6 +462,9 @@ Options:
       --fragment-offset <FRAGMENT_OFFSET>
           The library row that `--lib-precursors` row 0 came from, when that table is one isolation-window band of a larger library (`groups.window_groups` writes such bands, with ids rebased to `0..n`). The band's fragments are then read from the shared `--lib-fragments` table by that id range, selectively when the table is sorted by `candidate_id`, so a band needs no fragment table of its own
 
+      --q1-cal <Q1_CAL>
+          The run's `cal.json` with its Q1 calibration (`rt_im_train.q1_calibrate`), which `extract.q1_fragments` decides with
+
       --config <CONFIG>
 ```
 
@@ -733,6 +736,15 @@ Options:
       --cross-run-from <CROSS_RUN_FROM>...
           The second pass of the cross-run step: the first-pass `--out-fragment` tables of every run of the experiment, written with `--export-cross-run`, in run order. The fit follows `quant.fragment_selection = cross_run`, `pattern_fit` or `pattern_profile`, `quant.baseline_source = experiment` and `quant.fixed_scan_halfwidth_scale`. Without it those keys fall back to the per-run quant
 
+      --cross-run-pattern-from <CROSS_RUN_PATTERN_FROM>...
+          The tables the pattern dispersion of `--cross-run-from` is fitted on instead: the background-subtracted exports of every run (`--export-cross-run` with `--cross-run-from` the first-pass tables), in run order. `run-experiment` fits the background on the first-pass tables and the dispersion on these, which this reproduces; without it both come from `--cross-run-from`. Needs a pattern rule
+
+      --psms-extracted <PSMS_EXTRACTED>
+          `quant.q1_fragments`: the run's psms_extracted v6 (`extract.q1_fragments`), whose per-fragment Q1 decisions select the fragments and whose report records the Q1 model. Required with the key on, read only then
+
+      --spectra-ms2 <SPECTRA_MS2>
+          `quant.q1_fragments` / `quant.q1_cycle_halfwidth`: the run's spectra_ms2 (v3 records the Q1 step and cycle of every sample). Required with either key on, read only then
+
       --config <CONFIG>
 ```
 
@@ -988,6 +1000,8 @@ Plus the 7 repeated flags removed above: see "Global flags".
 Peaks per MS2 spectrum for an mzML or a diaPASEF `.d`, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard.
 
 The pre-flight for a decision the documentation says must be made per acquisition. Reading it before setting a cap is the difference between bounding peak volume and deleting fragment evidence from most spectra. A diaPASEF `.d` is counted after the native reader's centroiding, which is what `convert` writes for it.
+
+For an mzML the `isolation` block says how `convert` reads the MS2 isolation windows of the spectra counted: with offsets, without isolation, or a target and no offsets. A scanning-quadrupole file of the last kind (SCIEX ZT Scan DIA) is refused without `convert.isolation_half_width`; the block names the layout of its targets and a half-width to start from (docs/37_ztscan.md).
 
 Usage: mumdia peak-census [OPTIONS] --mzml <MZML>
 

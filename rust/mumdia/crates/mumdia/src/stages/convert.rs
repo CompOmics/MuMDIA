@@ -253,9 +253,15 @@ impl ConvertSchemas {
     /// The schemas a conversion writes: the v2 spectra and isolation windows when the
     /// source carries ion mobility, the v1 artifacts otherwise.
     pub fn for_source(has_im: bool) -> ConvertSchemas {
+        Self::for_conversion(has_im, false)
+    }
+
+    /// [`ConvertSchemas::for_source`], with spectra_ms2 v3 when the conversion recorded the
+    /// Q1 sweep of a scanning quadrupole (`q1`).
+    pub fn for_conversion(has_im: bool, q1: bool) -> ConvertSchemas {
         ConvertSchemas {
             ms1: artifact::spectra_ms1(has_im),
-            ms2: artifact::spectra_ms2(has_im),
+            ms2: artifact::spectra_ms2_q1(has_im, q1),
             isolation_windows: artifact::isolation_windows(has_im),
             ms2_to_ms1: artifact::MS2_TO_MS1,
         }
@@ -317,12 +323,16 @@ struct Ms2Chunk {
     mz: Vec<Vec<f32>>,
     inten: Vec<Vec<f32>>,
     im: Vec<Vec<f32>>,
+    /// The Q1 sweep of v3 ([`Q1Sweep`]), filled only while it is recorded.
+    q1_cycle: Vec<u32>,
+    q1_step: Vec<u32>,
 }
 
 impl Ms2Chunk {
     /// The v1 columns, and for a source with ion mobility (`has_im`, fixed per run) the
-    /// window 1/K0 bounds and the per-peak `im` list of v2.
-    fn cols(&mut self, has_im: bool) -> Vec<Col> {
+    /// window 1/K0 bounds and the per-peak `im` list of v2, or under a recorded Q1 sweep
+    /// (`q1`, fixed per run) `q1_cycle` and `q1_step`, appended last (v3).
+    fn cols(&mut self, has_im: bool, q1: bool) -> Vec<Col> {
         let mut c = vec![
             Col::U32("scan_index".into(), std::mem::take(&mut self.idx)),
             Col::Str("id".into(), std::mem::take(&mut self.id)),
@@ -352,7 +362,74 @@ impl Ms2Chunk {
         if has_im {
             c.push(Col::LargeListF32("im".into(), std::mem::take(&mut self.im)));
         }
+        if q1 {
+            c.push(Col::U32(
+                "q1_cycle".into(),
+                std::mem::take(&mut self.q1_cycle),
+            ));
+            c.push(Col::U32(
+                "q1_step".into(),
+                std::mem::take(&mut self.q1_step),
+            ));
+        }
         c
+    }
+}
+
+/// The Q1 sweep of a scanning-quadrupole acquisition as convert reads it (spectra_ms2 v3):
+/// recorded when `convert.isolation_half_width` widened the first MS2 spectrum, which then
+/// named a target and no offsets (SCIEX ZT Scan DIA). The decision is taken on that first
+/// spectrum, so every row group has the same columns, and a file that carries its offsets
+/// is written exactly as without the key.
+///
+/// The quadrupole sweeps the precursor range upward once per cycle, so a cycle starts at
+/// the first MS2 spectrum and at every MS2 spectrum whose target is not above the target
+/// of the MS2 spectrum before it; the step is the spectrum's position in its cycle, in
+/// acquisition order (0 for the first). On a regular sweep the step is the rank of the
+/// window target, the same in every cycle. MS1 spectra are not counted.
+#[derive(Debug, Default)]
+struct Q1Sweep {
+    /// Decided on the first MS2 spectrum: `Some(true)` records the sweep.
+    on: Option<bool>,
+    cycle: u32,
+    step: u32,
+    prev_target: Option<f64>,
+    /// The longest cycle seen, in steps.
+    max_steps: u32,
+}
+
+impl Q1Sweep {
+    /// Decide on the first MS2 spectrum, `widened` by the half-width or not.
+    fn decide(&mut self, widened: bool) -> bool {
+        *self.on.get_or_insert(widened)
+    }
+
+    fn on(&self) -> bool {
+        self.on == Some(true)
+    }
+
+    /// The cycle and step of the next MS2 spectrum, of window target `target`.
+    fn next(&mut self, target: f64) -> (u32, u32) {
+        match self.prev_target {
+            None => {}
+            Some(p) if target > p => self.step += 1,
+            Some(_) => {
+                self.cycle += 1;
+                self.step = 0;
+            }
+        }
+        self.prev_target = Some(target);
+        self.max_steps = self.max_steps.max(self.step + 1);
+        (self.cycle, self.step)
+    }
+
+    /// Cycles seen (0 before the first spectrum).
+    fn cycles(&self) -> u32 {
+        if self.prev_target.is_some() {
+            self.cycle + 1
+        } else {
+            0
+        }
     }
 }
 
@@ -431,14 +508,19 @@ struct Ms2Row {
     /// without `convert.isolation_half_width` ([`Isolation::TargetOnly`]); [`Fold`] decides
     /// whether the file is refused. `None` for every other spectrum.
     target_only: Option<f64>,
+    /// The window is a target widened by `convert.isolation_half_width`
+    /// ([`Isolation::Widened`]): what decides whether [`Q1Sweep`] is recorded.
+    widened: bool,
 }
 
 /// How an MS2 spectrum's isolation window is read (`isolation_bounds`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Isolation {
-    /// `(target, lower, upper)` m/z: explicit offsets, or a target widened by
-    /// `convert.isolation_half_width`.
+    /// `(target, lower, upper)` m/z: explicit offsets.
     Window(f64, f64, f64),
+    /// `(target, lower, upper)` m/z: a target without offsets widened by
+    /// `convert.isolation_half_width`.
+    Widened(f64, f64, f64),
     /// No isolation: no precursor, no window, or "no isolation" (MS:1003159). The whole
     /// m/z range, as for an all-ion acquisition: [`ALL_ION_WINDOW`].
     AllIon,
@@ -476,7 +558,7 @@ fn isolation_bounds(
     match half_width {
         Some(h) => {
             let h = h as f32;
-            Isolation::Window(
+            Isolation::Widened(
                 w.target as f64,
                 (w.target - h) as f64,
                 (w.target + h) as f64,
@@ -515,7 +597,7 @@ fn decode_one<S: SpectrumLike>(
             let prec = spec.precursor();
             let isolation = isolation_bounds(prec.map(|pr| &pr.isolation_window), half_width);
             let (wt, wl, wu) = match isolation {
-                Isolation::Window(t, l, u) => (t, l, u),
+                Isolation::Window(t, l, u) | Isolation::Widened(t, l, u) => (t, l, u),
                 // AIF / all-ion: no quad isolation -> full-range window.
                 Isolation::AllIon | Isolation::TargetOnly(_) => ALL_ION_WINDOW,
             };
@@ -523,6 +605,7 @@ fn decode_one<S: SpectrumLike>(
                 Isolation::TargetOnly(t) => Some(t),
                 _ => None,
             };
+            let widened = matches!(isolation, Isolation::Widened(..));
             let (pmz, pz) = match prec.and_then(|pr| pr.ions.first()) {
                 Some(ion) => (Some(ion.mz), ion.charge),
                 None => (None, None),
@@ -542,6 +625,7 @@ fn decode_one<S: SpectrumLike>(
                 im_lo: None,
                 im_hi: None,
                 target_only,
+                widened,
             }))
         }
         _ => Decoded::Other,
@@ -661,6 +745,112 @@ fn target_only_refusal(mzml: &str, t: &TargetOnly) -> anyhow::Error {
     )
 }
 
+/// The half-width [`IsolationCensus`] suggests for a scanning quadrupole, in steps of its
+/// sweep: a window five steps wide. The file names the quadrupole's position and not its
+/// window, so the window has to come from the method; the measured SCIEX ZT Scan DIA method
+/// isolates 3.8 m/z in steps of 0.761 m/z (five steps), and on its runs the half-widths
+/// 1.5, 1.9 and 2.3 m/z identified the same within one seed's noise (docs/37_ztscan.md).
+pub const SCANNING_HALF_WIDTH_STEPS: f64 = 2.5;
+
+/// What the isolation windows of a file's MS2 spectra say, read as `convert` reads them
+/// (`mumdia peak-census`, and through it the desktop's check of the selected files): how many
+/// spectra state their window's offsets, how many isolate nothing, and how many name a target
+/// and no offsets; for the last, whether `convert` refuses the file without
+/// `convert.isolation_half_width`, the layout of the targets, whether it is a scanning
+/// quadrupole (the rule the refusal names: at least 50 distinct targets repeating cycle after
+/// cycle in steps under 1.5 m/z) and the half-width to suggest ([`SCANNING_HALF_WIDTH_STEPS`]
+/// steps).
+#[derive(Default)]
+pub struct IsolationCensus {
+    ms2: usize,
+    with_offsets: usize,
+    no_isolation: usize,
+    target_only: TargetOnly,
+    /// `(target, retention time in s)` of the target-only spectra of the sample, for the
+    /// cycle time.
+    timed: Vec<(f64, f64)>,
+}
+
+impl IsolationCensus {
+    /// Count one MS2 spectrum (any other level is ignored).
+    pub fn record<S: SpectrumLike>(&mut self, spec: &S) {
+        if spec.ms_level() != 2 {
+            return;
+        }
+        self.ms2 += 1;
+        let iso = isolation_bounds(spec.precursor().map(|pr| &pr.isolation_window), None);
+        match iso {
+            Isolation::Window(..) | Isolation::Widened(..) => self.with_offsets += 1,
+            Isolation::AllIon => self.no_isolation += 1,
+            Isolation::TargetOnly(t) => {
+                self.target_only.record(spec.id(), t);
+                if self.timed.len() < TARGET_ONLY_SAMPLE {
+                    self.timed.push((t, spec.start_time() * 60.0));
+                }
+            }
+        }
+    }
+
+    /// The median time between two spectra of one target: the cycle of a sweep that
+    /// repeats. `None` with fewer than two spectra of any target.
+    fn cycle_s(&self) -> Option<f64> {
+        let mut by: Vec<(i64, f64)> = self
+            .timed
+            .iter()
+            .map(|&(t, rt)| ((t * 1e4).round() as i64, rt))
+            .collect();
+        by.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        let mut d: Vec<f64> = by
+            .windows(2)
+            .filter(|w| w[0].0 == w[1].0 && w[1].1 > w[0].1)
+            .map(|w| w[1].1 - w[0].1)
+            .collect();
+        if d.is_empty() {
+            return None;
+        }
+        d.sort_by(f64::total_cmp);
+        Some(d[d.len() / 2])
+    }
+
+    /// The census as JSON (the `isolation` block of `mumdia peak-census`).
+    pub fn to_json(&self) -> serde_json::Value {
+        let t = &self.target_only;
+        let refused = t.differ;
+        let (layout, scanning, suggested) = if t.n > 0 {
+            let l = target_layout(&t.sample);
+            let scanning = l.is_scanning_quadrupole();
+            // Rounded to 0.05 m/z: the suggestion is a method's half-width, not a fit.
+            let hw = (scanning && refused)
+                .then(|| (SCANNING_HALF_WIDTH_STEPS * l.median_step * 20.0).round() / 20.0);
+            (
+                json!({
+                    "distinct_targets": l.distinct,
+                    "lowest_target": l.lo,
+                    "highest_target": l.hi,
+                    "median_step": l.median_step,
+                    "spectra_per_target": l.repeats,
+                    "cycle_s": self.cycle_s(),
+                }),
+                scanning,
+                hw,
+            )
+        } else {
+            (serde_json::Value::Null, false, None)
+        };
+        json!({
+            "ms2_spectra": self.ms2,
+            "with_offsets": self.with_offsets,
+            "no_isolation": self.no_isolation,
+            "target_only": t.n,
+            "convert_refuses": refused,
+            "layout": layout,
+            "scanning_quadrupole": scanning,
+            "suggested_half_width": suggested,
+            "suggested_half_width_steps": suggested.map(|_| SCANNING_HALF_WIDTH_STEPS),
+        })
+    }
+}
+
 /// The order-dependent half of the conversion: the accumulators, the parquet
 /// writers, and the four folds whose values depend on what came before.
 struct Fold {
@@ -688,6 +878,9 @@ struct Fold {
     target_only: TargetOnly,
     /// The input, for the refusal of a target-only file.
     source: String,
+    /// The Q1 sweep of spectra_ms2 v3, recorded when the first MS2 spectrum was widened by
+    /// `convert.isolation_half_width`.
+    q1: Q1Sweep,
 }
 
 impl Fold {
@@ -714,6 +907,7 @@ impl Fold {
             first_bad_rt: None,
             target_only: TargetOnly::default(),
             source: String::new(),
+            q1: Q1Sweep::default(),
         }
     }
 
@@ -767,6 +961,7 @@ impl Fold {
                     im_lo,
                     im_hi,
                     target_only,
+                    widened,
                 } = *r;
                 self.nonfinite_peaks += nonfinite_peaks;
                 // A target and no offsets: refused once a second target and enough of the
@@ -814,11 +1009,19 @@ impl Fold {
                     self.ms2.im_hi.push(im_hi);
                     self.ms2.im.push(im.unwrap_or_default());
                 }
+                // The Q1 sweep (v3), on a source without 1/K0 whose first MS2 spectrum the
+                // half-width widened.
+                if !self.has_im && self.q1.decide(widened) {
+                    let (c, k) = self.q1.next(wt);
+                    self.ms2.q1_cycle.push(c);
+                    self.ms2.q1_step.push(k);
+                }
                 self.map_ms2.push(scan_index);
                 self.map_ms1
                     .push(self.last_ms1_index.map(|x| x as i32).unwrap_or(-1));
                 if self.ms2.idx.len() >= SPECTRA_CHUNK {
-                    self.ms2_w.write_cols(self.ms2.cols(self.has_im))?;
+                    self.ms2_w
+                        .write_cols(self.ms2.cols(self.has_im, self.q1.on()))?;
                 }
             }
             Decoded::Other => {}
@@ -1456,6 +1659,7 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
         nonfinite_rt,
         first_bad_rt,
         target_only,
+        q1,
         ..
     } = fold;
     // Target-only spectra (`Isolation::TargetOnly`) in a file shorter than the sample, or
@@ -1477,7 +1681,7 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
         );
     }
     ms1_w.write_cols(ms1.cols(native_tdf))?;
-    ms2_w.write_cols(ms2.cols(native_tdf))?;
+    ms2_w.write_cols(ms2.cols(native_tdf, q1.on()))?;
 
     // A short read means the file ended before the index said it would. `--max-spectra`
     // truncates deliberately, so it is excluded.
@@ -1570,7 +1774,7 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
 
     let elapsed = t0.elapsed().as_millis();
     let n_iw = iw_written.rows;
-    let schemas = ConvertSchemas::for_source(native_tdf);
+    let schemas = ConvertSchemas::for_conversion(native_tdf, q1.on());
     let mut params = json!({
         "mzml": p.mzml,
         "max_spectra": p.max_spectra,
@@ -1585,6 +1789,18 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
             .as_object_mut()
             .expect("params is an object")
             .insert("isolation_half_width".into(), json!(h));
+    }
+    // The Q1 sweep spectra_ms2 v3 records, only when it is recorded.
+    if q1.on() {
+        info!(
+            cycles = q1.cycles(),
+            max_steps = q1.max_steps,
+            "convert: scanning-quadrupole sweep recorded (spectra_ms2 v3: q1_cycle, q1_step)"
+        );
+        params.as_object_mut().expect("params is an object").insert(
+            "q1_sweep".into(),
+            json!({"cycles": q1.cycles(), "max_steps": q1.max_steps}),
+        );
     }
     // The reader and its centroiding settings, for a native diaPASEF run only: an mzML
     // report keeps exactly the fields it always had, and an absent `reader` reads as mzML
@@ -2495,6 +2711,7 @@ mod tests {
                 im_lo: Some(lo),
                 im_hi: Some(hi),
                 target_only: None,
+                widened: false,
             };
             fold.absorb(k as u32 + 1, Decoded::Ms2(Box::new(row)))
                 .unwrap();
@@ -2512,7 +2729,7 @@ mod tests {
             ..
         } = fold;
         ms1_w.write_cols(ms1.cols(true)).unwrap();
-        ms2_w.write_cols(ms2.cols(true)).unwrap();
+        ms2_w.write_cols(ms2.cols(true, false)).unwrap();
         ms1_w.close().unwrap();
         ms2_w.close().unwrap();
         let cols = mumdia_io::table::column_names(m2).unwrap();
@@ -2555,6 +2772,7 @@ mod tests {
             im_lo: Some(f32::NAN),
             im_hi: Some(1.0),
             target_only: None,
+            widened: false,
         };
         let e = fold
             .absorb(0, Decoded::Ms2(Box::new(row)))
@@ -2759,7 +2977,7 @@ mod tests {
         );
         assert_eq!(
             isolation_bounds(Some(&target), Some(1.9)),
-            Isolation::Window(t as f64, (t - 1.9f32) as f64, (t + 1.9f32) as f64)
+            Isolation::Widened(t as f64, (t - 1.9f32) as f64, (t + 1.9f32) as f64)
         );
         let none = Iw::new(0.0, 0.0, 0.0, St::Unknown);
         assert_eq!(isolation_bounds(Some(&none), Some(1.9)), Isolation::AllIon);
@@ -2838,10 +3056,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// The census of a file read as `mumdia peak-census` reads it (`IsolationCensus`).
+    fn census_of(path: &std::path::Path) -> serde_json::Value {
+        let reader = mzdata::MZReader::open_path(path).unwrap();
+        let mut c = IsolationCensus::default();
+        for spec in reader {
+            c.record(&spec);
+        }
+        c.to_json()
+    }
+
+    /// The isolation census says what convert would do with a file before a run does it: a
+    /// scanning quadrupole's target-only spectra are refused, with their layout, the cycle
+    /// time and a half-width of five steps; the same file with offsets needs nothing; a
+    /// target-only file of fixed windows is refused with no half-width suggested.
+    #[test]
+    fn the_isolation_census_recognises_a_scanning_quadrupole_and_suggests_a_half_width() {
+        let d = tmpdir("ztscan_census");
+        let (bare, explicit, fixed) = (
+            d.join("bare.mzML"),
+            d.join("explicit.mzML"),
+            d.join("fixed.mzML"),
+        );
+        let a = scanning_run(4, 120, None);
+        let b = scanning_run(4, 120, Some(1.9));
+        std::fs::write(&bare, mzml(a.len(), &a)).unwrap();
+        std::fs::write(&explicit, mzml(b.len(), &b)).unwrap();
+        let c = census_of(&bare);
+        assert_eq!(c["ms2_spectra"], 480);
+        assert_eq!(c["target_only"], 480);
+        assert_eq!(c["with_offsets"], 0);
+        assert_eq!(c["convert_refuses"], true);
+        assert_eq!(c["scanning_quadrupole"], true);
+        assert_eq!(c["layout"]["distinct_targets"], 120);
+        let step = c["layout"]["median_step"].as_f64().unwrap();
+        assert!((step - 0.7614).abs() < 1e-3, "{c}");
+        let cycle = c["layout"]["cycle_s"].as_f64().unwrap();
+        assert!((cycle - 1.002).abs() < 1e-3, "{c}");
+        assert_eq!(c["suggested_half_width"].as_f64(), Some(1.9));
+        assert_eq!(c["suggested_half_width_steps"].as_f64(), Some(2.5));
+
+        let c = census_of(&explicit);
+        assert_eq!(c["with_offsets"], 480);
+        assert_eq!(c["target_only"], 0);
+        assert_eq!(c["convert_refuses"], false);
+        assert_eq!(c["scanning_quadrupole"], false);
+        assert!(
+            c["layout"].is_null() && c["suggested_half_width"].is_null(),
+            "{c}"
+        );
+
+        // 24 fixed windows 25 m/z apart that lost their offsets: refused, nothing suggested.
+        let mut f = Vec::new();
+        let mut index = 0usize;
+        for cyc in 0..6 {
+            let rt = format!("{:.6}", 0.05 * cyc as f64);
+            for w in 0..24 {
+                let t = 412.5 + 25.0 * w as f64;
+                let iso = format!(
+                    r#"<cvParam cvRef="MS" accession="MS:1000827" name="isolation window target m/z" value="{t}"/>"#
+                );
+                f.push(
+                    spectrum(index, 2, &rt, &[150.0, 300.0], &[5.0, 6.0])
+                        .replace(FIXED_ISOLATION, &iso),
+                );
+                index += 1;
+            }
+        }
+        std::fs::write(&fixed, mzml(f.len(), &f)).unwrap();
+        let c = census_of(&fixed);
+        assert_eq!(c["convert_refuses"], true);
+        assert_eq!(c["scanning_quadrupole"], false);
+        assert_eq!(c["layout"]["distinct_targets"], 24);
+        assert!(c["suggested_half_width"].is_null(), "{c}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// `convert.isolation_half_width = h` on a target-only file writes exactly what the same
-    /// file with explicit offsets of `h` writes: every spectra artifact byte for byte, so the
-    /// key reproduces a rewrite that only adds the offsets. Offsets a file carries win over
-    /// the key.
+    /// file with explicit offsets of `h` writes: the MS1 spectra, the isolation windows and
+    /// the scan map byte for byte, and the same MS2 columns, to which it adds the Q1 sweep
+    /// (spectra_ms2 v3). Offsets a file carries win over the key, and such a file is written
+    /// byte for byte as without it.
     #[test]
     fn the_half_width_reproduces_explicit_offsets() {
         let d = tmpdir("ztscan_hw");
@@ -2855,7 +3150,6 @@ mod tests {
         let o_both = convert_with(&explicit, &d.join("both"), Some(5.0)).unwrap();
         for (x, y, z) in [
             (&o_bare.ms1, &o_explicit.ms1, &o_both.ms1),
-            (&o_bare.ms2, &o_explicit.ms2, &o_both.ms2),
             (
                 &o_bare.isolation_windows,
                 &o_explicit.isolation_windows,
@@ -2871,6 +3165,40 @@ mod tests {
             assert_eq!(bx, std::fs::read(y).unwrap(), "{x}");
             assert_eq!(bx, std::fs::read(z).unwrap(), "{z}");
         }
+        // MS2: the file with offsets is v1 whatever the key; the widened one is v3, the same
+        // v1 columns plus the sweep.
+        assert_eq!(
+            std::fs::read(&o_explicit.ms2).unwrap(),
+            std::fs::read(&o_both.ms2).unwrap()
+        );
+        assert_eq!(o_explicit.schemas.ms2, ("spectra_ms2", 1));
+        assert_eq!(o_both.schemas.ms2, ("spectra_ms2", 1));
+        assert_eq!(o_bare.schemas.ms2, ("spectra_ms2", 3));
+        let (tb, te) = (
+            mumdia_io::table::TableFile::open(&o_bare.ms2).unwrap(),
+            mumdia_io::table::TableFile::open(&o_explicit.ms2).unwrap(),
+        );
+        for c in [
+            "window_target",
+            "window_lower",
+            "window_upper",
+            "rt_seconds",
+        ] {
+            assert_eq!(tb.f64(c).unwrap(), te.f64(c).unwrap(), "{c}");
+        }
+        assert_eq!(tb.u32("scan_index").unwrap(), te.u32("scan_index").unwrap());
+        assert_eq!(tb.list_f32("mz").unwrap(), te.list_f32("mz").unwrap());
+        assert_eq!(
+            mumdia_io::table::column_names(&o_explicit.ms2)
+                .unwrap()
+                .len()
+                + 2,
+            mumdia_io::table::column_names(&o_bare.ms2).unwrap().len()
+        );
+        assert_eq!(
+            crate::spectra::load_ms2(&o_bare.ms2).unwrap().len(),
+            crate::spectra::load_ms2(&o_explicit.ms2).unwrap().len()
+        );
         let t = mumdia_io::table::TableFile::open(&o_bare.isolation_windows).unwrap();
         let (lo, hi) = (t.f64("lower").unwrap(), t.f64("upper").unwrap());
         assert_eq!(lo.len(), 50);
@@ -2887,7 +3215,76 @@ mod tests {
             serde_json::json!(1.9)
         );
         assert!(params(&o_explicit).get("isolation_half_width").is_none());
+        assert_eq!(
+            params(&o_bare)["q1_sweep"],
+            serde_json::json!({"cycles": 3, "max_steps": 50})
+        );
+        assert!(params(&o_both).get("q1_sweep").is_none());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The sweep spectra_ms2 v3 records: a cycle per sweep and the step in acquisition
+    /// order, read back by `spectra::load_q1_sweep`; a v1 table has none. A cycle cut short
+    /// (the end of a run) keeps its steps.
+    #[test]
+    fn the_q1_sweep_is_recorded_per_spectrum() {
+        let d = tmpdir("ztscan_sweep");
+        let path = d.join("zt.mzML");
+        let mut spectra = scanning_run(3, 60, None);
+        // The last cycle ends after 20 bins.
+        spectra.truncate(2 * 61 + 1 + 20);
+        std::fs::write(&path, mzml(spectra.len(), &spectra)).unwrap();
+        let o = convert_with(&path, &d.join("out"), Some(1.9)).unwrap();
+        let sw = crate::spectra::load_q1_sweep(&o.ms2)
+            .unwrap()
+            .expect("v3 records the sweep");
+        assert_eq!(sw.cycle.len(), 2 * 60 + 20);
+        for (i, (&c, &k)) in sw.cycle.iter().zip(&sw.step).enumerate() {
+            assert_eq!((c as usize, k as usize), (i / 60, i % 60), "row {i}");
+        }
+        // scan_index counts the MS1 spectra too: cycle c, step k is spectrum 61 c + 1 + k.
+        for (i, &si) in sw.scan_index.iter().enumerate() {
+            assert_eq!(si as usize, 61 * (i / 60) + 1 + i % 60);
+        }
+        let scans = crate::spectra::load_ms2(&o.ms2).unwrap();
+        assert_eq!(scans.len(), sw.cycle.len());
+        // The window as read: the target and +-1.9 around it.
+        let t: f32 = "394.25579223504104".parse().unwrap();
+        assert_eq!(scans[0].window.target_mz, t as f64);
+        assert_eq!(scans[0].window.lower_mz, (t - 1.9f32) as f64);
+        let v1 = convert_with(
+            &{
+                let p = d.join("explicit.mzML");
+                let b = scanning_run(2, 60, Some(1.9));
+                std::fs::write(&p, mzml(b.len(), &b)).unwrap();
+                p
+            },
+            &d.join("v1"),
+            None,
+        )
+        .unwrap();
+        assert!(crate::spectra::load_q1_sweep(&v1.ms2).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_sweep_starts_a_cycle_where_the_target_falls_back() {
+        let mut q = Q1Sweep::default();
+        assert!(q.decide(true));
+        assert!(q.decide(false), "decided on the first spectrum");
+        let got: Vec<(u32, u32)> = [400.0, 401.0, 402.0, 400.0, 401.0, 401.0, 402.0]
+            .into_iter()
+            .map(|t| q.next(t))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (2, 0), (2, 1)]
+        );
+        assert_eq!((q.cycles(), q.max_steps), (3, 3));
+        let mut off = Q1Sweep::default();
+        assert!(!off.decide(false));
+        assert!(!off.decide(true));
+        assert!(!off.on());
     }
 
     /// Every MS2 spectrum naming the SAME target and no offsets is what an all-ion

@@ -583,6 +583,24 @@ fn peak_census(mzml: String) -> Result<serde_json::Value, String> {
     pf::peak_census(&mzml)
 }
 
+/// How the engine would read the isolation windows of each selected mzML
+/// (`ztscan::probe_all`): a SCIEX ZT Scan DIA file names its quadrupole positions and not
+/// its window, and is refused without `convert.isolation_half_width`, so the interface says
+/// so and fills in the half-width before a search starts. Off the interface thread: each
+/// file costs an engine process of about two seconds.
+#[tauri::command]
+async fn scanning_probe(mzml: Vec<String>) -> Result<Vec<mumdia_console::ztscan::Probe>, String> {
+    tauri::async_runtime::spawn_blocking(move || mumdia_console::ztscan::probe_all(&mzml))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The ZT Scan recipe as overrides on top of the chosen preset (`ztscan::recipe_overrides`).
+#[tauri::command]
+fn ztscan_recipe() -> Result<std::collections::BTreeMap<String, serde_json::Value>, String> {
+    mumdia_console::ztscan::recipe_overrides()
+}
+
 /// The settings schema the editor renders its form from.
 #[tauri::command]
 fn config_schema() -> Result<settings::Schema, String> {
@@ -902,6 +920,10 @@ const PRESET_FILES: &[(&str, &str)] = &[
         "diapasef.json",
         include_str!("../../../configs/examples/diapasef.json"),
     ),
+    // The SCIEX ZT Scan DIA recipe: the imported-library recipe plus the scanning-quadrupole
+    // keys (`ztscan::RECIPE`). The search screen also offers its keys on top of any preset
+    // when it recognises a ZT Scan file.
+    ("ztscan.json", mumdia_console::ztscan::RECIPE),
     (
         "fasta-sidecars.json",
         include_str!("../../../configs/examples/fasta-sidecars.json"),
@@ -973,6 +995,8 @@ fn main() {
             search_space,
             config_overrides,
             peak_census,
+            scanning_probe,
+            ztscan_recipe,
             history,
             history_check,
             preflight,

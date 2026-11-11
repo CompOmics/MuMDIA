@@ -256,6 +256,13 @@ pub struct PatternInput<'a> {
     pub pred: &'a [f32],
     /// Whether the slot's fragment was observed in at least one run of the experiment.
     pub eligible: &'a [bool],
+    /// `quant.q1_fragments`: slots left out of this run's fit (fragments that do not belong
+    /// to the precursor here). They stay in the set `S` and in the scale, which are the
+    /// experiment's, and take no part in either level. Empty: none.
+    pub masked: &'a [bool],
+    /// `quant.q1_integration = elution_fit`: the integration weights of the window samples
+    /// (`q1quant::elution_weights`), in place of the trapezoid weights. `None`: the trapezoid.
+    pub weights: Option<&'a [f64]>,
 }
 
 /// A pattern rule's quantity, the fragments of `S`, and the status.
@@ -290,12 +297,22 @@ pub fn pattern_quantity(
     }
     let pp: Vec<f64> = (0..nf).map(|f| if sel[f] { p[f] } else { 0.0 }).collect();
     let tm: Vec<bool> = inp.rt.iter().map(|r| r.is_finite()).collect();
-    let tw = trapezoid_weights(inp.rt);
+    let tw = match inp.weights {
+        Some(k) => k.to_vec(),
+        None => trapezoid_weights(inp.rt),
+    };
+    // The slots this run fits: `S` less the masked ones (all of `S` without a mask).
+    let fit: Vec<bool> = (0..nf)
+        .map(|f| sel[f] && !inp.masked.get(f).copied().unwrap_or(false))
+        .collect();
+    if !fit.iter().any(|&b| b) {
+        return (None, n_sel, "no_belonging_pattern_fragments");
+    }
     // Level 1: the rank-1 cell model.
     let mut w = vec![0.0f64; nf * nt];
     for f in 0..nf {
         for t in 0..nt {
-            if sel[f] && tm[t] {
+            if fit[f] && tm[t] {
                 w[f * nt + t] = 1.0;
             }
         }
@@ -316,7 +333,7 @@ pub fn pattern_quantity(
         for f in 0..nf {
             for t in 0..nt {
                 let i = f * nt + t;
-                w[i] = if sel[f] && tm[t] {
+                w[i] = if fit[f] && tm[t] {
                     let mu = pp[f] * g[t];
                     huber_excess(
                         inp.x[i],
@@ -347,21 +364,21 @@ pub fn pattern_quantity(
     for f in 0..nf {
         for t in 0..nt {
             let xi = inp.x[f * nt + t];
-            row[t] = if sel[f] && tm[t] {
+            row[t] = if fit[f] && tm[t] {
                 let mu = pp[f] * g[t];
                 xi.min(mu + PATTERN_HUBER * noise_var(mu, phi_cell, PATTERN_KAPPA).sqrt())
             } else {
                 xi
             };
         }
-        a[f] = if sel[f] {
+        a[f] = if fit[f] {
             weighted_area(&row, &tw)
         } else {
             0.0
         };
     }
     // Level 2: the areas against the pattern.
-    let mut wf: Vec<f64> = sel.iter().map(|&s| if s { 1.0 } else { 0.0 }).collect();
+    let mut wf: Vec<f64> = fit.iter().map(|&s| if s { 1.0 } else { 0.0 }).collect();
     let mut c = f64::NAN;
     for it in 0..=PATTERN_ITERATIONS {
         let (mut sp, mut sa) = (0.0f64, 0.0f64);
@@ -375,7 +392,7 @@ pub fn pattern_quantity(
         }
         let cc = if c.is_nan() { 0.0 } else { c };
         for f in 0..nf {
-            wf[f] = if sel[f] {
+            wf[f] = if fit[f] {
                 let mu = cc * pp[f];
                 huber_excess(a[f], mu, noise_var(mu, phi, PATTERN_KAPPA), PATTERN_HUBER)
             } else {
@@ -398,6 +415,44 @@ pub struct CandidateRun {
 /// candidate has enough runs and fragments, or when `phi` is not positive (runs that do not
 /// vary, where the noise model has no scale).
 pub fn dispersion_label_free(runs: &[Vec<CandidateRun>]) -> Option<(f64, usize, usize)> {
+    // `quant.q1_fragments` exports the fragments it left out of a run with a NaN area: such a
+    // (candidate, fragment) cell is left out of the candidate in every run, totals included,
+    // so a run is normalised over the fragments every run measured. Without one the runs are
+    // read as they are.
+    let bad: BTreeSet<(u32, u32)> = runs
+        .iter()
+        .flatten()
+        .flat_map(|cr| {
+            cr.areas
+                .iter()
+                .filter(|(_, a)| !a.is_finite())
+                .map(move |&(f, _)| (cr.cid, f))
+        })
+        .collect();
+    if !bad.is_empty() {
+        let kept: Vec<Vec<CandidateRun>> = runs
+            .iter()
+            .map(|run| {
+                run.iter()
+                    .map(|cr| CandidateRun {
+                        cid: cr.cid,
+                        areas: cr
+                            .areas
+                            .iter()
+                            .copied()
+                            .filter(|&(f, _)| !bad.contains(&(cr.cid, f)))
+                            .collect(),
+                    })
+                    .collect()
+            })
+            .collect();
+        return dispersion_finite(&kept);
+    }
+    dispersion_finite(runs)
+}
+
+/// [`dispersion_label_free`] of runs whose every area is finite.
+fn dispersion_finite(runs: &[Vec<CandidateRun>]) -> Option<(f64, usize, usize)> {
     // Per candidate: (runs, sum of the run totals), in run order.
     let mut per_cand: BTreeMap<u32, (usize, f64)> = BTreeMap::new();
     for run in runs {
@@ -605,6 +660,99 @@ mod tests {
             "{phi} {used} {eligible}"
         );
         assert!(dispersion_label_free(&vary[..2]).is_none());
+    }
+
+    /// A NaN area (a fragment `quant.q1_fragments` left out of one run) leaves its cell out
+    /// of the candidate in every run: the dispersion is that of the other fragments.
+    #[test]
+    fn a_nan_cell_is_left_out_of_its_candidate_in_every_run() {
+        let cand = |scale: f64, f3: f64| CandidateRun {
+            cid: 1,
+            areas: vec![(0, 100.0 * scale), (1, 50.0), (2, 25.0), (3, f3)],
+        };
+        let three = |scale: f64| CandidateRun {
+            cid: 1,
+            areas: vec![(0, 100.0 * scale), (1, 50.0), (2, 25.0)],
+        };
+        let with_nan: Vec<Vec<CandidateRun>> = [(1.0, 10.0), (1.2, f64::NAN), (0.9, 10.0)]
+            .iter()
+            .map(|&(k, f3)| vec![cand(k, f3)])
+            .collect();
+        let without: Vec<Vec<CandidateRun>> =
+            [1.0, 1.2, 0.9].iter().map(|&k| vec![three(k)]).collect();
+        assert_eq!(
+            dispersion_label_free(&with_nan),
+            dispersion_label_free(&without)
+        );
+    }
+
+    fn pattern_case(masked: &[bool], weights: Option<&[f64]>) -> PatternQuantity {
+        // Four fragments, a Gaussian elution over five samples, fragment 3 interfered.
+        let rt = [10.0, 11.0, 12.0, 13.0, 14.0];
+        let pred = [1.0f32, 0.8, 0.6, 0.5];
+        let g = [0.2, 0.7, 1.0, 0.7, 0.2];
+        let mut x = Vec::new();
+        for (f, &pv) in pred.iter().enumerate() {
+            for (t, &gt) in g.iter().enumerate() {
+                let mut v = 100.0 * (pv as f64).powf(PATTERN_GAMMA) * gt;
+                if f == 3 {
+                    v += 400.0 * if t == 2 { 1.0 } else { 0.5 };
+                }
+                x.push(v);
+            }
+        }
+        let eligible = [true; 4];
+        pattern_quantity(
+            &PatternInput {
+                x: &x,
+                rt: &rt,
+                pred: &pred,
+                eligible: &eligible,
+                masked,
+                weights,
+            },
+            5.0,
+            5.0,
+            false,
+        )
+    }
+
+    /// No mask is the fit as it was; a masked slot takes no part in the fit but stays in the
+    /// set and the scale; every slot masked gives no quantity.
+    #[test]
+    fn a_masked_slot_leaves_the_fit_and_keeps_the_set() {
+        let none = pattern_case(&[], None);
+        assert_eq!(pattern_case(&[false; 4], None), none);
+        let m = pattern_case(&[false, false, false, true], None);
+        assert_eq!(m.1, none.1);
+        assert_eq!(m.2, "quantified");
+        // The masked fit sees only the clean fragments: their quantity is the clean one,
+        // 100 x the pattern scale x the trapezoid of g.
+        let p = |v: f32| (v as f64).powf(PATTERN_GAMMA);
+        let scale = p(1.0) + p(0.8) + p(0.6);
+        let want = 100.0
+            * scale
+            * weighted_area(
+                &[0.2, 0.7, 1.0, 0.7, 0.2],
+                &trapezoid_weights(&[10.0, 11.0, 12.0, 13.0, 14.0]),
+            );
+        assert!(
+            (m.0.unwrap() - want).abs() < 1e-9 * want,
+            "{:?} vs {want}",
+            m.0
+        );
+        assert_eq!(
+            pattern_case(&[true; 4], None),
+            (None, 4, "no_belonging_pattern_fragments")
+        );
+        // Weights replace the trapezoid: unit weights sum the samples.
+        let w = pattern_case(&[false, false, false, true], Some(&[1.0; 5]));
+        let want_sum = 100.0 * scale * 2.8;
+        assert!(
+            (w.0.unwrap() - want_sum).abs() < 1e-9 * want_sum,
+            "{:?}",
+            w.0
+        );
     }
 
     #[test]

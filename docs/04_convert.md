@@ -92,6 +92,26 @@ v2 (`SPECTRA_MS2_V2`, native diaPASEF only) adds `window_im_lower` and
 `window_im_upper` (nullable `f32`, before `mz`) and a per-peak `im` list (last). The
 window id then deduplicates on the m/z and the 1/K0 bounds (`IsolationWindow::key`).
 
+v3 (`SPECTRA_MS2_V3`, `artifact::spectra_ms2_q1`) is written only when
+`convert.isolation_half_width` widened the first MS2 spectrum of the file, that is for a
+scanning-quadrupole acquisition whose spectra name a target and no offsets (section "SCIEX
+ZT Scan DIA"). It is v1 plus two `u32` columns, appended last:
+
+| Column | Type | Meaning |
+|---|---|---|
+| `q1_cycle` | `u32` | The sweep the spectrum belongs to, from 0. A cycle starts at the first MS2 spectrum and at every MS2 spectrum whose target is not above the target of the MS2 spectrum before it: the quadrupole sweeps the precursor range upward once a cycle. MS1 spectra are not counted. |
+| `q1_step` | `u32` | The spectrum's position in its sweep, in acquisition order, from 0. On a regular sweep it is the rank of the window target, the same in every cycle (step `k` of REP01 has target 394.256 + 0.7614 k in all 3,238 cycles); a cycle cut short at the end of the run keeps the steps it has. |
+
+The window columns stay as read: the target the file names and `target +- h`. The
+decision is taken on the first MS2 spectrum (`Q1Sweep::decide`), so every row group has
+the same columns, and a file that carries its offsets is written byte for byte as without
+the key, v1 (`the_half_width_reproduces_explicit_offsets`). The report's params record
+`q1_sweep` (`cycles`, `max_steps`); readers select columns by name, so `load_ms2` reads
+every version, and `spectra::load_q1_sweep` returns the two columns of a v3 table (`None`
+for v1 and v2). The Q1 calibration (`rt_im_train.q1_calibrate`, docs/08_rt_im_train.md,
+section 4h) reads them; on a v1 table it derives the cycles from the targets by the same
+rule.
+
 ### `isolation_windows.parquet` (`ISOLATION_WINDOWS`, schema v1; written at `convert.rs:215`)
 
 | Column | Type | Meaning |
@@ -736,8 +756,11 @@ Nothing was written.
 
 The refusal names the layout: many distinct targets (at least 50), repeating cycle after
 cycle (at least twice in the sample), in steps under 1.5 m/z, far finer than any
-fixed-window method (the narrowest step 2 m/z), is called a scanning quadrupole. The fix
-is the method's Q1 half-width:
+fixed-window method (the narrowest step 2 m/z), is called a scanning quadrupole.
+`mumdia peak-census` applies the same rule to the spectra it counts and reports it in its
+`isolation` block before a run, with a half-width to start from (five steps; the file does
+not record the window), and the desktop application shows it for every selected mzML
+(docs/37_ztscan.md, section 2). The fix is the method's Q1 half-width:
 
 ```json
 {"convert": {"isolation_half_width": 1.9}}
@@ -781,10 +804,54 @@ groups at 1%, about 106,500 precursors per run on `run_psm_q`, in 40 min at an 8
 peak on 64 threads (the rewritten files: 110,581 / 89,032 / 8,958), the peak from three
 concurrent second-pass extracts; a single run takes about 36-40 GB.
 
-What the engine does not do: model the quadrupole sweep. Each bin is an independent fixed
-window, its spectra a chromatogram cadence of their own, and the transmission profile of a
-precursor across the bins of one cycle is not used. Search the precursor range the method
-scanned with a library restricted to it.
+By default the engine does not model the quadrupole sweep: each bin is an independent
+fixed window, and a candidate's chromatogram interleaves the bins that cover its precursor.
+Search the precursor range the method scanned with a library restricted to it. Three
+opt-in keys model the sweep (`extract.q1_cycles`, `extract.q1_profile`,
+`features.q1_features`; docs/09_extract.md, section 10): summing the bins of a cycle lost
+about 14%, and the Q1-profile features gained 0.4%, so all three stay off.
+
+With the key, convert also records the sweep itself (spectra_ms2 v3, `q1_cycle` and
+`q1_step`, section "`spectra_ms2.parquet`" above): on REP01 3,238 cycles of 663 steps, every
+step with one target in every cycle, the step the rank of its target. Three further opt-in
+keys calibrate what the sweep and the MS1 scans measure, before anything decides on them:
+
+- `rt_im_train.q1_calibrate` (docs/08_rt_im_train.md, section 4h): the recorded target is
+  the centre of the Q1 window, not an edge; the seed fragments' Q1 centres fit the
+  isotope-envelope model to a median of 0.003 steps (MAD 0.16 steps; 0.11 steps early
+  before the calibration); the window is wider and softer than 3.8 m/z, whole within 0.57
+  m/z of its centre and nothing beyond 4.56 m/z. Written to `cal.json` only.
+- `extract.ms1_calibrate = "surface"` and `extract.prec_tol_auto` (docs/09_extract.md, section
+  11): the ZenoTOF's MS1 error is +2.84 ppm with a robust SD of 2.67 ppm and drifts by about
+  1 ppm over the gradient; the 3 ppm default tolerance holds two thirds of the anchors' MS1
+  peaks, and the rule of three robust SD sets 7.2 ppm.
+
+Measured on REP01 (the recipe above; seeds 1-3 rescore the run's competed table with
+`MUMDIA_NN_SEED`; the human-library arms on one host, the entrapment arms on another, each
+compared on its own host):
+
+| arm | precursors, seed 0 | precursors, mean of seeds 0-3 (range) | entrapment library: human / entrapment precursors, combined FDP, seed 0 | the same, mean of seeds 0-3 |
+|---|---|---|---|---|
+| none of the three | 97,401 | 97,317 (96,873-97,541) | 95,050 / 365, 1.35% | 95,115 / 375.8, 1.39% (1.35-1.44%) |
+| `q1_calibrate` | 97,401 (scored table byte-identical) | | 95,050 / 365, 1.35% (identical) | |
+| `ms1_calibrate = "surface"` | 97,599 | | 95,246 / 377, 1.39% | |
+| `prec_tol_auto` (7.4 / 7.1 ppm) | 97,841 | | 94,941 / 371, 1.37% | |
+| all three (7.2 / 7.0 ppm) | 97,824 | 97,765 (97,509-97,951) | 95,120 / 369, 1.36% | 95,295 / 380.5, 1.40% (1.36-1.43%) |
+
+The calibration changes the count by little: +0.46% precursors over four seeds on the human
+library, +0.19% human precursors on the entrapment library at the same combined FDP. Each
+single key moves seed 0 by -0.1% to +0.5%, inside the seed spread. All three stay off
+(benchmark-gated, one acquisition).
+
+The per-fragment Q1 decisions read the recorded sweep (spectra_ms2 v3 is required:
+`extract.q1_fragments`, docs/09_extract.md, section 12): for every library fragment of every
+accepted row, whether its signal is centred in the sweep where the calibrated window puts the
+candidate's precursor, with three consumers (`features.q1_fragment_features`,
+`retrace.q1_repick`, `rescore.shadow_q1`). On REP01 the four keys together gave +3.0%
+precursors over four seeds and +3.2% human precursors on the entrapment library at the base
+arm's measured FDP, whose value at a reported 1% fell from 1.39% to 1.22%; three runs as one
+experiment +2.3% (113,013 against 110,433). All four stay off (benchmark-gated, one
+acquisition).
 
 ### The two extension collisions
 

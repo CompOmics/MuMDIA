@@ -22,6 +22,13 @@ pub mod artifact {
     /// `window_im_upper`. A 3D source writes v1. Readers select columns by name, so both
     /// versions load everywhere.
     pub const SPECTRA_MS2_V2: (&str, u32) = ("spectra_ms2", 2);
+    /// v3, written only when `convert.isolation_half_width` widened the target-only spectra
+    /// of a scanning-quadrupole acquisition (SCIEX ZT Scan DIA): v1 plus `q1_cycle` and
+    /// `q1_step` (UInt32), appended last: the sweep a spectrum belongs to and its position
+    /// in that sweep, in acquisition order. The window columns stay as read. Every other
+    /// source writes v1 or v2, byte for byte. Readers select columns by name, so every
+    /// version loads everywhere.
+    pub const SPECTRA_MS2_V3: (&str, u32) = ("spectra_ms2", 3);
     pub const ISOLATION_WINDOWS: (&str, u32) = ("isolation_windows", 1);
     /// v2, written only for a source with ion mobility: each window's 1/K0 bounds
     /// `im_lower` and `im_upper`, so slots sharing an m/z range are separate rows. A 3D
@@ -69,6 +76,26 @@ pub mod artifact {
     /// and meaning are the IM branch's v4; v3 (`apex_im` filled alone) is never written. A
     /// 3D extract writes v2, byte for byte. Readers select columns by name.
     pub const PSMS_EXTRACTED_V4: (&str, u32) = ("psms_extracted", 4);
+    /// v5, written only under `extract.q1_profile` (scanning-quadrupole spectra, which carry
+    /// no 1/K0): v2 plus the Q1-profile evidence `q1_corr`, `q1_offset`, `q1_frag_sd` and
+    /// `q1_bin_frac` (Float64), appended last. Readers select columns by name.
+    pub const PSMS_EXTRACTED_V5: (&str, u32) = ("psms_extracted", 5);
+    /// v6, written only under `extract.q1_fragments` (scanning-quadrupole spectra, which
+    /// carry no 1/K0): v2 (with v5's Q1-profile columns when `extract.q1_profile` is on as
+    /// well) plus the per-fragment Q1 decision: the row's summary `q1f_*` (Float64) and one
+    /// Float32 list per decision, `q1f_frag_class` (0 absent, 1 belongs, 2 interfered),
+    /// `q1f_frag_offset` (steps), `q1f_frag_resid` and `q1f_frag_corr2d`, each with one entry
+    /// per library fragment in the library's order, appended last. Readers select columns
+    /// by name.
+    pub const PSMS_EXTRACTED_V6: (&str, u32) = ("psms_extracted", 6);
+    /// v7, written only under `features.ms1_envelope` (spectra without 1/K0): the table of
+    /// v2, v5 or v6 plus the MS1 isotope-envelope evidence, appended last: per row the
+    /// summed intensity and the intensity-weighted ppm error of the isotopes M-1 to M+4 over
+    /// the MS1 scans around the apex (`ms1e_i_m1`, `ms1e_i_0` .. `ms1e_i_4`, `ms1e_ppm_m1`,
+    /// `ms1e_ppm_0` .. `ms1e_ppm_4`; NaN error where an isotope is not found), the summed
+    /// intensity at the half-spacing positions above M0 and M+1 (`ms1e_i_half`), and the
+    /// MS1 scans read (`ms1e_scans`), all Float64. Readers select columns by name.
+    pub const PSMS_EXTRACTED_V7: (&str, u32) = ("psms_extracted", 7);
     /// v1: every row stores its whole `rt` axis and its whole `intensity` trace.
     pub const CHROMATOGRAMS: (&str, u32) = ("chromatograms", 1);
     /// v2, the default (`extract.chromatogram_schema = 2`): the axis once per candidate
@@ -97,6 +124,14 @@ pub mod artifact {
     /// `run-experiment` under `mbr.first_pass_flag` when the second pass ran; every other
     /// quant writes v2, byte for byte. Readers select columns by name.
     pub const PEPTIDE_QUANT_V3: (&str, u32) = ("peptide_quant", 3);
+    /// v4: v2 (or v3 with `first_pass_id`) plus `q1_quant` (Utf8), appended last: how
+    /// `quant.q1_fragments` quantified the row (`belonging`, from the fragments that belong
+    /// on the cycle traces; `fallback`, every fragment on the cycle traces because fewer than
+    /// `quant.q1_min_belonging` belong; `uncollapsed`, the traces as extracted because the
+    /// candidate has no Q1 decision or a sample outside the sweep; `no_traces`). Written
+    /// only under `quant.q1_fragments`; every other quant writes v2 or v3, byte for byte.
+    /// Readers select columns by name.
+    pub const PEPTIDE_QUANT_V4: (&str, u32) = ("peptide_quant", 4);
     pub const PROTEIN_GROUP_QUANT: (&str, u32) = ("protein_group_quant", 2);
     pub const FRAGMENT_QUANT: (&str, u32) = ("fragment_quant", 1);
     /// v5, the cross-run export (`quant --export-cross-run`, or the first pass of the
@@ -188,6 +223,16 @@ pub mod artifact {
         }
     }
 
+    /// [`spectra_ms2`], or [`SPECTRA_MS2_V3`] when the conversion recorded the Q1 sweep
+    /// (`q1`), which only a source without ion mobility does.
+    pub fn spectra_ms2_q1(has_im: bool, q1: bool) -> (&'static str, u32) {
+        if q1 && !has_im {
+            SPECTRA_MS2_V3
+        } else {
+            spectra_ms2(has_im)
+        }
+    }
+
     /// The `isolation_windows` schema a conversion writes: [`ISOLATION_WINDOWS_V2`] when
     /// the source carries ion mobility, else [`ISOLATION_WINDOWS`].
     pub fn isolation_windows(has_im: bool) -> (&'static str, u32) {
@@ -232,6 +277,16 @@ pub mod artifact {
         }
     }
 
+    /// [`peptide_quant`], or [`PEPTIDE_QUANT_V4`] when the table carries `q1_quant`
+    /// (`quant.q1_fragments`).
+    pub fn peptide_quant_q1(first_pass_flag: bool, q1: bool) -> (&'static str, u32) {
+        if q1 {
+            PEPTIDE_QUANT_V4
+        } else {
+            peptide_quant(first_pass_flag)
+        }
+    }
+
     /// The `psms_extracted` schema an extract writes: [`PSMS_EXTRACTED_V4`] when the
     /// extracted spectra carry per-peak 1/K0, else [`PSMS_EXTRACTED`].
     pub fn psms_extracted(has_im: bool) -> (&'static str, u32) {
@@ -239,6 +294,42 @@ pub mod artifact {
             PSMS_EXTRACTED_V4
         } else {
             PSMS_EXTRACTED
+        }
+    }
+
+    /// [`psms_extracted`], or [`PSMS_EXTRACTED_V5`] when the table carries the Q1-profile
+    /// evidence (`q1`), which extract refuses on spectra with 1/K0.
+    pub fn psms_extracted_q1(has_im: bool, q1: bool) -> (&'static str, u32) {
+        if q1 && !has_im {
+            PSMS_EXTRACTED_V5
+        } else {
+            psms_extracted(has_im)
+        }
+    }
+
+    /// [`psms_extracted_q1`], or [`PSMS_EXTRACTED_V6`] when the table carries the
+    /// per-fragment Q1 decision (`q1f`), which extract refuses on spectra with 1/K0.
+    pub fn psms_extracted_q1f(has_im: bool, q1: bool, q1f: bool) -> (&'static str, u32) {
+        if q1f && !has_im {
+            PSMS_EXTRACTED_V6
+        } else {
+            psms_extracted_q1(has_im, q1)
+        }
+    }
+
+    /// [`psms_extracted_q1f`], or [`PSMS_EXTRACTED_V7`] when the table carries the MS1
+    /// isotope-envelope evidence (`ms1e`, `features.ms1_envelope`), which extract refuses on
+    /// spectra with 1/K0.
+    pub fn psms_extracted_ms1e(
+        has_im: bool,
+        q1: bool,
+        q1f: bool,
+        ms1e: bool,
+    ) -> (&'static str, u32) {
+        if ms1e && !has_im {
+            PSMS_EXTRACTED_V7
+        } else {
+            psms_extracted_q1f(has_im, q1, q1f)
         }
     }
 
@@ -292,6 +383,10 @@ mod tests {
         assert_eq!(seed_psms(false), SEED_PSMS);
         assert_eq!(seed_psms(false), ("seed_psms", 1));
         assert_eq!(seed_psms(true), ("seed_psms", 2));
+        assert_eq!(spectra_ms2_q1(false, false), ("spectra_ms2", 1));
+        assert_eq!(spectra_ms2_q1(false, true), ("spectra_ms2", 3));
+        assert_eq!(spectra_ms2_q1(true, false), ("spectra_ms2", 2));
+        assert_eq!(spectra_ms2_q1(true, true), ("spectra_ms2", 2));
     }
 
     /// Extraction keeps main's 3D versions; 1/K0 moves psms_extracted to v4 and each
@@ -301,6 +396,40 @@ mod tests {
         assert_eq!(psms_extracted(false), PSMS_EXTRACTED);
         assert_eq!(psms_extracted(false), ("psms_extracted", 2));
         assert_eq!(psms_extracted(true), ("psms_extracted", 4));
+        assert_eq!(psms_extracted_q1(false, false), ("psms_extracted", 2));
+        assert_eq!(psms_extracted_q1(false, true), ("psms_extracted", 5));
+        assert_eq!(psms_extracted_q1(true, false), ("psms_extracted", 4));
+        assert_eq!(
+            psms_extracted_q1f(false, false, false),
+            ("psms_extracted", 2)
+        );
+        assert_eq!(
+            psms_extracted_q1f(false, true, false),
+            ("psms_extracted", 5)
+        );
+        assert_eq!(
+            psms_extracted_q1f(false, false, true),
+            ("psms_extracted", 6)
+        );
+        assert_eq!(psms_extracted_q1f(false, true, true), ("psms_extracted", 6));
+        assert_eq!(
+            psms_extracted_q1f(true, false, false),
+            ("psms_extracted", 4)
+        );
+        for (q1, q1f) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert_eq!(
+                psms_extracted_ms1e(false, q1, q1f, false),
+                psms_extracted_q1f(false, q1, q1f)
+            );
+            assert_eq!(
+                psms_extracted_ms1e(false, q1, q1f, true),
+                ("psms_extracted", 7)
+            );
+        }
+        assert_eq!(
+            psms_extracted_ms1e(true, false, false, true),
+            ("psms_extracted", 4)
+        );
         assert_eq!(chromatograms(1, false), CHROMATOGRAMS);
         assert_eq!(chromatograms(2, false), CHROMATOGRAMS_V2);
         assert_eq!(chromatograms(1, true), ("chromatograms", 3));
@@ -332,5 +461,9 @@ mod tests {
         assert_eq!(peptide_quant(false), PEPTIDE_QUANT);
         assert_eq!(peptide_quant(false), ("peptide_quant", 2));
         assert_eq!(peptide_quant(true), ("peptide_quant", 3));
+        assert_eq!(peptide_quant_q1(false, false), ("peptide_quant", 2));
+        assert_eq!(peptide_quant_q1(true, false), ("peptide_quant", 3));
+        assert_eq!(peptide_quant_q1(false, true), ("peptide_quant", 4));
+        assert_eq!(peptide_quant_q1(true, true), ("peptide_quant", 4));
     }
 }

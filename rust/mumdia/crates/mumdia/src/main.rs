@@ -325,6 +325,10 @@ enum Cmd {
         /// sorted by `candidate_id`, so a band needs no fragment table of its own.
         #[arg(long)]
         fragment_offset: Option<u32>,
+        /// The run's `cal.json` with its Q1 calibration (`rt_im_train.q1_calibrate`), which
+        /// `extract.q1_fragments` decides with.
+        #[arg(long)]
+        q1_cal: Option<String>,
         #[arg(long)]
         config: Option<String>,
     },
@@ -578,6 +582,22 @@ enum Cmd {
         /// quant.
         #[arg(long, num_args = 1..)]
         cross_run_from: Vec<String>,
+        /// The tables the pattern dispersion of `--cross-run-from` is fitted on instead: the
+        /// background-subtracted exports of every run (`--export-cross-run` with
+        /// `--cross-run-from` the first-pass tables), in run order. `run-experiment` fits the
+        /// background on the first-pass tables and the dispersion on these, which this
+        /// reproduces; without it both come from `--cross-run-from`. Needs a pattern rule.
+        #[arg(long, num_args = 1.., requires = "cross_run_from")]
+        cross_run_pattern_from: Vec<String>,
+        /// `quant.q1_fragments`: the run's psms_extracted v6 (`extract.q1_fragments`), whose
+        /// per-fragment Q1 decisions select the fragments and whose report records the Q1
+        /// model. Required with the key on, read only then.
+        #[arg(long)]
+        psms_extracted: Option<String>,
+        /// `quant.q1_fragments` / `quant.q1_cycle_halfwidth`: the run's spectra_ms2 (v3 records
+        /// the Q1 step and cycle of every sample). Required with either key on, read only then.
+        #[arg(long)]
+        spectra_ms2: Option<String>,
         #[arg(long)]
         config: Option<String>,
     },
@@ -792,6 +812,12 @@ enum Cmd {
     /// bounding peak volume and deleting fragment evidence from most spectra. A diaPASEF
     /// `.d` is counted after the native reader's centroiding, which is what `convert`
     /// writes for it.
+    ///
+    /// For an mzML the `isolation` block says how `convert` reads the MS2 isolation windows
+    /// of the spectra counted: with offsets, without isolation, or a target and no offsets.
+    /// A scanning-quadrupole file of the last kind (SCIEX ZT Scan DIA) is refused without
+    /// `convert.isolation_half_width`; the block names the layout of its targets and a
+    /// half-width to start from (docs/37_ztscan.md).
     PeakCensus {
         #[arg(long)]
         mzml: String,
@@ -1082,6 +1108,10 @@ fn peak_census(
     let mut counts: Vec<usize> = Vec::new();
     let mut profile = 0usize;
     let mut ms1 = 0usize;
+    // How convert would read each MS2 spectrum's isolation window, for an mzML: a scanning
+    // quadrupole's file that names targets and no offsets is refused without
+    // `convert.isolation_half_width`, and the census says so before a run starts.
+    let mut isolation = stages::convert::IsolationCensus::default();
     if native {
         (counts, ms1) = stages::convert::tdf_peak_counts(mzml, max_spectra, tdf)?;
     } else {
@@ -1092,6 +1122,7 @@ fn peak_census(
             if max_spectra > 0 && i >= max_spectra {
                 break;
             }
+            isolation.record(&spec);
             if spec.ms_level() != 2 {
                 if spec.ms_level() == 1 {
                     ms1 += 1;
@@ -1156,6 +1187,8 @@ fn peak_census(
     if native {
         // Which reader counted, so a census of a `.d` is not read as an msconvert one.
         out["reader"] = serde_json::json!(mumdia::instrument::READER_TIMSRUST);
+    } else {
+        out["isolation"] = isolation.to_json();
     }
     Ok(out)
 }
@@ -2029,6 +2062,12 @@ fn real_main() -> Result<()> {
                      is still optimistic"
                 );
             }
+            if cfg.rt_im_train.q1_calibrate {
+                tracing::warn!(
+                    "rt_im_train.q1_calibrate is set but `mumdia rt-im-train` reads no spectra; \
+                     only `run`/`run-experiment` calibrate the Q1 sweep"
+                );
+            }
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::rt_im_train::run(stages::rt_im_train::RtImTrainParams {
                 precursor_span: None,
@@ -2084,10 +2123,27 @@ fn real_main() -> Result<()> {
             out_chromatograms,
             restrict_candidates,
             fragment_offset,
+            q1_cal,
             config,
         } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            // The per-fragment Q1 decision reads the run's calibration; the re-pick runs
+            // inside extract.
+            let mut ext_cfg = cfg.extract.clone();
+            if ext_cfg.q1_fragments {
+                let cal = q1_cal.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "extract.q1_fragments needs the run's cal.json with its Q1 calibration: \
+                         pass --q1-cal"
+                    )
+                })?;
+                ext_cfg.q1_model = Some(stages::q1frag::read_model(cal)?);
+                ext_cfg.q1_repick = cfg.retrace.q1_repick;
+                ext_cfg.q1_repick_peaks = cfg.retrace.q1_repick_peaks;
+            }
+            // `features.ms1_envelope`: extract reads the MS1 isotope-envelope evidence.
+            ext_cfg.ms1_envelope = cfg.features.ms1_envelope;
             stages::extract::run(stages::extract::ExtractParams {
                 precursor_span: None,
                 fragment_offset,
@@ -2115,7 +2171,7 @@ fn real_main() -> Result<()> {
                 out_psms: &out_psms,
                 out_chrom: &out_chromatograms,
                 restrict_candidates: restrict_candidates.as_deref(),
-                cfg: &cfg.extract,
+                cfg: &ext_cfg,
                 config_hash: &ch,
             })?;
         }
@@ -2644,10 +2700,45 @@ fn real_main() -> Result<()> {
             out_quant_fragments,
             export_cross_run,
             cross_run_from,
+            cross_run_pattern_from,
+            psms_extracted,
+            spectra_ms2,
             config,
         } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            let q1 = if cfg.quant.q1_fragments {
+                match (&psms_extracted, &spectra_ms2) {
+                    (Some(pe), Some(sp)) => Some(stages::q1quant::Q1QuantInputs {
+                        psms_extracted: Some(pe),
+                        spectra_ms2: sp,
+                    }),
+                    _ => anyhow::bail!(
+                        "quant.q1_fragments needs --psms-extracted (the run's psms_extracted \
+                         v6) and --spectra-ms2 (its spectra_ms2 v3)"
+                    ),
+                }
+            } else if cfg.quant.q1_cycle_halfwidth > 0 {
+                match &spectra_ms2 {
+                    Some(sp) => Some(stages::q1quant::Q1QuantInputs {
+                        psms_extracted: None,
+                        spectra_ms2: sp,
+                    }),
+                    None => anyhow::bail!(
+                        "quant.q1_cycle_halfwidth needs --spectra-ms2 (the run's spectra_ms2, \
+                         whose Q1 sweep gives each sample its cycle)"
+                    ),
+                }
+            } else {
+                if psms_extracted.is_some() || spectra_ms2.is_some() {
+                    tracing::warn!(
+                        "quant: --psms-extracted and --spectra-ms2 are read only under \
+                         quant.q1_fragments or quant.q1_cycle_halfwidth, which this \
+                         configuration leaves off"
+                    );
+                }
+                None
+            };
             let cross_run = if cross_run_from.is_empty() {
                 None
             } else {
@@ -2660,7 +2751,17 @@ fn real_main() -> Result<()> {
                          quant.fixed_scan_halfwidth_scale > 0"
                     );
                 }
-                Some(stages::quant::fit_cross_run(&cross_run_from, &cfg.quant)?)
+                let mut fit = stages::quant::fit_cross_run(&cross_run_from, &cfg.quant)?;
+                if !cross_run_pattern_from.is_empty() {
+                    if !cfg.quant.fragment_selection.uses_pattern_fit() {
+                        anyhow::bail!(
+                            "--cross-run-pattern-from refits the pattern dispersion, and \
+                             quant.fragment_selection is not pattern_fit or pattern_profile"
+                        );
+                    }
+                    fit.pattern = stages::quant_pattern::fit_pattern(&cross_run_pattern_from)?;
+                }
+                Some(fit)
             };
             let losers = match &overlap_losers {
                 Some(path) => stages::pool::read_losers(path, &chromatograms)?,
@@ -2687,6 +2788,7 @@ fn real_main() -> Result<()> {
                 cross_run: cross_run.as_ref(),
                 export_cross_run,
                 first_pass_ids: None,
+                q1,
             })?;
         }
         Cmd::QuantLfq {

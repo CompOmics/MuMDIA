@@ -119,6 +119,10 @@ const state = {
   // How many of the oldest remembered folders the cap has pushed out, so History can
   // say so instead of losing them silently (#282).
   knownDropped: readStored("mumdia.folders.dropped", 0),
+  // SCIEX ZT Scan DIA files (`refreshZtscanNote`): the engine's isolation census of each
+  // selected mzML by path (null when it could not be read), whether the user typed the
+  // half-width, and the recipe's overrides once read.
+  ztscan: { probes: {}, hwTyped: false, recipe: null },
 };
 
 function readStored(key, fallback) {
@@ -276,6 +280,10 @@ async function init() {
     });
   }
   $("norm-scope").addEventListener("change", refreshNormOptions);
+  // A half-width the user typed is theirs: a later probe no longer replaces it.
+  $("ztscan-hw").addEventListener("input", () => {
+    state.ztscan.hwTyped = true;
+  });
   $("suggest-conditions").addEventListener("click", () => {
     state.conditionTyped = {};
     renderMzmlList();
@@ -1587,6 +1595,129 @@ async function renderMzmlList() {
     $("lib-for").value = anyDiapasef ? "diapasef" : "other";
     refreshLibForNote();
   }
+  // Which of them the engine would refuse for want of a Q1 half-width; asked once per file.
+  refreshZtscanNote();
+}
+
+// -- SCIEX ZT Scan DIA ------------------------------------------------------------------
+// A ZT Scan DIA mzML names each MS2 spectrum's quadrupole position and not the window it
+// isolated. The engine refuses such a file unless `convert.isolation_half_width` says how
+// wide the window was: read as it is, every spectrum would cover the whole m/z range and
+// the search would grow until the machine runs out of memory. The engine's own census of
+// each selected mzML (`scanning_probe`, the rule `convert` refuses by) says which files are
+// such and suggests a half-width; this card explains it, fills the half-width in and offers
+// the ZT Scan recipe on top of the preset. Vendor files are not probed: the census would
+// convert them first.
+async function refreshZtscanNote() {
+  const z = state.ztscan;
+  const todo = state.picks.mzml.filter((f) => !isVendor(f) && !(f in z.probes));
+  if (todo.length) {
+    // Marked before the call, so a second render while it runs does not ask again.
+    for (const f of todo) z.probes[f] = null;
+    let got = [];
+    try {
+      got = await invoke("scanning_probe", { mzml: todo });
+    } catch {
+      /* Advisory: the engine reports the refusal itself if the file is used. */
+    }
+    for (const p of got || []) z.probes[p.path] = p.isolation || null;
+  }
+  if (ztscanFiles().length && !z.recipe) {
+    try {
+      z.recipe = await invoke("ztscan_recipe");
+    } catch {
+      z.recipe = null;
+    }
+  }
+  renderZtscanNote();
+}
+
+// The selected files the engine would refuse without a half-width, in selection order.
+function ztscanFiles() {
+  return state.picks.mzml.filter((f) => state.ztscan.probes[f]?.convert_refuses);
+}
+
+function ztscanScanning() {
+  return ztscanFiles().filter((f) => state.ztscan.probes[f].scanning_quadrupole);
+}
+
+// The recipe's keys refuse spectra without a Q1 sweep, so it is offered only when every
+// selected file is a scanning-quadrupole run.
+function ztscanRecipeAllowed() {
+  const scanning = ztscanScanning();
+  return scanning.length > 0 && scanning.length === state.picks.mzml.length;
+}
+
+function ztscanRecipeOn() {
+  return ztscanRecipeAllowed() && !!$("ztscan-recipe").checked && !!state.ztscan.recipe;
+}
+
+function renderZtscanNote() {
+  const refused = ztscanFiles();
+  show($("ztscan-note"), refused.length > 0);
+  if (!refused.length) return;
+  const scanning = ztscanScanning();
+  const other = refused.filter((f) => !scanning.includes(f));
+  const n = state.picks.mzml.length;
+  const parts = [];
+  if (scanning.length) {
+    const l = state.ztscan.probes[scanning[0]].layout || {};
+    const fmt = (v, d) => (Number.isFinite(v) ? v.toFixed(d) : "?");
+    const which =
+      n === 1
+        ? "This file is"
+        : `${scanning.length} of the ${n} selected files ${scanning.length === 1 ? "is" : "are"}`;
+    parts.push(
+      `${which} a scanning-quadrupole acquisition (SCIEX ZT Scan DIA): every MS2 spectrum ` +
+        `names the quadrupole's position (${fmtInt(l.distinct_targets)} positions from ` +
+        `${fmt(l.lowest_target, 1)} to ${fmt(l.highest_target, 1)} m/z, ` +
+        `${fmt(l.median_step, 4)} m/z apart, repeating every ${fmt(l.cycle_s, 2)} s), but not ` +
+        "the width of the window it isolated. MuMDIA needs that width to read the file: " +
+        "without it every spectrum would cover the whole m/z range and the search would " +
+        "run out of memory, so it refuses the file."
+    );
+    parts.push(
+      "The file does not record the width. The half-width below assumes a window five " +
+        "positions wide, as on the measured 3.8 m/z method, where half-widths from 1.5 to " +
+        "2.3 m/z identified the same; enter half of your method's Q1 window if it differs."
+    );
+  }
+  if (other.length) {
+    parts.push(
+      `${other.map(baseName).join(", ")} ${other.length === 1 ? "names" : "name"} an ` +
+        "isolation target in every MS2 spectrum but no window width, in a layout that is " +
+        "not a scanning quadrupole: the converter most likely left the window offsets out. " +
+        "Converting the vendor file again with one that writes them is the better fix; the " +
+        "half-width below applies to these files too."
+    );
+  }
+  $("ztscan-body").textContent = parts.join(" ");
+  if (!state.ztscan.hwTyped) {
+    const first = state.ztscan.probes[scanning[0] || refused[0]];
+    const hw = first?.suggested_half_width;
+    $("ztscan-hw").value = Number.isFinite(hw) ? String(hw) : "";
+  }
+  const allowed = ztscanRecipeAllowed();
+  $("ztscan-recipe").disabled = !allowed;
+  if (!allowed) $("ztscan-recipe").checked = false;
+  $("ztscan-recipe-note").textContent = allowed
+    ? "Measured on one ZT Scan acquisition: about 3% more precursors at a lower measured " +
+      "false discovery proportion, and about a third of the replicate CV of the default " +
+      "quantification, for roughly twice the extraction time. Not yet validated on a " +
+      "second acquisition."
+    : "The recipe's settings need every selected file to be a ZT Scan run; select only " +
+      "those to use it.";
+}
+
+// What the ZT Scan card adds to the run's configuration: the half-width for the files that
+// need one, and with the recipe chosen its settings (the half-width the user confirmed
+// replaces the recipe's).
+function ztscanOverrides() {
+  if (!ztscanFiles().length) return {};
+  const out = ztscanRecipeOn() ? { ...state.ztscan.recipe } : {};
+  const hw = parseFloat($("ztscan-hw").value);
+  if (Number.isFinite(hw) && hw > 0) out["convert.isolation_half_width"] = hw;
+  return out;
 }
 
 // What `vendor_of` calls a .d the engine reads natively, with its ion mobility.
@@ -2518,6 +2649,20 @@ function searchProblems() {
         "Set Bands to Off, or choose the prescreen before prediction."
     );
   }
+  const zt = ztscanFiles();
+  if (zt.length && !(parseFloat($("ztscan-hw").value) > 0)) {
+    out.push(
+      "These files name the quadrupole's position but not the width of the window it " +
+        "isolated, and cannot be searched without the Q1 half-width: " +
+        `${zt.map(baseName).join(", ")}. Enter it in the SCIEX ZT Scan DIA card.`
+    );
+  }
+  if (ztscanRecipeOn() && $("bands").value === "custom" && customBands().bands > 1) {
+    out.push(
+      "The ZT Scan recipe calibrates the Q1 sweep of the whole run, which cannot be split " +
+        "into bands. Set Bands to Off, or leave the recipe out."
+    );
+  }
   return out;
 }
 
@@ -3390,6 +3535,17 @@ async function startSearch() {
   }
 
   const bands = await resolveBands(built ? built[0] : null);
+  if (ztscanRecipeOn() && bands.bands > 1) {
+    banner(
+      $("start-error"),
+      `This search would be split into ${bands.bands} bands to fit the memory of this ` +
+        "machine, and the ZT Scan recipe calibrates the Q1 sweep of the whole run, which " +
+        "cannot be split. Leave the recipe out, or set Bands to Off if the machine has the " +
+        "memory."
+    );
+    screen("input");
+    return;
+  }
   if ($("prescreen").value === "after" && bands.bands > 1) {
     banner(
       $("start-error"),
@@ -3413,6 +3569,7 @@ async function startSearch() {
     ...bandOverrides(bands),
     ...normOverrides(),
     ...(libraryIrt ? { "rt_im_train.library_irt": libraryIrt } : {}),
+    ...ztscanOverrides(),
   };
   if (Object.keys(overrides).length) {
     try {

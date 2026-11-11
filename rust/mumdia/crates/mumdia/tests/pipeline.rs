@@ -483,6 +483,7 @@ fn search_stages_return_the_hashes_of_the_files_they_wrote() {
         cross_run: None,
         export_cross_run: false,
         first_pass_ids: None,
+        q1: None,
     })
     .unwrap();
     assert_written(&wq.peptide, &qpep);
@@ -544,6 +545,7 @@ fn downstream_bytes(psms: &str, chrom: &str, cfg: &Config, tag: &str) -> Vec<Vec
         cross_run: None,
         export_cross_run: false,
         first_pass_ids: None,
+        q1: None,
     })
     .unwrap();
     [feats, competed, scored, qpep, qprot, qfrag]

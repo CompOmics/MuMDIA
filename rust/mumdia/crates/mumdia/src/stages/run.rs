@@ -910,6 +910,15 @@ pub fn run(p: RunParams) -> Result<()> {
         cross_run: None,
         export_cross_run: false,
         first_pass_ids: None,
+        // `quant.q1_fragments` / `quant.q1_cycle_halfwidth`: the extracted rows' decisions
+        // and the sweep of the spectra.
+        q1: cfg
+            .quant
+            .reads_q1_sweep()
+            .then_some(crate::stages::q1quant::Q1QuantInputs {
+                psms_extracted: Some(&psms),
+                spectra_ms2: &co.ms2,
+            }),
     })?;
     man.record(wq.peptide.record(
         artifact::PEPTIDE_QUANT.0,

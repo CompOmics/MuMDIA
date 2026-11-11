@@ -41,6 +41,7 @@ block, as before.
 | `rust/mumdia/crates/mumdia/src/calibrate.rs` | Calibration math: `linear_fit`, the `Loess` local-linear smoother, and `percentile`. Shared, no external deps. |
 | `rust/mumdia/crates/mumdia/src/stages/run.rs` | Orchestrator. Runs the optional DeepLC fine-tune between `search-seed` and this stage, then calls `rt_im_train::run` (see `run.rs:265-314`). |
 | `rust/mumdia/crates/mumdia/src/stages/rt_bootstrap.rs` | `rt_im_train.multihead_anchors` (section 4f): the `auto` decision on the seed anchor count, the bootstrap search of the adapting run, the search-anchor table writer, and the refit of the multi-head calibration with its fallback. |
+| `rust/mumdia/crates/mumdia/src/stages/q1cal.rs` | `rt_im_train.q1_calibrate` (section 4h): the Q1 sweep, the seed fragments' Q1 profiles, the isotope-envelope transmission model, its fit and the `q1_calibration` block of `cal.json`. |
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | `run_deeplc_finetune` (sidecar.rs:110-155): the file-contract client that invokes the fine-tune worker. |
 | `scripts/deeplc_finetune.py` | The fine-tune worker: transfer-learns DeepLC (4.5.0 or newer; older versions are refused) on the seed and writes a new library parquet with replaced `predicted_irt`. |
 | `rust/mumdia/crates/mumdia-core/src/config.rs` | `RtImTrainConfig` (config.rs:447-512), `CalibrationMethod` enum (config.rs:56-61), and the load-time validation that rejects `calibration_method=none` (config.rs:1336-1342). |
@@ -146,7 +147,9 @@ of section 7 (`im_method`, `im_n_train`, `im_global`, `im_per_charge`, `w_im`, `
 `im_holdout_resid_abs_median`, `im_holdout_resid_p_im`, `im_in_sample_resid_abs_median`;
 docs/15 has the table; under `im_window_sizing = seed_decoy_corrected`, the default, also the
 `im_window_sizing` block of section 7), and the report's stats gain `im_n_train` and `w_im`.
-A 3D `cal.json` is unchanged.
+A 3D `cal.json` is unchanged. Under `rt_im_train.q1_calibrate` (scanning-quadrupole spectra,
+default off) the chain adds a `q1_calibration` block after the stage has written the file
+(section 4h).
 
 Every "median" among the three is the nearest-rank `percentile(.., 0.5)`
 (calibrate.rs:156-164), not an interpolated median.
@@ -897,6 +900,130 @@ No anchor cap is added: `--max-ref` takes the first N reference rows in table or
 search anchors, precursor m/z), the engine never passes it, and the alpha was erratic across
 subset sizes without a cap preventing the failure.
 
+### 4h. Q1 calibration of scanning-quadrupole spectra (`q1_calibrate`, default off)
+
+`rt_im_train.q1_calibrate` (`stages::q1cal`, called by `chain::extract_to_compete` right
+after the RT fit; the RT bootstrap pass skips it, as it skips retrace) calibrates the Q1
+dimension of a SCIEX ZT Scan DIA run read with `convert.isolation_half_width`
+(docs/04_convert.md, "SCIEX ZT Scan DIA"): where the quadrupole's window really sits
+relative to the target the file records for each step, how wide it is and how soft its
+edges are. It writes a `q1_calibration` block into `cal.json` and changes nothing else:
+no stage reads it yet, so every other artifact of a run with the key is the one without it.
+The block carries its own `version` (1); a `cal.json` without the key is unchanged. The
+standalone `mumdia rt-im-train` reads no spectra and warns that it skips the key. It is
+refused on a layout that is not a scanning quadrupole (the thresholds of extract's
+`Q1Layout`), on spectra with 1/K0 and with `groups.window_groups > 1`.
+
+**What it measures.** The sweep comes from spectra_ms2 v3 (`q1_cycle`, docs/04) or, on a v1
+table, from the targets by convert's rule. For every anchor (a target seed PSM under the
+anchor cut, one per candidate, at most 50,000 by score) and its six strongest library
+fragments, the matched intensity (nearest peak within the seed's fragment tolerance of the
+offset-corrected fragment m/z) is read in every step whose target lies within two
+half-widths of the precursor m/z, in the seed scan's cycle and two cycles either side, and
+summed per step over those five cycles: the fragment's Q1 profile. Its intensity-weighted
+centroid over the step targets is the fragment's observed Q1 centre.
+
+**The expected centre.** A window of half-width `h` centred at `target + delta`, whole
+within `h - e/2` of its centre and falling linearly to nothing at `h + e/2` (a box of `2h`
+convolved with a box of `e`; the nominal `e` is one step, the window swept during one
+step), summed over the precursor's isotopes M+0..M+5. Each isotope is weighted by its
+Poisson-averagine abundance (`constants::averagine_isotopes`, the lambda the MS1 isotope
+features use) times `(1 - f)^i`, `f` the fragment's share of the precursor mass: the chance
+that the heavy atoms of isotope `i` all fall in the complementary fragment, so that the
+fragment is still matched at its monoisotopic m/z. Without that factor every fragment
+looks 0.35 steps early, because its heavier precursor isotopes mostly give heavier
+fragments that are not matched (on REP01 below, over a +-5 m/z range of steps: a median
+residual of -0.345 steps with the envelope alone, -0.069 with the fragment-conditional
+envelope). The residual of a
+profile is observed minus expected centroid, in steps.
+
+**The fit** (`q1cal::fit`). A window centred `delta` above its target shows a precursor
+`delta` early in the sweep, so the offset is fitted to `delta - residual`: an additive
+model of robust LOESS terms (span 0.3, two bisquare iterations; backfitting, two rounds of
+two passes; each LOESS on at most 20,000 profiles), always of the precursor m/z, and of the
+fragment m/z and of the retention time, each kept when it narrows the profiles' residual
+spread (robust SD) by at least 2%. The half-width and edge width minimise the squared
+difference of the normalised profiles from the model with a per-profile scale and floor
+(the floor absorbs the random matches a 20 ppm tolerance finds in every step), on a grid of
+`h` from half to twice the half-width as read and `e` from 0 to six steps, refined around
+the best. The offset is fitted under the nominal shape, the shape under that offset and the
+offset again under the fitted shape. The nominal shape also scores three readings of the
+target: the window's centre (`delta = 0`), its lower edge (`delta = +h`, the window
+`[target, target + 2h]`) and its upper edge (`delta = -h`); `target_marks` names the one of
+least squares.
+
+**The fragment decision tolerances** (`fragment_decision`, only under
+`extract.q1_fragments`, which reads them). With the window just fitted
+(`q1frag::model_from_calibration` of this block), every anchor's RT x step patch of every
+library fragment is read from the spectra (at most 20,000 anchors, every k-th): the seven
+cycles around the seed scan's cycle, the steps within the window's reach plus two either
+side of the precursor's expected Q1 centre, the nearest peak of each cell within the
+fragment tolerance. `q1frag::learn` decides on them as extract does (docs/09_extract.md,
+section 12) and sets the tolerances from what the confident anchors' fragments look like:
+the offset tolerance is the median plus three robust SD (1.4826 MAD) of the fragments'
+own Q1 centres minus their candidate's shared centre, the centre tolerance the same of the
+shared centres against the expected one, and the 2D-correlation floor the 5th percentile
+of the correlation of the fragments within the offset tolerance, with guards for a
+degenerate anchor set (tolerances at least half a step, the floor at most 0.8). They are
+learned once without tolerances (one round over every present fragment), then again from
+the two-round decisions under the first. The block records the tolerances, the first
+tolerances, and for each of the three passes the shares of present, belonging and
+interfered fragments and the distributions of the offsets, the shared centres and the 2D
+correlation; the log line `q1-calibrate: per-fragment decision tolerances learned from the
+seed` carries the tolerances. The bootstrap pass, which skips the calibration otherwise,
+runs it when extract decides per fragment there too. On REP01 (12,653 anchors, every second
+one, 151,567 fragments, 4 s): the fragments' offsets from their shared centre have a robust
+SD of 0.44 steps in the learning pass and 0.38 under the tolerances, the shared centres 0.27
+and 0.22 steps around +0.01; the tolerances are 1.15 steps (offset), 0.69 steps (centre) and
+a 2D-correlation floor of 0.556 (first pass 1.31, 0.82 and 0.519), under which 79.1% of the
+anchors' fragments belong, 20.8% are interfered and 0.1% are absent. The entrapment-library
+run learns 1.10, 0.68 and 0.578.
+
+**`cal.json` `q1_calibration`.** `status` (`fitted`, or `too_few_profiles` under 200),
+`anchors`, `profiles`, `sweep` (`recorded`, `cycles`, `step_mz`, `half_width_as_read_mz`),
+`isotope_model`, `target_marks`, `hypotheses` (sum of squares and median residual of each
+reading), `offset` (`median_mz`, `median_steps`, `terms` with a 20-point grid and offset per
+term, `selection` with the residual spread after each candidate term), `half_width_mz`,
+`edge_width_mz`, `plateau_half_mz`, `support_half_mz`, and `residual_steps`: the
+distribution (n, median, MAD, robust SD, quartiles, p05, p95) under the nominal and the
+calibrated model, and the nominal residual by octile of precursor m/z, fragment m/z and
+retention time. The same numbers are logged (`q1-calibrate:`).
+
+**Measured** on ZenoTOF 8600 K562 REP01 (100 ng, 15 min, `isolation_half_width = 1.9`,
+spectra v3; 63 s inside the run on 64 threads):
+
+| | nominal model | calibrated |
+|---|---|---|
+| profiles (25,305 anchors) | 151,789 | 151,789 |
+| residual median, steps | -0.108 | +0.003 |
+| residual MAD, steps | 0.188 | 0.158 |
+| residual robust SD, steps | 0.279 | 0.234 |
+| p05 / p95, steps | -0.82 / +0.49 | -0.68 / +0.56 |
+
+- **The target is the window's centre.** Sum of squares 162 for the centre against 745 for
+  the lower edge and 765 for the upper edge, whose median residuals are +2.34 and -2.42
+  steps, the 2.5 steps a 1.9 m/z shift is. The fitted offset is +0.016 m/z (0.02 steps) at
+  the median profile.
+- **The offset depends on precursor m/z**: +0.24 m/z at 395 m/z, falling to -0.06 m/z at
+  900 m/z (nominal residual by precursor octile from -0.24 to -0.04 steps). Fragment m/z
+  (nominal residuals from -0.21 steps for fragments under 400 m/z to +0.03 above 1,044) and
+  retention time (-0.17 to -0.08) each narrowed the residuals by under 1% once the
+  precursor term was in (0.2336 -> 0.2325 and 0.2329 steps), so neither is kept; what is
+  left by fragment m/z after the calibration is -0.04 to +0.05 steps.
+- **The window is wider and softer than its nominal 3.8 m/z**: `h` 2.57 m/z and `e` 4.00
+  m/z, whole within 0.57 m/z of its centre and nothing beyond 4.56 m/z (sum of squares 117
+  against 162 for the nominal shape). The pooled profile of the strongest quarter of the
+  profiles, in 0.25 m/z bins of target minus envelope centre, peaks at 0.141 of a profile's
+  intensity per step and halves at about +-2.6 m/z, so a precursor shows in about seven
+  steps of a cycle rather than five. Where the softness comes from (the quadrupole's
+  edges, or the time ions take from the quadrupole to the TOF pulse while the sweep moves on)
+  is not separated here.
+
+The phase gate of the ZT Scan plan was that the seed fragments' Q1 centres fit the envelope
+model: they do, to a median of 0.003 steps and a MAD of 0.16 steps after the calibration,
+and 0.11 steps early before it. Nothing applies the calibration yet; the per-fragment Q1
+decisions it is for are a later change.
+
 ### 5. Optional adaptive per-region window (default off)
 
 When `adaptive_rt_window` is set (and `n_train >= min_anchors`, which guarantees the
@@ -1281,6 +1408,7 @@ though the enum variant still exists.
 | `finetune_deeplc` | `false` | Enable the DeepLC multitask fine-tune pre-step in `run` (run.rs:265). Requires `predict_frag.deeplc_python` (preflight, run.rs:62-67). On one measured run it was not needed per file once the library iRT had been fine-tuned once: the per-run LOESS reached the same residuals for much less wall clock (see the fine-tune section for the scope of that measurement). |
 | `multihead_anchors` | `auto` | Anchors of the multi-head calibration on the run that adapts the library. `search` refits it on the confident targets (`precursor_q <= q_train`, observed RT = `apex_rt`) of a bootstrap search of that run in `<run>/rt_bootstrap/`, and falls back to the seed-anchored library with a warning when that is not possible; refused with `finetune_deeplc`, `multihead_calibration = 0` and `groups.window_groups > 1`. `seed` never does. `auto` is `search` on a run whose seed found fewer than `multihead_search_below` anchors (or only at a relaxed q), else `seed` (section 4f). |
 | `multihead_search_below` | `2500` | `auto`'s threshold on the seed anchor count (distinct target base peptides at `q_train`). |
+| `q1_calibrate` | `false` | Scanning-quadrupole spectra only: calibrate the Q1 window (centre offset, half-width, edge width) on the seed fragments and write `q1_calibration` to `cal.json`; changes no other artifact (section 4h). |
 | `finetune_epochs` | `25` | Fine-tune epoch cap (`--epochs`); early stopping usually halts sooner. Used only when `finetune_deeplc`. |
 | `finetune_patience` | `10` | Early-stopping patience (`--patience`): epochs without val-loss improvement before stopping. |
 | `finetune_batch` | `0` | Fine-tune batch size (`--batch`). `0` auto-scales to the seed size so each epoch has ~30+ steps (config.rs:473-477); a fixed large batch underfits small seeds. |

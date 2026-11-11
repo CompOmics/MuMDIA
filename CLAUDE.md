@@ -150,7 +150,8 @@ Key semantics:
   `[target - h, target + h]`, byte-identical to a rewrite that adds the offsets.
   msconvert 3.0.25036 writes such a `.wiff2` with no precursor at all, which only
   extract's footprint guard (`extract.max_footprint_gib`, auto = the machine's
-  memory) stops. The engine does not model the Q1 sweep across bins;
+  memory) stops. By default the engine does not model the Q1 sweep across bins
+  (the opt-in keys are under "Changes that remain benchmark-gated");
   `docs/04_convert.md` "SCIEX ZT Scan DIA" has the measured recipe.
 - An imported library row with an empty `protein` is grouped as `UNASSIGNED` at
   load, with a warning that counts the rows (DIA-NN writes the iRT-kit standards
@@ -1033,7 +1034,13 @@ Do not enable these by default from a single AIF count:
   2.3-2.7% entrapment FDP on its transfers (docs/12); the default second pass is not
   gated;
 - acquisition-specific fragment/peak caps. The shipped default stays uncapped;
-  see the peak-cap subsection above.
+  see the peak-cap subsection above;
+- the scanning-quadrupole (ZT Scan DIA) model: `extract.q1_profile` with
+  `features.q1_features` measured +0.4% precursors on one ZenoTOF 8600 run (four
+  NN seeds) and +0.1% human precursors on its entrapment library at an unchanged
+  measured FDP; `extract.q1_cycles`, which sums a candidate's bins of a cycle into
+  one point, lost 12-14% and should stay off; no second ZT Scan acquisition has
+  been converted with its isolation targets (docs/09_extract.md, section 10).
 
 `compete.group_by = peptidoform_charge` is the default (2026-09-06) and is
 required, not optional, for a PTM or modification search. Under `base_peptide`
