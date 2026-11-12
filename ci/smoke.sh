@@ -1829,25 +1829,37 @@ done
 
 # 5p'. Protein annotations in the library itself (#299). The fixture library has the side table
 #     `digest` wrote beside it; one copy gets those annotations written into its own
-#     protein_ids / protein_names / genes columns (`_lib_io.embed_annotations`, what the
-#     importer and the decoy builders write) and no side table, another copy, written by the
-#     same writer, has neither. check_smoke.py asserts that the first fills the TSVs' cells from
-#     its columns, that the second runs, warns, records the gap in its manifest and leaves the
-#     cells empty, and that the two score and quantify byte for byte alike.
+#     protein_ids / protein_names / genes columns (the rule `_lib_io.annotate_precursors`
+#     applies for the importer and the decoy builders, a decoy taking its target's values,
+#     here with pyarrow alone: the smoke needs no pandas) and no side table, another copy,
+#     written by the same writer, has neither. check_smoke.py asserts that the first fills the
+#     TSVs' cells from its columns, that the second runs, warns, records the gap in its
+#     manifest and leaves the cells empty, and that the two score and quantify byte for byte
+#     alike.
 echo "=== smoke: protein annotations in the library"
 mkdir -p "$work/lib_cols" "$work/lib_bare"
 "$PY" - "$work/lib_prec.parquet" "$work/lib_cols/lib_precursors.parquet" \
     "$work/lib_bare/lib_precursors.parquet" <<'PYEOF'
 import sys
 sys.path.insert(0, "scripts")
-import pandas as pd
-from _lib_io import ANNOTATION_COLUMNS, embed_annotations, write_engine_parquet
+import pyarrow as pa
+import pyarrow.parquet as pq
+from _lib_io import (ANNOTATION_COLUMNS, annotations_path, lookup_annotation,
+                     read_protein_annotations)
 src, cols, bare = sys.argv[1:4]
-df, how = embed_annotations(pd.read_parquet(src), src)
-if how != "side table":
-    sys.exit(f"the fixture library should take its annotations from its side table, got {how}")
-write_engine_parquet(df, cols)
-write_engine_parquet(df.drop(columns=list(ANNOTATION_COLUMNS)), bare)
+side = read_protein_annotations(annotations_path(src))
+if not side:
+    sys.exit(f"the fixture library should have its side table beside it, {annotations_path(src)}")
+t = pq.read_table(src)
+keys = [p[6:] if lab == "decoy" and p.startswith("DECOY_") else p
+        for p, lab in zip(t.column("protein").to_pylist(), t.column("label").to_pylist())]
+cells = [lookup_annotation(side, k) for k in keys]
+annotated = t
+for j, c in enumerate(ANNOTATION_COLUMNS):
+    annotated = annotated.append_column(c, pa.array([x[j] for x in cells], pa.string()))
+pq.write_table(annotated, cols, compression="snappy")
+pq.write_table(t, bare, compression="snappy")
+print(f"protein annotations: {len(side)} entries written into {cols}")
 PYEOF
 for arm in cols bare; do
     cp "$work/lib_frag.parquet" "$work/lib_$arm/lib_fragments.parquet"
