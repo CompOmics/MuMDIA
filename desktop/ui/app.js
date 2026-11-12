@@ -1792,6 +1792,10 @@ function setupRow(it) {
     edit.hidden = true;
     rename.disabled = false;
   });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") ok.click();
+    if (e.key === "Escape") back.click();
+  });
   ok.addEventListener("click", async () => {
     setupsMessage();
     try {
