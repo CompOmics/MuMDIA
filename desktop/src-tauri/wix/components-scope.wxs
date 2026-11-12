@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Where the desktop application's analysis components go: the installer's choice.
+
+  The components are the Python environments and ThermoRawFileParser that the Setup screen
+  installs (DIA-NN installs itself with its own installer). They are never in this package:
+  the application downloads them after the installation. The administrator who runs this
+  installer chooses where they will go:
+
+    user     each user installs them from the Setup screen into their own folder
+             (%LOCALAPPDATA%\MuMDIA), without administrator rights. The default, and what
+             every earlier release did.
+    machine  an administrator installs them once into [INSTALLDIR]components, shared by
+             every user of the computer, who can run but not change them.
+
+  Libraries, settings, caches, temporary files and results stay per-user in both.
+
+  The choice is the public property COMPONENTS_SCOPE, so a silent installation passes it:
+  msiexec /i MuMDIA.msi COMPONENTS_SCOPE=machine /qn. The installer writes it to
+  HKLM\Software\CompOmics\MuMDIA, value ComponentsScope, where the application reads it
+  (src/scope.rs), and reads it back at the start of its next run, so an upgrade or a
+  reinstallation without the property keeps it. A value given on the command line wins over
+  the remembered one. Any value other than user or machine (in any case) stops the
+  installation before anything is installed.
+
+  The interactive installer shows the choice on a page after the installation folder. Its
+  checkbox, ticked by default and only for the program folder, opens MuMDIA when Finish is
+  pressed with the argument that installs the required components at once (the application
+  then asks Windows for an administrator's permission). The checkbox is on this page and not
+  on the last one because the last page has a single optional checkbox, which Tauri's
+  template already uses for "Launch MuMDIA": when that one is ticked, the launch carries the
+  argument through the template's LAUNCHAPPARGS; when it is not, MumdiaOpenForComponents
+  starts the application.
+
+  Nothing here deletes anything. The MSI removes on uninstall the one registry value it
+  wrote; the components it never placed stay until an administrator removes them from the
+  Setup screen or by hand (desktop/README.md, "Where the components are installed").
+
+  Linked through componentGroupRefs in tauri.conf.json (and again in
+  tauri.vcruntime.conf.json, whose fragment list replaces this one rather than adding to it).
+  The dialog takes its place by re-routing the Next and Back buttons around it with a higher
+  Order than WixUI_InstallDir's own events, which is how the Tauri template skips the licence
+  page. Its radio buttons are bound to the private MumdiaScopeChoice rather than to
+  COMPONENTS_SCOPE: Windows Installer requires the property of a radio button group to have a
+  value in the Property table (ICE34), and such a value on COMPONENTS_SCOPE would hide the
+  remembered choice. MumdiaScopeChoice is set from COMPONENTS_SCOPE before the page shows and
+  copied back on Next. ci/check_msi_scope.ps1 checks the built package's tables for every
+  piece.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <!-- No default value here: the default is set after the remembered choice is read, so
+         that neither ever overrides a value given on the command line. -->
+    <Property Id="COMPONENTS_SCOPE" Secure="yes" />
+    <Property Id="MUMDIA_REMEMBERED_SCOPE" Secure="yes">
+      <RegistrySearch Id="MumdiaRememberedScope" Root="HKLM" Key="Software\CompOmics\MuMDIA"
+                      Name="ComponentsScope" Type="raw" Win64="yes" />
+    </Property>
+    <Property Id="INSTALL_COMPONENTS" Value="1" Secure="yes" />
+    <!-- The page's own copy (see above). -->
+    <Property Id="MumdiaScopeChoice" Value="user" />
+
+    <!-- After AppSearch and before LaunchConditions, in whichever sequence runs first. -->
+    <SetProperty Id="COMPONENTS_SCOPE" Action="MumdiaScopeRemembered" Value="[MUMDIA_REMEMBERED_SCOPE]"
+                 After="AppSearch" Sequence="first">NOT COMPONENTS_SCOPE AND MUMDIA_REMEMBERED_SCOPE</SetProperty>
+    <SetProperty Id="COMPONENTS_SCOPE" Action="MumdiaScopeDefault" Value="user"
+                 After="MumdiaScopeRemembered" Sequence="first">NOT COMPONENTS_SCOPE</SetProperty>
+    <!-- One spelling each, so the page's radio buttons show the choice and the registry
+         holds what the application compares. -->
+    <SetProperty Id="COMPONENTS_SCOPE" Action="MumdiaScopeMachine" Value="machine"
+                 After="MumdiaScopeDefault" Sequence="first">COMPONENTS_SCOPE ~= "machine"</SetProperty>
+    <SetProperty Id="COMPONENTS_SCOPE" Action="MumdiaScopeUser" Value="user"
+                 After="MumdiaScopeMachine" Sequence="first">COMPONENTS_SCOPE ~= "user"</SetProperty>
+    <SetProperty Id="MumdiaScopeChoice" Action="MumdiaScopeToPage" Value="[COMPONENTS_SCOPE]"
+                 After="MumdiaScopeUser" Sequence="ui">COMPONENTS_SCOPE</SetProperty>
+
+    <Condition Message="COMPONENTS_SCOPE must be user (each user installs the analysis components into their own folder; the default) or machine (an administrator installs them once into the program folder for every user).">
+      <![CDATA[Installed OR COMPONENTS_SCOPE = "user" OR COMPONENTS_SCOPE = "machine"]]>
+    </Condition>
+
+    <ComponentGroup Id="MumdiaComponentsScope" Directory="INSTALLDIR">
+      <Component Id="MumdiaComponentsScopeRegistry" Guid="{D006C777-41E9-4EC9-B36D-529D095EFE41}" Win64="yes">
+        <RegistryValue Root="HKLM" Key="Software\CompOmics\MuMDIA" Name="ComponentsScope"
+                       Type="string" Value="[COMPONENTS_SCOPE]" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Started by Finish when "Launch MuMDIA" is not ticked (see above). As the user who ran
+         the installer, not elevated: the application asks for elevation itself. -->
+    <CustomAction Id="MumdiaOpenForComponents" Impersonate="yes" FileKey="Path"
+                  ExeCommand="--install-components-on-start" Return="asyncNoWait" />
+
+    <UI>
+      <Dialog Id="MumdiaScopeDlg" Width="370" Height="270" Title="!(loc.InstallDirDlg_Title)">
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)" />
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg">1</Publish>
+        </Control>
+
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="320" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="Choose where MuMDIA keeps its Python environments and converters." />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="200" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="{\WixUI_Font_Title}Analysis components" />
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="!(loc.InstallDirDlgBannerBitmap)" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+
+        <Control Id="Scope" Type="RadioButtonGroup" X="20" Y="52" Width="330" Height="96" Property="MumdiaScopeChoice">
+          <RadioButtonGroup Property="MumdiaScopeChoice">
+            <RadioButton Value="user" X="0" Y="0" Width="330" Height="16" Text="&amp;Each user's own folder (default)" />
+            <RadioButton Value="machine" X="0" Y="48" Width="330" Height="16" Text="The &amp;program folder, shared by every user" />
+          </RadioButtonGroup>
+        </Control>
+        <Control Id="UserDescription" Type="Text" X="33" Y="69" Width="317" Height="28" NoPrefix="yes"
+                 Text="Each user installs them from MuMDIA's Setup screen into their own folder, without administrator rights." />
+        <Control Id="MachineDescription" Type="Text" X="33" Y="117" Width="317" Height="30" NoPrefix="yes"
+                 Text="Installed once into [INSTALLDIR]components. Every user runs them; only an administrator installs, updates or removes them." />
+
+        <Control Id="InstallNow" Type="CheckBox" X="20" Y="154" Width="330" Height="30" Property="INSTALL_COMPONENTS" CheckBoxValue="1"
+                 Text="&amp;Install the required components when setup finishes: MuMDIA opens and downloads a few hundred megabytes. Windows asks for permission.">
+          <Condition Action="disable"><![CDATA[MumdiaScopeChoice <> "machine"]]></Condition>
+          <Condition Action="enable"><![CDATA[MumdiaScopeChoice = "machine"]]></Condition>
+        </Control>
+        <Control Id="Note" Type="Text" X="20" Y="192" Width="330" Height="36" NoPrefix="yes"
+                 Text="Libraries, settings, caches and results stay in each user's own folder either way. To change this later, install MuMDIA again with the other choice; the components are then installed again in the new place." />
+      </Dialog>
+
+      <!-- Into the WixUI_InstallDir sequence: install folder, this page, ready to install. -->
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="MumdiaScopeDlg" Order="5">WIXUI_DONTVALIDATEPATH OR WIXUI_INSTALLDIR_VALID="1"</Publish>
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MumdiaScopeDlg" Order="3">NOT Installed</Publish>
+      <Publish Dialog="MumdiaScopeDlg" Control="Back" Event="NewDialog" Value="InstallDirDlg" Order="1">1</Publish>
+      <Publish Dialog="MumdiaScopeDlg" Control="Next" Property="COMPONENTS_SCOPE" Value="[MumdiaScopeChoice]" Order="1">1</Publish>
+      <Publish Dialog="MumdiaScopeDlg" Control="Next" Property="LAUNCHAPPARGS" Value="--install-components-on-start" Order="2">MumdiaScopeChoice = "machine" AND INSTALL_COMPONENTS = "1"</Publish>
+      <Publish Dialog="MumdiaScopeDlg" Control="Next" Property="LAUNCHAPPARGS" Value="{}" Order="3">NOT (MumdiaScopeChoice = "machine" AND INSTALL_COMPONENTS = "1")</Publish>
+      <Publish Dialog="MumdiaScopeDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="4">1</Publish>
+
+      <!-- Finish: the template's own launch, when ticked, already carries the argument. -->
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="MumdiaOpenForComponents" Order="2"><![CDATA[COMPONENTS_SCOPE = "machine" AND INSTALL_COMPONENTS = "1" AND NOT Installed AND NOT (WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1)]]></Publish>
+    </UI>
+  </Fragment>
+</Wix>

@@ -254,6 +254,31 @@ than a number. Both are recorded in every run's `manifest.json`.
   table, `digest` a FASTA search's own).
 ### Added
 
+- **The Windows installer can put the desktop application's analysis components in the
+  program folder, shared by every user.** The administrator who runs the installer chooses,
+  on a new "Analysis components" page or with `COMPONENTS_SCOPE=user|machine` for a silent
+  installation, where the Python environments and ThermoRawFileParser go: each user's own
+  folder (`%LOCALAPPDATA%\MuMDIA`, the default and what every earlier release did) or
+  `<installation folder>\components` (`C:\Program Files\MuMDIA\components`). In the program
+  folder an administrator installs them once and every user runs them without being able to
+  change them; the installer can open MuMDIA at Finish to install the required environment at
+  once. The choice is recorded in `HKLM\Software\CompOmics\MuMDIA` (`ComponentsScope`), read
+  back by the next installation so an upgrade keeps it, and read by the application when it
+  starts. The Setup screen says which folder holds the components; there, Install, Update,
+  Reinstall and Remove run as administrator through an elevated copy of the application, and
+  Windows asks for permission (a declined prompt is explained, with the command an
+  administrator can run). `mumdia-console.exe --install-components primary,thermo` (or `all`)
+  and `--remove-components` do the same from an elevated prompt or a deployment tool, for a
+  scripted installation and after each upgrade. An installation into the program folder keeps
+  uv's interpreter there, copies packages rather than hard-linking them, compiles them, and
+  resets their permissions to the folder's, so every user can read them. Libraries, settings,
+  setups, caches, temporary files, results, run logs and the DIA-NN path and licence answer
+  stay per-user in both modes. The MSI places no components and deletes none, so an upgrade
+  leaves them as they are and an uninstall leaves them in place; the Managed data card removes
+  them. The user scope is unchanged, and so are the engine, its outputs and configuration
+  hashes. `ci/check_msi_scope.ps1` checks the package's tables, and the Windows CI job
+  installs it with each choice (desktop/README.md, "Where the components are installed").
+
 - **Setups in the desktop application: a search setup saved under a name, or to a file
   (#297).** The Setups card on the Settings screen keeps the current setup in My setups
   (load, rename, save to a file, delete) or saves it to a file of the user's choice, and

@@ -3,7 +3,8 @@
   "bundle": {
     "windows": {
       "wix": {
-        "fragmentPaths": ["wix/vc-runtime.wxs"],
+        "fragmentPaths": ["wix/components-scope.wxs", "wix/vc-runtime.wxs"],
+        "componentGroupRefs": ["MumdiaComponentsScope"],
         "mergeRefs": ["VCRuntimeX64"]
       }
     }

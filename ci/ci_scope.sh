@@ -103,7 +103,7 @@ classify() {
         env/console-* | configs/config-schema.json) echo desktop ;;
         # The Linux desktop job's frontend checks, which the installer does not run.
         ci/check_desktop_ui.py | ci/test_desktop_ui.mjs) echo desktop_ui ;;
-        ci/check_msi_runtime.ps1 | ci/find_vc_merge_module.ps1) echo msi ;;
+        ci/check_msi_runtime.ps1 | ci/check_msi_scope.ps1 | ci/find_vc_merge_module.ps1) echo msi ;;
         # Everything else is the engine: configs/examples, docker/*.json, test_data/,
         # the smoke scripts, ci/run_name_cases.json, .gitattributes, and any path this
         # script has not been taught about.
@@ -152,7 +152,7 @@ case "$job" in
     # its workers in scripts/.
     desktop)
         has engine desktop desktop_ui scripts && decide true "$why" ;;
-    # The installer: desktop/ and what the application compiles in, the two installer
+    # The installer: desktop/ and what the application compiles in, the three installer
     # scripts, and the workflow (the `all` class above).
     desktop-windows)
         has desktop msi && decide true "$why" ;;

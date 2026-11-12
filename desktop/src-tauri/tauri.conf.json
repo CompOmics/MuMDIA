@@ -38,6 +38,12 @@
     "resources": {
       "binaries/*": "binaries/",
       "binaries/scripts/*": "binaries/scripts/"
+    },
+    "windows": {
+      "wix": {
+        "fragmentPaths": ["wix/components-scope.wxs"],
+        "componentGroupRefs": ["MumdiaComponentsScope"]
+      }
     }
   }
 }

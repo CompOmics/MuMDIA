@@ -100,10 +100,11 @@ later than to remove one.
 ## Analysis components
 
 The application installs its own Python environment with `uv`, so conda is never
-needed. It goes under the per-user data directory (`%LOCALAPPDATA%\MuMDIA` or
+needed. By default it goes under the per-user data directory (`%LOCALAPPDATA%\MuMDIA` or
 `~/.local/share/MuMDIA`), not beside the executable, because on Windows that is
 Program Files and an installer that needs administrator rights on first run is not
-an easy install.
+an easy install. On Windows, an administrator can choose the program folder instead,
+shared by every user ("Where the components are installed" below).
 
 **Searching without the components is refused.** MuMDIA does run with no Python at
 all, but the recorded numbers make that a bad default to offer: on the same file the
@@ -253,6 +254,10 @@ outright, because this is a recursive delete driven by a string from the fronten
 `components_remove` refuses entirely while a search, an installation or a library
 build is running, since those hold the very files it would delete.
 
+When an administrator chose the program folder for the components, the same holds for
+`<installation folder>\components`: the installer did not place it, so uninstalling leaves
+it ("Where the components are installed" below).
+
 By hand, the same thing:
 
 ```powershell
@@ -293,7 +298,7 @@ Managed data card. The storage folder holds:
 
 The Python environments and the downloaded tools (ThermoRawFileParser, DIA-NN) stay in the
 default folder unless **Also keep the Python environments and downloaded tools there** is
-ticked: an environment cannot be relocated (its interpreter paths are absolute), so moving
+ticked (when they are in the program folder, they stay there and the option is not offered): an environment cannot be relocated (its interpreter paths are absolute), so moving
 it means installing it again, a few hundred megabytes nobody should get by surprise. With
 the option, `uv`'s interpreters move too (`uv-python/`, `UV_PYTHON_INSTALL_DIR`). Nothing is
 copied in either case: the caches, libraries and models are rebuilt or downloaded where the
@@ -314,6 +319,82 @@ about a folder inside OneDrive or on a network share and about a storage folder 
 than 20 GB free. The run log (`mumdia-console.log`) is opened before the engine starts, and
 a results folder that cannot take it stops the start with the reason instead of running a
 search with no log. The pure logic is `src/storage.rs`, with its tests.
+
+### Where the components are installed
+
+The components are the Python environments and ThermoRawFileParser (DIA-NN's own installer
+decides where DIA-NN goes). On Windows, the administrator who runs the MuMDIA installer
+chooses where they go:
+
+| | Each user's own folder (default) | The program folder |
+|---|---|---|
+| folder | `%LOCALAPPDATA%\MuMDIA` (or the storage folder) | `<installation folder>\components`, by default `C:\Program Files\MuMDIA\components` |
+| installed by | each user, from the Setup screen, without administrator rights | an administrator, once for every user |
+| a standard user | installs, updates and removes their own copy | runs them and cannot change them |
+
+In both modes each user's data stays per-user: libraries, settings, setups, caches, temporary
+files, model downloads, results, run logs, and the located DIA-NN with the user's licence
+answer. The choice is recorded in `HKLM\Software\CompOmics\MuMDIA`, value `ComponentsScope`
+(`user` or `machine`), which the application reads when it starts (`src/scope.rs`). The
+AppImage has no installer, so Linux always uses each user's folder.
+
+**Choosing it.** The interactive installer has an "Analysis components" page after the
+installation folder. With the program folder selected, its box "Install the required
+components when setup finishes" (ticked by default) makes Finish open MuMDIA, which installs
+the required environment at once; Windows asks for an administrator's permission. A silent
+installation passes the property, then installs the components from an elevated prompt or a
+deployment tool running as SYSTEM:
+
+```powershell
+msiexec /i MuMDIA_0.12.0_x64_en-US.msi COMPONENTS_SCOPE=machine /qn
+$p = Start-Process "C:\Program Files\MuMDIA\mumdia-console.exe" `
+       -ArgumentList "--install-components", "primary,thermo" -Wait -PassThru
+$p.ExitCode   # 0 done, 1 failed, 2 bad arguments, 3 not run as administrator
+```
+
+`COMPONENTS_SCOPE` is `user` (the default) or `machine`, in any case; any other value stops
+the installation (1603) before anything is installed. `--install-components` takes
+`primary`, `ms2pip`, `visdia`, `thermo` or `all`; `--remove-components` removes them; both
+log to `components\logs\`. The packages are downloaded, so the computer needs network access.
+These flags belong to the desktop application; the engine is unchanged.
+
+**On the Setup screen** the folder in use is named. In the program folder, Install, Update,
+Reinstall and the Managed data card's Remove run that one change in an elevated copy of the
+application (`src/elevate.rs`): Windows shows its permission prompt, where a standard user can
+enter an administrator's name and password, and a declined prompt is explained with the
+command an administrator can run instead. The packages are then imported for real as the user
+at the window. Such an installation keeps uv's interpreter in `components\uv-python`, copies
+packages rather than hard-linking them from the administrator's cache, compiles them, and
+resets every file's permissions to the program folder's (`icacls /reset`), so every user can
+read them. A user's own earlier copies are listed on the Managed data card as "no longer
+used"; MuMDIA does not fall back to them, because two copies could hold different package
+versions, which change results.
+
+**Upgrades** keep the choice: the installer reads the recorded value back, and a value on the
+command line wins. An upgrade does not touch the components. When a release pins newer
+package versions, the Setup screen shows "update needed" and searches wait until an
+administrator presses Update or runs `--install-components` again, which a deployment script
+should do after every upgrade.
+
+**Changing it later.** Install again with the other choice (a newer version with the property,
+or, for the installed version, uninstall and install again), or set the value as an
+administrator:
+`reg add HKLM\Software\CompOmics\MuMDIA /v ComponentsScope /t REG_SZ /d user /f /reg:64`.
+Nothing is moved, because an environment cannot be relocated: the components are installed
+again in the new place, and the old copy is removed from the Managed data card (the program
+folder's before switching back to each user's folder, since the card then no longer lists it).
+
+**Uninstalling** removes what the installer placed, the registry value included, and nothing
+else. The program folder's components were placed later, by MuMDIA, so they stay: remove them
+from the Managed data card before uninstalling, or afterwards as an administrator, when nobody
+is searching: `Remove-Item -Recurse -Force "C:\Program Files\MuMDIA\components"`.
+
+Tested: the folders of both modes (`scope.rs`, `storage.rs`, `components.rs`), the Setup
+screen in both (`ci/test_desktop_ui.mjs`), the package's tables (`ci/check_msi_scope.ps1`),
+and, on the Windows CI runner, silent installations with each value, the remembered choice,
+the installed application's helper on the program folder, and an uninstall that leaves the
+components. Not tested: the interactive page and its Finish action, the permission prompt,
+a standard user's view of the shared components, and an upgrade between two built versions.
 
 ### Two environments, not one (historical)
 
