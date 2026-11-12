@@ -84,6 +84,22 @@ pub struct Manifest {
     /// bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention: Option<Retention>,
+    /// Why the reports carry no protein annotations ([`ProteinAnnotationsGap`]). Written only
+    /// for a library search without any, so every other manifest keeps its bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protein_annotations_missing: Option<ProteinAnnotationsGap>,
+}
+
+/// A search from a library whose reports carry no protein annotations: the library has no
+/// `protein_ids`, `protein_names` and `genes` columns, no `protein_annotations.parquet` sits
+/// beside it and none was given (`mumdia::protein_annotations`). Recorded only then, so the
+/// manifest of every annotated search keeps its bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProteinAnnotationsGap {
+    /// The library precursor table the search was given.
+    pub lib_precursors: String,
+    /// The warning the search logged, which says what is empty and how to fill it.
+    pub warning: String,
 }
 
 /// The record of a retention tier applied to a finished output directory
@@ -134,6 +150,7 @@ impl Manifest {
             artifacts: BTreeMap::new(),
             rt_calibration_missing: Vec::new(),
             retention: None,
+            protein_annotations_missing: None,
         }
     }
 
@@ -260,6 +277,32 @@ mod tests {
         );
         let back: Manifest = serde_json::from_str(&json).unwrap();
         assert_eq!(back.rt_calibration_missing, m.rt_calibration_missing);
+    }
+
+    /// The protein-annotation gap is written only for a library search without annotations,
+    /// so the manifest of a FASTA search, or of an annotated library search, has exactly the
+    /// keys it had before the field existed.
+    #[test]
+    fn the_protein_annotation_gap_is_written_only_when_present() {
+        let mut m = Manifest::new("{}".into(), "c".repeat(64));
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(!json.contains("protein_annotations_missing"), "{json}");
+        m.protein_annotations_missing = Some(ProteinAnnotationsGap {
+            lib_precursors: "lib/lib_precursors.parquet".into(),
+            warning: "no protein annotations".into(),
+        });
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(
+            json.contains(
+                "\"protein_annotations_missing\":{\"lib_precursors\":\"lib/lib_precursors.parquet\""
+            ),
+            "{json}"
+        );
+        let back: Manifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.protein_annotations_missing,
+            m.protein_annotations_missing
+        );
     }
 
     #[test]
