@@ -572,6 +572,10 @@
         <input id="threads" type="number" min="1" step="1" placeholder="all cores">
         <span class="hint inline" id="cores"></span>
       </div>
+      <p class="hint">
+        To keep this search's setup under a name, or save it to a file for another computer
+        or a colleague, use Setups on the Settings screen.
+      </p>
 
       <div class="rule"></div>
       <div class="card-title">Prescreen</div>
@@ -670,6 +674,56 @@
 
     <div id="settings-error" class="banner bad" hidden></div>
     <div id="settings-saved" class="banner ok" hidden></div>
+
+    <!-- Setups (#297): the Search screen's choices and these settings, kept under a name or
+         written to a file. Filled by refreshSetups; a setup read is checked and summarised
+         by reviewSetup, and only Apply changes anything. -->
+    <div class="card" id="setups-card">
+      <div class="card-title">Setups</div>
+      <p class="card-sub setups-sub">
+        A setup is how a search is set up: the choices on the Search screen and the settings
+        on this screen. Keep one under a name to come back to it, or save it to a file to use
+        it on another computer or send it to a colleague. The files and folders of a search,
+        the conditions of its files and the thread counts are not part of a setup, nor are
+        the settings that describe a computer rather than a search (the programs and
+        interpreters it uses, its caches, and how much of its memory and processors a search
+        may take): loading a setup keeps this computer's own.
+      </p>
+      <div class="setups-bar">
+        <label for="setups-name">Name</label>
+        <input type="text" id="setups-name" maxlength="120" spellcheck="false"
+               placeholder="for example Phospho or Label-free" />
+        <button class="btn" id="setups-save">Save in My setups</button>
+        <button class="btn quiet" id="setups-export">Save to a file…</button>
+        <button class="btn quiet" id="setups-import">Load from a file…</button>
+      </div>
+      <div id="setups-error" class="banner bad" role="alert" hidden></div>
+      <div id="setups-done" class="banner ok" role="status" hidden></div>
+
+      <div class="setup-review" id="setups-review" role="region"
+           aria-labelledby="setups-review-title" hidden>
+        <div class="card-title" id="setups-review-title"></div>
+        <div class="card-sub" id="setups-review-meta"></div>
+        <div id="setups-review-warn" class="banner warn" hidden></div>
+        <ul class="setup-changes" id="setups-review-changes"></ul>
+        <label class="check" id="setups-keep-row">
+          <input type="checkbox" id="setups-keep" checked />
+          <span>Also keep it in My setups</span>
+        </label>
+        <div class="dact">
+          <button class="btn" id="setups-apply">Apply</button>
+          <button class="btn quiet" id="setups-cancel">Cancel</button>
+        </div>
+      </div>
+
+      <div class="rule"></div>
+      <div class="card-title">My setups</div>
+      <div id="setups-list"></div>
+      <p class="hint" id="setups-empty" hidden>
+        None saved yet. Name the current setup above and press Save in My setups.
+      </p>
+      <p class="hint" id="setups-where"></p>
+    </div>
 
     <div class="row" style="margin-bottom:12px">
       <input id="settings-search" type="search" placeholder="Search settings…"
