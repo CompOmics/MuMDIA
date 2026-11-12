@@ -208,7 +208,10 @@ gitignored (large binaries kept on disk).
 The precursor and fragment schemas match the library-input contract consumed by
 the fragment index (`rust/mumdia/crates/mumdia/src/index.rs:55-71`):
 `candidate_id, peptidoform_id, base_peptide_id, peptidoform, charge,
-precursor_mz, predicted_irt, label, protein, n_fragments` for precursors, and
+precursor_mz, predicted_irt, label, protein, n_fragments` for precursors (a library imported
+now also carries `protein_ids, protein_names, genes`, the protein annotations the reports'
+last three columns are filled from; this one predates them, so a search on it warns and
+leaves those cells empty), and
 `candidate_id, mz, predicted_intensity, name, ion_type, ordinal, frag_charge`
 for fragments. `candidate_id` is contiguous and precursors are sorted by
 `precursor_mz`, the preconditions the index build checks on load.

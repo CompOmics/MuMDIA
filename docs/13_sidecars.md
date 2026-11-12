@@ -235,25 +235,32 @@ code.
   Fragment.Series.Number, Fragment.Charge, Protein.Names`/`Protein.Ids`).
 - OUT `<out_precursors>`: `candidate_id, peptidoform_id, base_peptide_id,
   peptidoform, charge, precursor_mz, predicted_irt, label(="target"), protein,
-  n_fragments`. `<out_fragments>`: `candidate_id, mz, predicted_intensity, name,
-  ion_type, ordinal, frag_charge` (`import_diann_lib.py:59-83`).
+  n_fragments`, then `predicted_im` when the library has a 1/K0 and the protein annotation
+  columns `protein_ids, protein_names, genes` (below). `<out_fragments>`: `candidate_id, mz,
+  predicted_intensity, name, ion_type, ordinal, frag_charge` (`import_diann_lib.py:59-83`).
 - `protein` is `Protein.Names` for a precursor whose every `;`-separated name is a UniProt
   entry name (one word with an underscore, `ALBU_HUMAN`), else `Protein.Ids`. DIA-NN fills
   `Protein.Names` only for headers it parses as UniProt; for `CON_sp|...` contaminants or
   the `REAL_sp|` / `ENTRAP_sp|` headers of an entrapment FASTA it writes the first
   description word (`Keratin,`) or nothing, which merged distinct proteins into one group or
   left mapped precursors UNASSIGNED. Empty in both columns is `UNASSIGNED`.
-- OUT `protein_annotations.parquet` beside `<out_precursors>` (`--annotations <path>`
-  elsewhere, `--no-annotations` not at all): one row per distinct `protein` string with its
+- The protein annotations are three more columns of `<out_precursors>` (#299):
   `protein_ids` (from `Protein.Ids`, the accession field of a `db|ACCESSION|ENTRY_NAME`
   id), `protein_names` (the entry names of `Protein.Names`, then those of such ids) and
-  `genes` (`Genes` without description words), read in the first pass only. The engine
-  joins it at report time (docs/15, "protein_annotations"); `protein` is unchanged. The
-  decoy builders (`make_reverse_decoys.py`, `make_shift_decoys.py`, `predict_decoys.py`)
-  copy it beside their output library (`_lib_io.carry_protein_annotations`), and
-  `predict_decoys.py` imports DIA-NN's prediction of the decoys with `--no-annotations`.
-  A library with neither `Protein.Ids` nor `Protein.Names` gets none, and a table left in
-  the output folder by another library is removed.
+  `genes` (`Genes` without description words), per distinct `protein` string over every
+  precursor of it, `Genes` read in the first pass only. They are in the library, so it
+  carries them wherever its two tables are copied, and the engine reads them at report
+  time from the target rows (docs/15, "protein_annotations"); `protein` is unchanged.
+  Optional flags, after the three positional arguments: `--fasta <path>` fills what the
+  library leaves empty from the FASTA headers; `--annotations <path>` also writes them as a
+  side table there; `--no-annotations` writes no columns, which is how `predict_decoys.py`
+  imports DIA-NN's prediction of the decoys. The decoy builders (`make_reverse_decoys.py`,
+  `make_shift_decoys.py`, `predict_decoys.py`) and `augment_library.py` keep the columns,
+  each decoy carrying its target's values, and write them from the side table beside an
+  input library imported before the columns existed (`_lib_io.embed_annotations`). A
+  library with neither `Protein.Ids` nor `Protein.Names` gets no columns, and a search on
+  it warns; a `protein_annotations.parquet` left in the output folder by another library is
+  removed, because the engine reads one beside a library without the columns.
 - A modification written before the first residue (`(UniMod:1)PEPK`) is N-terminal.
   It is kept as the ProForma group `[Acetyl]-PEPK` when its accession is kept
   (`--keep-unimod 1,4,35` for protein N-terminal acetylation), and the precursor is
