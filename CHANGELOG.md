@@ -240,6 +240,28 @@ than a number. Both are recorded in every run's `manifest.json`.
 - The manifest records a search's annotation table with the producer `library-columns`
   when it was read from the library's columns (`library-input` remains a copied side
   table, `digest` a FASTA search's own).
+### Added
+
+- **Setups in the desktop application: a search setup saved under a name, or to a file
+  (#297).** The Setups card on the Settings screen keeps the current setup in My setups
+  (load, rename, save to a file, delete) or saves it to a file of the user's choice, and
+  loads one from a file, so a setup for phospho and one for label-free data can be kept side
+  by side, moved to another computer or sent to a colleague. A setup holds the Search
+  screen's choices (search space and library source, digest, modifications, experiment mode
+  and normalisation, prescreen, bands, the ZT Scan analysis and a typed Q1 half-width) and the
+  Settings screen's engine settings as the preset they start from plus the changes to it. It
+  leaves out what belongs to a dataset or a computer: files, folders, conditions, thread
+  counts, and the engine settings that name programs and caches or limit the computer's
+  processors and memory, which loading keeps as the receiving computer's own; an interpreter
+  path is carried as `"auto"`, because a search that needs an interpreter cannot do without
+  one. The
+  file is JSON with a format id and a format version (`mumdia-desktop-settings`, version 1)
+  and a migration step per later version, so a file saved now keeps loading. Loading checks
+  the setup first and lists what it would change before Apply: a value this version cannot
+  use refuses it, naming the field, and a setting it does not know, or from a newer version,
+  is listed and left out. Loaded on a fresh profile, a setup gives a search the same
+  configuration as on the computer that saved it (desktop/README.md, "Setups"). "Save and
+  use" with nothing changed from the preset now uses the preset itself.
 
 ## [0.12.0] - 2026-11-11
 

@@ -94,6 +94,18 @@ const state = {
   schema: null,
   overrides: {},
   savedConfig: null,
+  // The presets the Search screen offers, by name and path (`presets`).
+  presets: [],
+  // The built-in preset the Settings screen's values start from ("" for the engine
+  // defaults), and the one "My settings" was saved from: a setup names it and lists the
+  // changes from it (#297).
+  settingsPreset: "",
+  savedPreset: "",
+  // The override set of the configuration the next search uses, to tell edits on the
+  // Settings screen that are not saved and used yet.
+  inUse: {},
+  // Named setups (`setups_list`), and a setup read and checked, waiting for Apply.
+  setups: { list: [], dir: "", pending: null },
   // The Search tab's modification choice: "name|residue" -> "var" or "fix", and the
   // engine's catalogue it is chosen from.
   mods: new Map(),
@@ -123,9 +135,12 @@ const state = {
   // selected mzML by path (null when it could not be read), whether the user typed the
   // half-width, the overrides that turn the ZT Scan analysis off once read (`ztscan_off`),
   // whether the user changed the analysis checkbox (until then it is ticked whenever the
-  // analysis applies), and what the analysis's library settings changed in the Search space
-  // card (`syncZtscanLibrary`).
-  ztscan: { probes: {}, hwTyped: false, off: null, analysisTouched: false, lib: null },
+  // analysis applies) and what they chose (null when only `analysisTouched` says so), and
+  // what the analysis's library settings changed in the Search space card
+  // (`syncZtscanLibrary`).
+  ztscan: {
+    probes: {}, hwTyped: false, off: null, analysisTouched: false, analysisChoice: null, lib: null,
+  },
 };
 
 function readStored(key, fallback) {
@@ -241,6 +256,7 @@ async function init() {
 
   try {
     const list = await invoke("presets");
+    state.presets = list.map((p) => ({ name: p.name, path: p.path }));
     const sel = $("preset");
     for (const p of list) {
       const o = document.createElement("option");
@@ -266,7 +282,10 @@ async function init() {
         refreshStorage();
         refreshManaged();
       }
-      if (b.dataset.screen === "settings") loadSettings();
+      if (b.dataset.screen === "settings") {
+        loadSettings();
+        refreshSetups();
+      }
       if (b.dataset.screen === "history") loadHistory();
     });
   }
@@ -292,8 +311,15 @@ async function init() {
   // Once the user ticks or clears the ZT Scan analysis, the choice is theirs.
   $("ztscan-analysis").addEventListener("change", () => {
     state.ztscan.analysisTouched = true;
+    state.ztscan.analysisChoice = $("ztscan-analysis").checked;
     renderZtscanNote();
   });
+  // Setups, on the Settings screen (#297).
+  $("setups-save").addEventListener("click", saveNamedSetup);
+  $("setups-export").addEventListener("click", exportCurrentSetup);
+  $("setups-import").addEventListener("click", importSetupFile);
+  $("setups-apply").addEventListener("click", applyPendingSetup);
+  $("setups-cancel").addEventListener("click", cancelPendingSetup);
   $("suggest-conditions").addEventListener("click", () => {
     state.conditionTyped = {};
     renderMzmlList();
@@ -406,14 +432,28 @@ const COMMON_SETTINGS = [
   ["rescore.seeds", "Rescoring seeds"],
 ];
 
+// Load the schema and seed the form once. A setup can be saved or loaded while the first
+// load is still under way, so a second call waits for the first rather than starting
+// another (which would wire every listener twice).
 async function loadSettings() {
   if (state.schema) return;
+  if (!state.settingsLoading) {
+    state.settingsLoading = loadSettingsOnce().finally(() => {
+      state.settingsLoading = null;
+    });
+  }
+  return state.settingsLoading;
+}
+
+async function loadSettingsOnce() {
+  let schema;
   try {
-    state.schema = await invoke("config_schema");
+    schema = await invoke("config_schema");
   } catch (e) {
     banner($("settings-error"), String(e));
     return;
   }
+  state.schema = schema;
   await seedOverridesFromPreset();
   $("settings-search").addEventListener("input", renderSettings);
   $("only-changed").addEventListener("change", renderSettings);
@@ -444,17 +484,32 @@ async function loadSettings() {
 async function seedOverridesFromPreset() {
   state.overrides = {};
   const path = $("preset").value;
-  if (!path) return;
-  try {
-    const flat = await invoke("config_overrides", { path });
-    for (const [k, v] of Object.entries(flat)) {
-      const f = state.schema.fields.find((x) => x.path === k);
-      if (!f || sameAsDefault(f, v)) continue;
-      state.overrides[k] = v;
+  // Which built-in preset these values start from: "My settings" keeps the one it was
+  // saved from, so a setup can name it.
+  state.settingsPreset =
+    path && path === state.savedConfig ? state.savedPreset : presetNameOf(path);
+  if (path) {
+    try {
+      state.overrides = await seededOverrides(path);
+    } catch (e) {
+      banner($("settings-error"), `Could not read the selected preset: ${e}`);
     }
-  } catch (e) {
-    banner($("settings-error"), `Could not read the selected preset: ${e}`);
   }
+  state.inUse = { ...state.overrides };
+}
+
+/// The override set a configuration file amounts to, as the form holds it: the settings
+/// the schema describes, and only those that differ from the engine defaults.
+async function seededOverrides(path) {
+  const out = {};
+  if (!path) return out;
+  const flat = await invoke("config_overrides", { path });
+  for (const [k, v] of Object.entries(flat)) {
+    const f = state.schema.fields.find((x) => x.path === k);
+    if (!f || sameAsDefault(f, v)) continue;
+    out[k] = v;
+  }
+  return out;
 }
 
 /// Whether `value` is the engine default for `f`. List-valued settings carry their
@@ -639,33 +694,1148 @@ function onSettingChanged(el) {
   renderSettings();
 }
 
+// True when the settings were saved and are used by the next search.
 async function saveSettings() {
   banner($("settings-error"), "");
   banner($("settings-saved"), "");
   try {
-    const path = await invoke("save_settings", {
-      name: "console",
-      overrides: state.overrides,
-    });
+    const used = await useSettings(state.overrides, state.settingsPreset);
+    banner(
+      $("settings-saved"),
+      used.asPreset
+        ? `No setting differs from ${presetText(used.presetName)}, so the next search uses it as it is.`
+        : `Saved and accepted by the engine: the selected preset plus your edits. The next search uses this file.`
+    );
+    return true;
+  } catch (e) {
+    banner($("settings-error"), String(e));
+    return false;
+  }
+}
+
+// Make `overrides` (the Settings screen's values, relative to the engine defaults, starting
+// from the built-in preset `presetName`) the settings the next search uses: the preset
+// itself when they are exactly its values, so the search reads the preset file as it would
+// had nothing been edited; otherwise "My settings", written and checked by the engine.
+// Throws the engine's reason when it refuses them, having changed nothing.
+async function useSettings(overrides, presetName) {
+  presetName = presetName || "";
+  const presetPath = presetPathOf(presetName);
+  const sel = $("preset");
+  let asPreset = false;
+  if (presetPath !== null && sameOverrides(overrides, await seededOverrides(presetPath))) {
+    sel.value = presetPath;
+    asPreset = true;
+  } else {
+    const path = await invoke("save_settings", { name: "console", overrides });
     state.savedConfig = path;
+    state.savedPreset = presetName;
     // The saved file becomes the preset the next search uses, so the settings on
     // this screen and the settings a run uses cannot diverge.
-    const sel = $("preset");
-    let opt = [...sel.options].find((o) => o.value === path);
-    if (!opt) {
-      opt = document.createElement("option");
+    const options = sel.options ? [...sel.options] : [];
+    if (!options.some((o) => o.value === path)) {
+      const opt = document.createElement("option");
       opt.value = path;
       opt.textContent = "My settings";
       sel.appendChild(opt);
     }
     sel.value = path;
-    banner(
-      $("settings-saved"),
-      `Saved and accepted by the engine: the selected preset plus your edits. The next search uses this file.`
-    );
-  } catch (e) {
-    banner($("settings-error"), String(e));
   }
+  state.overrides = { ...overrides };
+  state.settingsPreset = presetName;
+  state.inUse = { ...overrides };
+  return { asPreset, presetName };
+}
+
+// Edits on the Settings screen that the next search would not use, because they were not
+// saved and used.
+function settingsUnsaved() {
+  return !sameOverrides(state.overrides, state.inUse);
+}
+
+// ── setups ──────────────────────────────────────────────────────────────────
+// A setup is how a search is set up, kept under a name or written to a file so it can be
+// used again, moved to another computer or sent to a colleague (#297). The file's
+// envelope, its format version and the named setups are the backend's (`setups.rs`); what
+// is in it is read from the screens and put back here, because this is where their state
+// lives:
+//
+// - the Search screen's choices, without its files, folders, conditions and thread counts;
+// - the Settings screen's engine settings, as the built-in preset they start from, the
+//   settings changed from it and the preset's settings returned to the engine default,
+//   without the settings that describe a computer rather than a search (`LOCAL_SETTINGS`).
+//
+// Loading one is checked first and shown as the list of what it changes, and only Apply
+// changes anything. A value this version cannot use refuses the whole setup, naming the
+// field; a setting it does not know is listed and left out.
+
+// Engine settings that describe a computer, or one dataset, rather than a search: where the
+// programs and caches are, how much of the machine a search may use, and the conditions of a
+// set of files by run name. A setup leaves them out, and loading one keeps this computer's
+// own values.
+const LOCAL_SETTINGS = new Set([
+  "convert.thermo_raw_parser",
+  "convert.msconvert",
+  "predict_frag.sidecar_script_dir",
+  "predict_frag.library_cache",
+  "rt_im_train.deeplc_projection_cache",
+  "rescore.percolator_bin",
+  "rescore.features_file",
+  "convert.parallel_conversions",
+  "extract.windows_in_flight",
+  "extract.max_footprint_gib",
+  "features.chrom_loaders",
+  "rescore.max_feature_matrix_gib",
+  "rt_im_train.deeplc_predict_shards",
+  "experiment.parallel_runs",
+  "experiment.overlap_front_threads",
+  "experiment.conditions",
+]);
+
+// The interpreters. A path is this computer's, but a search that needs an interpreter cannot
+// do without one (the engine refuses `rescore.classifier = nn_torch` without `rescore.python`,
+// MS2PIP, DeepLC and IM2Deep without theirs), so a setup carries "auto" for a path, which
+// finds the interpreter on the computer the setup is loaded on, and loading one keeps an
+// interpreter this computer named itself.
+const INTERPRETER_SETTINGS = new Set([
+  "predict_frag.ms2pip_python",
+  "predict_frag.peptdeep_python",
+  "predict_frag.deeplc_python",
+  "predict_frag.im2deep_python",
+  "rescore.python",
+  "mbr.python",
+]);
+
+// A setting's value as a setup carries it: an interpreter's path as "auto".
+function portableValue(path, v) {
+  return INTERPRETER_SETTINGS.has(path) && typeof v === "string" && v !== "auto" ? "auto" : v;
+}
+
+// Settings whose value on this computer a loaded setup keeps, where the user set one.
+function isComputersOwn(path) {
+  return LOCAL_SETTINGS.has(path) || INTERPRETER_SETTINGS.has(path);
+}
+
+// Every setting a setup holds outside the engine settings, with how it is checked and the
+// name the summary uses. `select`, `radio` and `id` name the control on the Search screen
+// (`ci/test_desktop_ui.mjs` checks the values against index.html); `names` are the words
+// for a value the summary shows when the control does not say them.
+const SETUP_SPEC = [
+  { path: "search_space.source", kind: "choice", values: ["fasta", "library"], label: "Search space",
+    tabs: true, names: { fasta: "From a FASTA", library: "From a spectral library" } },
+  { path: "search_space.library_input", kind: "choice", values: ["tables", "diann"],
+    label: "Spectral library input", radio: "libin",
+    names: { tables: "MuMDIA library tables", diann: "a DIA-NN library" } },
+  { path: "search_space.library_build", kind: "choice", values: ["diann", "builtin"],
+    label: "Library from a FASTA built with", radio: "libsrc",
+    names: { diann: "DIA-NN", builtin: "the built-in predictors" } },
+  { path: "search_space.library_for", kind: "choice", values: ["other", "diapasef"],
+    label: "Library for", select: "lib-for" },
+  { path: "digest.enzyme", kind: "enzyme", label: "Cleavage", select: "d-enzyme" },
+  { path: "digest.cleavage_rule", kind: "text", label: "Cleavage rule", id: "d-rule" },
+  { path: "digest.missed_cleavages", kind: "int", min: 0, label: "Missed cleavages", id: "d-missed" },
+  { path: "digest.min_length", kind: "int", min: 1, label: "Shortest peptide", id: "d-minlen" },
+  { path: "digest.max_length", kind: "int", min: 1, label: "Longest peptide", id: "d-maxlen" },
+  { path: "digest.min_charge", kind: "int", min: 1, label: "Lowest charge", id: "d-minz" },
+  { path: "digest.max_charge", kind: "int", min: 1, label: "Highest charge", id: "d-maxz" },
+  { path: "digest.precursor_mz_min", kind: "mz", label: "Lowest precursor m/z", id: "d-prmin" },
+  { path: "digest.precursor_mz_max", kind: "mz", label: "Highest precursor m/z", id: "d-prmax" },
+  { path: "digest.fragment_mz_min", kind: "mz", label: "Lowest fragment m/z", id: "d-frmin" },
+  { path: "digest.fragment_mz_max", kind: "mz", label: "Highest fragment m/z", id: "d-frmax" },
+  { path: "modifications.fixed", kind: "sites", label: "Fixed modifications" },
+  { path: "modifications.variable", kind: "sites", label: "Variable modifications" },
+  { path: "modifications.max_variable", kind: "int", min: 0, label: "Variable modifications per peptide",
+    id: "d-maxvar" },
+  { path: "experiment.mode", kind: "choice", values: ["experiment", "separate"], label: "Several files",
+    radio: "runmode", names: { experiment: "One experiment", separate: "Search each separately" } },
+  { path: "experiment.normalisation", kind: "choice", values: ["none", "all", "condition"],
+    label: "Normalisation", select: "norm-scope" },
+  { path: "prescreen.mode", kind: "choice", values: ["off", "before", "after", "tags"], label: "Prescreen",
+    select: "prescreen" },
+  { path: "prescreen.strength", kind: "choice", values: ["light", "balanced", "stringent"],
+    label: "Prescreen strength", select: "prescreen-strength" },
+  { path: "bands.mode", kind: "choice", values: ["auto", "off", "custom"], label: "Bands", select: "bands" },
+  { path: "bands.count", kind: "int", min: 1, label: "Custom bands", id: "bands-n" },
+  { path: "bands.at_a_time", kind: "int", min: 1, label: "Custom bands at a time", id: "bands-parallel" },
+  { path: "ztscan.analysis", kind: "bool", label: "ZT Scan analysis",
+    names: { true: "on for ZT Scan files (the default)", false: "off" } },
+  { path: "ztscan.q1_half_width", kind: "positive", label: "ZT Scan Q1 half-width (m/z)",
+    id: "ztscan-hw", empty: "from each file" },
+  { path: "engine.preset", kind: "preset", label: "Preset" },
+  { path: "engine.changes", kind: "changes", label: "Engine settings changed from the preset" },
+  { path: "engine.reset", kind: "reset", label: "Preset settings returned to the engine default" },
+];
+
+const SETUP_FILTERS = [{ name: "MuMDIA settings", extensions: ["json"] }];
+
+const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+
+// JSON with every object's keys sorted, so two values compare equal whatever their order.
+function canonical(v) {
+  if (v === undefined) return undefined;
+  return JSON.stringify(v, (_k, x) =>
+    isObject(x) ? Object.fromEntries(Object.keys(x).sort().map((k) => [k, x[k]])) : x
+  );
+}
+
+function sameOverrides(a, b) {
+  return canonical(a || {}) === canonical(b || {});
+}
+
+function getPath(obj, path) {
+  let cur = obj;
+  for (const part of path.split(".")) {
+    if (!isObject(cur) || !(part in cur)) return undefined;
+    cur = cur[part];
+  }
+  return cur;
+}
+
+// `{"rescore.seeds": 3}` as the nested object a configuration file holds.
+function nestPaths(flat) {
+  const root = {};
+  for (const [path, value] of Object.entries(flat)) {
+    const parts = path.split(".");
+    let cur = root;
+    for (const part of parts.slice(0, -1)) {
+      if (!isObject(cur[part])) cur[part] = {};
+      cur = cur[part];
+    }
+    cur[parts[parts.length - 1]] = value;
+  }
+  return root;
+}
+
+// The inverse of `nestPaths`, which stops at a setting the schema knows, so an object-valued
+// setting stays one value.
+function flattenConfig(obj, known, prefix = "", out = {}) {
+  for (const [k, v] of Object.entries(obj || {})) {
+    const path = prefix ? `${prefix}.${k}` : k;
+    if (isObject(v) && !known.has(path)) flattenConfig(v, known, path, out);
+    else out[path] = v;
+  }
+  return out;
+}
+
+function schemaPaths() {
+  return new Set((state.schema?.fields || []).map((f) => f.path));
+}
+
+function fieldOf(path) {
+  return (state.schema?.fields || []).find((f) => f.path === path);
+}
+
+// A built-in preset's path from its name: "" for the engine defaults, null for a name this
+// application does not offer.
+function presetPathOf(name) {
+  if (!name) return "";
+  const p = state.presets.find((x) => x.name === name);
+  return p ? p.path : null;
+}
+
+function presetNameOf(path) {
+  if (!path) return "";
+  return state.presets.find((x) => x.path === path)?.name || "";
+}
+
+function presetText(name) {
+  return name ? `the preset "${name}"` : "the engine defaults";
+}
+
+// The ZT Scan analysis as a setup holds it: on (the engine's default for ZT Scan files)
+// unless the user cleared it.
+function ztscanAnalysisSetting() {
+  const z = state.ztscan;
+  if (!z.analysisTouched) return true;
+  if (typeof z.analysisChoice === "boolean") return z.analysisChoice;
+  return !(ztscanAnalysisAllowed() && !$("ztscan-analysis").checked);
+}
+
+// The Search screen as a setup holds it. The ZT Scan analysis sets the library's search
+// space while it is on; what it set is read as the value it replaced (and is set again
+// when the setup is loaded for ZT Scan files), so a setup holds the user's own choices.
+function captureSearch() {
+  const z = state.ztscan;
+  const own = (id) => {
+    const el = $(id);
+    if (!el) return undefined;
+    if (z.lib && id in z.lib.set && el.value === z.lib.set[id]) return z.lib.before[id] ?? "";
+    return el.value;
+  };
+  const d = libraryParams("", own);
+  const mods = new Map(state.mods);
+  for (const key of z.lib?.mods || []) if (mods.get(key) === "var") mods.delete(key);
+  const { fixed, variable } = selectedMods(mods);
+  const count = (id) => {
+    const v = parseInt($(id).value, 10);
+    return Number.isFinite(v) && v > 0 ? v : 1;
+  };
+  const hw = parseFloat($("ztscan-hw").value);
+  return {
+    search_space: {
+      source: state.mode,
+      library_input: state.libIn,
+      // DIA-NN unless the user chose the built-in predictors: a fallback while DIA-NN
+      // cannot be used is this computer's, not the setup's.
+      library_build: state.libSrcChosen ? state.libSrc : "diann",
+      library_for: $("lib-for").value || "other",
+    },
+    digest: {
+      enzyme: d.enzyme,
+      cleavage_rule: d.enzyme === "custom" ? d.cleavage_rule || null : null,
+      missed_cleavages: d.missed_cleavages,
+      min_length: d.min_pep_len,
+      max_length: d.max_pep_len,
+      min_charge: d.min_charge,
+      max_charge: d.max_charge,
+      precursor_mz_min: d.min_pr_mz,
+      precursor_mz_max: d.max_pr_mz,
+      fragment_mz_min: d.min_fr_mz,
+      fragment_mz_max: d.max_fr_mz,
+    },
+    modifications: { fixed, variable, max_variable: maxVariableMods(own("d-maxvar")) },
+    experiment: { mode: state.runMode, normalisation: $("norm-scope").value },
+    prescreen: { mode: $("prescreen").value, strength: $("prescreen-strength").value },
+    bands: { mode: $("bands").value, count: count("bands-n"), at_a_time: count("bands-parallel") },
+    ztscan: {
+      analysis: ztscanAnalysisSetting(),
+      q1_half_width: z.hwTyped && Number.isFinite(hw) && hw > 0 ? hw : null,
+    },
+  };
+}
+
+// The Settings screen's values as a setup holds them: the preset they start from, the
+// settings that differ from it and the preset's settings returned to the engine default.
+// `local` names the settings left out because they describe this computer, `paths` the
+// interpreters whose path was written as "auto".
+async function captureEngine() {
+  let presetName = state.settingsPreset || "";
+  let presetPath = presetPathOf(presetName);
+  if (presetPath === null) {
+    // The preset these values started from is no longer offered: they are written out in
+    // full, relative to the engine defaults.
+    presetName = "";
+    presetPath = "";
+  }
+  const base = await seededOverrides(presetPath);
+  const changes = {};
+  const reset = [];
+  const local = [];
+  const paths = [];
+  const keys = [...new Set([...Object.keys(state.overrides), ...Object.keys(base)])].sort();
+  for (const k of keys) {
+    const has = k in state.overrides;
+    const value = has ? portableValue(k, state.overrides[k]) : undefined;
+    if (has && value !== state.overrides[k]) paths.push(k);
+    if (has && canonical(value) === canonical(base[k])) continue;
+    if (LOCAL_SETTINGS.has(k)) {
+      local.push(k);
+      continue;
+    }
+    if (has) changes[k] = value;
+    else reset.push(k);
+  }
+  return { engine: { preset: presetName || null, changes: nestPaths(changes), reset }, local, paths };
+}
+
+// The current setup, for saving it: the Settings screen's edits are saved and used first
+// when they are not yet, so a setup is always what the next search here would run.
+async function currentSetup() {
+  await loadSettings();
+  if (!state.schema) throw "The settings could not be read, so a setup cannot be saved yet.";
+  const savedEdits = settingsUnsaved();
+  if (savedEdits) {
+    try {
+      await useSettings(state.overrides, state.settingsPreset);
+    } catch (e) {
+      throw `The changes on the Settings screen were refused by the engine, so no setup was saved: ${e}`;
+    }
+  }
+  const { engine, local, paths } = await captureEngine();
+  const settings = { engine, ...captureSearch() };
+  // The same check a load makes, so a setup that is saved can always be loaded.
+  const v = validateSetup(settings);
+  if (v.errors.length) {
+    throw `This setup cannot be saved: ${v.errors.join(" ")} Correct it on the Search screen first.`;
+  }
+  return { settings: v.setup, local, paths, savedEdits };
+}
+
+function siteText(s) {
+  return s.position ? `${s.name} (${TERMINI[s.position]?.text || s.position})` : `${s.name} (${s.residue})`;
+}
+
+// Check one setting of a setup; `{ value }` (normalised) or `{ error }`.
+function checkSetupValue(e, v, where, out) {
+  const name = `${where} (${e.label})`;
+  const not = (what) => ({ error: `${name} must be ${what}, not ${JSON.stringify(v)}.` });
+  switch (e.kind) {
+    case "choice":
+      return e.values.includes(v)
+        ? { value: v }
+        : not(`one of ${e.values.map((x) => JSON.stringify(x)).join(", ")}`);
+    case "int":
+      return Number.isSafeInteger(v) && v >= e.min ? { value: v } : not(`a whole number of ${e.min} or more`);
+    case "mz":
+      return v === null || (typeof v === "number" && Number.isFinite(v) && v > 0)
+        ? { value: v }
+        : not("a positive number, or null for no limit");
+    case "positive":
+      return v === null || (typeof v === "number" && Number.isFinite(v) && v > 0)
+        ? { value: v }
+        : not("a positive number, or null");
+    case "bool":
+      return typeof v === "boolean" ? { value: v } : not("true or false");
+    case "text":
+      return v === null || typeof v === "string"
+        ? { value: typeof v === "string" && v.trim() ? v.trim() : null }
+        : not("text, or null");
+    case "enzyme":
+      return ENZYMES.some((x) => x.name === v)
+        ? { value: v }
+        : not(`a cleavage this version knows (${ENZYMES.map((x) => x.name).join(", ")})`);
+    case "preset": {
+      if (v === null || v === "") return { value: null };
+      if (typeof v === "string" && presetPathOf(v) !== null) return { value: v };
+      const offered = state.presets.map((p) => p.name).join(", ") || "none";
+      return { error: `${name} names ${JSON.stringify(v)}, a preset this version does not offer (it offers: ${offered}).` };
+    }
+    case "sites": {
+      if (!Array.isArray(v)) return not("a list of modification sites");
+      const known = new Set((state.catalogue?.modifications || []).map((m) => m.name));
+      const sites = [];
+      for (const [i, s] of v.entries()) {
+        const at = `${where}[${i}]`;
+        if (!isObject(s)) return { error: `${at} must be an object with a residue and a name.` };
+        for (const k of Object.keys(s)) {
+          if (!["residue", "name", "position"].includes(k)) out.unknown.push(`${at}.${k}`);
+        }
+        if (typeof s.name !== "string" || !known.has(s.name)) {
+          return { error: `${at}: ${JSON.stringify(s.name)} is not a modification this version knows.` };
+        }
+        const position = s.position ?? "";
+        const ok = position
+          ? s.residue === "*" && position in TERMINI
+          : typeof s.residue === "string" && /^[A-Z]$/.test(s.residue);
+        if (!ok) {
+          return {
+            error:
+              `${at}: ${s.name} at ${JSON.stringify(s.residue)}` +
+              (position ? ` ${JSON.stringify(position)}` : "") +
+              " is not a site: a residue is one capital letter, a terminus is the residue \"*\" " +
+              `with the position ${Object.keys(TERMINI).map((t) => JSON.stringify(t)).join(" or ")}.`,
+          };
+        }
+        sites.push(position ? { residue: "*", name: s.name, position } : { residue: s.residue, name: s.name });
+      }
+      // The order the screen writes them in (`selectedMods`), each site once.
+      const map = new Map(sites.map((s) => [modKey(s.name, s.residue, s.position), "var"]));
+      return { value: selectedMods(map).variable };
+    }
+    case "changes": {
+      if (!isObject(v)) return not("an object of engine settings");
+      const known = schemaPaths();
+      const flat = flattenConfig(v, known);
+      const kept = {};
+      for (const [path, value] of Object.entries(flat)) {
+        const f = fieldOf(path);
+        if (!f) {
+          out.unknown.push(`${where}.${path}`);
+          continue;
+        }
+        if (LOCAL_SETTINGS.has(path)) {
+          out.local.push(path);
+          continue;
+        }
+        const problem = engineValueProblem(f, value);
+        if (problem) return { error: `${where}.${path} ${problem}, not ${JSON.stringify(value)}.` };
+        const portable = portableValue(path, value);
+        if (portable !== value) out.paths.push(path);
+        kept[path] = normaliseEngineValue(f, portable);
+      }
+      return { value: nestPaths(kept) };
+    }
+    case "reset": {
+      if (!Array.isArray(v) || v.some((x) => typeof x !== "string")) {
+        return not("a list of engine setting names");
+      }
+      const out2 = [];
+      for (const path of v) {
+        if (!fieldOf(path)) out.unknown.push(`${where}: ${path}`);
+        else if (LOCAL_SETTINGS.has(path)) out.local.push(path);
+        else if (!out2.includes(path)) out2.push(path);
+      }
+      return { value: out2.sort() };
+    }
+    default:
+      return { error: `${name} cannot be read.` };
+  }
+}
+
+// Why `v` is not a value of the engine setting `f`, or null. The engine has the last word:
+// a setup whose engine settings change is checked by it before it is shown.
+function engineValueProblem(f, v) {
+  const nullable = f.optional || f.default === null || f.default === "null" || f.kind === "other";
+  if (v === null) return nullable ? null : "cannot be empty";
+  switch (f.kind) {
+    case "bool":
+      return typeof v === "boolean" ? null : "must be true or false";
+    case "integer":
+      return Number.isSafeInteger(v) ? null : "must be a whole number";
+    case "float":
+      return typeof v === "number" && Number.isFinite(v) ? null : "must be a number";
+    case "enum": {
+      const choices = (f.choices || []).map(String);
+      return choices.includes(String(v)) && (typeof v === "string" || typeof v === "boolean")
+        ? null
+        : `must be one of ${choices.join(", ")}`;
+    }
+    case "string":
+      return typeof v === "string" ? null : "must be text";
+    default:
+      return null;
+  }
+}
+
+// A choice spelled `true` or `false` is a JSON boolean to the engine, as the editor sends it.
+function normaliseEngineValue(f, v) {
+  if (f.kind === "enum" && (v === "true" || v === "false")) return v === "true";
+  return v;
+}
+
+// Check a setup's settings against this version: the normalised setup holds every setting
+// it could use; `errors` refuse it, `unknown` and `local` are reported and left out, and
+// `paths` are interpreters whose path is read as "auto".
+function validateSetup(settings) {
+  const out = { setup: {}, errors: [], unknown: [], local: [], paths: [] };
+  if (!isObject(settings)) {
+    out.errors.push("Its settings are not an object.");
+    return out;
+  }
+  const sections = new Map();
+  for (const e of SETUP_SPEC) {
+    const [sec, key] = e.path.split(".");
+    if (!sections.has(sec)) sections.set(sec, new Map());
+    sections.get(sec).set(key, e);
+  }
+  for (const [sec, body] of Object.entries(settings)) {
+    const spec = sections.get(sec);
+    if (!spec) {
+      out.unknown.push(`settings.${sec}`);
+      continue;
+    }
+    if (!isObject(body)) {
+      out.errors.push(`settings.${sec} must be an object, not ${JSON.stringify(body)}.`);
+      continue;
+    }
+    for (const [key, value] of Object.entries(body)) {
+      const e = spec.get(key);
+      const where = `settings.${sec}.${key}`;
+      if (!e) {
+        out.unknown.push(where);
+        continue;
+      }
+      const r = checkSetupValue(e, value, where, out);
+      if (r.error) out.errors.push(r.error);
+      else {
+        if (!out.setup[sec]) out.setup[sec] = {};
+        out.setup[sec][key] = r.value;
+      }
+    }
+  }
+  const m = out.setup.modifications || {};
+  if (m.fixed && m.variable) {
+    const fixed = new Set(m.fixed.map((s) => modKey(s.name, s.residue, s.position)));
+    const both = m.variable.filter((s) => fixed.has(modKey(s.name, s.residue, s.position)));
+    if (both.length) {
+      out.errors.push(
+        `settings.modifications: ${both.map(siteText).join(", ")} ${both.length === 1 ? "is" : "are"} ` +
+          "both fixed and variable."
+      );
+    }
+  }
+  const eng = out.setup.engine || {};
+  if (eng.changes && eng.reset) {
+    const changed = new Set(Object.keys(flattenConfig(eng.changes, schemaPaths())));
+    const both = eng.reset.filter((p) => changed.has(p));
+    if (both.length) {
+      out.errors.push(`settings.engine: ${both.join(", ")} ${both.length === 1 ? "is" : "are"} both changed and reset.`);
+    }
+  }
+  return out;
+}
+
+// What loading `doc` would do, checked: the normalised setup, the engine settings it makes
+// (`overrides`, relative to the engine defaults, as the Settings screen holds them) and what
+// the summary must say. Throws the reason a setup is refused, before anything changes.
+async function planSetup(doc) {
+  await loadSettings();
+  if (!state.schema) throw "The settings could not be read, so a setup cannot be loaded yet.";
+  const name = doc.name || "This setup";
+  const v = validateSetup(doc.settings);
+  if (v.errors.length) {
+    const more = v.errors.length > 8 ? ` And ${v.errors.length - 8} more.` : "";
+    throw `"${name}" cannot be loaded, so nothing was changed. ${v.errors.slice(0, 8).join(" ")}${more}`;
+  }
+  const warnings = [...(doc.notes || [])];
+  if (v.unknown.length) {
+    warnings.push(
+      `${doc.newer ? "From the newer version and not known to this one" : "Not known to this version"}, ` +
+        `so left out: ${v.unknown.join(", ")}.`
+    );
+  }
+  if (v.local.length) {
+    warnings.push(
+      "Left out because they describe a computer rather than a search, so this one keeps its " +
+        `own: ${v.local.join(", ")}.`
+    );
+  }
+  if (v.paths.length) {
+    warnings.push(
+      `Interpreter paths of another computer, read as "auto", which finds this one's: ` +
+        `${v.paths.join(", ")}.`
+    );
+  }
+  const setup = v.setup;
+  let engine = null;
+  if (setup.engine) {
+    const presetName = "preset" in setup.engine ? setup.engine.preset || "" : state.settingsPreset || "";
+    const presetPath = presetPathOf(presetName);
+    const base = await seededOverrides(presetPath);
+    const next = { ...base };
+    for (const k of setup.engine.reset || []) delete next[k];
+    for (const [k, val] of Object.entries(flattenConfig(setup.engine.changes || {}, schemaPaths()))) {
+      if (sameAsDefault(fieldOf(k), val)) delete next[k];
+      else next[k] = val;
+    }
+    // This computer's own settings of that kind, where the user set them, are kept.
+    const lineage = await seededOverrides(presetPathOf(state.settingsPreset || "") || "");
+    const kept = [];
+    for (const [k, val] of Object.entries(state.overrides)) {
+      if (!isComputersOwn(k) || canonical(lineage[k]) === canonical(val)) continue;
+      if (canonical(next[k]) !== canonical(val)) kept.push(k);
+      next[k] = val;
+    }
+    if (kept.length) {
+      warnings.push(`This computer's own ${kept.join(", ")} ${kept.length === 1 ? "is" : "are"} kept.`);
+    }
+    const mine = !sameOverrides(next, base);
+    if (mine && state.engineOk) {
+      try {
+        await invoke("check_settings", { overrides: next });
+      } catch (e) {
+        throw `"${name}" cannot be loaded, so nothing was changed: the engine refuses its settings. ${e}`;
+      }
+    }
+    if (settingsUnsaved()) {
+      warnings.push("The changes on the Settings screen that were not saved and used are replaced.");
+    }
+    engine = { presetName, presetPath, overrides: next, mine };
+  }
+  if (setup.search_space?.library_build === "diann" && $("libsrc-diann").disabled) {
+    warnings.push(
+      "This setup builds a library from a FASTA with DIA-NN, which cannot be used on this " +
+        "computer yet (see Setup): the built-in predictors are used until it can."
+    );
+  }
+  return { setup, engine, warnings };
+}
+
+// A setup's value as the summary shows it.
+function setupValueText(e, v) {
+  if (v === undefined) return "not set";
+  switch (e.kind) {
+    case "sites":
+      return v.length ? v.map(siteText).join(", ") : "none";
+    case "mz":
+      return v === null ? "no limit" : String(v);
+    case "positive":
+      return v === null ? e.empty || "none" : String(v);
+    case "text":
+      return v === null ? "none" : v;
+    case "enzyme":
+      return ENZYMES.find((x) => x.name === v)?.label || v;
+    default: {
+      if (e.names && String(v) in e.names) return e.names[String(v)];
+      const sel = e.select ? $(e.select) : null;
+      const opt = sel?.options ? [...sel.options].find((o) => o.value === v) : null;
+      return opt ? opt.textContent : String(v);
+    }
+  }
+}
+
+function engineValueText(path, v) {
+  if (v === undefined) {
+    const d = fieldOf(path)?.default;
+    return d === null || d === undefined ? "the engine default" : `the engine default (${displayValue(d)})`;
+  }
+  return typeof v === "string" ? v : JSON.stringify(v);
+}
+
+// What loading a checked setup changes, one line each.
+function setupChanges(before, plan) {
+  const lines = [];
+  for (const e of SETUP_SPEC) {
+    if (e.path.startsWith("engine.")) continue;
+    const after = getPath(plan.setup, e.path);
+    if (after === undefined) continue;
+    const was = getPath(before, e.path);
+    if (canonical(was) === canonical(after)) continue;
+    lines.push(`${e.label}: ${setupValueText(e, was)} → ${setupValueText(e, after)}`);
+  }
+  if (plan.engine) {
+    if ((plan.engine.presetName || "") !== (state.settingsPreset || "")) {
+      lines.push(`Preset: ${presetText(state.settingsPreset)} → ${presetText(plan.engine.presetName)}`);
+    }
+    const next = plan.engine.overrides;
+    const keys = [...new Set([...Object.keys(state.overrides), ...Object.keys(next)])].sort();
+    for (const k of keys) {
+      if (canonical(state.overrides[k]) === canonical(next[k])) continue;
+      lines.push(`${k}: ${engineValueText(k, state.overrides[k])} → ${engineValueText(k, next[k])}`);
+    }
+  }
+  return lines;
+}
+
+// Put a checked setup on the screens. The engine settings go first, because saving them is
+// the one step that can still fail, and a setup that fails must change nothing.
+async function applySetup(plan) {
+  if (plan.engine) {
+    await useSettings(plan.engine.overrides, plan.engine.presetName);
+    if (state.schema) renderSettings();
+  }
+  await applySearchSetup(plan.setup);
+}
+
+// The Search screen part of a setup. Only the settings the setup holds are set; the rest
+// stay as they are.
+async function applySearchSetup(s) {
+  const z = state.ztscan;
+  const sp = s.search_space || {};
+  if (sp.source !== undefined) setMode(sp.source);
+  if (sp.library_input !== undefined) selectLibIn(sp.library_input);
+  if (sp.library_build !== undefined) {
+    // DIA-NN is the default and comes back by itself once it can be used.
+    state.libSrcChosen = sp.library_build === "builtin";
+    selectLibSrc(sp.library_build);
+  }
+  if (sp.library_for !== undefined) {
+    $("lib-for").value = sp.library_for;
+    refreshLibForNote();
+  }
+
+  // A field the setup sets is the user's own value: the ZT Scan analysis, when it applies,
+  // sets its library over it again and takes it back to this value when it goes off.
+  const own = (id) => {
+    if (z.lib) {
+      delete z.lib.set[id];
+      delete z.lib.before[id];
+    }
+  };
+  const d = s.digest || {};
+  for (const e of SETUP_SPEC) {
+    if (!e.path.startsWith("digest.") || !e.id || e.kind === "text") continue;
+    const v = d[e.path.slice("digest.".length)];
+    if (v === undefined) continue;
+    $(e.id).value = v === null ? "" : String(v);
+    own(e.id);
+  }
+  if (d.enzyme !== undefined) $("d-enzyme").value = d.enzyme;
+  if (typeof d.cleavage_rule === "string") $("d-rule").value = d.cleavage_rule;
+  if (d.enzyme !== undefined || d.cleavage_rule !== undefined) cleavageChanged();
+
+  const m = s.modifications || {};
+  for (const [key, kind] of [["fixed", "fix"], ["variable", "var"]]) {
+    if (!m[key]) continue;
+    for (const [k, v] of [...state.mods]) if (v === kind) state.mods.delete(k);
+    for (const site of m[key]) state.mods.set(modKey(site.name, site.residue, site.position), kind);
+    if (kind === "var" && z.lib) z.lib.mods = [];
+  }
+  if (m.max_variable !== undefined) {
+    $("d-maxvar").value = String(m.max_variable);
+    own("d-maxvar");
+  }
+  if (m.fixed || m.variable || m.max_variable !== undefined) modsChanged();
+
+  const ex = s.experiment || {};
+  if (ex.mode !== undefined) {
+    state.runMode = ex.mode;
+    $(`runmode-${ex.mode}`).checked = true;
+  }
+  if (ex.normalisation !== undefined) $("norm-scope").value = ex.normalisation;
+  refreshNormOptions();
+
+  const pre = s.prescreen || {};
+  if (pre.mode !== undefined) $("prescreen").value = pre.mode;
+  if (pre.strength !== undefined) $("prescreen-strength").value = pre.strength;
+  refreshPrescreenNote();
+
+  const b = s.bands || {};
+  if (b.mode !== undefined) {
+    $("bands").value = b.mode;
+    show($("bands-custom"), b.mode === "custom");
+  }
+  if (b.count !== undefined) $("bands-n").value = String(b.count);
+  if (b.at_a_time !== undefined) $("bands-parallel").value = String(b.at_a_time);
+  renderSpace();
+
+  const zt = s.ztscan || {};
+  if (zt.analysis !== undefined) {
+    z.analysisTouched = !zt.analysis;
+    z.analysisChoice = zt.analysis ? null : false;
+  }
+  if (zt.q1_half_width !== undefined) {
+    if (zt.q1_half_width === null) z.hwTyped = false;
+    else {
+      $("ztscan-hw").value = String(zt.q1_half_width);
+      z.hwTyped = true;
+    }
+  }
+  renderZtscanNote();
+  summariseMods();
+  scheduleSpace();
+  scheduleBuiltinPlan();
+  if (state.libSrc === "diann") await refreshLibSrcNote();
+}
+
+// ── setups: the Settings screen card ─────────────────────────────────────────
+
+function setupsMessage(error, done) {
+  banner($("setups-error"), error || "");
+  banner($("setups-done"), done || "");
+}
+
+function setupName() {
+  return ($("setups-name").value || "").trim();
+}
+
+// What saving said about the settings it left out or saved on the way.
+function savedNotes(cur) {
+  const parts = [];
+  if (cur.savedEdits) {
+    parts.push("The changes on this screen were saved and are used by the next search, as the setup has them.");
+  }
+  if (cur.local.length) {
+    parts.push(`Not in the setup, as they describe this computer: ${cur.local.join(", ")}.`);
+  }
+  if (cur.paths.length) {
+    parts.push(
+      `Saved as "auto" rather than this computer's interpreter path, so the other computer ` +
+        `finds its own: ${cur.paths.join(", ")}.`
+    );
+  }
+  return parts.length ? ` ${parts.join(" ")}` : "";
+}
+
+// Ask a yes-or-no question; true to go on.
+async function askYesNo(message, title, okLabel) {
+  try {
+    return await dialog.ask(message, { title, kind: "warning", okLabel, cancelLabel: "Cancel" });
+  } catch {
+    return window.confirm(message);
+  }
+}
+
+// Keep `settings` as a named setup, asking before one of the same name is replaced. The
+// item saved, or null when the user kept the one there.
+async function keepSetup(name, settings) {
+  let r = await invoke("setups_save", { name, settings, overwrite: false });
+  if (r.existing) {
+    const replace = await askYesNo(
+      `A setup named "${r.existing}" is already saved. Replace it?`,
+      "Replace a saved setup",
+      "Replace"
+    );
+    if (!replace) return null;
+    r = await invoke("setups_save", { name, settings, overwrite: true });
+  }
+  return r.item;
+}
+
+async function saveNamedSetup() {
+  setupsMessage();
+  const name = setupName();
+  if (!name) return setupsMessage("Give the setup a name first, for example Phospho or Label-free.");
+  let cur;
+  try {
+    cur = await currentSetup();
+    const item = await keepSetup(name, cur.settings);
+    if (!item) return setupsMessage("", "Nothing was saved; the setup already saved under that name is kept.");
+    setupsMessage("", `Saved "${item.name}" in My setups.${savedNotes(cur)}`);
+  } catch (e) {
+    return setupsMessage(String(e));
+  }
+  await refreshSetups();
+}
+
+// A file name a setup's name can become.
+function setupFileName(name) {
+  const safe = name.replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").trim().replace(/^\.+/, "");
+  return `${safe || "settings"}.json`;
+}
+
+async function exportCurrentSetup() {
+  setupsMessage();
+  const name = setupName();
+  if (!name) {
+    return setupsMessage(
+      "Give the setup a name first: the file carries it, and it is shown when the file is loaded."
+    );
+  }
+  try {
+    const cur = await currentSetup();
+    const path = await dialog.save({ defaultPath: setupFileName(name), filters: SETUP_FILTERS });
+    if (!path) return;
+    const out = await invoke("setup_write", { path, name, settings: cur.settings });
+    setupsMessage("", `Saved "${name}" to ${out}.${savedNotes(cur)}`);
+  } catch (e) {
+    setupsMessage(String(e));
+  }
+}
+
+async function importSetupFile() {
+  setupsMessage();
+  let path;
+  try {
+    path = await dialog.open({ multiple: false, filters: SETUP_FILTERS });
+  } catch (e) {
+    return setupsMessage(String(e));
+  }
+  if (!path) return;
+  if (Array.isArray(path)) path = path[0];
+  let doc;
+  try {
+    doc = await invoke("setup_read", { path });
+  } catch (e) {
+    return setupsMessage(String(e));
+  }
+  await reviewSetup(doc, { kind: "file", path });
+}
+
+// Check a setup read from a file or from My setups and show what it would change, with
+// Apply and Cancel. Nothing changes until Apply.
+async function reviewSetup(doc, origin) {
+  cancelPendingSetup(true);
+  // Checking the engine settings runs the engine once, which takes a moment.
+  setupsMessage("", `Checking "${doc.name}"…`);
+  let plan;
+  try {
+    plan = await planSetup(doc);
+  } catch (e) {
+    setupsMessage(String(e));
+    return null;
+  }
+  setupsMessage();
+  const changes = setupChanges(captureSearch(), plan);
+  state.setups.pending = { doc, plan, origin, changes };
+
+  $("setups-review-title").textContent = `Load "${doc.name}"?`;
+  const meta = [];
+  if (doc.created_by) meta.push(`Saved by ${doc.created_by}`);
+  if (doc.created) meta.push(`${meta.length ? "on" : "Saved on"} ${fmtWhen(doc.created)}`);
+  if (origin.kind === "file") meta.push(`${meta.length ? "in" : "From"} ${origin.path}`);
+  $("setups-review-meta").textContent = meta.length ? `${meta.join(" ")}.` : "";
+  banner($("setups-review-warn"), plan.warnings.join("\n"));
+  const list = $("setups-review-changes");
+  list.textContent = "";
+  const lines = changes.length
+    ? changes.slice(0, 40)
+    : ["Nothing changes: the current settings are already this setup's."];
+  for (const line of lines) list.appendChild(node("li", "", line));
+  if (changes.length > 40) list.appendChild(node("li", "", `… and ${changes.length - 40} more.`));
+  show($("setups-keep-row"), origin.kind === "file");
+  $("setups-keep").checked = true;
+  $("setups-apply").disabled = false;
+  $("setups-cancel").disabled = false;
+  show($("setups-review"), true);
+  $("setups-apply").focus?.();
+  return plan;
+}
+
+// Close the summary without applying. `quiet` closes it without a message, for a new
+// summary replacing it.
+function cancelPendingSetup(quiet) {
+  const had = !!state.setups.pending;
+  state.setups.pending = null;
+  show($("setups-review"), false);
+  if (had && quiet !== true) setupsMessage("", "Nothing was changed.");
+}
+
+async function applyPendingSetup() {
+  const p = state.setups.pending;
+  if (!p) return;
+  $("setups-apply").disabled = true;
+  $("setups-cancel").disabled = true;
+  try {
+    await applySetup(p.plan);
+  } catch (e) {
+    $("setups-apply").disabled = false;
+    $("setups-cancel").disabled = false;
+    return setupsMessage(`"${p.doc.name}" was not loaded, and nothing was changed: ${e}`);
+  }
+  state.setups.pending = null;
+  show($("setups-review"), false);
+  const n = p.changes.length;
+  let message = `Loaded "${p.doc.name}": ${n ? `${n} change${n === 1 ? "" : "s"}` : "nothing changed"}.`;
+  if (p.plan.engine) {
+    message += p.plan.engine.mine
+      ? " Its engine settings are saved as My settings and used by the next search."
+      : ` The next search uses ${presetText(p.plan.engine.presetName)}.`;
+  }
+  if (p.origin.kind === "file" && $("setups-keep").checked) {
+    try {
+      const item = await keepSetup(p.doc.name, p.plan.setup);
+      message += item ? ` Kept in My setups as "${item.name}".` : " Not added to My setups.";
+    } catch (e) {
+      message += ` It could not be kept in My setups: ${e}`;
+    }
+    await refreshSetups();
+  }
+  setupsMessage("", message);
+}
+
+function fmtWhen(iso) {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return iso;
+  return new Date(t).toLocaleString("en-GB", { dateStyle: "medium", timeStyle: "short" });
+}
+
+async function refreshSetups() {
+  let r;
+  try {
+    r = await invoke("setups_list");
+  } catch (e) {
+    return setupsMessage(String(e));
+  }
+  state.setups.list = r.items || [];
+  state.setups.dir = r.dir || "";
+  $("setups-where").textContent = state.setups.dir
+    ? `Kept in ${state.setups.dir}, outside the storage folder: changing the storage folder, ` +
+      "removing managed data or uninstalling MuMDIA does not remove them."
+    : "";
+  show($("setups-empty"), state.setups.list.length === 0);
+  const host = $("setups-list");
+  host.textContent = "";
+  for (const it of state.setups.list) host.appendChild(setupRow(it));
+}
+
+// One named setup: Load, Rename, Save to a file and Delete, the rename and the
+// confirmation opening in place as on the Managed data card.
+function setupRow(it) {
+  const row = node("div", "dataitem");
+  const title = node("div", "dname", it.name);
+  const when = node("div", "dsize", it.created ? fmtWhen(it.created) : "");
+  const detail = it.error
+    ? `Cannot be read: ${it.error}`
+    : [it.preset ? `Starts from the preset "${it.preset}"` : "Starts from the engine defaults", it.created_by]
+        .filter(Boolean)
+        .join(" · ");
+  row.append(title, when, node("div", "dhelp", detail));
+
+  const act = node("div", "dact");
+  const button = (text, label) => {
+    const b = node("button", "btn quiet", text);
+    b.type = "button";
+    b.setAttribute("aria-label", label);
+    return b;
+  };
+  const load = button("Load", `Load the setup ${it.name}`);
+  const rename = button("Rename", `Rename the setup ${it.name}`);
+  const save = button("Save to a file…", `Save the setup ${it.name} to a file`);
+  const del = button("Delete", `Delete the setup ${it.name}`);
+  if (!it.error) act.append(load, rename, save);
+  act.appendChild(del);
+  row.appendChild(act);
+
+  load.addEventListener("click", async () => {
+    setupsMessage();
+    let doc;
+    try {
+      doc = await invoke("setups_read", { id: it.id });
+    } catch (e) {
+      return setupsMessage(String(e));
+    }
+    await reviewSetup(doc, { kind: "named", id: it.id });
+  });
+
+  save.addEventListener("click", async () => {
+    setupsMessage();
+    try {
+      const path = await dialog.save({ defaultPath: setupFileName(it.name), filters: SETUP_FILTERS });
+      if (!path) return;
+      const out = await invoke("setups_export", { id: it.id, path });
+      setupsMessage("", `Saved "${it.name}" to ${out}.`);
+    } catch (e) {
+      setupsMessage(String(e));
+    }
+  });
+
+  const edit = node("div", "dconfirm");
+  edit.hidden = true;
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = it.name;
+  input.maxLength = 120;
+  input.setAttribute("aria-label", `New name for ${it.name}`);
+  const editButtons = node("div", "dact");
+  const ok = node("button", "btn", "Rename");
+  const back = node("button", "btn quiet", "Cancel");
+  editButtons.append(ok, back);
+  edit.append(input, editButtons);
+  row.appendChild(edit);
+  rename.addEventListener("click", () => {
+    edit.hidden = false;
+    rename.disabled = true;
+    input.focus?.();
+  });
+  back.addEventListener("click", () => {
+    edit.hidden = true;
+    rename.disabled = false;
+  });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") ok.click();
+    if (e.key === "Escape") back.click();
+  });
+  ok.addEventListener("click", async () => {
+    setupsMessage();
+    try {
+      const r = await invoke("setups_rename", { id: it.id, name: input.value });
+      setupsMessage("", `Renamed "${it.name}" to "${r.name}".`);
+    } catch (e) {
+      return setupsMessage(String(e));
+    }
+    await refreshSetups();
+  });
+
+  const ask = node("div", "dconfirm");
+  ask.hidden = true;
+  ask.appendChild(node("p", "dwarn", `Delete the setup "${it.name}"? This cannot be undone.`));
+  const askButtons = node("div", "dact");
+  const yes = node("button", "btn", "Delete permanently");
+  const no = node("button", "btn quiet", "Cancel");
+  askButtons.append(yes, no);
+  ask.appendChild(askButtons);
+  row.appendChild(ask);
+  del.addEventListener("click", () => {
+    ask.hidden = false;
+    del.disabled = true;
+    no.focus?.();
+  });
+  no.addEventListener("click", () => {
+    ask.hidden = true;
+    del.disabled = false;
+  });
+  yes.addEventListener("click", async () => {
+    setupsMessage();
+    try {
+      await invoke("setups_delete", { id: it.id });
+      setupsMessage("", `Deleted "${it.name}".`);
+    } catch (e) {
+      return setupsMessage(String(e));
+    }
+    await refreshSetups();
+  });
+  return row;
 }
 
 // ── components ──────────────────────────────────────────────────────────────
@@ -1723,10 +2893,15 @@ function renderZtscanNote() {
   }
   // The engine runs the analysis for these files by default, so the box is ticked whenever
   // it applies, until the user ticks or clears it themselves.
+  // A choice the user made (or a loaded setup made) holds again once the analysis applies
+  // again, after a selection it did not apply to had cleared the box.
   const allowed = ztscanAnalysisAllowed();
   $("ztscan-analysis").disabled = !allowed;
   if (!allowed) $("ztscan-analysis").checked = false;
   else if (!state.ztscan.analysisTouched) $("ztscan-analysis").checked = true;
+  else if (typeof state.ztscan.analysisChoice === "boolean") {
+    $("ztscan-analysis").checked = state.ztscan.analysisChoice;
+  }
   $("ztscan-analysis-note").textContent = allowed
     ? "Measured on one ZT Scan acquisition (K562 on a ZenoTOF 8600): with its library " +
       "settings, about 9% more precursors than the half-width alone, a measured false " +
@@ -2161,25 +3336,27 @@ async function showPeakCensus(mzml) {
 // user need never have opened decided the search space, the cache key, and whether
 // the "already built" note was even true. The `if (!el) return dflt` guards made
 // every mismatch silent. That card is gone; this flow is the only way to build one.
-function libraryParams(fasta) {
+// `read` gives a field's text by element id; a setup reads the fields as they would be with
+// the ZT Scan analysis's library taken back (`captureSearch`).
+function libraryParams(fasta, read = (id) => $(id)?.value) {
   const n = (id, dflt) => {
-    const el = $(id);
-    if (!el) return dflt;
-    const v = parseInt(el.value, 10);
+    const raw = read(id);
+    if (raw === undefined || raw === null) return dflt;
+    const v = parseInt(raw, 10);
     return Number.isFinite(v) ? v : dflt;
   };
   const mz = (id) => {
-    const el = $(id);
-    if (!el || el.value.trim() === "") return null;
-    const v = parseFloat(el.value);
+    const raw = read(id);
+    if (raw === undefined || raw === null || String(raw).trim() === "") return null;
+    const v = parseFloat(raw);
     return Number.isFinite(v) && v > 0 ? v : null;
   };
-  const enzyme = $("d-enzyme") ? $("d-enzyme").value : "trypsin_p";
+  const enzyme = read("d-enzyme") ?? "trypsin_p";
   return {
     fasta,
     out_dir: "",
     enzyme,
-    cleavage_rule: enzyme === "custom" ? ($("d-rule").value || "").trim() : null,
+    cleavage_rule: enzyme === "custom" ? (read("d-rule") || "").trim() : null,
     missed_cleavages: n("d-missed", 1),
     min_pep_len: n("d-minlen", 7),
     max_pep_len: n("d-maxlen", 30),
@@ -2273,18 +3450,18 @@ function parseModKey(key) {
   return { name, residue, position: position || "" };
 }
 
-function maxVariableMods() {
-  const v = parseInt($("d-maxvar").value, 10);
+function maxVariableMods(raw = $("d-maxvar").value) {
+  const v = parseInt(raw, 10);
   return Number.isFinite(v) && v >= 0 ? v : 1;
 }
 
 // The choice as engine configuration, in catalogue order then residue order, so the
 // same choice always derives the same configuration.
-function selectedMods() {
+function selectedMods(mods = state.mods) {
   const fixed = [];
   const variable = [];
   for (const m of state.catalogue?.modifications || []) {
-    const picked = [...state.mods.entries()]
+    const picked = [...mods.entries()]
       .map(([k, kind]) => ({ ...parseModKey(k), kind }))
       .filter((x) => x.name === m.name)
       .sort((a, b) => (a.residue + a.position).localeCompare(b.residue + b.position));
@@ -2777,6 +3954,23 @@ async function resolveBands(libPrecursors) {
 // other output, so every search started here asks for it.
 function viewerOverrides() {
   return { "quant.fragment_detail": true };
+}
+
+// What the Search screen adds to the run's configuration, on top of the chosen preset: the
+// digest and modification fields for a library the engine builds from a FASTA, and the
+// prescreen, the band plan, the normalisation scope, a library's retention-time handling
+// and the ZT Scan choices in every mode. `bands` is `resolveBands`'s answer, `built` the
+// tables a DIA-NN build produced, `libraryIrt` what a library's library.json names.
+function runOverrides({ bands, built = null, libraryIrt = null }) {
+  return {
+    ...viewerOverrides(),
+    ...(state.mode === "fasta" && !built ? digestOverrides() : {}),
+    ...prescreenOverrides(),
+    ...bandOverrides(bands),
+    ...normOverrides(),
+    ...(libraryIrt ? { "rt_im_train.library_irt": libraryIrt } : {}),
+    ...ztscanOverrides(),
+  };
 }
 
 function bandOverrides(b) {
@@ -3734,15 +4928,7 @@ async function startSearch() {
   // as the FASTA search would have handled them.
   const libraryIrt =
     state.mode === "library" ? await libraryIrtOf(p.lib_precursors) : null;
-  const overrides = {
-    ...viewerOverrides(),
-    ...(state.mode === "fasta" && !built ? digestOverrides() : {}),
-    ...prescreenOverrides(),
-    ...bandOverrides(bands),
-    ...normOverrides(),
-    ...(libraryIrt ? { "rt_im_train.library_irt": libraryIrt } : {}),
-    ...ztscanOverrides(),
-  };
+  const overrides = runOverrides({ bands, built, libraryIrt });
   if (Object.keys(overrides).length) {
     try {
       config = await invoke("derive_config", { base: config, overrides });

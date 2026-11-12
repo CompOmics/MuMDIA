@@ -3,7 +3,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use mumdia_console::{
-    components, diann, engine, predictors, preflight as pf, run, settings, sizing, thermo, viewer,
+    components, diann, engine, predictors, preflight as pf, run, settings, setups, sizing, thermo,
+    viewer,
 };
 
 use std::collections::HashMap;
@@ -622,6 +623,77 @@ fn save_settings(
     Ok(path)
 }
 
+/// Ask the engine whether an override set (the Settings screen's values, relative to the
+/// engine defaults) is a configuration it accepts, without making it the one in use: how a
+/// setup is checked before its summary is shown, so a setup the engine refuses changes
+/// nothing (#297). Written to a scratch file of its own, never to the file a search uses.
+#[tauri::command]
+fn check_settings(
+    overrides: std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<(), String> {
+    let path = settings::derive("setup-check", None, overrides)?;
+    let verdict = settings::validate(&path);
+    let _ = std::fs::remove_file(&path);
+    verdict
+}
+
+/// The named setups (`setups::list_in`) and the folder they are kept in.
+#[tauri::command]
+fn setups_list() -> serde_json::Value {
+    let dir = setups::dir();
+    serde_json::json!({
+        "dir": dir.display().to_string(),
+        "items": setups::list_in(&dir),
+    })
+}
+
+/// Keep a setup under a name. One already saved under that name is replaced only with
+/// `overwrite`; otherwise its name comes back, for the interface to ask.
+#[tauri::command]
+fn setups_save(
+    name: String,
+    settings: serde_json::Value,
+    overwrite: bool,
+) -> Result<setups::SaveOutcome, String> {
+    setups::save_in(&setups::dir(), &name, &settings, overwrite)
+}
+
+/// One named setup, read and brought up to the current format, for the interface to check
+/// and show before it is applied.
+#[tauri::command]
+fn setups_read(id: String) -> Result<setups::Document, String> {
+    setups::read_in(&setups::dir(), &id)
+}
+
+#[tauri::command]
+fn setups_rename(id: String, name: String) -> Result<setups::Item, String> {
+    setups::rename_in(&setups::dir(), &id, &name)
+}
+
+#[tauri::command]
+fn setups_delete(id: String) -> Result<(), String> {
+    setups::delete_in(&setups::dir(), &id)
+}
+
+/// Write a named setup to a file the user chose, exactly as it is kept.
+#[tauri::command]
+fn setups_export(id: String, path: String) -> Result<String, String> {
+    setups::export_in(&setups::dir(), &id, &path)
+}
+
+/// Write the current setup to a file the user chose ("Save to a file").
+#[tauri::command]
+fn setup_write(path: String, name: String, settings: serde_json::Value) -> Result<String, String> {
+    setups::write_file(&path, &name, &settings)
+}
+
+/// Read a settings file the user chose ("Load from a file"), for the interface to check and
+/// show before it is applied.
+#[tauri::command]
+fn setup_read(path: String) -> Result<setups::Document, String> {
+    setups::read_file(&path)
+}
+
 /// The run configuration for the built-in library path: the chosen preset (or the
 /// engine defaults when none) with the Search screen's digest fields merged on top,
 /// validated by the engine like a saved settings file.
@@ -825,10 +897,16 @@ fn presets() -> Vec<serde_json::Value> {
     // Materialised copies first: in a packaged build this is the only place they
     // exist. See `materialise_presets` for why they are compiled in rather than
     // shipped as bundle resources.
-    match materialise_presets() {
-        Ok(d) => dirs.push(d),
-        Err(e) => eprintln!("could not write the bundled presets: {e}"),
-    }
+    let materialised = match materialise_presets() {
+        Ok(d) => {
+            dirs.push(d.clone());
+            Some(d)
+        }
+        Err(e) => {
+            eprintln!("could not write the bundled presets: {e}");
+            None
+        }
+    };
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(d) = exe.parent() {
@@ -860,10 +938,17 @@ fn presets() -> Vec<serde_json::Value> {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
+        // The compiled-in presets share their folder with what the application writes
+        // there (`settings::config_dir`: "My settings", a search's derived configuration),
+        // which are not presets. Listed, the last search's derived configuration was offered
+        // as a preset, and a setup (#297) could name it: only the compiled-in names are
+        // offered from that folder.
+        let shipped_only = materialised.as_deref() == Some(dir.as_path());
         let mut found: Vec<_> = entries
             .flatten()
             .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|e| e == "json"))
+            .filter(|p| !shipped_only || is_shipped_preset(p))
             .collect();
         found.sort();
         for p in found {
@@ -939,6 +1024,13 @@ const PRESET_FILES: &[(&str, &str)] = &[
     ),
 ];
 
+/// Whether `path` is named like one of the compiled-in presets.
+fn is_shipped_preset(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| PRESET_FILES.iter().any(|(name, _)| *name == n))
+}
+
 /// Write the compiled-in presets into the per-user data directory and return it.
 ///
 /// Rewritten every call rather than only when absent, so that upgrading the
@@ -990,6 +1082,15 @@ fn main() {
             vcruntime_state,
             config_schema,
             save_settings,
+            check_settings,
+            setups_list,
+            setups_save,
+            setups_read,
+            setups_rename,
+            setups_delete,
+            setups_export,
+            setup_write,
+            setup_read,
             derive_config,
             modifications,
             enzymes,
@@ -1137,6 +1238,27 @@ mod tests {
             names.iter().any(|n| n == "diann-library"),
             "the sidecar presets must survive the filter: {names:?}"
         );
+    }
+
+    #[test]
+    fn what_the_application_writes_beside_the_presets_is_not_offered_as_one() {
+        // "My settings" and a search's derived configuration are written in the folder the
+        // compiled-in presets are materialised into; neither is a preset.
+        let dir = materialise_presets().expect("presets must materialise");
+        let stray = dir.join(format!("zz-not-a-preset-{}.json", std::process::id()));
+        std::fs::write(&stray, r#"{"rescore": {"classifier": "nn_torch"}}"#).unwrap();
+        let listed: Vec<String> = presets()
+            .into_iter()
+            .filter_map(|p| p["path"].as_str().map(str::to_string))
+            .collect();
+        let _ = std::fs::remove_file(&stray);
+        assert!(
+            !listed.iter().any(|p| p.contains("zz-not-a-preset")),
+            "{listed:?}"
+        );
+        assert!(is_shipped_preset(Path::new("/x/diann-library.json")));
+        assert!(!is_shipped_preset(Path::new("/x/console.json")));
+        assert!(!is_shipped_preset(Path::new("/x/search-derived.json")));
     }
 
     #[test]
