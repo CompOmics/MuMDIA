@@ -253,8 +253,11 @@ pub const LOGS_DIR_NAME: &str = "logs";
 /// - `UV_LINK_MODE=copy`: `uv` hard-links packages from its cache by default, and a hard
 ///   link shares the file's permissions with the cache copy in the administrator's
 ///   profile, which other users cannot read. A copy takes the program folder's.
-/// - `UV_COMPILE_BYTECODE=1`: compile every module now, because no user can write the
-///   `__pycache__` folders later, and an import without them compiles again on every run.
+///
+/// Not `UV_COMPILE_BYTECODE`: uv's compile step writes a script into its cache first, and
+/// on Windows that write failed once with `os error 1224` (a file another process had
+/// mapped) and failed the whole installation of packages that were already in place.
+/// [`compile_bytecode`] compiles afterwards instead, where a failure is only a warning.
 ///
 /// Set over anything in the environment: each of them is needed for the installation to
 /// work for the other users.
@@ -268,8 +271,86 @@ pub fn machine_uv_env(tools: &Path) -> Vec<(&'static str, std::ffi::OsString)> {
         ),
         ("UV_PYTHON_PREFERENCE", "only-managed".into()),
         ("UV_LINK_MODE", "copy".into()),
-        ("UV_COMPILE_BYTECODE", "1".into()),
     ]
+}
+
+/// The folder of the interpreter an environment was created from: the `home` line of its
+/// `pyvenv.cfg`, which `uv venv` writes. `None` when the file or the line is missing.
+pub fn interpreter_home(venv: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(venv.join("pyvenv.cfg")).ok()?;
+    text.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key.trim().eq_ignore_ascii_case("home") && !value.trim().is_empty())
+            .then(|| PathBuf::from(value.trim()))
+    })
+}
+
+/// What [`compile_bytecode`] compiles for the environment `venv`: its packages, and the
+/// standard library of the interpreter it was created from. Windows layout, the only one
+/// with a machine scope.
+pub fn bytecode_dirs(venv: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![venv.join("Lib").join("site-packages")];
+    if let Some(home) = interpreter_home(venv) {
+        dirs.push(home.join("Lib"));
+    }
+    dirs.into_iter().filter(|d| d.is_dir()).collect()
+}
+
+/// The arguments of `python -m compileall` for `dirs`: quiet but for errors, every
+/// processor, and test folders left out, because some packages ship test data written for
+/// another Python version, which never compiles and is never imported.
+pub fn compileall_args(dirs: &[PathBuf]) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = ["-m", "compileall", "-q", "-j", "0", "-x"]
+        .iter()
+        .map(Into::into)
+        .collect();
+    args.push(r"[\\/]tests?[\\/]".into());
+    args.extend(dirs.iter().map(|d| d.as_os_str().to_owned()));
+    args
+}
+
+/// Compile an environment in the program folder to bytecode, so that no user has to.
+///
+/// Users cannot write the `__pycache__` folders there, so a module without its bytecode
+/// is compiled again in memory on every import, by every user. That only costs time:
+/// a module that does not compile here is compiled when imported, as it would have been
+/// anyway. A failure is therefore returned as the warning to log, never as a failed
+/// installation.
+pub fn compile_bytecode(python: &Path, venv: &Path) -> Result<(), String> {
+    let dirs = bytecode_dirs(venv);
+    if dirs.is_empty() {
+        return Ok(());
+    }
+    let out = crate::engine::command(python)
+        .args(compileall_args(&dirs))
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("could not run {}: {e}", python.display()))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    Err(format!(
+        "some modules were not compiled ahead ({}); they are compiled when they are \
+         imported instead, which only makes that import slower: {}",
+        out.status,
+        crate::loadcheck::tail(&text, 3)
+    ))
+}
+
+/// The folders whose permissions an installation of `venv` into the program folder,
+/// `tools`, resets: the environment itself and the interpreters `uv` keeps beside it.
+/// Not the whole of `tools`: the other environments are not this installation's, and
+/// resetting tens of thousands of their files took minutes per installation.
+pub fn permission_dirs(tools: &Path, venv: &Path) -> Vec<PathBuf> {
+    [
+        venv.to_path_buf(),
+        tools.join(crate::storage::UV_PYTHON_SUBDIR),
+    ]
+    .into_iter()
+    .filter(|d| d.is_dir())
+    .collect()
 }
 
 /// Give every file under `dir` the permissions it inherits from the program folder
@@ -966,7 +1047,7 @@ fn carry_outcome(prev: &Status, fresh: Status) -> Status {
 /// installation runs in an elevated copy of this application instead
 /// ([`install_as_administrator`]); in the elevated copy, or in an application an
 /// administrator started elevated, it runs here with [`machine_uv_env`] and ends with
-/// [`reset_permissions`].
+/// [`compile_bytecode`] and [`reset_permissions`] on [`permission_dirs`].
 pub fn install(installer: Arc<Installer>, env: Env) -> Result<(), String> {
     let layout = crate::storage::layout();
     if needs_administrator(&layout) {
@@ -1117,14 +1198,23 @@ pub fn install(installer: Arc<Installer>, env: Env) -> Result<(), String> {
         if machine {
             log(
                 &installer,
+                "== compiling the packages, which no user can do later".into(),
+            );
+            if let Err(e) = compile_bytecode(&managed_python(env), &venv) {
+                log(&installer, format!("warning: {e}"));
+            }
+            log(
+                &installer,
                 "== giving every user of this computer read access to the components".into(),
             );
-            if let Err(e) = reset_permissions(&tools) {
-                if let Ok(mut s) = installer.slot(env).lock() {
-                    s.install_status = "failed".into();
-                    s.error = Some(e);
+            for dir in permission_dirs(&tools, &venv) {
+                if let Err(e) = reset_permissions(&dir) {
+                    if let Ok(mut s) = installer.slot(env).lock() {
+                        s.install_status = "failed".into();
+                        s.error = Some(e);
+                    }
+                    return;
                 }
-                return;
             }
         }
 
@@ -1941,7 +2031,79 @@ mod tests {
         );
         assert_eq!(env["UV_PYTHON_PREFERENCE"], "only-managed");
         assert_eq!(env["UV_LINK_MODE"], "copy");
-        assert_eq!(env["UV_COMPILE_BYTECODE"], "1");
+        // Compiled afterwards by `compile_bytecode`, where a failure is only a warning.
+        assert!(!env.contains_key("UV_COMPILE_BYTECODE"));
+    }
+
+    #[test]
+    fn the_interpreter_of_an_environment_is_read_from_its_pyvenv_cfg() {
+        let d = scratch("pyvenv-home");
+        let venv = d.join("python");
+        std::fs::create_dir_all(&venv).unwrap();
+        assert_eq!(interpreter_home(&venv), None);
+        let home = d
+            .join("uv-python")
+            .join("cpython-3.11.14-windows-x86_64-none");
+        std::fs::write(
+            venv.join("pyvenv.cfg"),
+            format!(
+                "implementation = CPython\nHome = {}\nuv = 0.10.6\n",
+                home.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(interpreter_home(&venv), Some(home.clone()));
+        // Compiled: the packages, and the standard library once it exists.
+        std::fs::create_dir_all(venv.join("Lib").join("site-packages")).unwrap();
+        assert_eq!(
+            bytecode_dirs(&venv),
+            vec![venv.join("Lib").join("site-packages")]
+        );
+        std::fs::create_dir_all(home.join("Lib")).unwrap();
+        assert_eq!(
+            bytecode_dirs(&venv),
+            vec![venv.join("Lib").join("site-packages"), home.join("Lib")]
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn compileall_is_quiet_parallel_and_leaves_test_folders_out() {
+        let dirs = vec![PathBuf::from("a"), PathBuf::from("b")];
+        let args: Vec<String> = compileall_args(&dirs)
+            .into_iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "-m",
+                "compileall",
+                "-q",
+                "-j",
+                "0",
+                "-x",
+                r"[\\/]tests?[\\/]",
+                "a",
+                "b"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_installation_resets_the_permissions_of_its_own_environment_only() {
+        let tools = scratch("permission-dirs");
+        let venv = tools.join("python-visdia");
+        assert!(permission_dirs(&tools, &venv).is_empty());
+        std::fs::create_dir_all(&venv).unwrap();
+        std::fs::create_dir_all(tools.join("python")).unwrap();
+        assert_eq!(permission_dirs(&tools, &venv), vec![venv.clone()]);
+        std::fs::create_dir_all(tools.join(crate::storage::UV_PYTHON_SUBDIR)).unwrap();
+        assert_eq!(
+            permission_dirs(&tools, &venv),
+            vec![venv.clone(), tools.join(crate::storage::UV_PYTHON_SUBDIR)]
+        );
+        std::fs::remove_dir_all(&tools).ok();
     }
 
     #[test]

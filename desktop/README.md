@@ -362,11 +362,13 @@ These flags belong to the desktop application; the engine is unchanged.
 Reinstall and the Managed data card's Remove run that one change in an elevated copy of the
 application (`src/elevate.rs`): Windows shows its permission prompt, where a standard user can
 enter an administrator's name and password, and a declined prompt is explained with the
-command an administrator can run instead. The packages are then imported for real as the user
-at the window. Such an installation keeps uv's interpreter in `components\uv-python`, copies
-packages rather than hard-linking them from the administrator's cache, compiles them, and
-resets every file's permissions to the program folder's (`icacls /reset`), so every user can
-read them. A user's own earlier copies are listed on the Managed data card as "no longer
+command an administrator can run instead. Such changes run one at a time: a second waits for
+the first. The packages are then imported for real as the user at the window. Such an
+installation keeps uv's interpreter in `components\uv-python`, copies packages rather than
+hard-linking them from the administrator's cache, compiles them and the interpreter's
+standard library with `python -m compileall` (a module that does not compile is a warning,
+not a failure), and resets the permissions of that environment and of `uv-python` to the
+program folder's (`icacls /reset`), so every user can read them. A user's own earlier copies are listed on the Managed data card as "no longer
 used"; MuMDIA does not fall back to them, because two copies could hold different package
 versions, which change results.
 

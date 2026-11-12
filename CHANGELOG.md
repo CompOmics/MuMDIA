@@ -279,9 +279,11 @@ than a number. Both are recorded in every run's `manifest.json`.
   Windows asks for permission (a declined prompt is explained, with the command an
   administrator can run). `mumdia-console.exe --install-components primary,thermo` (or `all`)
   and `--remove-components` do the same from an elevated prompt or a deployment tool, for a
-  scripted installation and after each upgrade. An installation into the program folder keeps
-  uv's interpreter there, copies packages rather than hard-linking them, compiles them, and
-  resets their permissions to the folder's, so every user can read them. Libraries, settings,
+  scripted installation and after each upgrade. Changes as administrator run one at a time. An
+  installation into the program folder keeps uv's interpreter there, copies packages rather
+  than hard-linking them, compiles them and the interpreter's standard library, and resets the
+  permissions of that environment and the interpreter to the folder's, so every user can read
+  them. Libraries, settings,
   setups, caches, temporary files, results, run logs and the DIA-NN path and licence answer
   stay per-user in both modes. The MSI places no components and deletes none, so an upgrade
   leaves them as they are and an uninstall leaves them in place; the Managed data card removes

@@ -427,13 +427,42 @@ fn outcome(launch: Launch, args: &[&str], tools: &Path, exe: &Path) -> Result<()
     }
 }
 
+/// Held by [`run_helper`] for as long as its elevated copy runs: one at a time.
+///
+/// Installing visDIA while MS2PIP and the required environment were installing, each in
+/// its own elevated copy, failed with `os error 1224` on a file in the shared `uv` cache,
+/// and every copy reset the permissions of the same folder at once. One after the other
+/// costs nothing that matters: each waits for its own permission prompt anyway.
+#[cfg_attr(not(windows), allow(dead_code))]
+static ELEVATED_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Wait for this process's previous elevated copy to end, telling `on_line` when there
+/// is one to wait for. The guard is the turn; a panic in an earlier holder does not
+/// stop the next one.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn elevated_turn(on_line: &mut dyn FnMut(String)) -> std::sync::MutexGuard<'static, ()> {
+    match ELEVATED_TURN.try_lock() {
+        Ok(turn) => turn,
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            on_line(
+                "== waiting for the other change as administrator to finish, one at a time".into(),
+            );
+            ELEVATED_TURN.lock().unwrap_or_else(|p| p.into_inner())
+        }
+    }
+}
+
 /// Run `args` (a helper command) in an elevated copy of this application and wait for
 /// it, passing each line of its log to `on_line` as it is written. Windows shows its
-/// permission prompt first.
+/// permission prompt first. One at a time ([`ELEVATED_TURN`]): a second call waits
+/// for the first to end.
 pub fn run_helper(args: &[&str], on_line: &mut dyn FnMut(String)) -> Result<(), String> {
     #[cfg(windows)]
     {
         use std::sync::mpsc::RecvTimeoutError;
+
+        let _turn = elevated_turn(on_line);
 
         let exe = std::env::current_exe()
             .map_err(|e| format!("cannot find this application's own executable: {e}"))?;
@@ -487,6 +516,27 @@ pub fn run_helper(args: &[&str], on_line: &mut dyn FnMut(String)) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_second_change_as_administrator_waits_for_the_first() {
+        let first = elevated_turn(&mut |l| panic!("nothing to wait for, yet: {l}"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let mut said = Vec::new();
+            let _turn = elevated_turn(&mut |l| said.push(l));
+            tx.send(said).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "the second ran while the first held its turn"
+        );
+        drop(first);
+        let said = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        assert_eq!(said.len(), 1);
+        assert!(said[0].contains("one at a time"), "{said:?}");
+        second.join().unwrap();
+    }
 
     fn args(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
