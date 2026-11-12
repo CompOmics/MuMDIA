@@ -1826,6 +1826,7 @@ pub fn build(builder: Arc<Builder>, req: BuildRequest) -> Result<(), String> {
             threads: req.threads,
             keep_unimod: build_keep_unimod(&plan),
             decoy_args: req.decoy_diann_args(),
+            fasta: Some(PathBuf::from(&req.fasta)),
         };
         let result = convert(&builder, &conversion, Source::Predicted(stem));
         // The marker last, after both tables are on disk. Anything that dies before
@@ -1900,6 +1901,10 @@ struct Conversion {
     /// Extra `predict_decoys.py` arguments (`--diann-arg=...`): the fragment m/z limits of
     /// the build, empty for an import or a build without them.
     decoy_args: Vec<String>,
+    /// The FASTA a build predicted from, given to the importer (`--fasta`) so it can name what
+    /// the DIA-NN library leaves without an accession, entry name or gene; `None` for an
+    /// import, whose library names its proteins itself.
+    fasta: Option<PathBuf>,
 }
 
 /// A DIA-NN library a user chose, by the format it is in.
@@ -2035,11 +2040,13 @@ fn keep_unimod_args(ids: Option<&[u32]>) -> Vec<String> {
     }
 }
 
-/// The two tables a conversion writes into `out_dir`. The importer also writes the protein
-/// annotation table (`protein_annotations.parquet`: accessions, entry names, genes) there,
-/// beside `lib_precursors.parquet`, where the engine finds it; a library converted before
-/// the table existed has none, and its search reports carry no `protein_ids`,
-/// `protein_names` or `genes` columns.
+/// The two tables a conversion writes into `out_dir`. The protein annotations (accessions,
+/// entry names, genes) are columns of `lib_precursors.parquet` itself, which the importer
+/// writes and the decoy steps keep (#299), so the library carries them wherever it is copied.
+/// A library converted by 0.10.0 to 0.12.0 has them in a `protein_annotations.parquet` beside
+/// it instead, which the engine still reads; one converted before 0.10.0 has none, and a
+/// search on it warns and leaves the reports' `protein_ids`, `protein_names` and `genes`
+/// empty.
 fn final_tables(out_dir: &Path) -> (PathBuf, PathBuf) {
     (
         out_dir.join("lib_precursors.parquet"),
@@ -2070,6 +2077,9 @@ fn conversion_steps(c: &Conversion, predicted: &Path) -> Vec<(&'static str, Vec<
                 tgt_frag.display().to_string(),
             ];
             a.extend(keep.iter().cloned());
+            if let Some(fasta) = &c.fasta {
+                a.extend(["--fasta".to_string(), fasta.display().to_string()]);
+            }
             a
         }),
         (
@@ -2448,6 +2458,7 @@ pub fn import(builder: Arc<Builder>, req: ImportRequest) -> Result<(), String> {
             threads: req.threads,
             keep_unimod: Some(kept.clone()),
             decoy_args: Vec::new(),
+            fasta: None,
         };
         let result = convert(&builder, &conversion, Source::Chosen(library));
         finish(&builder, result, |dir| {
@@ -3461,6 +3472,7 @@ PEPTIDEK
             threads: 6,
             keep_unimod,
             decoy_args: Vec::new(),
+            fasta: None,
         }
     }
 
@@ -3571,11 +3583,11 @@ PEPTIDEK
         );
     }
 
-    /// The importer writes `protein_annotations.parquet` beside its precursor table, and the
-    /// engine reads it beside the precursor table a search is given. Every step writes into
-    /// the one library folder, so the table is beside `lib_precursors.parquet` without a copy;
-    /// the decoy prediction imports its own DIA-NN library in a subfolder, so its (decoy)
-    /// import never replaces the targets' table.
+    /// The importer writes the protein annotations into its precursor table's columns, which
+    /// the decoy steps keep, so the final `lib_precursors.parquet` carries them. Every step
+    /// writes into the one library folder, and the decoy prediction imports its own DIA-NN
+    /// library in a subfolder, so its (decoy) import touches nothing of the targets'. An
+    /// import has no FASTA to give the importer; a build gives its own (below).
     #[test]
     fn the_protein_annotations_land_beside_the_final_precursor_table() {
         let c = a_conversion(None);
@@ -3590,7 +3602,7 @@ PEPTIDEK
         assert!(!steps[0]
             .1
             .iter()
-            .any(|a| a == "--no-annotations" || a == "--annotations"));
+            .any(|a| a == "--no-annotations" || a == "--annotations" || a == "--fasta"));
         // reversal: its output precursors are in the same folder.
         assert_eq!(
             Path::new(&steps[1].1[3]).parent(),
@@ -3601,6 +3613,23 @@ PEPTIDEK
         let work = PathBuf::from(&steps[2].1[w + 1]);
         assert_ne!(work, c.out_dir);
         assert_eq!(work.parent(), Some(c.out_dir.as_path()));
+    }
+
+    /// A build gives the importer the FASTA it predicted from, so the importer can name from
+    /// its headers what the DIA-NN library leaves empty; nothing else in the steps changes.
+    #[test]
+    fn a_build_gives_the_importer_its_fasta() {
+        let plain = a_conversion(None);
+        let mut c = a_conversion(None);
+        c.fasta = Some(PathBuf::from("/data/proteome.fasta"));
+        let (with, without) = (
+            conversion_steps(&c, Path::new("/in/lib.parquet")),
+            conversion_steps(&plain, Path::new("/in/lib.parquet")),
+        );
+        let n = without[0].1.len();
+        assert_eq!(with[0].1[..n], without[0].1[..]);
+        assert_eq!(with[0].1[n..], ["--fasta", "/data/proteome.fasta"]);
+        assert_eq!(with[1..], without[1..]);
     }
 
     #[test]
