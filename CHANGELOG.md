@@ -225,7 +225,7 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
-- **The desktop application pins visDIA at 8459ff2, which shows SCIEX ZT Scan DIA runs**
+- **The desktop application pins visDIA at 36eef08, which shows SCIEX ZT Scan DIA runs**
   (CompOmics/visDIA#15). The pinned viewer refused a ZT Scan run's `spectra_ms2` v3 and
   `psms_extracted` v6 and v8, so its precursor page had no spectra and drew each XIC through
   every Q1 step, a sawtooth. The precursor page of a ZT Scan run now draws each XIC as one
