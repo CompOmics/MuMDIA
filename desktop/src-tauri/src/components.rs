@@ -71,6 +71,11 @@ pub struct Status {
     pub load_check: String,
     /// Why the real import failed, as the interface shows it, when it did.
     pub load_error: Option<String>,
+    /// How many lines were ever added to `install_log`, which is capped by dropping the
+    /// oldest: the elevated helper (`crate::elevate`) streams the lines added since it last
+    /// looked.
+    #[serde(skip)]
+    pub log_seq: u64,
 }
 
 /// Every module the primary environment must provide.
@@ -118,6 +123,22 @@ pub enum Env {
 }
 
 impl Env {
+    /// The id the interface and the command line use (`primary`, `ms2pip`, `visdia`).
+    pub fn id(self) -> &'static str {
+        match self {
+            Env::Primary => "primary",
+            Env::Ms2pip => "ms2pip",
+            Env::Visdia => "visdia",
+        }
+    }
+
+    /// The environment an id names.
+    pub fn from_id(id: &str) -> Option<Env> {
+        [Env::Primary, Env::Ms2pip, Env::Visdia]
+            .into_iter()
+            .find(|e| e.id() == id)
+    }
+
     fn dir_name(self) -> &'static str {
         match self {
             Env::Primary => "python",
@@ -178,20 +199,121 @@ pub fn hex(bytes: impl AsRef<[u8]>) -> String {
 
 /// Per-user application data: predicted libraries, saved settings, and (exported to the
 /// engine) caches, temporary files and model downloads. The storage folder chosen on the
-/// Setup screen, else the default folder (`crate::storage`).
+/// Setup screen, else the default folder (`crate::storage`). Per-user in both scopes.
 ///
-/// Not beside the executable: on Windows that is under Program Files, which a
-/// normal user cannot write to, and an installer that needs administrator rights to
-/// finish its first run is not the easy installation this exists to provide.
+/// Never beside the executable: on Windows that is under Program Files, which a normal
+/// user cannot write to.
 pub fn data_dir() -> PathBuf {
     crate::storage::storage_dir()
 }
 
 /// Where the managed Python environments and the downloaded tools (ThermoRawFileParser,
-/// DIA-NN) live: the default folder, unless the user moved them with the storage folder
-/// (`crate::storage`), because a moved environment has to be installed again.
+/// DIA-NN) live.
+///
+/// In the user scope, the default per-user folder, unless the user moved them with the
+/// storage folder (`crate::storage`), because a moved environment has to be installed
+/// again. This is the default because an installer that needs administrator rights to
+/// finish its first run is not the easy installation this exists to provide.
+///
+/// In the machine scope, which the administrator chose in the installer
+/// (`crate::scope`), `components\` in the program folder, shared by every user and changed
+/// only by an administrator ([`install`] asks Windows for permission through
+/// `crate::elevate`).
 pub fn tools_dir() -> PathBuf {
     crate::storage::tools_dir()
+}
+
+/// Where the components of this process are: each user's folder or the program folder.
+pub fn scope() -> crate::scope::Scope {
+    crate::storage::layout().scope
+}
+
+/// Whether changing the components needs an administrator: they are in the program folder
+/// and this process cannot write there. Never inside the elevated helper itself, which
+/// checked that it can write before it started, so an installation cannot ask for
+/// elevation from an elevated process in a loop.
+pub fn needs_administrator(layout: &crate::storage::Layout) -> bool {
+    layout.scope == crate::scope::Scope::Machine
+        && !crate::elevate::in_helper()
+        && crate::storage::writable_without_creating(&layout.tools).is_err()
+}
+
+/// The folder in the program folder that keeps the elevated helper's logs, which every
+/// user can read (`crate::elevate`).
+pub const LOGS_DIR_NAME: &str = "logs";
+
+/// The `uv` settings of an installation into the program folder, `tools`.
+///
+/// - `UV_PYTHON_INSTALL_DIR`: the interpreter `uv venv` downloads goes beside the
+///   environments. By default it goes to the installing user's own roaming folder, and an
+///   environment refers to its interpreter by absolute path, so every other user would get
+///   an environment whose interpreter they cannot read.
+/// - `UV_PYTHON_PREFERENCE=only-managed`: never base the environment on a Python found on
+///   the installing administrator's `PATH` or in their profile, for the same reason.
+/// - `UV_LINK_MODE=copy`: `uv` hard-links packages from its cache by default, and a hard
+///   link shares the file's permissions with the cache copy in the administrator's
+///   profile, which other users cannot read. A copy takes the program folder's.
+/// - `UV_COMPILE_BYTECODE=1`: compile every module now, because no user can write the
+///   `__pycache__` folders later, and an import without them compiles again on every run.
+///
+/// Set over anything in the environment: each of them is needed for the installation to
+/// work for the other users.
+pub fn machine_uv_env(tools: &Path) -> Vec<(&'static str, std::ffi::OsString)> {
+    vec![
+        (
+            "UV_PYTHON_INSTALL_DIR",
+            tools
+                .join(crate::storage::UV_PYTHON_SUBDIR)
+                .into_os_string(),
+        ),
+        ("UV_PYTHON_PREFERENCE", "only-managed".into()),
+        ("UV_LINK_MODE", "copy".into()),
+        ("UV_COMPILE_BYTECODE", "1".into()),
+    ]
+}
+
+/// Give every file under `dir` the permissions it inherits from the program folder
+/// (`icacls <dir> /reset /T /Q`), so every user can read and run what an
+/// administrator installed there.
+///
+/// Belt and braces beside [`machine_uv_env`]: a file created elsewhere and renamed into
+/// the program folder keeps the permissions of the folder it was created in, and that is
+/// a user's profile for anything a tool unpacks in its temporary folder first. Windows
+/// only; elsewhere there is no machine scope and nothing to do.
+///
+/// Without `/C`, so the first file it cannot reset stops it with a failing exit code and
+/// the installation is reported as failed. The folder is checked first, because icacls
+/// treats a path that does not exist as a pattern that matches nothing and succeeds.
+pub fn reset_permissions(dir: &Path) -> Result<(), String> {
+    if !dir.is_dir() {
+        return Err(format!(
+            "the permissions of {} could not be reset: it is not a folder",
+            dir.display()
+        ));
+    }
+    if !cfg!(windows) {
+        return Ok(());
+    }
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    let icacls = PathBuf::from(root).join("System32").join("icacls.exe");
+    let out = crate::engine::command(&icacls)
+        .arg(dir)
+        .args(["/reset", "/T", "/Q"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("could not run icacls: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    Err(format!(
+        "the permissions of {} could not be reset, so other users may not be able to read \
+         the components ({}): {}",
+        dir.display(),
+        out.status,
+        crate::loadcheck::tail(&text, 3)
+    ))
 }
 
 pub fn venv_dir(env: Env) -> PathBuf {
@@ -660,6 +782,28 @@ impl Installer {
         }
     }
 
+    /// Add one line to `env`'s installation log, dropping the oldest beyond 2000.
+    fn push_log(&self, env: Env, line: String) {
+        if let Ok(mut s) = self.slot(env).lock() {
+            push_line(&mut s, line);
+        }
+    }
+
+    /// The lines added to `env`'s log since `seen` (updated), and the state as it stands.
+    /// For the elevated helper, which prints an installation's log as it grows.
+    pub fn log_since(&self, env: Env, seen: &mut u64) -> (Vec<String>, Status) {
+        let Ok(s) = self.slot(env).lock() else {
+            return (Vec::new(), Status::default());
+        };
+        let fresh = s
+            .log_seq
+            .saturating_sub(*seen)
+            .min(s.install_log.len() as u64) as usize;
+        *seen = s.log_seq;
+        let lines = s.install_log[s.install_log.len() - fresh..].to_vec();
+        (lines, s.clone())
+    }
+
     /// Forget a finished installation's outcome, after its files were removed.
     ///
     /// `refresh` preserves a terminal `done` or `failed` on purpose (see below), so
@@ -782,6 +926,16 @@ impl Installer {
     }
 }
 
+/// Append `line` to an installation log, keeping the newest 2000 lines.
+fn push_line(s: &mut Status, line: String) {
+    s.install_log.push(line);
+    s.log_seq += 1;
+    if s.install_log.len() > 2000 {
+        let drop = s.install_log.len() - 2000;
+        s.install_log.drain(0..drop);
+    }
+}
+
 /// A refreshed status, `fresh` from disk, with what an installation put in `prev`.
 ///
 /// Anything an installation put there outlives a refresh. Keeping only "installing"
@@ -790,6 +944,7 @@ impl Installer {
 /// transition would wait for ever.
 fn carry_outcome(prev: &Status, fresh: Status) -> Status {
     let mut s = fresh;
+    s.log_seq = prev.log_seq;
     if prev.install_status != "idle" && !prev.install_status.is_empty() {
         s.install_status = prev.install_status.clone();
         s.install_log = prev.install_log.clone();
@@ -806,27 +961,31 @@ fn carry_outcome(prev: &Status, fresh: Status) -> Status {
 /// Runs on its own thread and streams both streams into the shared log, because a
 /// several-hundred-megabyte download with no visible progress is indistinguishable
 /// from a hang.
+///
+/// In the machine scope, from a process that cannot write to the program folder, the
+/// installation runs in an elevated copy of this application instead
+/// ([`install_as_administrator`]); in the elevated copy, or in an application an
+/// administrator started elevated, it runs here with [`machine_uv_env`] and ends with
+/// [`reset_permissions`].
 pub fn install(installer: Arc<Installer>, env: Env) -> Result<(), String> {
+    let layout = crate::storage::layout();
+    if needs_administrator(&layout) {
+        return install_as_administrator(installer, env);
+    }
+    let machine = layout.scope == crate::scope::Scope::Machine;
+    let tools = layout.tools.clone();
     let uv = find_uv().ok_or_else(|| {
         "the installer component `uv` was not found beside the application or on PATH".to_string()
     })?;
     let reqs = requirements(env)?;
     let venv = venv_dir(env);
-    std::fs::create_dir_all(tools_dir())
-        .map_err(|e| format!("cannot create {}: {e}", tools_dir().display()))?;
+    std::fs::create_dir_all(&tools)
+        .map_err(|e| format!("cannot create {}: {e}", tools.display()))?;
 
     installer.begin(env)?;
 
     std::thread::spawn(move || {
-        let log = |installer: &Installer, line: String| {
-            if let Ok(mut s) = installer.slot(env).lock() {
-                s.install_log.push(line);
-                if s.install_log.len() > 2000 {
-                    let drop = s.install_log.len() - 2000;
-                    s.install_log.drain(0..drop);
-                }
-            }
-        };
+        let log = |installer: &Installer, line: String| installer.push_log(env, line);
 
         // Two steps: an interpreter, then the packages. `uv venv` downloads a
         // standalone CPython if the machine has none, which is the whole point.
@@ -893,6 +1052,11 @@ pub fn install(installer: Arc<Installer>, env: Env) -> Result<(), String> {
             // uv's package cache (and, with the environments moved, its interpreters) in
             // the storage folder, when one was chosen.
             crate::storage::apply(&mut cmd);
+            if machine {
+                for (k, v) in machine_uv_env(&tools) {
+                    cmd.env(k, v);
+                }
+            }
             cmd.args(&args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -924,9 +1088,7 @@ pub fn install(installer: Arc<Installer>, env: Env) -> Result<(), String> {
                     // Lossy and to the end: a package build's Python writes in the
                     // code page, and a reader that stopped would close the pipe.
                     crate::childio::for_each_line_lossy(stream, |line| {
-                        if let Ok(mut s) = installer.slot(env).lock() {
-                            s.install_log.push(line);
-                        }
+                        installer.push_log(env, line);
                     });
                 });
             }
@@ -952,67 +1114,121 @@ pub fn install(installer: Arc<Installer>, env: Env) -> Result<(), String> {
             }
         }
 
-        // Verify rather than assume: uv exiting zero says the packages resolved, not
-        // that the interpreter can load them. That takes two checks. `status_of` asks
-        // `find_spec`, which locates each package without executing it, so it reports a
-        // package that is absent and nothing more. It cannot see one that is installed
-        // but does not load: a torch whose DLLs fail to initialise (on Windows, for want
-        // of the Visual C++ runtime) passes it, and the first search then stops minutes
-        // in. The real import (`loadcheck`) is the second check, and it is the one that
-        // catches that.
-        let mut fresh = status_of(env);
-        if fresh.complete {
+        if machine {
             log(
                 &installer,
-                "== checking that the packages load (a real import, deeplc first)".into(),
+                "== giving every user of this computer read access to the components".into(),
             );
-            let python = PathBuf::from(fresh.python.clone().unwrap_or_default());
-            let outcome = run_probe(env, &python);
-            if let Ok(mut p) = installer.probes.lock() {
-                p.insert(
-                    env.dir_name(),
-                    Probe {
-                        key: probe_key(&fresh),
-                        outcome: Some(outcome.clone()),
-                    },
-                );
-            }
-            match crate::loadcheck::report(&outcome) {
-                None => {
-                    fresh.load_check = "ok".into();
-                    log(&installer, "all packages load".into());
+            if let Err(e) = reset_permissions(&tools) {
+                if let Ok(mut s) = installer.slot(env).lock() {
+                    s.install_status = "failed".into();
+                    s.error = Some(e);
                 }
-                Some((message, lines)) => {
-                    // The heading is already in the log.
-                    for line in lines.into_iter().skip(1) {
-                        log(&installer, line);
-                    }
-                    fresh.complete = false;
-                    fresh.load_check = "failed".into();
-                    fresh.load_error = Some(message);
-                }
+                return;
             }
         }
-        if let Ok(mut s) = installer.slot(env).lock() {
-            let log_so_far = s.install_log.clone();
-            *s = fresh;
-            s.install_log = log_so_far;
-            if s.complete {
-                s.install_status = "done".into();
-            } else {
-                s.install_status = "failed".into();
-                s.error = Some(match &s.load_error {
-                    Some(e) => e.clone(),
-                    None => format!(
-                        "the packages installed but the interpreter still cannot import: {}",
-                        s.missing.join(", ")
-                    ),
-                });
-            }
-        }
+
+        record_outcome(&installer, env);
     });
 
     Ok(())
+}
+
+/// Install `env` into the program folder through an elevated copy of this application
+/// (`crate::elevate`): Windows asks for permission, the elevated copy runs [`install`],
+/// and its log is shown here as it grows. The packages are then tested by a real import
+/// as this user, who is the one who has to be able to load them.
+fn install_as_administrator(installer: Arc<Installer>, env: Env) -> Result<(), String> {
+    installer.begin(env)?;
+    std::thread::spawn(move || {
+        installer.push_log(
+            env,
+            format!(
+                "== installing into the program folder, {}, as administrator. Windows asks \
+                 for permission.",
+                tools_dir().display()
+            ),
+        );
+        let ran = crate::elevate::run_helper(&[crate::elevate::INSTALL_FLAG, env.id()], &mut |l| {
+            installer.push_log(env, l)
+        });
+        match ran {
+            Ok(()) => record_outcome(&installer, env),
+            Err(e) => {
+                if let Ok(mut s) = installer.slot(env).lock() {
+                    s.install_status = "failed".into();
+                    s.error = Some(e);
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+/// After the packages were installed: check that they are all there and that they load,
+/// and publish the outcome.
+fn record_outcome(installer: &Installer, env: Env) {
+    let log = |installer: &Installer, line: String| installer.push_log(env, line);
+    // Verify rather than assume: uv exiting zero says the packages resolved, not
+    // that the interpreter can load them. That takes two checks. `status_of` asks
+    // `find_spec`, which locates each package without executing it, so it reports a
+    // package that is absent and nothing more. It cannot see one that is installed
+    // but does not load: a torch whose DLLs fail to initialise (on Windows, for want
+    // of the Visual C++ runtime) passes it, and the first search then stops minutes
+    // in. The real import (`loadcheck`) is the second check, and it is the one that
+    // catches that.
+    let mut fresh = status_of(env);
+    if fresh.complete {
+        log(
+            installer,
+            "== checking that the packages load (a real import, deeplc first)".into(),
+        );
+        let python = PathBuf::from(fresh.python.clone().unwrap_or_default());
+        let outcome = run_probe(env, &python);
+        if let Ok(mut p) = installer.probes.lock() {
+            p.insert(
+                env.dir_name(),
+                Probe {
+                    key: probe_key(&fresh),
+                    outcome: Some(outcome.clone()),
+                },
+            );
+        }
+        match crate::loadcheck::report(&outcome) {
+            None => {
+                fresh.load_check = "ok".into();
+                log(installer, "all packages load".into());
+            }
+            Some((message, lines)) => {
+                // The heading is already in the log.
+                for line in lines.into_iter().skip(1) {
+                    log(installer, line);
+                }
+                fresh.complete = false;
+                fresh.load_check = "failed".into();
+                fresh.load_error = Some(message);
+            }
+        }
+    }
+    if let Ok(mut s) = installer.slot(env).lock() {
+        let log_so_far = s.install_log.clone();
+        let seq = s.log_seq;
+        *s = fresh;
+        s.install_log = log_so_far;
+        s.log_seq = seq;
+        if s.complete {
+            s.install_status = "done".into();
+        } else {
+            s.install_status = "failed".into();
+            s.error = Some(match &s.load_error {
+                Some(e) => e.clone(),
+                None => format!(
+                    "the packages installed but the interpreter still cannot import: {}",
+                    s.missing.join(", ")
+                ),
+            });
+        }
+    }
 }
 
 // -- removing managed data ---------------------------------------------------
@@ -1025,6 +1241,11 @@ pub fn install(installer: Arc<Installer>, env: Env) -> Result<(), String> {
 // removes exactly what it placed under Program Files, so an uninstall leaves all of
 // it behind. Measured on one development machine: 8.9 GB, with nothing in the
 // interface that could remove it.
+//
+// In the machine scope (`crate::scope`) the components are in `components\` in the
+// program folder, but the MSI did not place them there either: an administrator's
+// elevated copy of this application did, after the installation. So an uninstall leaves
+// them too, and they are removed here, as administrator, like the rest.
 //
 // That the installer leaves it is not itself the bug. An upgrade reinstalls over the
 // same data directory and reuses a several-hundred-megabyte download and a library
@@ -1047,7 +1268,19 @@ pub struct Removable {
     /// Removing this discards work measured in hours rather than minutes, so the
     /// interface warns rather than merely confirming.
     pub costly: bool,
+    /// In the program folder, shared by every user of the computer (the machine scope):
+    /// removing it removes it for everyone, and needs an administrator.
+    pub shared: bool,
 }
+
+/// The items that are installed components rather than the user's own data: in the
+/// machine scope these are the program folder's, and a user's own leftover copies of them
+/// are offered as [`USER_COPY_PREFIX`] items.
+pub const COMPONENT_IDS: &[&str] = &["primary", "ms2pip", "visdia", "thermo", "diann", "runtime"];
+
+/// The id prefix of a component left in the user's own folder from before the components
+/// moved to the program folder, which the application no longer uses.
+pub const USER_COPY_PREFIX: &str = "user-";
 
 /// Bytes under `p`: the file itself, or everything below a directory.
 ///
@@ -1075,11 +1308,28 @@ fn size_on_disk(p: &Path) -> u64 {
 /// owns it exports, so a renamed directory cannot quietly become unremovable. An item
 /// with nothing on disk is omitted: the interface shows what exists rather than a
 /// catalogue of what could.
-fn inventory(tools: &Path, data: &Path) -> Vec<Removable> {
-    // The environments and the downloaded tools are under `tools`, what the application
-    // builds and saves under `data` (the storage folder); without a storage folder the two
-    // are the same directory.
+///
+/// The environments and the downloaded tools are under `tools`, what the application
+/// builds and saves under `data` (the storage folder), and the DIA-NN state under
+/// `user_tools` (`crate::storage::Layout::user_tools`); without a storage folder and in the
+/// user scope the three are the same directory.
+fn inventory(tools: &Path, data: &Path, user_tools: &Path) -> Vec<Removable> {
     let root = tools;
+    // The interpreter the environments were created from, where uv put it beside them
+    // (always in the machine scope; in the user scope when they moved with the storage
+    // folder), and the elevated helper's logs. Offered only once no environment is left,
+    // because every environment needs the interpreter to run.
+    let envs_left = [Env::Primary, Env::Ms2pip, Env::Visdia]
+        .iter()
+        .any(|e| root.join(e.dir_name()).exists());
+    let runtime = if envs_left {
+        Vec::new()
+    } else {
+        vec![
+            root.join(crate::storage::UV_PYTHON_SUBDIR),
+            root.join(LOGS_DIR_NAME),
+        ]
+    };
     let items: Vec<(&str, &str, &str, bool, Vec<PathBuf>)> = vec![
         (
             "primary",
@@ -1131,6 +1381,15 @@ fn inventory(tools: &Path, data: &Path) -> Vec<Removable> {
             vec![root.join(crate::diann::MANAGED_DIR_NAME)],
         ),
         (
+            "runtime",
+            "Python interpreter",
+            "The Python the environments were created from, and the installation logs. \
+             Offered once no environment uses it; installing an environment downloads it \
+             again.",
+            false,
+            runtime,
+        ),
+        (
             "libraries",
             "Predicted spectral libraries",
             "Libraries DIA-NN predicted from your FASTA files, kept so that the same \
@@ -1147,7 +1406,7 @@ fn inventory(tools: &Path, data: &Path) -> Vec<Removable> {
             false,
             vec![
                 data.join(crate::settings::CONFIG_DIR_NAME),
-                root.join(crate::diann::STATE_FILE_NAME),
+                user_tools.join(crate::diann::STATE_FILE_NAME),
             ],
         ),
     ];
@@ -1171,15 +1430,45 @@ fn inventory(tools: &Path, data: &Path) -> Vec<Removable> {
                 bytes: paths.iter().map(|p| size_on_disk(p)).sum(),
                 paths: paths.iter().map(|p| p.display().to_string()).collect(),
                 costly,
+                shared: false,
             })
         })
         .collect()
 }
 
-/// Delete one inventory item under `tools` or `data` (see [`inventory`]), returning the
-/// bytes freed.
-fn remove_in(tools: &Path, data: &Path, id: &str) -> Result<u64, String> {
-    let item = inventory(tools, data)
+/// What [`removable`] lists for a layout: the inventory, and in the machine scope the
+/// program folder's components marked `shared` plus the user's own leftover copies of
+/// components from before the components moved there.
+fn inventory_of(l: &crate::storage::Layout) -> Vec<Removable> {
+    let mut items = inventory(&l.tools, &l.storage, &l.user_tools);
+    if l.scope != crate::scope::Scope::Machine {
+        return items;
+    }
+    for it in items.iter_mut() {
+        it.shared = COMPONENT_IDS.contains(&it.id.as_str());
+    }
+    let leftovers = inventory(&l.default_root, &l.storage, &l.default_root)
+        .into_iter()
+        .filter(|r| COMPONENT_IDS.contains(&r.id.as_str()))
+        .map(|mut r| {
+            r.id = format!("{USER_COPY_PREFIX}{}", r.id);
+            r.label = format!("{} (your own copy, no longer used)", r.label);
+            r.detail = format!(
+                "Installed in your own folder before the components on this computer moved \
+                 to the program folder. MuMDIA uses the program folder's now, so this only \
+                 takes space. {}",
+                r.detail
+            );
+            r
+        });
+    items.extend(leftovers);
+    items
+}
+
+/// Delete one inventory item under `tools`, `data` or `user_tools` (see [`inventory`]),
+/// returning the bytes freed.
+fn remove_in(tools: &Path, data: &Path, user_tools: &Path, id: &str) -> Result<u64, String> {
+    let item = inventory(tools, data, user_tools)
         .into_iter()
         .find(|r| r.id == id)
         .ok_or_else(|| format!("`{id}` is not a removable component, or is not installed"))?;
@@ -1189,7 +1478,7 @@ fn remove_in(tools: &Path, data: &Path, id: &str) -> Result<u64, String> {
     // because canonicalising the item itself would follow a link and resolve to the
     // target this then deletes.
     // A root that does not exist holds no item, so it is simply not a candidate.
-    let real_roots: Vec<PathBuf> = [tools, data]
+    let real_roots: Vec<PathBuf> = [tools, data, user_tools]
         .iter()
         .filter_map(|r| r.canonicalize().ok())
         .collect();
@@ -1236,7 +1525,7 @@ fn remove_in(tools: &Path, data: &Path, id: &str) -> Result<u64, String> {
 /// What this application has created under [`data_dir`], as removable items, and the
 /// engine's own caches when they hold anything.
 pub fn removable() -> Vec<Removable> {
-    let mut items = inventory(&tools_dir(), &data_dir());
+    let mut items = inventory_of(&crate::storage::layout());
     items.extend(
         engine_cache_json(&["cache", "--json"])
             .ok()
@@ -1253,7 +1542,43 @@ pub fn remove(id: &str) -> Result<u64, String> {
     if id == ENGINE_CACHES_ID {
         return clear_engine_caches();
     }
-    remove_in(&tools_dir(), &data_dir(), id)
+    remove_with(&crate::storage::layout(), id)
+}
+
+/// [`remove`] for the folders of `l`.
+fn remove_with(l: &crate::storage::Layout, id: &str) -> Result<u64, String> {
+    if let Some(own) = id.strip_prefix(USER_COPY_PREFIX) {
+        // A leftover copy exists only beside the program folder's, and only components.
+        if l.scope != crate::scope::Scope::Machine || !COMPONENT_IDS.contains(&own) {
+            return Err(format!(
+                "`{id}` is not a removable component, or is not installed"
+            ));
+        }
+        return remove_in(&l.default_root, &l.storage, &l.default_root, own);
+    }
+    remove_in(&l.tools, &l.storage, &l.user_tools, id)
+}
+
+/// Whether removing `id` needs an administrator: a component in the program folder, from
+/// a process that cannot write there.
+pub fn removal_needs_administrator(id: &str) -> bool {
+    let l = crate::storage::layout();
+    COMPONENT_IDS.contains(&id) && needs_administrator(&l)
+}
+
+/// [`remove`], through the elevated helper when the item is in the program folder and
+/// this process cannot write there (`crate::elevate`). Returns the bytes freed.
+pub fn remove_as_needed(id: &str) -> Result<u64, String> {
+    if !removal_needs_administrator(id) {
+        return remove(id);
+    }
+    let before = removable()
+        .into_iter()
+        .find(|r| r.id == id)
+        .map(|r| r.bytes)
+        .ok_or_else(|| format!("`{id}` is not a removable component, or is not installed"))?;
+    crate::elevate::run_helper(&[crate::elevate::REMOVE_FLAG, id], &mut |_| {})?;
+    Ok(before)
 }
 
 /// The `id` of the engine's caches among the [`removable`] items.
@@ -1315,6 +1640,7 @@ fn engine_caches_item(v: &serde_json::Value) -> Option<Removable> {
         paths,
         bytes,
         costly: true,
+        shared: false,
     })
 }
 
@@ -1401,7 +1727,7 @@ mod tests {
     fn the_inventory_lists_only_what_is_on_disk() {
         let d = scratch("listing");
         assert!(
-            inventory(&d, &d).is_empty(),
+            inventory(&d, &d, &d).is_empty(),
             "an empty data directory has nothing to remove"
         );
 
@@ -1414,7 +1740,7 @@ mod tests {
             100,
         );
 
-        let inv = inventory(&d, &d);
+        let inv = inventory(&d, &d, &d);
         let ids: Vec<&str> = inv.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -1449,7 +1775,7 @@ mod tests {
             30,
         );
 
-        let freed = remove_in(&d, &d, "primary").unwrap();
+        let freed = remove_in(&d, &d, &d, "primary").unwrap();
         assert_eq!(freed, 2060, "everything the item covers, and nothing else");
         assert!(!d.join("python").exists());
         assert!(!d.join("console-requirements.txt").exists());
@@ -1459,7 +1785,7 @@ mod tests {
             .join("my.json")
             .is_file());
         assert_eq!(
-            inventory(&d, &d)
+            inventory(&d, &d, &d)
                 .iter()
                 .map(|r| r.id.clone())
                 .collect::<Vec<_>>(),
@@ -1496,7 +1822,7 @@ mod tests {
                 .join("x.parquet"),
             1000,
         );
-        let inv = inventory(&tools, &data);
+        let inv = inventory(&tools, &data, &tools);
         let by = |id: &str| inv.iter().find(|r| r.id == id).cloned().unwrap();
         assert_eq!(by("primary").bytes, 10);
         assert_eq!(by("libraries").bytes, 100);
@@ -1505,13 +1831,188 @@ mod tests {
             10,
             "the saved settings and the DIA-NN state"
         );
-        assert_eq!(remove_in(&tools, &data, "settings").unwrap(), 10);
+        assert_eq!(remove_in(&tools, &data, &tools, "settings").unwrap(), 10);
         assert!(!data.join(crate::settings::CONFIG_DIR_NAME).exists());
         assert!(!tools.join(crate::diann::STATE_FILE_NAME).exists());
-        assert_eq!(remove_in(&tools, &data, "libraries").unwrap(), 100);
+        assert_eq!(remove_in(&tools, &data, &tools, "libraries").unwrap(), 100);
         assert!(tools.join(crate::diann::LIBRARY_CACHE_NAME).exists());
         let _ = std::fs::remove_dir_all(&tools);
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// A machine-scope layout over scratch folders: the program folder's components,
+    /// and a user's default folder.
+    fn machine_layout(name: &str) -> crate::storage::Layout {
+        let components = scratch(&format!("{name}-components"));
+        let root = scratch(&format!("{name}-user"));
+        crate::storage::Layout {
+            default_root: root.clone(),
+            storage: root.clone(),
+            tools: components,
+            user_tools: root,
+            configured: false,
+            move_environments: false,
+            scope: crate::scope::Scope::Machine,
+        }
+    }
+
+    #[test]
+    fn in_the_machine_scope_the_components_are_shared_and_the_rest_is_the_users() {
+        let l = machine_layout("machine-inventory");
+        file(&l.tools.join("python").join("pyvenv.cfg"), 10);
+        file(
+            &l.tools
+                .join(THERMO_DIR_NAME)
+                .join("ThermoRawFileParser.exe"),
+            20,
+        );
+        file(
+            &l.tools
+                .join(crate::storage::UV_PYTHON_SUBDIR)
+                .join("py.exe"),
+            30,
+        );
+        file(&l.user_tools.join(crate::diann::STATE_FILE_NAME), 3);
+        file(
+            &l.storage
+                .join(crate::settings::CONFIG_DIR_NAME)
+                .join("a.json"),
+            7,
+        );
+        // A copy the user installed before the components moved to the program folder.
+        file(&l.default_root.join("python").join("pyvenv.cfg"), 1000);
+
+        let inv = inventory_of(&l);
+        let by = |id: &str| inv.iter().find(|r| r.id == id).cloned();
+        let primary = by("primary").expect("the shared environment");
+        assert!(primary.shared, "removing it removes it for every user");
+        assert!(primary.paths[0].starts_with(&l.tools.display().to_string()));
+        assert!(by("thermo").unwrap().shared);
+        // The interpreter is not offered while an environment needs it.
+        assert!(by("runtime").is_none());
+        let settings = by("settings").expect("the user's own settings");
+        assert!(!settings.shared);
+        assert_eq!(
+            settings.bytes, 10,
+            "the saved settings and the DIA-NN state"
+        );
+        let own = by("user-primary").expect("the user's own leftover copy");
+        assert!(!own.shared);
+        assert_eq!(own.bytes, 1000);
+        assert!(own.label.contains("no longer used"), "{}", own.label);
+        // Only components have leftover copies: the settings are listed once.
+        assert!(by("user-settings").is_none());
+
+        // The leftover copy goes, the shared environment stays.
+        assert_eq!(remove_with(&l, "user-primary").unwrap(), 1000);
+        assert!(!l.default_root.join("python").exists());
+        assert!(l.tools.join("python").join("pyvenv.cfg").is_file());
+        // Removing the shared environment (as the elevated helper does) leaves the
+        // interpreter, which is then offered on its own.
+        assert_eq!(remove_with(&l, "primary").unwrap(), 10);
+        let runtime = inventory_of(&l)
+            .into_iter()
+            .find(|r| r.id == "runtime")
+            .expect("the interpreter, now that no environment needs it");
+        assert!(runtime.shared);
+        assert_eq!(runtime.bytes, 30);
+        // A leftover id names only components, and only in the machine scope.
+        assert!(remove_with(&l, "user-settings").is_err());
+        let mut user = l.clone();
+        user.scope = crate::scope::Scope::User;
+        assert!(remove_with(&user, "user-thermo").is_err());
+        let _ = std::fs::remove_dir_all(&l.tools);
+        let _ = std::fs::remove_dir_all(&l.default_root);
+    }
+
+    #[test]
+    fn a_machine_installation_keeps_its_interpreter_and_packages_in_the_program_folder() {
+        let tools = PathBuf::from(if cfg!(windows) {
+            r"C:\Program Files\MuMDIA\components"
+        } else {
+            "/opt/MuMDIA/components"
+        });
+        let env: std::collections::BTreeMap<_, _> = machine_uv_env(&tools).into_iter().collect();
+        assert_eq!(
+            env["UV_PYTHON_INSTALL_DIR"],
+            tools
+                .join(crate::storage::UV_PYTHON_SUBDIR)
+                .into_os_string()
+        );
+        assert_eq!(env["UV_PYTHON_PREFERENCE"], "only-managed");
+        assert_eq!(env["UV_LINK_MODE"], "copy");
+        assert_eq!(env["UV_COMPILE_BYTECODE"], "1");
+    }
+
+    #[test]
+    fn resetting_the_permissions_of_a_folder_succeeds_and_keeps_its_files() {
+        // The real `icacls /reset` on Windows (a no-op elsewhere), on a folder this process
+        // owns, as the end of an installation into the program folder runs it.
+        let d = scratch("icacls");
+        file(&d.join("sub").join("module.pyc"), 16);
+        reset_permissions(&d).unwrap();
+        assert_eq!(
+            std::fs::read(d.join("sub").join("module.pyc"))
+                .unwrap()
+                .len(),
+            16
+        );
+        // A folder that is not there is an error, not a success that reset nothing.
+        assert!(reset_permissions(&d.join("not-there")).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_user_scope_never_needs_an_administrator() {
+        let d = scratch("no-admin");
+        let l = crate::storage::Layout {
+            default_root: d.clone(),
+            storage: d.clone(),
+            tools: d.clone(),
+            user_tools: d.clone(),
+            configured: false,
+            move_environments: false,
+            scope: crate::scope::Scope::User,
+        };
+        assert!(!needs_administrator(&l));
+        // A writable program folder (an administrator's elevated window) needs no prompt.
+        let mut m = l.clone();
+        m.scope = crate::scope::Scope::Machine;
+        assert!(!needs_administrator(&m));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn env_ids_round_trip() {
+        for e in [Env::Primary, Env::Ms2pip, Env::Visdia] {
+            assert_eq!(Env::from_id(e.id()), Some(e));
+        }
+        assert_eq!(Env::from_id("thermo"), None);
+    }
+
+    #[test]
+    fn the_log_since_a_point_survives_the_cap() {
+        let inst = Installer::default();
+        let mut seen = 0;
+        for i in 0..5 {
+            inst.push_log(Env::Primary, format!("line {i}"));
+        }
+        let (lines, _) = inst.log_since(Env::Primary, &mut seen);
+        assert_eq!(lines.len(), 5);
+        assert!(inst.log_since(Env::Primary, &mut seen).0.is_empty());
+        // More lines than the cap keeps: only what is still there is returned.
+        for i in 0..2500 {
+            inst.push_log(Env::Primary, format!("more {i}"));
+        }
+        let (lines, s) = inst.log_since(Env::Primary, &mut seen);
+        assert_eq!(lines.len(), 2000);
+        assert_eq!(lines.last().unwrap(), "more 2499");
+        assert_eq!(s.install_log.len(), 2000);
+        inst.push_log(Env::Primary, "last".into());
+        assert_eq!(
+            inst.log_since(Env::Primary, &mut seen).0,
+            vec!["last".to_string()]
+        );
     }
 
     #[test]
@@ -1520,13 +2021,13 @@ mod tests {
         // A recursive delete taking a string from the interface: anything that is not
         // one of the known ids must fail before the disk is touched.
         for id in ["", "..", "python", "primary", "../../Users"] {
-            let e = remove_in(&d, &d, id).unwrap_err();
+            let e = remove_in(&d, &d, &d, id).unwrap_err();
             assert!(e.contains("not a removable component"), "{id}: {e}");
         }
         // `primary` is refused above only because nothing is installed. Once it is, the
         // same id works: the guard is presence, not a name filter.
         file(&d.join("python").join("pyvenv.cfg"), 1);
-        assert!(remove_in(&d, &d, "primary").is_ok());
+        assert!(remove_in(&d, &d, &d, "primary").is_ok());
 
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -1624,8 +2125,9 @@ mod tests {
         } else {
             assert!(s.ends_with("bin/python"), "{s}");
         }
-        // Never inside the installation directory, which is not user-writable on
-        // Windows.
+        // In the user scope, never inside the installation directory, which is not
+        // user-writable on Windows. (The machine scope puts them there on purpose; it is
+        // tested through `inventory_of` and `crate::storage`.)
         let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|e| e.parent().map(|p| p.to_path_buf()));

@@ -396,6 +396,7 @@ async function init() {
   });
   refreshStorage();
   refreshManaged();
+  installOnStart();
   $("stop").addEventListener("click", stop);
   $("another").addEventListener("click", () => screen("input"));
   $("open-folder").addEventListener("click", () => invoke("reveal", { path: state.outDir }));
@@ -1925,6 +1926,13 @@ function componentsBannerText(c) {
     );
   }
   if (p.error) return p.error;
+  if (!p.complete && !componentInstalling(p) && machineNeedsAdmin(c)) {
+    return (
+      "The analysis components on this computer are installed in the program folder, " +
+      "shared by every user, and they are not ready. Only an administrator can install or " +
+      "update them: press the button and Windows asks for an administrator's permission."
+    );
+  }
   for (const [k, label] of COMPONENT_ENVS.slice(1)) {
     const e = c[k] || {};
     if (componentInstalling(e)) continue;
@@ -1938,6 +1946,38 @@ function componentsBannerText(c) {
     );
   }
   return "";
+}
+
+// Whether the components are in the program folder (the installer's choice, `scope.rs`)
+// and this window cannot change them without asking Windows for an administrator.
+function machineNeedsAdmin(c) {
+  const loc = (c && c.location) || {};
+  return loc.scope === "machine" && !!loc.needs_administrator;
+}
+
+// Where the components are: each user's own folder, or the program folder, shared by every
+// user of the computer, which the administrator chose when installing MuMDIA.
+function renderLocation(loc) {
+  state.location = loc || null;
+  const where = $("components-where");
+  if (!loc) {
+    show(where, false);
+    return;
+  }
+  const machine = loc.scope === "machine";
+  $("setup-sub").textContent = machine
+    ? "MuMDIA needs a small Python environment for retention-time modelling and rescoring. " +
+      "On this computer it is kept in the program folder and shared by every user, so an " +
+      "administrator installs and updates it once for everyone."
+    : "MuMDIA needs a small Python environment for retention-time modelling and rescoring. " +
+      "It is installed once, into your user folder, and needs no administrator rights.";
+  where.textContent = machine
+    ? `Components: ${loc.dir}, in the program folder, shared by every user of this computer. ` +
+      (loc.needs_administrator
+        ? "Installing, updating or removing one asks Windows for an administrator's permission."
+        : "This window runs as administrator, so it changes them directly.")
+    : `Components: ${loc.dir}, your own folder.`;
+  show(where, true);
 }
 
 async function refreshComponents() {
@@ -1975,6 +2015,7 @@ function renderComponents(c) {
   const m = c.ms2pip || {};
   const v = c.visdia || {};
   state.componentsReady = !!p.complete;
+  renderLocation(c.location);
 
   const pill = $("primary-pill");
   const btn = $("install-primary");
@@ -2120,6 +2161,30 @@ async function installVcRuntime() {
   pollVcRuntime();
 }
 
+// Opened by the installer's Finish button (`--install-components-on-start`, asked once of
+// the backend): install the required components into the program folder at once, unless
+// they are already there or being tested.
+async function installOnStart() {
+  let req;
+  try {
+    req = await invoke("startup_request");
+  } catch {
+    return;
+  }
+  if (!req || !req.install_components) return;
+  let c;
+  try {
+    c = await invoke("components_status");
+  } catch {
+    return;
+  }
+  const p = c.primary || {};
+  if (!c.location || c.location.scope !== "machine") return;
+  if (p.complete || componentInstalling(p) || componentTesting(p)) return;
+  screen("setup");
+  await installComponents("primary");
+}
+
 async function installComponents(env) {
   banner($("setup-error"), "");
   // Feedback before the backend answers. The command returns as soon as the installation
@@ -2168,7 +2233,7 @@ function bytesLabel(n) {
 function managedRow(item) {
   const row = node("div", "dataitem");
   row.append(
-    node("div", "dname", item.label),
+    node("div", "dname", item.shared ? `${item.label} (shared by every user)` : item.label),
     node("div", "dsize", bytesLabel(item.bytes)),
     node("div", "dhelp", item.detail)
   );
@@ -2185,10 +2250,14 @@ function managedRow(item) {
     node(
       "p",
       "dwarn",
-      item.costly
-        ? "This is not downloaded again. Getting it back means running the prediction " +
+      item.shared
+        ? "This removes it for every user of this computer, and Windows asks for an " +
+            "administrator's permission. Make sure nobody is searching with it. An " +
+            "administrator can install it again from this screen."
+        : item.costly
+          ? "This is not downloaded again. Getting it back means running the prediction " +
             "once more, which takes hours on a whole proteome."
-        : "This is deleted permanently. Reinstall it from this screen when you need it."
+          : "This is deleted permanently. Reinstall it from this screen when you need it."
     )
   );
   const buttons = node("div", "dact");
@@ -2233,6 +2302,14 @@ function managedRow(item) {
 function renderManaged(m) {
   state.managedDir = m.dir;
   $("managed-where").textContent = m.dir;
+  if (m.scope === "machine") {
+    $("managed-sub").textContent =
+      "Your libraries, settings and caches live in the storage folder above. The analysis " +
+      `components are in the program folder (${m.components_dir}), shared by every user: ` +
+      "removing one removes it for everyone and needs an administrator. Uninstalling MuMDIA " +
+      "removes none of this, because the installer only removes what it put in the program " +
+      "folder itself and all of this was written later. Remove what you no longer need here.";
+  }
   const items = m.items || [];
   $("managed-total").textContent = items.length
     ? bytesLabel(items.reduce((a, x) => a + x.bytes, 0))
@@ -2269,11 +2346,15 @@ function renderStorage(s) {
   }
   const free = s.free_bytes == null ? "" : ` (${bytesLabel(s.free_bytes)} free)`;
   $("storage-where").textContent = s.folder + free;
-  $("storage-envs").textContent =
-    s.environments === s.folder
+  const shared = s.scope === "machine";
+  $("storage-envs").textContent = shared
+    ? `The analysis components are in the program folder (${s.environments}), shared by ` +
+      "every user of this computer; the storage folder does not move them."
+    : s.environments === s.folder
       ? "The Python environments and downloaded tools are in this folder too."
       : `Python environments and downloaded tools: ${s.environments}`;
-  $("storage-move-envs").checked = !!s.move_environments;
+  $("storage-move-envs").checked = !shared && !!s.move_environments;
+  $("storage-move-envs").disabled = shared;
   show($("storage-reset"), s.configured);
   banner($("storage-error"), s.error ? `MuMDIA cannot write here: ${s.error}` : "");
   banner($("storage-warn"), (s.warnings || []).join("\n"));

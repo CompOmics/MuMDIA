@@ -344,6 +344,10 @@ pub struct Status {
     /// Whether a download is published for this platform at all.
     pub available: bool,
     pub download_bytes: u64,
+    /// How many lines were ever added to `log`, which keeps only the newest: the elevated
+    /// helper (`crate::elevate`) streams the lines added since it last looked.
+    #[serde(skip)]
+    pub log_seq: u64,
 }
 
 #[derive(Default)]
@@ -395,6 +399,7 @@ impl Installer {
             let err = s.error.clone();
             let step = s.step.clone();
             let pct = s.percent;
+            fresh.log_seq = s.log_seq;
             *s = fresh;
             if keep != "idle" {
                 s.install_status = keep;
@@ -410,9 +415,38 @@ impl Installer {
         fresh
     }
 
+    /// The lines added to the log since `seen` (updated), and the state as it stands,
+    /// without probing the disk. For the elevated helper.
+    pub fn log_since(&self, seen: &mut u64) -> (Vec<String>, Status) {
+        let Ok(s) = self.state.lock() else {
+            return (Vec::new(), Status::default());
+        };
+        let fresh = s.log_seq.saturating_sub(*seen).min(s.log.len() as u64) as usize;
+        *seen = s.log_seq;
+        (s.log[s.log.len() - fresh..].to_vec(), s.clone())
+    }
+
+    /// Mark an installation as started, refusing a second one.
+    fn begin(&self) -> Result<(), String> {
+        let mut s = self
+            .state
+            .lock()
+            .map_err(|_| "internal state is poisoned".to_string())?;
+        if s.install_status == "installing" {
+            return Err("an install is already running".into());
+        }
+        s.install_status = "installing".into();
+        s.step = "downloading ThermoRawFileParser".into();
+        s.percent = 0;
+        s.log.clear();
+        s.error = None;
+        Ok(())
+    }
+
     fn log(&self, line: String) {
         if let Ok(mut s) = self.state.lock() {
             s.log.push(line);
+            s.log_seq += 1;
             if s.log.len() > 300 {
                 let drop = s.log.len() - 300;
                 s.log.drain(0..drop);
@@ -495,6 +529,9 @@ fn probe(exe: &std::path::Path) -> (bool, Option<String>) {
 }
 
 /// Download and unpack the converter.
+///
+/// In the machine scope (`crate::scope`), from a process that cannot write to the program
+/// folder, through an elevated copy of this application ([`install_as_administrator`]).
 pub fn install(installer: Arc<Installer>) -> Result<(), String> {
     let Some(a) = asset() else {
         return Err(
@@ -503,20 +540,12 @@ pub fn install(installer: Arc<Installer>) -> Result<(), String> {
                 .into(),
         );
     };
-    {
-        let mut s = installer
-            .state
-            .lock()
-            .map_err(|_| "internal state is poisoned".to_string())?;
-        if s.install_status == "installing" {
-            return Err("an install is already running".into());
-        }
-        s.install_status = "installing".into();
-        s.step = "downloading ThermoRawFileParser".into();
-        s.percent = 0;
-        s.log.clear();
-        s.error = None;
+    let layout = crate::storage::layout();
+    if crate::components::needs_administrator(&layout) {
+        return install_as_administrator(installer);
     }
+    let machine = layout.scope == crate::scope::Scope::Machine;
+    installer.begin()?;
 
     std::thread::spawn(move || {
         let dir = crate::components::tools_dir();
@@ -562,6 +591,14 @@ pub fn install(installer: Arc<Installer>) -> Result<(), String> {
             }
         }
 
+        if machine {
+            installer.log("== giving every user of this computer read access to it".into());
+            if let Err(e) = crate::components::reset_permissions(&target) {
+                installer.fail(e);
+                return;
+            }
+        }
+
         let (ok, version) = probe(&exe);
         if !ok {
             installer.fail(format!(
@@ -578,6 +615,51 @@ pub fn install(installer: Arc<Installer>) -> Result<(), String> {
         }
     });
 
+    Ok(())
+}
+
+/// Install the converter into the program folder through an elevated copy of this
+/// application (`crate::elevate`), then check that it runs for this user.
+fn install_as_administrator(installer: Arc<Installer>) -> Result<(), String> {
+    installer.begin()?;
+    std::thread::spawn(move || {
+        if let Ok(mut s) = installer.state.lock() {
+            s.step = "installing as administrator".into();
+        }
+        installer.log(format!(
+            "== installing into the program folder, {}, as administrator. Windows asks for \
+             permission.",
+            crate::components::tools_dir().display()
+        ));
+        let ran = crate::elevate::run_helper(&[crate::elevate::INSTALL_FLAG, "thermo"], &mut |l| {
+            installer.log(l)
+        });
+        if let Err(e) = ran {
+            installer.fail(e);
+            return;
+        }
+        let Some(exe) = crate::components::thermo_parser() else {
+            installer.fail(format!(
+                "the installation as administrator finished, but no ThermoRawFileParser is in {}",
+                crate::components::thermo_dir().display()
+            ));
+            return;
+        };
+        let (ok, version) = probe(&exe);
+        if !ok {
+            installer.fail(format!(
+                "{} was installed but does not run for this user",
+                exe.display()
+            ));
+            return;
+        }
+        installer.log(format!("== installed: {}", version.unwrap_or_default()));
+        if let Ok(mut s) = installer.state.lock() {
+            s.install_status = "done".into();
+            s.step = "installed".into();
+            s.percent = 100;
+        }
+    });
     Ok(())
 }
 
@@ -928,6 +1010,24 @@ mod tests {
         std::fs::create_dir_all(ag.join("AcqData")).unwrap();
         assert_eq!(label(ag.to_str().unwrap()), "Agilent .d");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_log_since_a_point_survives_the_cap() {
+        let inst = Installer::default();
+        let mut seen = 0;
+        for i in 0..400 {
+            inst.log(format!("line {i}"));
+        }
+        let (lines, _) = inst.log_since(&mut seen);
+        assert_eq!(lines.len(), 300, "only what the log still holds");
+        assert_eq!(lines.last().unwrap(), "line 399");
+        inst.log("next".into());
+        assert_eq!(inst.log_since(&mut seen).0, vec!["next".to_string()]);
+        assert!(inst.log_since(&mut seen).0.is_empty());
+        // A refresh keeps the count, so a reader does not see old lines again.
+        let _ = inst.refresh();
+        assert!(inst.log_since(&mut seen).0.is_empty());
     }
 
     #[test]

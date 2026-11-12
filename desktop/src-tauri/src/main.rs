@@ -3,13 +3,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use mumdia_console::{
-    components, diann, engine, predictors, preflight as pf, run, settings, setups, sizing, thermo,
-    viewer,
+    components, diann, elevate, engine, predictors, preflight as pf, run, settings, setups, sizing,
+    thermo, viewer,
 };
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tauri::Manager;
@@ -24,6 +24,9 @@ struct AppState {
     thermo: Arc<thermo::Installer>,
     viewers: Arc<viewer::Viewers>,
     vcruntime: Arc<mumdia_console::vcruntime::Installer>,
+    /// Opened by the installer's Finish button to install the components
+    /// (`--install-components-on-start`); answered once by `startup_request`.
+    install_on_start: AtomicBool,
 }
 
 /// Show a results folder in visDIA, starting the viewer if needed, and return its
@@ -216,10 +219,18 @@ fn components_status(state: tauri::State<'_, AppState>) -> serde_json::Value {
         && [&primary, &ms2pip, &visdia]
             .iter()
             .any(|s| mumdia_console::vcruntime::applies(s.load_error.as_deref()));
+    // Where the components are, so the screen can say so, and whether changing them needs
+    // an administrator (the program folder, from a window that cannot write to it).
+    let layout = mumdia_console::storage::layout();
     serde_json::json!({
         "primary": primary,
         "ms2pip": ms2pip,
         "visdia": visdia,
+        "location": {
+            "scope": layout.scope,
+            "dir": layout.tools.display().to_string(),
+            "needs_administrator": components::needs_administrator(&layout),
+        },
         "vc_runtime": {
             "available": mumdia_console::vcruntime::available(),
             "needed": vc_needed,
@@ -241,6 +252,16 @@ fn components_install(
         Arc::clone(&state.installer),
         env.unwrap_or(components::Env::Primary),
     )
+}
+
+/// Whether this window was opened by the installer's Finish button to install the
+/// components (`--install-components-on-start`, `wix/components-scope.wxs`). True once: a
+/// reload of the interface must not start a second installation.
+#[tauri::command]
+fn startup_request(state: tauri::State<'_, AppState>) -> serde_json::Value {
+    serde_json::json!({
+        "install_components": state.install_on_start.swap(false, Ordering::Relaxed),
+    })
 }
 
 /// Test again whether an environment's packages load (`components::Installer::recheck`),
@@ -329,6 +350,8 @@ fn managed_work_in_progress(state: &AppState) -> Option<String> {
 fn components_removable() -> serde_json::Value {
     serde_json::json!({
         "dir": components::data_dir().display().to_string(),
+        "components_dir": components::tools_dir().display().to_string(),
+        "scope": components::scope(),
         "items": components::removable(),
     })
 }
@@ -378,9 +401,11 @@ fn storage_set(
 ///
 /// Destructive, so it refuses while anything might be reading those files: a search
 /// holds the Python environment open, an installation is writing into it, and a
-/// library build is writing the cache.
+/// library build is writing the cache. A component in the program folder is removed by an
+/// elevated copy of the application (`components::remove_as_needed`), which waits for the
+/// permission prompt, so the work runs off the interface thread.
 #[tauri::command]
-fn components_remove(
+async fn components_remove(
     state: tauri::State<'_, AppState>,
     id: String,
 ) -> Result<serde_json::Value, String> {
@@ -389,10 +414,13 @@ fn components_remove(
             "{busy}. Wait for it to finish, or stop it, before removing anything."
         ));
     }
-    let freed = components::remove(&id)?;
+    let target = id.clone();
+    let freed = tauri::async_runtime::spawn_blocking(move || components::remove_as_needed(&target))
+        .await
+        .map_err(|e| format!("the removal stopped unexpectedly: {e}"))??;
     // The install trackers keep a terminal `done` on purpose, so without this a removed
     // component would go on reporting itself installed until the application restarted.
-    match id.as_str() {
+    match id.strip_prefix(components::USER_COPY_PREFIX).unwrap_or(&id) {
         "primary" => state.installer.forget(components::Env::Primary),
         "ms2pip" => state.installer.forget(components::Env::Ms2pip),
         "visdia" => state.installer.forget(components::Env::Visdia),
@@ -1054,9 +1082,32 @@ fn materialise_presets() -> Result<std::path::PathBuf, String> {
 }
 
 fn main() {
+    // `--install-components` / `--remove-components`: the elevated helper the Setup screen
+    // starts for the program folder, or an administrator's deployment script
+    // (`elevate`). It does its work and exits without opening a window.
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    if let Some(parsed) = elevate::parse(&args) {
+        let code = match parsed {
+            Ok(inv) => elevate::helper_main(&inv),
+            Err(e) => {
+                use std::io::Write as _;
+                let _ = writeln!(std::io::stderr(), "{e}");
+                elevate::EXIT_USAGE
+            }
+        };
+        std::process::exit(code);
+    }
+    let state = AppState::default();
+    state
+        .install_on_start
+        .store(elevate::wants_install_on_start(&args), Ordering::Relaxed);
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(AppState::default())
+        .manage(state)
         .setup(|app| {
             // Tell the engine and component lookups where the bundler put things.
             // Without this an AppImage cannot find its own engine: its resources live
@@ -1076,6 +1127,7 @@ fn main() {
             components_removable,
             components_remove,
             components_recheck,
+            startup_request,
             storage_info,
             storage_set,
             vcruntime_install,
