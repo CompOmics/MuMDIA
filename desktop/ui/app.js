@@ -770,23 +770,17 @@ function settingsUnsaved() {
 // field; a setting it does not know is listed and left out.
 
 // Engine settings that describe a computer, or one dataset, rather than a search: where the
-// programs, interpreters and caches are, how much of the machine a search may use, and the
-// conditions of a set of files by run name. A setup leaves them out, and loading one keeps
-// this computer's own values.
+// programs and caches are, how much of the machine a search may use, and the conditions of a
+// set of files by run name. A setup leaves them out, and loading one keeps this computer's
+// own values.
 const LOCAL_SETTINGS = new Set([
   "convert.thermo_raw_parser",
   "convert.msconvert",
-  "predict_frag.ms2pip_python",
-  "predict_frag.peptdeep_python",
-  "predict_frag.deeplc_python",
-  "predict_frag.im2deep_python",
   "predict_frag.sidecar_script_dir",
   "predict_frag.library_cache",
   "rt_im_train.deeplc_projection_cache",
-  "rescore.python",
   "rescore.percolator_bin",
   "rescore.features_file",
-  "mbr.python",
   "convert.parallel_conversions",
   "extract.windows_in_flight",
   "extract.max_footprint_gib",
@@ -797,6 +791,30 @@ const LOCAL_SETTINGS = new Set([
   "experiment.overlap_front_threads",
   "experiment.conditions",
 ]);
+
+// The interpreters. A path is this computer's, but a search that needs an interpreter cannot
+// do without one (the engine refuses `rescore.classifier = nn_torch` without `rescore.python`,
+// MS2PIP, DeepLC and IM2Deep without theirs), so a setup carries "auto" for a path, which
+// finds the interpreter on the computer the setup is loaded on, and loading one keeps an
+// interpreter this computer named itself.
+const INTERPRETER_SETTINGS = new Set([
+  "predict_frag.ms2pip_python",
+  "predict_frag.peptdeep_python",
+  "predict_frag.deeplc_python",
+  "predict_frag.im2deep_python",
+  "rescore.python",
+  "mbr.python",
+]);
+
+// A setting's value as a setup carries it: an interpreter's path as "auto".
+function portableValue(path, v) {
+  return INTERPRETER_SETTINGS.has(path) && typeof v === "string" && v !== "auto" ? "auto" : v;
+}
+
+// Settings whose value on this computer a loaded setup keeps, where the user set one.
+function isComputersOwn(path) {
+  return LOCAL_SETTINGS.has(path) || INTERPRETER_SETTINGS.has(path);
+}
 
 // Every setting a setup holds outside the engine settings, with how it is checked and the
 // name the summary uses. `select`, `radio` and `id` name the control on the Search screen
@@ -988,7 +1006,8 @@ function captureSearch() {
 
 // The Settings screen's values as a setup holds them: the preset they start from, the
 // settings that differ from it and the preset's settings returned to the engine default.
-// `local` names the settings left out because they describe this computer.
+// `local` names the settings left out because they describe this computer, `paths` the
+// interpreters whose path was written as "auto".
 async function captureEngine() {
   let presetName = state.settingsPreset || "";
   let presetPath = presetPathOf(presetName);
@@ -1002,18 +1021,21 @@ async function captureEngine() {
   const changes = {};
   const reset = [];
   const local = [];
+  const paths = [];
   const keys = [...new Set([...Object.keys(state.overrides), ...Object.keys(base)])].sort();
   for (const k of keys) {
     const has = k in state.overrides;
-    if (has && canonical(state.overrides[k]) === canonical(base[k])) continue;
+    const value = has ? portableValue(k, state.overrides[k]) : undefined;
+    if (has && value !== state.overrides[k]) paths.push(k);
+    if (has && canonical(value) === canonical(base[k])) continue;
     if (LOCAL_SETTINGS.has(k)) {
       local.push(k);
       continue;
     }
-    if (has) changes[k] = state.overrides[k];
+    if (has) changes[k] = value;
     else reset.push(k);
   }
-  return { engine: { preset: presetName || null, changes: nestPaths(changes), reset }, local };
+  return { engine: { preset: presetName || null, changes: nestPaths(changes), reset }, local, paths };
 }
 
 // The current setup, for saving it: the Settings screen's edits are saved and used first
@@ -1029,14 +1051,14 @@ async function currentSetup() {
       throw `The changes on the Settings screen were refused by the engine, so no setup was saved: ${e}`;
     }
   }
-  const { engine, local } = await captureEngine();
+  const { engine, local, paths } = await captureEngine();
   const settings = { engine, ...captureSearch() };
   // The same check a load makes, so a setup that is saved can always be loaded.
   const v = validateSetup(settings);
   if (v.errors.length) {
     throw `This setup cannot be saved: ${v.errors.join(" ")} Correct it on the Search screen first.`;
   }
-  return { settings: v.setup, local, savedEdits };
+  return { settings: v.setup, local, paths, savedEdits };
 }
 
 function siteText(s) {
@@ -1127,7 +1149,9 @@ function checkSetupValue(e, v, where, out) {
         }
         const problem = engineValueProblem(f, value);
         if (problem) return { error: `${where}.${path} ${problem}, not ${JSON.stringify(value)}.` };
-        kept[path] = normaliseEngineValue(f, value);
+        const portable = portableValue(path, value);
+        if (portable !== value) out.paths.push(path);
+        kept[path] = normaliseEngineValue(f, portable);
       }
       return { value: nestPaths(kept) };
     }
@@ -1180,9 +1204,10 @@ function normaliseEngineValue(f, v) {
 }
 
 // Check a setup's settings against this version: the normalised setup holds every setting
-// it could use; `errors` refuse it, `unknown` and `local` are reported and left out.
+// it could use; `errors` refuse it, `unknown` and `local` are reported and left out, and
+// `paths` are interpreters whose path is read as "auto".
 function validateSetup(settings) {
-  const out = { setup: {}, errors: [], unknown: [], local: [] };
+  const out = { setup: {}, errors: [], unknown: [], local: [], paths: [] };
   if (!isObject(settings)) {
     out.errors.push("Its settings are not an object.");
     return out;
@@ -1265,6 +1290,12 @@ async function planSetup(doc) {
         `own: ${v.local.join(", ")}.`
     );
   }
+  if (v.paths.length) {
+    warnings.push(
+      `Interpreter paths of another computer, read as "auto", which finds this one's: ` +
+        `${v.paths.join(", ")}.`
+    );
+  }
   const setup = v.setup;
   let engine = null;
   if (setup.engine) {
@@ -1281,7 +1312,7 @@ async function planSetup(doc) {
     const lineage = await seededOverrides(presetPathOf(state.settingsPreset || "") || "");
     const kept = [];
     for (const [k, val] of Object.entries(state.overrides)) {
-      if (!LOCAL_SETTINGS.has(k) || canonical(lineage[k]) === canonical(val)) continue;
+      if (!isComputersOwn(k) || canonical(lineage[k]) === canonical(val)) continue;
       if (canonical(next[k]) !== canonical(val)) kept.push(k);
       next[k] = val;
     }
@@ -1486,6 +1517,12 @@ function savedNotes(cur) {
   }
   if (cur.local.length) {
     parts.push(`Not in the setup, as they describe this computer: ${cur.local.join(", ")}.`);
+  }
+  if (cur.paths.length) {
+    parts.push(
+      `Saved as "auto" rather than this computer's interpreter path, so the other computer ` +
+        `finds its own: ${cur.paths.join(", ")}.`
+    );
   }
   return parts.length ? ` ${parts.join(" ")}` : "";
 }

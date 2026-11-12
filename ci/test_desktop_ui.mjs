@@ -175,6 +175,7 @@ function load() {
     "canonical",
     "SETUP_SPEC",
     "LOCAL_SETTINGS",
+    "INTERPRETER_SETTINGS",
   ];
   const exported = names.map((n) => `${n}: typeof ${n} === "undefined" ? undefined : ${n}`);
   const api = vm.runInContext(`${body}\n;({ ${exported.join(", ")} });`, ctx);
@@ -771,7 +772,15 @@ async function profile() {
       files[SAVED] = nest(flat);
       return SAVED;
     },
-    check_settings: () => null,
+    // The engine's rule that matters here (`config.rs`: a sidecar classifier needs its
+    // interpreter), so a setup that leaves the interpreter out is refused as the engine would.
+    check_settings: ({ overrides }) => {
+      const sidecar = ["nn_torch", "mokapot", "entrapment"].includes(overrides["rescore.classifier"]);
+      if (sidecar && !overrides["rescore.python"]) {
+        throw "invalid config: rescore.classifier=NnTorch requires rescore.python";
+      }
+      return null;
+    },
     search_space: () => ({ plan: { bands: 1, parallel: 1, note: "" }, machine: null }),
     builtin_plan: ({ preset }) => ({ base: preset, note: "", blocked: null, warning: null }),
     diann_library_plan: () => ({ ready: false, diann_version: "DIA-NN 2.2.0" }),
@@ -837,10 +846,12 @@ async function loadInto(p, doc, origin = { kind: "file", path: "/shared/setup.js
 test("a setup saved on one profile gives a fresh profile the same engine configuration", async () => {
   const a = await profile();
   const s = a.api.state;
-  // The Settings screen: two edits to the preset, one setting of this machine.
+  // The Settings screen: two edits to the preset, this machine's interpreter and a limit
+  // sized to this machine.
   s.overrides["rescore.seeds"] = 3;
   delete s.overrides["extract.apex_rt_prior_s"]; // the preset's 120, returned to the default
   s.overrides["rescore.python"] = "C:/envs/rescore/python.exe";
+  s.overrides["extract.windows_in_flight"] = 8;
   assert.equal(await a.api.saveSettings(), true);
   assert.equal(a.el("preset").value, SAVED, "the edits are My settings");
   // The Search screen: a phospho search from a FASTA with the built-in predictors.
@@ -866,7 +877,9 @@ test("a setup saved on one profile gives a fresh profile the same engine configu
   a.el("setups-name").value = "Phospho";
   await a.api.exportCurrentSetup();
   assert.equal(a.el("setups-error").hidden, true, a.el("setups-error").textContent);
-  assert.match(a.el("setups-done").textContent, /Not in the setup, as they describe this computer: rescore\.python/);
+  const done = a.el("setups-done").textContent;
+  assert.match(done, /Not in the setup, as they describe this computer: extract\.windows_in_flight\./);
+  assert.match(done, /Saved as "auto" rather than this computer's interpreter path, so the other computer finds its own: rescore\.python\./);
   const file = a.files["/shared/Phospho.json"];
   assert.equal(file.name, "Phospho");
   const st = file.settings;
@@ -876,6 +889,7 @@ test("a setup saved on one profile gives a fresh profile the same engine configu
     reset: ["extract.apex_rt_prior_s"],
   });
   assert.equal(JSON.stringify(st).includes("python.exe"), false, "no path of this machine");
+  assert.equal(JSON.stringify(st).includes("windows_in_flight"), false, "no limit of this machine");
   assert.deepEqual(st.digest, {
     enzyme: "custom", cleavage_rule: "K*,R*,!*P", missed_cleavages: 2, min_length: 8, max_length: 35,
     min_charge: 2, max_charge: 4, precursor_mz_min: 400, precursor_mz_max: 1200.5,
@@ -896,15 +910,18 @@ test("a setup saved on one profile gives a fresh profile the same engine configu
   assert.equal(b.el("preset").value, SAVED, "changes from the preset are My settings here too");
   assert.equal(b.store.get("phospho")?.name, "Phospho", "kept in My setups");
   // The loaded profile saves the same setup, and its searches get the same configuration
-  // but for the left-out setting, which is this profile's own (the preset's "auto").
+  // but for the left-out settings: this profile's own (the preset's "auto", no limit).
   const again = await b.api.currentSetup();
   assert.deepEqual(sortKeys(host(again.settings)), sortKeys(file.settings));
   const ca = await searchConfig(a);
   const cb = await searchConfig(b);
   assert.equal(cb.derived.rescore.python, "auto");
   assert.equal(ca.derived.rescore.python, "C:/envs/rescore/python.exe");
+  assert.equal(cb.derived.extract?.windows_in_flight, undefined);
   delete ca.derived.rescore.python;
   delete cb.derived.rescore.python;
+  delete ca.derived.extract.windows_in_flight;
+  if (!Object.keys(ca.derived.extract).length) delete ca.derived.extract;
   assert.equal(JSON.stringify(sortKeys(cb.derived)), JSON.stringify(sortKeys(ca.derived)));
   assert.equal(cb.derived.prescreen.score_before_prediction, true);
   assert.equal(cb.derived.groups.window_groups, 4);
@@ -1036,6 +1053,7 @@ test("settings this version does not know, or that belong to a computer, are lis
   settings.engine.changes = {
     rescore: { seeds: 2, python: "C:/other/python.exe", new_model: "x" },
     predict_frag: { deeplc_python: "D:/deeplc/python.exe" },
+    extract: { windows_in_flight: 16 },
   };
   settings.modifications.fixed[0].note = "always";
   const doc = { ...asRead({ name: "Later", settings }), version: 2, newer: true, notes: ["Written by a newer version of MuMDIA."] };
@@ -1052,16 +1070,18 @@ test("settings this version does not know, or that belong to a computer, are lis
   ]) {
     assert.ok(warn.includes(key), `${key} is not listed: ${warn}`);
   }
-  assert.match(warn, /describe a computer rather than a search, so this one keeps its own: rescore\.python, predict_frag\.deeplc_python\./);
+  assert.match(warn, /describe a computer rather than a search, so this one keeps its own: extract\.windows_in_flight\./);
+  assert.match(warn, /Interpreter paths of another computer, read as "auto", which finds this one's: rescore\.python, predict_frag\.deeplc_python\./);
   assert.match(warn, /This computer's own rescore\.python is kept\./);
   const changes = [...p.api.state.setups.pending.changes];
   assert.ok(changes.includes("Missed cleavages: 1 \u2192 2"), changes.join("\n"));
   assert.ok(changes.includes("rescore.seeds: the engine default (1) \u2192 2"), changes.join("\n"));
-  assert.ok(!changes.some((l) => /python/.test(l)), changes.join("\n"));
+  assert.ok(!changes.some((l) => /python|windows_in_flight/.test(l)), changes.join("\n"));
   p.dialog.ask = async () => true;
   await p.api.applyPendingSetup();
   assert.equal(p.api.state.overrides["rescore.python"], "/home/me/env/bin/python");
   assert.equal(p.api.state.overrides["predict_frag.deeplc_python"], "auto");
+  assert.equal(p.api.state.overrides["extract.windows_in_flight"], undefined);
   assert.equal(p.api.state.overrides["rescore.seeds"], 2);
   assert.equal(p.el("d-missed").value, "2");
   assert.match(p.el("setups-done").textContent, /Loaded "Later": 2 changes\./);
@@ -1120,6 +1140,46 @@ test("Cancel changes nothing, and a setup that matches the screens says so", asy
   assert.equal(p.el("d-missed").value, "1");
 });
 
+test("an interpreter is carried as auto, so a setup that needs one still runs elsewhere", async () => {
+  // Started from the engine defaults, which name no interpreter: the neural rescorer needs
+  // `rescore.python`, and this computer's path is not the other's.
+  const a = await profile();
+  a.el("preset").value = "";
+  await a.api.seedOverridesFromPreset();
+  a.api.state.overrides["rescore.classifier"] = "nn_torch";
+  a.api.state.overrides["rescore.python"] = "C:/envs/rescore/python.exe";
+  assert.equal(await a.api.saveSettings(), true);
+  const cur = await a.api.currentSetup();
+  assert.deepEqual(host(cur.settings.engine), {
+    preset: null,
+    changes: { rescore: { classifier: "nn_torch", python: "auto" } },
+    reset: [],
+  });
+  assert.deepEqual([...cur.paths], ["rescore.python"]);
+  // A fresh profile: accepted by the engine, and it finds its own interpreter.
+  const b = await profile();
+  await loadInto(b, asRead({ name: "NN", settings: cur.settings }));
+  assert.equal(b.api.state.overrides["rescore.python"], "auto");
+  assert.equal(b.el("preset").value, SAVED);
+  // A profile that named its own interpreter keeps it.
+  const c = await profile();
+  c.el("preset").value = "";
+  await c.api.seedOverridesFromPreset();
+  c.api.state.overrides["rescore.python"] = "/opt/mumdia/env/bin/python";
+  await c.api.saveSettings();
+  await loadInto(c, asRead({ name: "NN", settings: cur.settings }));
+  assert.equal(c.api.state.overrides["rescore.python"], "/opt/mumdia/env/bin/python");
+  // Without the interpreter the engine refuses it, and so does the load.
+  const d = await profile();
+  const bare = structuredClone(cur.settings);
+  delete bare.engine.changes.rescore.python;
+  d.el("preset").value = "";
+  await d.api.seedOverridesFromPreset();
+  const refused = await d.api.reviewSetup(asRead({ name: "Bare", settings: bare }), { kind: "file", path: "/b.json" });
+  assert.equal(refused, null);
+  assert.match(d.el("setups-error").textContent, /requires rescore\.python/);
+});
+
 test("a setup's choices are the Search screen's choices", () => {
   const { api } = load();
   const radios = (name) =>
@@ -1136,7 +1196,10 @@ test("a setup's choices are the Search screen's choices", () => {
   }
   // A machine's own settings are settings the engine has.
   const paths = new Set(SCHEMA.fields.map((f) => f.path));
-  for (const k of api.LOCAL_SETTINGS) assert.ok(paths.has(k), `${k} is not an engine setting`);
+  for (const k of [...api.LOCAL_SETTINGS, ...api.INTERPRETER_SETTINGS]) {
+    assert.ok(paths.has(k), `${k} is not an engine setting`);
+  }
+  for (const k of api.INTERPRETER_SETTINGS) assert.ok(!api.LOCAL_SETTINGS.has(k), k);
 });
 
 let failed = 0;

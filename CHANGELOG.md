@@ -204,8 +204,10 @@ than a number. Both are recorded in every run's `manifest.json`.
   and normalisation, prescreen, bands, the ZT Scan analysis and a typed Q1 half-width) and the
   Settings screen's engine settings as the preset they start from plus the changes to it. It
   leaves out what belongs to a dataset or a computer: files, folders, conditions, thread
-  counts, and the engine settings that name programs, interpreters and caches or limit the
-  computer's processors and memory, which loading keeps as the receiving computer's own. The
+  counts, and the engine settings that name programs and caches or limit the computer's
+  processors and memory, which loading keeps as the receiving computer's own; an interpreter
+  path is carried as `"auto"`, because a search that needs an interpreter cannot do without
+  one. The
   file is JSON with a format id and a format version (`mumdia-desktop-settings`, version 1)
   and a migration step per later version, so a file saved now keeps loading. Loading checks
   the setup first and lists what it would change before Apply: a value this version cannot

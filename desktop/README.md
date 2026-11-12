@@ -1025,19 +1025,27 @@ catalogue, the cleavage presets and the settings schema.
 
 Left out, because they belong to a dataset or to a computer rather than to a search: the
 spectra, the FASTA, the library tables and every folder; the conditions of the files; the
-Threads and DIA-NN threads counts; and the engine settings that say where programs,
-interpreters and caches are or how much of the computer a search may take
-(`LOCAL_SETTINGS` in `app.js`): the interpreter paths (`predict_frag.*_python`,
-`rescore.python`, `mbr.python`), `convert.thermo_raw_parser`, `convert.msconvert`,
-`predict_frag.sidecar_script_dir`, `rescore.percolator_bin`, `rescore.features_file`, the
-two cache locations (`predict_frag.library_cache`, `rt_im_train.deeplc_projection_cache`),
-the parallelism and memory limits (`convert.parallel_conversions`,
-`extract.windows_in_flight`, `extract.max_footprint_gib`, `features.chrom_loaders`,
-`rescore.max_feature_matrix_gib`, `rt_im_train.deeplc_predict_shards`,
-`experiment.parallel_runs`, `experiment.overlap_front_threads`) and `experiment.conditions`
-(conditions by run name). Saving says which of them it left out, and loading a setup keeps
-the receiving computer's own values. History is not part of a setup: it is this
-computer's list of results folders.
+Threads and DIA-NN threads counts; and the engine settings that say where programs and
+caches are or how much of the computer a search may take (`LOCAL_SETTINGS` in `app.js`):
+`convert.thermo_raw_parser`, `convert.msconvert`, `predict_frag.sidecar_script_dir`,
+`rescore.percolator_bin`, `rescore.features_file`, the two cache locations
+(`predict_frag.library_cache`, `rt_im_train.deeplc_projection_cache`), the parallelism and
+memory limits (`convert.parallel_conversions`, `extract.windows_in_flight`,
+`extract.max_footprint_gib`, `features.chrom_loaders`, `rescore.max_feature_matrix_gib`,
+`rt_im_train.deeplc_predict_shards`, `experiment.parallel_runs`,
+`experiment.overlap_front_threads`) and `experiment.conditions` (conditions by run name).
+
+The interpreters (`INTERPRETER_SETTINGS`: `predict_frag.ms2pip_python`, `peptdeep_python`,
+`deeplc_python`, `im2deep_python`, `rescore.python`, `mbr.python`) are carried as `"auto"`
+instead of a path. A path is this computer's, but a search that needs an interpreter cannot
+do without one: the engine refuses `rescore.classifier = nn_torch` without
+`rescore.python`, and MS2PIP, DeepLC and IM2Deep without theirs, so leaving them out would
+have made a setup started from the engine defaults unusable elsewhere. `"auto"` finds the
+receiving computer's interpreter.
+
+Saving says which settings it left out and which paths it wrote as `"auto"`, and loading a
+setup keeps the receiving computer's own values of both kinds, an interpreter path it named
+included. History is not part of a setup: it is this computer's list of results folders.
 
 Bands are kept as chosen. Automatic plans the search for the computer it runs on, and is
 the choice to share; Off and a Custom count are the sender's decisions, which the
@@ -1104,7 +1112,8 @@ whatever there is to know first. Nothing changes until Apply; Cancel changes not
 - **A setting this version does not know is listed and left out**, never dropped silently;
   for a file from a newer format the list says the settings come from the newer version.
 - **A machine setting in a file** (written by hand, or by another tool) is listed and left
-  out, and this computer's own value is kept.
+  out, and this computer's own value is kept; an interpreter path in a file is read as
+  `"auto"`, and an interpreter this computer named is kept.
 - Edits on the Settings screen that were not saved and used are replaced, and the summary
   says so; a library built with DIA-NN that DIA-NN cannot build on this computer yet is
   said too (the built-in predictors are used until it can, as for a new search).
@@ -1138,12 +1147,14 @@ the engine. `ci/test_desktop_ui.mjs` saves setups on one profile and loads them 
 with the real settings schema, modification catalogue, cleavage presets and example
 presets, and compares the configuration each search would hand the engine (the Search
 screen's `runOverrides` merged onto the preset or onto "My settings", as `settings::derive`
-merges them): identical, except a left-out machine setting, which is each computer's own.
-The cases are a phospho search from a FASTA with a custom cleavage, a terminal modification,
-the prescreen, custom bands, the ZT Scan analysis off and a typed Q1 half-width; edits
-without a machine setting (identical "My settings" and configuration); a preset used as
-it is (the preset file on both sides, nothing written); and ZT Scan files with the analysis
-on. `src/setups.rs` tests the file: what is written reads back as the same settings, the
+merges them): identical, except the left-out machine settings, which are each computer's
+own. The cases are a phospho search from a FASTA with a custom cleavage, a terminal
+modification, the prescreen, custom bands, the ZT Scan analysis off and a typed Q1
+half-width; edits without a machine setting (identical "My settings" and configuration); a
+preset used as it is (the preset file on both sides, nothing written); ZT Scan files with
+the analysis on; and the neural rescorer from the engine defaults, whose interpreter is
+carried as `"auto"` (the emulated `check_settings` applies the engine's rule that it needs
+one). `src/setups.rs` tests the file: what is written reads back as the same settings, the
 refusals, a newer and an older format, names and the store.
 
 The ZT Scan analysis sets the library's search space while it is on (docs/37_ztscan.md,
