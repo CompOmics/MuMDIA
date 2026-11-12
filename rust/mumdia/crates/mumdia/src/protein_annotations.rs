@@ -620,7 +620,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
 /// Write the annotations at `src` to `<out_dir>/protein_annotations.parquet`: a side table
 /// is validated and copied byte for byte (nothing to copy when it is that file already); a
 /// library precursor table's [`LIBRARY_COLUMNS`] are written as the side table they amount
-/// to ([`from_library`], [`write`]). Returns the table's path and row count.
+/// to ([`from_library`], [`write()`]). Returns the table's path and row count.
 pub fn publish(src: &str, out_dir: &str) -> Result<(String, u64)> {
     let (dst, n, _) = publish_from(src, out_dir)?;
     Ok((dst, n))
