@@ -36,8 +36,8 @@ import pyarrow.parquet as pq
 # The engine rejects `large_string` parquet columns ("column 'peptidoform' is not
 # utf8"), and `to_parquet` picks the width itself: pandas 3.x chooses the large
 # variant, so this helper silently emitted libraries the engine would not load.
-from _lib_io import (carry_protein_annotations, narrow_table, sort_fragments_by_candidate,
-                    write_engine_parquet)
+from _lib_io import (embed_annotations, narrow_table, retire_side_table,
+                    sort_fragments_by_candidate, write_engine_parquet)
 from _unimod import MASS_BY_NAME
 
 RES = {
@@ -231,6 +231,10 @@ def _fragment_mz(cum, length, rows, ion_is_b, ordinal, z):
 def main():
     inp, inf, outp, outf = sys.argv[1:5]
     prec = pd.read_parquet(inp)
+    # The protein annotations travel in the precursor table's columns, and each decoy below is
+    # a copy of its target's row, so it carries its target's values; a library from before
+    # the columns existed gets them from the side table beside it.
+    prec, _ = embed_annotations(prec, inp)
     tprec = prec[prec.label == 'target'].copy().reset_index(drop=True)
     tids = tprec.candidate_id.to_numpy().astype(np.int64)
     tgt_toks = {cid: parse(pf) for cid, pf in zip(tprec.candidate_id, tprec.peptidoform)}
@@ -398,8 +402,8 @@ def main():
     # them; restore candidate order so the engine can read one id range of the table.
     sort_fragments_by_candidate(outf)
 
-    # The targets' protein annotations, beside the output library (decoys have none).
-    carry_protein_annotations(inp, outp)
+    # A side table beside the output belongs to another library: this one carries its own.
+    retire_side_table(inp, outp)
     print(f"targets_in={len(tprec)} targets_out={len(tprec_out)} decoys={len(dprec)} total_prec={len(allp)} total_frag={n_out}", flush=True)
 
 

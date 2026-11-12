@@ -124,3 +124,41 @@ def test_merge_keeps_targets_and_takes_the_predicted_decoy_fragments(libraries, 
     assert np.all(counts[is_decoy] == n_pred)
     assert counts.tolist() == out_prec.column("n_fragments").to_pylist()
     assert np.all(np.diff(cid) >= 0), "fragments are not sorted by candidate_id"
+
+
+def test_merge_keeps_the_annotation_columns_decoys_carrying_their_targets(tmp_path):
+    """The merge keeps the input library's rows, so its protein annotation columns survive,
+    each decoy with its target's values (#299); an input from before the columns existed
+    gets them from the side table beside it."""
+    from test_decoy_builders import (_assert_decoys_carry_their_targets_annotations,
+                                     _with_annotation_columns)
+
+    tgt = _with_annotation_columns(_write_target_library(tmp_path), tmp_path / "annotated")
+    rev_p, rev_f = tmp_path / "rev_prec.parquet", tmp_path / "rev_frag.parquet"
+    run_worker_ok("make_reverse_decoys.py", tgt["prec"], tgt["frag"], rev_p, rev_f)
+    pp, pf, _ = _fake_prediction(rev_p, tmp_path)
+    op, of = tmp_path / "out" / "lib_precursors.parquet", tmp_path / "out" / "lib_fragments.parquet"
+    op.parent.mkdir()
+    run_worker_ok("predict_decoys.py", "merge", rev_p, rev_f, pp, pf, op, of)
+    assert_library_load_invariants(op, of, check_string_type=True)
+    _assert_decoys_carry_their_targets_annotations(op)
+
+    # The same library without the columns and with the side table beside it.
+    import sys
+
+    from conftest import SCRIPTS
+
+    sys.path.insert(0, str(SCRIPTS))
+    from _lib_io import ANNOTATION_COLUMNS, annotation_table_from_precursors, write_protein_annotations
+
+    old = tmp_path / "old"
+    old.mkdir()
+    t = pq.read_table(str(rev_p))
+    write_protein_annotations(annotation_table_from_precursors(t.to_pandas()),
+                              old / "protein_annotations.parquet")
+    pq.write_table(t.drop(list(ANNOTATION_COLUMNS)), str(old / "rev_prec.parquet"))
+    op2 = tmp_path / "out2" / "lib_precursors.parquet"
+    op2.parent.mkdir()
+    run_worker_ok("predict_decoys.py", "merge", old / "rev_prec.parquet", rev_f, pp, pf, op2,
+                  op2.parent / "lib_fragments.parquet")
+    _assert_decoys_carry_their_targets_annotations(op2)

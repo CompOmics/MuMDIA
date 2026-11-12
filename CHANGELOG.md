@@ -193,6 +193,53 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A search from a spectral library has its protein accessions, entry names and gene names
+  wherever the library goes (#299).** The annotations lived only in
+  `protein_annotations.parquet`, found beside the library's precursor table, so a library
+  whose two tables were copied without it, or one imported before 0.10.0 (a library the
+  desktop application had cached among them), gave TSVs without the `protein_ids`,
+  `protein_names` and `genes` columns, and nothing said so. An imported library now carries
+  them in three optional columns of its own precursor table, `protein_ids`,
+  `protein_names` and `genes`, which give every precursor the annotation of its `protein`:
+  `scripts/import_diann_lib.py` writes them from DIA-NN's `Protein.Ids`, `Protein.Names` and
+  `Genes`, as it wrote the side table; the decoy builders (`make_reverse_decoys.py`,
+  `make_shift_decoys.py`, `predict_decoys.py`) keep them on every target and copy them onto
+  its decoy, and write them from the side table beside an input imported before; and
+  `augment_library.py` names the peptides it adds from the FASTA. `run`, `run-experiment` and
+  `mumdia report` take the annotations from `--lib-annotations` / `--protein-annotations`
+  (which now also accept an annotated library precursor table), else the library's columns,
+  else the side table beside it; without any, the search warns when it starts and again at
+  its report and records `protein_annotations_missing` (the library and the warning) in its
+  manifest. The columns are read from the target rows when the report is written and never
+  by a search stage, so every identification, q value and quantity is the same: a smoke arm
+  searches one library with and without them and finds byte-identical scored and quant
+  tables. A FASTA search, and its library, are unchanged byte for byte (docs/15,
+  "protein_annotations").
+- **`import_diann_lib.py --fasta <path>` fills what a DIA-NN library leaves empty** (a gene
+  DIA-NN did not parse, a library without `Genes`) from the FASTA headers, matching each
+  protein's members and accessions to a header's first word, accession or entry name, and
+  keeps every value the library gives. The desktop application's library build passes the
+  FASTA it predicted from; an import of an existing library has none and needs none.
+
+### Changed
+
+- **`peptides.tsv`, `precursors.tsv` and `proteins.tsv` end with `protein_ids`,
+  `protein_names` and `genes` with or without annotations (#299).** Without annotations
+  their cells are empty, with a warning, where from 0.10.0 to 0.12.0 the columns were left
+  out: the files have one layout whatever the library, and a search without annotations is
+  never silent. A FASTA search, which always has them, writes the same bytes; a library
+  search without them gains three empty columns.
+- **The library importer and the decoy builders write no `protein_annotations.parquet`
+  beside the library they write**; the annotations are in its precursor table. A side table
+  found beside the output, which belongs to another library, is removed, as before. The
+  engine still reads a side table beside a library imported from 0.10.0 to 0.12.0, and a
+  FASTA search and a FASTA-built library still write theirs. `--annotations <path>` on the
+  importer still writes the side table, now in addition to the columns.
+- The manifest records a search's annotation table with the producer `library-columns`
+  when it was read from the library's columns (`library-input` remains a copied side
+  table, `digest` a FASTA search's own).
 ### Added
 
 - **Setups in the desktop application: a search setup saved under a name, or to a file

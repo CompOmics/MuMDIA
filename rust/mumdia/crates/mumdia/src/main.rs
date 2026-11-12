@@ -681,10 +681,12 @@ enum Cmd {
         /// Prebuilt fragment library paired with --lib-precursors.
         #[arg(long)]
         lib_fragments: Option<String>,
-        /// The library's protein annotation table (accessions, entry names, genes), which
-        /// adds `protein_ids`, `protein_names` and `genes` to the TSVs. Default: the
-        /// `protein_annotations.parquet` beside --lib-precursors when there is one; a FASTA
-        /// search writes its own.
+        /// The library's protein annotations (accessions, entry names, genes), which fill the
+        /// `protein_ids`, `protein_names` and `genes` columns of the TSVs: a protein
+        /// annotation table, or a library precursor table that carries those columns.
+        /// Default: the columns of --lib-precursors, else the `protein_annotations.parquet`
+        /// beside it; without either the columns are empty, with a warning. A FASTA search
+        /// writes its own.
         #[arg(long)]
         lib_annotations: Option<String>,
         #[arg(long)]
@@ -900,10 +902,12 @@ enum Cmd {
         /// A FASTA to number the sites of sites.tsv on their proteins.
         #[arg(long)]
         fasta: Option<String>,
-        /// The protein annotation table (`protein_annotations.parquet`): adds
-        /// `protein_ids`, `protein_names` and `genes` to the three TSVs. Default: the one the
-        /// experiment manifest names, else the one beside --psms-scored or in
-        /// --experiment-dir when there is one.
+        /// The protein annotations that fill the `protein_ids`, `protein_names` and `genes`
+        /// columns of the three TSVs: a protein annotation table
+        /// (`protein_annotations.parquet`), or a library precursor table that carries those
+        /// columns. Default: the table the experiment manifest names, else the one beside
+        /// --psms-scored or in --experiment-dir; without one the columns are empty, with a
+        /// warning.
         #[arg(long)]
         protein_annotations: Option<String>,
         /// Reported q threshold. Defaults to `quant.q_threshold` from `--config`
@@ -3089,7 +3093,7 @@ fn real_main() -> Result<()> {
                     .map(String::from);
                 // The protein annotations: --protein-annotations, else the table the
                 // manifest names, else one in the directory (an experiment from before the
-                // manifest named it). None of them leaves the TSVs as they were.
+                // manifest named it). None of them leaves the annotation cells empty.
                 let annotations = match protein_annotations.clone() {
                     Some(a) => Some(a),
                     None => e
@@ -3102,6 +3106,15 @@ fn real_main() -> Result<()> {
                             b.is_file().then(|| b.display().to_string())
                         }),
                 };
+                if annotations.is_none() {
+                    tracing::warn!(
+                        "report: no protein annotations (no --protein-annotations, none named by \
+                         {manifest_path} and no {} in {exp}), so the protein_ids, protein_names \
+                         and genes columns are empty; pass --protein-annotations with a protein \
+                         annotation table or an annotated library precursor table",
+                        mumdia::protein_annotations::FILE_NAME
+                    );
+                }
                 let out = out_dir.unwrap_or_else(|| exp.clone());
                 std::fs::create_dir_all(&out)?;
                 let pep = format!("{out}/peptides.tsv");
@@ -3159,6 +3172,15 @@ fn real_main() -> Result<()> {
                     let b = mumdia::protein_annotations::beside(&psms_scored);
                     b.is_file().then(|| b.display().to_string())
                 });
+                if annotations.is_none() {
+                    tracing::warn!(
+                        "report: no protein annotations (no --protein-annotations and no {} \
+                         beside {psms_scored}), so the protein_ids, protein_names and genes \
+                         columns are empty; pass --protein-annotations with a protein \
+                         annotation table or an annotated library precursor table",
+                        mumdia::protein_annotations::FILE_NAME
+                    );
+                }
                 let loc = (!loc_tables.is_empty()).then(|| stages::report::Localisation {
                     tables: &loc_tables,
                     experiment: None,

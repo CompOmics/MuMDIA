@@ -160,6 +160,7 @@ ion-mobility source (`artifact::fragment_library_precursors(has_im)`). Version 2
 | `protein` | Utf8 | no | - | protein accessions |
 | `n_fragments` | Int32 | no | - | number of fragments kept for this candidate after top-N |
 | `predicted_im` | Float64 | yes | V s cm^-2 (1/K0) | version 2 only. Library reduced ion mobility: IM2Deep's single-conformer CCS converted at `precursor_mz` (predict-frag under `predict_frag.im_predictor`; never null there, a miss is dropped with its pair), or the imported library's `IM` / `IonMobility` (null where the source value is missing, non-finite or not positive). A script-built decoy carries its target's value, null included |
+| `protein_ids`, `protein_names`, `genes` | Utf8 | no | - | optional, all three or none: the protein annotation of the row's `protein` (accessions, UniProt entry names, gene names, each `;`-separated, empty when unknown; "protein_annotations" below). Written by `scripts/import_diann_lib.py` and kept by the decoy builders and `augment_library.py`, a decoy carrying its target's values; never written by `predict-frag`, so a FASTA-built library has none and its schema version is unchanged. No search stage reads them: `report` takes them from the target rows (#299) |
 
 ### fragment_library fragments (`predict_frag.rs:212-223`)
 
@@ -178,13 +179,20 @@ ion-mobility source (`artifact::fragment_library_precursors(has_im)`). Version 2
 
 ### protein_annotations (`protein_annotations.rs`, `scripts/_lib_io.py`)
 
-`protein_annotations.parquet`, artifact `protein_annotations` v1: the accessions, entry
-names and gene names of a library's proteins, beside the library's precursor table. The
-library's `protein` column is the grouping key every later table inherits (the scored
-tables' `protein` and `protein_group`, quant, the cross-run LFQ, the TSVs) and stays as it
-is; this table only names it. `report` joins it to append `protein_ids`, `protein_names`
-and `genes` to the three TSVs ("TSV reports" below). Nothing else reads it, so every
-identification, q value and quantity is the same with or without it.
+The accessions, entry names and gene names of a library's proteins. The library's `protein`
+column is the grouping key every later table inherits (the scored tables' `protein` and
+`protein_group`, quant, the cross-run LFQ, the TSVs) and stays as it is; the annotations only
+name it. `report` joins them to fill `protein_ids`, `protein_names` and `genes`, the last three
+columns of the three TSVs ("TSV reports" below). Nothing else reads them, so every
+identification, q value and quantity is the same with or without them.
+
+They come in two shapes. An imported library carries them itself, in three optional columns
+of its precursor table (`protein_ids`, `protein_names`, `genes`, "fragment_library
+precursors" above), so they travel with the library wherever its two tables are copied
+(#299). Everything else is a side table, `protein_annotations.parquet`, artifact
+`protein_annotations` v1, one row per `protein` key: what `digest` writes for a FASTA, what
+the importer wrote beside a library from 0.10.0 to 0.12.0, and what a search writes into its
+output directory whatever its source.
 
 | column | type | notes |
 |---|---|---|
@@ -194,34 +202,53 @@ identification, q value and quantity is the same with or without it.
 | `genes` | utf8 | gene names, `;`-separated |
 | `description` | utf8 | free text (a FASTA header's description before ` OS=`); not reported |
 
-Every column is non-null; a value the source does not give is the empty string.
+Every column is non-null; a value the source does not give is the empty string. In the
+library's columns a NULL cell reads as empty.
 
-Writers. `scripts/import_diann_lib.py` writes one row per distinct library `protein` string
-from the DIA-NN columns `Protein.Ids`, `Protein.Names` and `Genes`: `protein_ids` are the
-`Protein.Ids` tokens, the accession field of a `db|ACCESSION|ENTRY_NAME` id (a `CON_sp|...`
-contaminant, an `ENTRAP_sp|...` entrapment protein); `protein_names` the entry names of
-`Protein.Names`, then those of such ids; `genes` the `Genes` tokens without the description
-words a non-UniProt header leaves there (`Keratin,`). Two precursors whose names merge
-isoforms under one key (`ALBU_HUMAN` for `P02768` and for `P02768;P02768-2`) give one row
-with every token once, in the order the library first gives them. `UNASSIGNED` and decoys
-get no row. `digest` writes one row per FASTA header, keyed by the header's first word
-(what it writes as `protein`): `sp|P02768|ALBU_HUMAN Serum albumin OS=... GN=ALB` gives
-`P02768`, `ALBU_HUMAN`, `ALB` and `Serum albumin`, a prefixed UniProt header
-(`CON_sp|P02769|ALBU_BOVIN`) its two fields, any other header its first word as the
-accession and nothing else. `make_reverse_decoys.py`, `make_shift_decoys.py` and
-`predict_decoys.py` copy the table beside their output library; `augment_library.py` adds
-the FASTA proteins of the peptides it adds. A library built before the table existed has
-none.
+Writers. `scripts/import_diann_lib.py` writes the library's columns from the DIA-NN columns
+`Protein.Ids`, `Protein.Names` and `Genes`, per distinct library `protein` string, and gives
+every precursor of that string its values: `protein_ids` are the `Protein.Ids` tokens, the
+accession field of a `db|ACCESSION|ENTRY_NAME` id (a `CON_sp|...` contaminant, an
+`ENTRAP_sp|...` entrapment protein); `protein_names` the entry names of `Protein.Names`, then
+those of such ids; `genes` the `Genes` tokens without the description words a non-UniProt
+header leaves there (`Keratin,`). Two precursors whose names merge isoforms under one key
+(`ALBU_HUMAN` for `P02768` and for `P02768;P02768-2`) get every token once, in the order the
+library first gives them. `UNASSIGNED` has empty cells. With `--fasta`, what the library
+leaves empty is filled from the FASTA headers (each protein's members and accessions matched
+as a header's first word, accession or entry name; a value the library gives is kept), and
+`--annotations <path>` also writes the side table. A library with neither `Protein.Ids` nor
+`Protein.Names` gets no columns. `make_reverse_decoys.py`, `make_shift_decoys.py` and
+`predict_decoys.py` keep the columns on every target and copy them onto its decoy (a decoy row
+is a copy of its target's row, so the two populations stay alike in every column the builder
+does not rewrite); an input library from before the columns existed gets them from the side
+table beside it (`_lib_io.embed_annotations`). `augment_library.py` names the peptides it adds
+from the side table `digest` writes for its FASTA, and the imported proteins from the FASTA
+when the imported library has no annotations. `digest` writes the side table, one row per
+FASTA header, keyed by the header's first word (what it writes as `protein`):
+`sp|P02768|ALBU_HUMAN Serum albumin OS=... GN=ALB` gives `P02768`, `ALBU_HUMAN`, `ALB` and
+`Serum albumin`, a prefixed UniProt header (`CON_sp|P02769|ALBU_BOVIN`) its two fields, any
+other header its first word as the accession and nothing else. A library imported before
+0.10.0 has neither shape.
 
-How the engine finds it. `run` and `run-experiment` take `--lib-annotations <path>`, else
-the `protein_annotations.parquet` beside `--lib-precursors` when there is one (validated
-before the search starts); a FASTA search uses the one its `digest` wrote into the output
-directory, which is rewritten from the FASTA on a library-cache hit, so the cache does not
-store it. The table is copied into the output directory (the experiment root), recorded in
-the manifest (`artifacts.protein_annotations`, and `experiment.protein_annotations` in
+How the engine finds them. `run` and `run-experiment` take, in this order: `--lib-annotations
+<path>` (a side table, or a library precursor table that carries the columns); the columns of
+`--lib-precursors` (`protein_annotations::LIBRARY_COLUMNS`, read from its target rows, the
+table's footer checked before the search starts); the `protein_annotations.parquet` beside
+`--lib-precursors` (validated before the search starts). With none of them the search warns
+when it starts and again at its report, records `protein_annotations_missing` (`{lib_precursors,
+warning}`) in `manifest.json` (in the `experiment` block of `experiment_manifest.json` for
+`run-experiment`), and writes the three TSV columns empty. A precursor table with only some of
+the three columns is refused before the search starts. A FASTA search uses the side table its
+`digest` wrote into the output directory, which is rewritten from the FASTA on a library-cache
+hit, so the cache does not store it, and a FASTA-built library keeps it beside its precursor
+table. Whatever the source, a side table lands in the output directory (the experiment root):
+copied byte for byte from a side table (manifest producer `library-input`), written from a
+library's columns (`library-columns`) or written by `digest` (`digest`). It is recorded in the
+manifest (`artifacts.protein_annotations`, and `experiment.protein_annotations` in
 `experiment_manifest.json`) and kept by every retention tier. `mumdia report` takes
-`--protein-annotations`, else the table the experiment manifest names, else the one in
-`--experiment-dir` or beside `--psms-scored`.
+`--protein-annotations` (a side table or an annotated library precursor table), else the table
+the experiment manifest names, else the one in `--experiment-dir` or beside `--psms-scored`,
+and warns when it finds none.
 
 ## Stage S: `search-seed` (`stages/search_seed.rs`)
 
@@ -1253,6 +1280,7 @@ provenance for reproducibility. Top-level `Manifest`:
 | `config_hash` | string | hash of the resolved config |
 | `model_identities` | object | map of role (`rt_predictor`, `fragment_predictor`, `rescorer`, `feature_schema_id`) to identity string |
 | `artifacts` | object | map of logical name to `ArtifactRecord` |
+| `protein_annotations_missing` | object | only for a search from a library without protein annotations ("protein_annotations" above): `lib_precursors`, the library, and `warning`, the text the search logged; `run-experiment` writes it in the `experiment` block of `experiment_manifest.json` |
 | `rt_calibration_missing` | array | only when the run had no retention-time calibration: one `{run, pass, calibration_status, n_train, cal_json}` per uncalibrated run (`stages/rt_health.rs`); `run-experiment` writes it in the `experiment` block of `experiment_manifest.json`, with `pass` `first_pass` or `second_pass` |
 | `lfq_normalisation` | object | `experiment_manifest.json` only, in its `experiment` block: `scope` (`all`, `condition`, `none`, `quant.normalisation_scope`), `method` (`median_ratio`, or `none` when no size factor was applied) and `size_factors`, the path of `lfq_size_factors.tsv` |
 | `conditions` | object | `experiment_manifest.json` only, in its `experiment` block, when any run has a condition (`--condition`, `--sample-sheet`, `experiment.conditions`): run name -> condition |
@@ -1296,17 +1324,19 @@ tighter `--q` does not revoke a transfer that already passed `mbr.q_transfer`. A
 transfer is a peptide-level acceptance, not protein-group confidence; a protein group
 admitted through a transferred row carries the flag so the reader can tell.
 
-**Protein annotation columns, every writer.** With a protein annotation table
-(`protein_annotations`, above) each file ends with three more columns, after every other
-one so that a reader addressing the existing columns by position is unaffected:
+**Protein annotation columns, every writer.** Each file ends with three more columns, after
+every other one so that a reader addressing the existing columns by position is unaffected:
 `protein_ids`, `protein_names` and `genes`, the accessions, UniProt entry names and gene
 names of the row's `protein` (`peptides.tsv`, `precursors.tsv`) or `protein_group`
-(`proteins.tsv`), each `;`-separated. A key that is in the table gives its row; one that is
-not (a FASTA library's protein string of a shared peptide) is split on `;` and its members'
-values are listed in member order, each once; a key with no row (`UNASSIGNED`) has empty
-cells. The lists are not positional: a gene shared by two accessions is listed once, so
-`protein_ids` and `genes` can differ in length. Without a table the three columns are
-absent and the files are byte-identical to what they were.
+(`proteins.tsv`), each `;`-separated, from the protein annotations (`protein_annotations`,
+above). A key that the annotations name gives its values; one that they do not (a FASTA
+library's protein string of a shared peptide) is split on `;` and its members' values are
+listed in member order, each once; a key with no annotation (`UNASSIGNED`) has empty cells.
+The lists are not positional: a gene shared by two accessions is listed once, so
+`protein_ids` and `genes` can differ in length. The columns are there with or without
+annotations, so the files have one layout whatever the library; without annotations every
+cell is empty and the search or `mumdia report` says so in a warning (#299; from 0.10.0 to
+0.12.0 the columns were left out instead, without a warning).
 
 Values are formatted for reading, not for analysis: `q_value` is printed to six
 decimals, `score` to four, and `quantity` to one
@@ -1330,7 +1360,7 @@ the best q (`report.rs:90,105-108`). Targets only, filtered on
 | `quantity` | `peptide_quant.parquet` joined on `(peptidoform, charge)` | empty when the precursor was not quantifiable or no `--peptide-quant` was passed (`report.rs:39-45,61-72`) |
 | `is_transferred` | `is_transferred` (`mumdia mbr`), `false` without it | `true` when the row was admitted as a match-between-runs transfer rather than on its q |
 | `transfer_q` | `transfer_q` (`mumdia mbr`) | the transfer q the row was accepted at, six decimals; empty on every other row |
-| `protein_ids`, `protein_names`, `genes` | `protein_annotations` joined on `protein` | with an annotation table only, after every other column (the localisation columns included) |
+| `protein_ids`, `protein_names`, `genes` | `protein_annotations` joined on `protein` | after every other column (the localisation columns included); empty without annotations |
 
 The row unit and the filter column deliberately disagree, and this is the single
 most common misreading of MuMDIA output: rows are precursors
@@ -1389,7 +1419,7 @@ with a non-empty group, filtered on `pg_q_value <= --q` (`report.rs:137`).
 | `quantity` | `protein_group_quant.parquet` joined on `protein_group` | empty when not quantifiable or no `--protein-quant` was passed |
 | `is_transferred` | `is_transferred` of the admitting row | `true` when the group entered through a transferred peptide row; a transfer is not protein-group confidence |
 | `transfer_q` | `transfer_q` of the admitting row | empty unless `is_transferred` |
-| `protein_ids`, `protein_names`, `genes` | `protein_annotations` joined on `protein_group` | with an annotation table only; per member of the group, in the group's order |
+| `protein_ids`, `protein_names`, `genes` | `protein_annotations` joined on `protein_group` | per member of the group, in the group's order; empty without annotations |
 
 Both grouped q columns (`peptide_q_value`, `pg_q_value`) are written only to each
 group's single winning row, so under an experiment-wide rescore the grouping is

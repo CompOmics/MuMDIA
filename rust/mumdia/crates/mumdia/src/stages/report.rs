@@ -31,9 +31,10 @@ pub struct ReportParams<'a> {
     /// Where `precursors.tsv` goes; `None` writes only the two files above.
     pub out_precursors: Option<&'a str>,
     pub q_threshold: f64,
-    /// The protein annotation table (`protein_annotations`): appends `protein_ids`,
-    /// `protein_names` and `genes` to every row of the three files. `None` writes them
-    /// byte for byte as before.
+    /// The protein annotations (`protein_annotations`: a side table, or a library precursor
+    /// table that carries the annotation columns), which fill `protein_ids`, `protein_names`
+    /// and `genes`, the last three columns of every row of the three files. `None` leaves
+    /// those cells empty; the columns are there either way.
     pub protein_annotations: Option<&'a str>,
 }
 
@@ -202,27 +203,28 @@ fn precursor_head_cells(
     Ok(())
 }
 
-/// The protein annotation table of a report, when it has one.
+/// The protein annotations of a report, when it has some.
 fn load_annotations(path: Option<&str>) -> Result<Option<ProteinAnnotations>> {
     path.map(ProteinAnnotations::load).transpose()
 }
 
-/// The annotation columns' header cells, after every other column; nothing without a table.
-fn annotation_header(w: &mut impl Write, ann: &Option<ProteinAnnotations>) -> Result<()> {
-    if ann.is_some() {
-        write!(w, "{}", crate::protein_annotations::TSV_HEADER)?;
-    }
+/// The annotation columns' header cells, after every other column. Written with or without
+/// annotations, so the three files have one layout whatever the library (#299).
+fn annotation_header(w: &mut impl Write) -> Result<()> {
+    write!(w, "{}", crate::protein_annotations::TSV_HEADER)?;
     Ok(())
 }
 
-/// The annotation cells of a row's `protein` (or `protein_group`) key.
+/// The annotation cells of a row's `protein` (or `protein_group`) key, empty without
+/// annotations.
 fn annotation_cells(
     w: &mut impl Write,
     ann: &Option<ProteinAnnotations>,
     protein: &str,
 ) -> Result<()> {
-    if let Some(a) = ann {
-        write!(w, "{}", a.cells(protein))?;
+    match ann {
+        Some(a) => write!(w, "{}", a.cells(protein))?,
+        None => write!(w, "\t\t\t")?,
     }
     Ok(())
 }
@@ -451,7 +453,7 @@ pub fn run_localised(p: ReportParams, loc: Option<&Localisation>) -> Result<Repo
     if let Some(c) = &site_cells {
         write!(w, "{}", c.header())?;
     }
-    annotation_header(&mut w, &ann)?;
+    annotation_header(&mut w)?;
     writeln!(w)?;
     let mut npep = 0u64;
     for &j in &order {
@@ -497,7 +499,7 @@ pub fn run_localised(p: ReportParams, loc: Option<&Localisation>) -> Result<Repo
         w2,
         "protein_group\tq_value\tquantity\tis_transferred\ttransfer_q"
     )?;
-    annotation_header(&mut w2, &ann)?;
+    annotation_header(&mut w2)?;
     writeln!(w2)?;
     let mut nprot = 0u64;
     for &j in &porder {
@@ -543,7 +545,7 @@ pub fn run_localised(p: ReportParams, loc: Option<&Localisation>) -> Result<Repo
         if let Some(c) = &site_cells {
             write!(w3, "{}", c.header())?;
         }
-        annotation_header(&mut w3, &ann)?;
+        annotation_header(&mut w3)?;
         writeln!(w3)?;
         for &j in &order {
             precursor_head_cells(
@@ -825,7 +827,7 @@ pub fn run_experiment_localised(
     if let Some(c) = &site_cells {
         write!(w, "{}", c.header())?;
     }
-    annotation_header(&mut w, &ann)?;
+    annotation_header(&mut w)?;
     writeln!(w)?;
     let mut npep = 0u64;
     for &j in &order {
@@ -888,7 +890,7 @@ pub fn run_experiment_localised(
         }
     }
     write!(w2, "\tis_transferred\ttransfer_q")?;
-    annotation_header(&mut w2, &ann)?;
+    annotation_header(&mut w2)?;
     writeln!(w2)?;
     let mut nprot = 0u64;
     for &j in &porder {
@@ -963,7 +965,7 @@ pub fn run_experiment_localised(
         if let Some(c) = &site_cells {
             write!(w3, "{}", c.header())?;
         }
-        annotation_header(&mut w3, &ann)?;
+        annotation_header(&mut w3)?;
         writeln!(w3)?;
         let none = vec![f64::NAN; n_runs];
         for &j in &order {
@@ -1941,7 +1943,7 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[0],
-            "precursor\tstripped_sequence\tcharge\tprotein\tq_value\tscore\tn_runs\tquantity_a\tquantity_b\tis_transferred\ttransfer_q"
+            "precursor\tstripped_sequence\tcharge\tprotein\tq_value\tscore\tn_runs\tquantity_a\tquantity_b\tis_transferred\ttransfer_q\tprotein_ids\tprotein_names\tgenes"
         );
         assert_eq!(lines.len(), 3, "header plus two precursors:\n{text}");
         assert!(
@@ -1964,7 +1966,7 @@ mod tests {
         let plines: Vec<&str> = prot.lines().collect();
         assert_eq!(
             plines[0],
-            "protein_group\tq_value\tn_runs\tlfq_a\tlfq_b\tis_transferred\ttransfer_q"
+            "protein_group\tq_value\tn_runs\tlfq_a\tlfq_b\tis_transferred\ttransfer_q\tprotein_ids\tprotein_names\tgenes"
         );
         assert_eq!(
             plines.len(),
@@ -2075,7 +2077,7 @@ mod tests {
         assert_eq!(
             lines[0],
             "precursor\tstripped_sequence\tcharge\tprotein\tq_value\tscore\tn_runs\tquantity_a\t\
-             quantity_b\tfirst_pass_a\tfirst_pass_b\tis_transferred\ttransfer_q"
+             quantity_b\tfirst_pass_a\tfirst_pass_b\tis_transferred\ttransfer_q\tprotein_ids\tprotein_names\tgenes"
         );
         let pep: Vec<&str> = lines[1].split('\t').collect();
         assert_eq!(
@@ -2093,7 +2095,7 @@ mod tests {
         assert_eq!(
             mixed[0],
             "precursor\tstripped_sequence\tcharge\tprotein\tq_value\tscore\tn_runs\tquantity_a\t\
-             quantity_b\tis_transferred\ttransfer_q"
+             quantity_b\tis_transferred\ttransfer_q\tprotein_ids\tprotein_names\tgenes"
         );
     }
 
@@ -2255,22 +2257,21 @@ mod tests {
         run_localised(params(), Some(&l)).unwrap();
         let text = std::fs::read_to_string(&pep).unwrap();
         let mut lines = text.lines();
-        assert!(lines
-            .next()
-            .unwrap()
-            .ends_with("\tsite_probability\tlocalised\tbest_site_peptidoform"));
+        assert!(lines.next().unwrap().ends_with(
+            "\tsite_probability\tlocalised\tbest_site_peptidoform\tprotein_ids\tprotein_names\tgenes"
+        ));
         let rows: Vec<&str> = lines.collect();
         assert!(
-            rows[0].ends_with("\t0.9500\ttrue\tPEPS[Phospho]TIDEK"),
+            rows[0].ends_with("\t0.9500\ttrue\tPEPS[Phospho]TIDEK\t\t\t"),
             "{}",
             rows[0]
         );
         assert!(
-            rows[1].ends_with("\t0.0500\tfalse\tPEPS[Phospho]TIDEK"),
+            rows[1].ends_with("\t0.0500\tfalse\tPEPS[Phospho]TIDEK\t\t\t"),
             "{}",
             rows[1]
         );
-        assert!(rows[2].ends_with("\t\t\t"), "{:?}", rows[2]);
+        assert!(rows[2].ends_with("\t\t\t\t\t\t"), "{:?}", rows[2]);
         let s = std::fs::read_to_string(&sites).unwrap();
         let site_rows: Vec<&str> = s.lines().skip(1).collect();
         assert_eq!(site_rows.len(), 1, "{s}");
@@ -2646,7 +2647,9 @@ mod tests {
         let text = std::fs::read_to_string(&peptides).unwrap();
         let header = text.lines().next().unwrap();
         assert!(
-            header.ends_with("\tquantity\tis_transferred\ttransfer_q"),
+            header.ends_with(
+                "\tquantity\tis_transferred\ttransfer_q\tprotein_ids\tprotein_names\tgenes"
+            ),
             "{header}"
         );
         let late = text
@@ -2672,7 +2675,7 @@ mod tests {
         let plines: Vec<&str> = prot.lines().collect();
         assert_eq!(
             plines[0],
-            "protein_group\tq_value\tquantity\tis_transferred\ttransfer_q"
+            "protein_group\tq_value\tquantity\tis_transferred\ttransfer_q\tprotein_ids\tprotein_names\tgenes"
         );
         let pg: Vec<&str> = plines[1].split('\t').collect();
         assert_eq!((pg[0], pg[3], pg[4]), ("PG1", "false", ""));
@@ -2959,7 +2962,20 @@ mod tests {
                     ("pe.tsv", "pe_old.tsv"),
                     ("ge.tsv", "ge_old.tsv"),
                 ] {
-                    let (x, y) = (std::fs::read(f(a)).unwrap(), std::fs::read(f(b)).unwrap());
+                    let (x, y) = (
+                        std::fs::read_to_string(f(a)).unwrap(),
+                        std::fs::read_to_string(f(b)).unwrap(),
+                    );
+                    // The one-pass report predates the annotation columns every report now
+                    // ends with, empty without annotations.
+                    let y: String = y
+                        .lines()
+                        .enumerate()
+                        .map(|(k, l)| match k {
+                            0 => format!("{l}{}\n", crate::protein_annotations::TSV_HEADER),
+                            _ => format!("{l}\t\t\t\n"),
+                        })
+                        .collect();
                     assert!(
                         x == y,
                         "{a} differs from the one-pass report (mbr {mbr}, threshold \
@@ -3174,7 +3190,7 @@ mod tests {
             header,
             "precursor\tstripped_sequence\tcharge\tprecursor_mz\tprotein\tprotein_group\t\
              q_value\tpeptide_q_value\tprotein_group_q_value\tscore\tapex_rt\tquantity\t\
-             is_transferred\ttransfer_q"
+             is_transferred\ttransfer_q\tprotein_ids\tprotein_names\tgenes"
         );
         let keys: Vec<(&str, &str)> = rows
             .iter()
@@ -3211,7 +3227,7 @@ mod tests {
             ("100.0", "40.0")
         );
         assert_eq!(rows[2][11], "", "no quant row: empty, not zero");
-        assert_eq!(&rows[0][12..], ["false", ""]);
+        assert_eq!(&rows[0][12..], ["false", "", "", "", ""]);
     }
 
     #[test]
@@ -3267,13 +3283,18 @@ mod tests {
             if with_lfq {
                 assert_eq!(
                     header,
-                    format!("{head}\tnormalised_a\tnormalised_b\tis_transferred\ttransfer_q")
+                    format!("{head}\tnormalised_a\tnormalised_b\tis_transferred\ttransfer_q\tprotein_ids\tprotein_names\tgenes")
                 );
                 assert_eq!(&rows[0][11..13], ["11.0", "12.5"]);
                 assert_eq!(&rows[2][11..13], ["", "7.0"]);
                 assert_eq!(&rows[3][11..13], ["", ""]);
             } else {
-                assert_eq!(header, format!("{head}\tis_transferred\ttransfer_q"));
+                assert_eq!(
+                    header,
+                    format!(
+                        "{head}\tis_transferred\ttransfer_q\tprotein_ids\tprotein_names\tgenes"
+                    )
+                );
             }
             // n_runs on run_psm_q: PEPTIDEK/2 in run 0 only; the oxidised form has an
             // experiment-wide precursor q of 0.008 but no run where its run_psm_q passes.
@@ -3325,12 +3346,14 @@ mod tests {
         assert!(c.peptide_rows > 0);
     }
 
-    /// The protein annotation table appends `protein_ids`, `protein_names` and `genes` to
-    /// every row of the three files, single-run and experiment-wide, and changes nothing
-    /// else: each annotated line is the unannotated line plus three cells. A protein group
-    /// without a row gets empty cells.
+    /// The three files end with `protein_ids`, `protein_names` and `genes` with or without
+    /// annotations, single-run and experiment-wide (#299): without them the cells are empty,
+    /// with them each line is the unannotated line with its three cells filled, and nothing
+    /// else changes. A protein group without a row keeps empty cells. A library precursor
+    /// table that carries the annotation columns fills them exactly as the side table it
+    /// amounts to.
     #[test]
-    fn protein_annotations_append_three_columns_and_change_nothing_else() {
+    fn protein_annotations_fill_the_three_columns_and_change_nothing_else() {
         let n_runs = 2u32;
         let names: Vec<String> = (0..n_runs).map(|i| format!("r{i}")).collect();
         let scored = random_scored(20_000, n_runs, true);
@@ -3359,6 +3382,47 @@ mod tests {
             ],
         )
         .unwrap();
+        // The same annotations in a library precursor table's columns, with decoy rows whose
+        // values differ, which must not be read.
+        let lib = tmp("annotated_lib_precursors.parquet");
+        let mut lib_rows: Vec<(String, String, String)> = Vec::new();
+        for k in &keys {
+            lib_rows.push((k.clone(), "target".into(), k.clone()));
+            lib_rows.push((format!("DECOY_{k}"), "decoy".into(), k.clone()));
+        }
+        write_table(
+            &lib,
+            vec![
+                Col::U32("candidate_id".into(), (0..lib_rows.len() as u32).collect()),
+                Col::Str(
+                    "label".into(),
+                    lib_rows.iter().map(|r| r.1.clone()).collect(),
+                ),
+                Col::Str(
+                    "protein".into(),
+                    lib_rows.iter().map(|r| r.0.clone()).collect(),
+                ),
+                Col::Str(
+                    "protein_ids".into(),
+                    lib_rows.iter().map(|r| cell(&r.2, "acc")).collect(),
+                ),
+                Col::Str(
+                    "protein_names".into(),
+                    lib_rows.iter().map(|r| cell(&r.2, "name")).collect(),
+                ),
+                Col::Str(
+                    "genes".into(),
+                    lib_rows
+                        .iter()
+                        .map(|r| match r.1.as_str() {
+                            "target" => cell(&r.2, "gene"),
+                            _ => "DECOY_GENE".to_string(),
+                        })
+                        .collect(),
+                ),
+            ],
+        )
+        .unwrap();
         let expect = |k: &str| -> String {
             if keys.iter().any(|x| x == k) {
                 format!(
@@ -3384,18 +3448,31 @@ mod tests {
                 let (a, b): (Vec<&str>, Vec<&str>) = (a.lines().collect(), b.lines().collect());
                 assert_eq!(a.len(), b.len(), "{name}: same rows");
                 assert!(a.len() > 1, "{name}: the fixture prints rows");
-                assert_eq!(
-                    b[0],
-                    format!("{}{}", a[0], crate::protein_annotations::TSV_HEADER)
-                );
+                assert_eq!(a[0], b[0], "{name}: one header with or without annotations");
+                assert!(a[0].ends_with(crate::protein_annotations::TSV_HEADER));
                 for (x, y) in a.iter().zip(&b).skip(1) {
+                    let stem = x
+                        .strip_suffix("\t\t\t")
+                        .expect("empty annotation cells without annotations");
                     let key = x.split('\t').nth(key_col).unwrap();
-                    assert_eq!(*y, format!("{x}{}", expect(key)), "{name}");
+                    assert_eq!(*y, format!("{stem}{}", expect(key)), "{name}");
                 }
             }
         };
-        let dirs = [tmp("ann_plain"), tmp("ann_on")];
-        for (d, a) in dirs.iter().zip([None, Some(ann.as_str())]) {
+        let same = |x: &str, y: &str| {
+            for (name, _) in files {
+                assert_eq!(
+                    std::fs::read(format!("{x}/{name}")).unwrap(),
+                    std::fs::read(format!("{y}/{name}")).unwrap(),
+                    "{name}: a library's columns fill the cells as its side table does"
+                );
+            }
+        };
+        let dirs = [tmp("ann_plain"), tmp("ann_on"), tmp("ann_lib")];
+        for (d, a) in dirs
+            .iter()
+            .zip([None, Some(ann.as_str()), Some(lib.as_str())])
+        {
             std::fs::create_dir_all(d).unwrap();
             run(ReportParams {
                 scored: &scored,
@@ -3410,8 +3487,12 @@ mod tests {
             .unwrap();
         }
         check(&dirs[0], &dirs[1]);
-        let dirs = [tmp("ann_exp_plain"), tmp("ann_exp_on")];
-        for (d, a) in dirs.iter().zip([None, Some(ann.as_str())]) {
+        same(&dirs[1], &dirs[2]);
+        let dirs = [tmp("ann_exp_plain"), tmp("ann_exp_on"), tmp("ann_exp_lib")];
+        for (d, a) in dirs
+            .iter()
+            .zip([None, Some(ann.as_str()), Some(lib.as_str())])
+        {
             std::fs::create_dir_all(d).unwrap();
             run_experiment(ExperimentReportParams {
                 scored: &scored,
@@ -3428,5 +3509,6 @@ mod tests {
             .unwrap();
         }
         check(&dirs[0], &dirs[1]);
+        same(&dirs[1], &dirs[2]);
     }
 }

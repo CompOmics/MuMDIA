@@ -48,8 +48,9 @@ import pandas as pd
 # The engine rejects `large_string` parquet columns ("column 'peptidoform' is not
 # utf8"), and `to_parquet` picks the width itself: pandas 3.x chooses the large
 # variant, so this helper silently emitted libraries the engine would not load.
-from _lib_io import (PROTEIN_ANNOTATIONS, annotations_path, read_protein_annotations,
-                    write_engine_parquet, write_protein_annotations)
+from _lib_io import (PROTEIN_ANNOTATIONS, annotate_precursors, complete_from_fasta,
+                    embed_annotations, fasta_annotations, fasta_index, read_protein_annotations,
+                    write_engine_parquet)
 
 # A bracketed modification, with the dash of a terminal group (`[Acetyl]-PEPK`).
 STRIP_MODS = re.compile(r"-?\[[^\]]*\]-?")
@@ -180,6 +181,20 @@ def main():
     # 3. Set-diff against the imported library's target population.
     print("[2/6] diff against imported library", flush=True)
     imp = pd.read_parquet(args.imported_precursors)
+    # The protein annotations travel in the precursor table's columns: the imported library's
+    # own, else those of the side table beside it, else, for a library without either, its
+    # proteins named from this FASTA (`_lib_io.complete_from_fasta`).
+    imp, how = embed_annotations(imp, args.imported_precursors)
+    fasta_rows = fasta_annotations(args.fasta)
+    if how == "none":
+        table = {}
+        targets = sorted(set(imp.loc[imp.label == "target", "protein"].astype(str)))
+        n_named = complete_from_fasta(table, targets, fasta_rows, fasta_index(fasta_rows))
+        annotate_precursors(imp, table)
+        print(f"      protein annotations: {n_named} of {len(targets)} imported protein "
+              f"entr(ies) named from {args.fasta}"
+              + ("; WARNING: none matched a FASTA header, so their cells stay empty"
+                 if targets and not n_named else ""), flush=True)
     imp_t = imp[imp.label == "target"].copy()
     present_bases = set(imp_t.peptidoform.map(stripped))
     present_forms = set(zip(imp_t.peptidoform, imp_t.charge.astype(int)))
@@ -211,6 +226,10 @@ def main():
                "--work-dir", args.work_dir], predict_frag_config(args.config, args.work_dir))
     mprec = pd.read_parquet(W("aug_missing_prec.parquet"))
     mfrag = pd.read_parquet(W("aug_missing_frag.parquet"))
+    # The added peptides' proteins are FASTA header words, annotated as `mumdia digest`
+    # annotated them beside its output (the FASTA's own headers when that table is absent).
+    digest_ann = read_protein_annotations(W(PROTEIN_ANNOTATIONS)) or fasta_rows
+    annotate_precursors(mprec, digest_ann)
 
     # 5. Make ids disjoint from the imported library where they must be (peptidoform
     #    and candidate ids), and keep base-peptide linkage where it exists: an added
@@ -252,16 +271,8 @@ def main():
     merged_prec["n_fragments"] = merged_prec["candidate_id"].map(nfrag).fillna(0).astype(np.int32)
     write_engine_parquet(merged_prec, W("aug_merged_prec.parquet"))
     write_engine_parquet(merged_frag, W("aug_merged_frag.parquet"))
-    # Protein annotations for the merged library: the imported library's, plus the FASTA
-    # proteins `mumdia digest` annotated beside its output, which name the added peptides'
-    # `protein` strings. The imported row wins a key both have. The decoy builder below
-    # carries the table from the work directory to the output library.
-    imported_ann = read_protein_annotations(annotations_path(args.imported_precursors))
-    merged_ann = read_protein_annotations(W(PROTEIN_ANNOTATIONS))
-    merged_ann.update(imported_ann)
-    if merged_ann:
-        n_ann = write_protein_annotations(merged_ann, W(PROTEIN_ANNOTATIONS))
-        print(f"      protein annotations: {n_ann} entries ({len(imported_ann)} imported)")
+    # Both halves carry the annotation columns, which the decoy builder keeps on every
+    # target and copies onto its decoy.
     print(f"      merged target precursors: {len(merged_prec)} (added {len(mprec)})")
     if "predicted_im" in merged_prec.columns:
         n_im = int(merged_prec["predicted_im"].notna().sum())

@@ -46,7 +46,7 @@ import pyarrow.parquet as pq
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from _lib_io import (carry_protein_annotations, narrow_table,  # noqa: E402
+from _lib_io import (embed_annotations, narrow_table, retire_side_table,  # noqa: E402
                     sort_fragments_by_candidate, write_engine_parquet)
 from _unimod import MODIFICATIONS  # noqa: E402
 
@@ -138,6 +138,9 @@ def tsv(in_prec, in_frag, out):
 
 def merge(in_prec, in_frag, pred_prec, pred_frag, out_prec, out_frag):
     prec = load_precursors(in_prec)
+    # The protein annotations travel in the precursor table's columns, decoys carrying their
+    # targets' values, and are kept with every row below (`_lib_io.embed_annotations`).
+    prec, _ = embed_annotations(prec, in_prec)
     pr = check_reverse(prec)
     pred = pd.read_parquet(pred_prec, columns=["candidate_id", "peptidoform", "charge"])
     pred = pred.assign(peptidoform=pred.peptidoform.map(strip_decoy)).drop_duplicates(
@@ -218,8 +221,8 @@ def merge(in_prec, in_frag, pred_prec, pred_frag, out_prec, out_frag):
         keep["n_fragments"] = counts.astype(np.int32)
     write_engine_parquet(keep, out_prec)
     n = sort_fragments_by_candidate(out_frag)
-    # The targets' protein annotations, beside the output library (decoys have none).
-    carry_protein_annotations(in_prec, out_prec)
+    # A side table beside the output belongs to another library: this one carries its own.
+    retire_side_table(in_prec, out_prec)
     print(f"merge: {len(keep)} precursors ({int((keep.label == 'decoy').sum())} decoys), "
           f"{n} fragments, dropped {len(drop)} precursors of unpredicted pairs")
 
@@ -262,7 +265,8 @@ def build(a):
         if not os.path.isfile(parquet):
             sys.exit(f"the re-export produced no {parquet}; DIA-NN 2.x is needed")
     pp, pfr = os.path.join(work, "pred_precursors.parquet"), os.path.join(work, "pred_fragments.parquet")
-    # The decoys' own import annotates nothing: decoys are never reported.
+    # The decoys' own import writes no annotation columns: the merge keeps the input
+    # library's, in which each decoy carries its target's values.
     imp = [sys.executable, os.path.join(HERE, "import_diann_lib.py"), parquet, pp, pfr,
            "--no-annotations"]
     if a.keep_unimod:

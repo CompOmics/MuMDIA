@@ -228,9 +228,10 @@ pub fn run(p: RunParams) -> Result<()> {
     // surfaced minutes later as a stage failure naming one artifact (`storage`).
     crate::storage::prepare_output(p.out_dir, cfg)?;
     let d = |name: &str| format!("{}/{}", p.out_dir, name);
-    // The library's protein annotation table, which only the report reads
-    // (`protein_annotations`): `--lib-annotations`, else the one beside `--lib-precursors`,
-    // validated here rather than at the end. A FASTA search writes its own (`digest`).
+    // The library's protein annotations, which only the report reads (`protein_annotations`):
+    // `--lib-annotations`, else the library's own columns, else the table beside
+    // `--lib-precursors`, validated here rather than at the end; a library with none is
+    // warned about here and at the report. A FASTA search writes its own (`digest`).
     let lib_annotations =
         crate::protein_annotations::resolve_input(p.lib_annotations, p.lib_precursors)?;
 
@@ -252,7 +253,10 @@ pub fn run(p: RunParams) -> Result<()> {
             ("fasta", p.fasta),
             ("lib_precursors", p.lib_precursors),
             ("lib_fragments", p.lib_fragments),
-            ("lib_annotations", lib_annotations.as_deref()),
+            (
+                "lib_annotations",
+                lib_annotations.as_ref().and_then(|s| s.hashed_input()),
+            ),
         ]
         .into_iter()
         .filter_map(|(role, path)| path.map(|x| (role.to_string(), x.to_string())))
@@ -984,22 +988,27 @@ pub fn run(p: RunParams) -> Result<()> {
     info!(stage = %"report", "run: stage start");
     let loc_tables: Vec<String> = localisation.iter().cloned().collect();
     let sites_tsv = d("sites.tsv");
-    // Copied into the output directory, so a later `mumdia report` finds it beside the
-    // scored table, and recorded only when there is one, so a run without it keeps its
-    // manifest.
+    // The annotations as a table in the output directory, so a later `mumdia report` finds
+    // it beside the scored table, recorded only when there is one. Without one the TSVs'
+    // three annotation columns are empty, which is said again here and recorded in the
+    // manifest (`protein_annotations_missing`).
     let annotations = match crate::protein_annotations::search_source(
-        lib_annotations.as_deref(),
+        lib_annotations.as_ref(),
         p.lib_precursors,
         p.out_dir,
     ) {
-        Some(src) => Some(crate::protein_annotations::publish_recorded(
-            &src,
-            p.out_dir,
-            p.lib_precursors.is_some(),
-            &ch,
-            Some(&mut man),
-        )?),
-        None => None,
+        Some(src) => Some(
+            crate::protein_annotations::publish_recorded(&src, p.out_dir, &ch, Some(&mut man))?.0,
+        ),
+        None => {
+            let lib = p.lib_precursors.unwrap_or_default();
+            warn!(
+                "report: {}",
+                crate::protein_annotations::missing_warning(lib)
+            );
+            man.protein_annotations_missing = Some(crate::protein_annotations::missing_gap(lib));
+            None
+        }
     };
     let loc = localisation.as_ref().map(|_| report::Localisation {
         tables: &loc_tables,

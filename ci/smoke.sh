@@ -1809,7 +1809,8 @@ PYEOF
 # 5p. Protein annotations: the report of the run's scored table without the annotation table
 #     (a copy of the scored table in a directory of its own), and with it (the scored table in
 #     the run directory, which finds the table there). check_smoke.py asserts the first is the
-#     run's TSVs minus their three annotation columns and the second the run's TSVs exactly.
+#     run's TSVs with their three annotation cells empty, and a warning, and the second the
+#     run's TSVs exactly.
 echo "=== smoke: protein annotations"
 mkdir -p "$work/report_plain"
 cp "$work/out/psms_scored.parquet" "$work/report_plain/psms_scored.parquet"
@@ -1826,6 +1827,48 @@ done
 [ ! -e "$work/report_plain/protein_annotations.parquet" ] \
     || { echo "the plain report arm has an annotation table"; exit 1; }
 
+# 5p'. Protein annotations in the library itself (#299). The fixture library has the side table
+#     `digest` wrote beside it; one copy gets those annotations written into its own
+#     protein_ids / protein_names / genes columns (the rule `_lib_io.annotate_precursors`
+#     applies for the importer and the decoy builders, a decoy taking its target's values,
+#     here with pyarrow alone: the smoke needs no pandas) and no side table, another copy,
+#     written by the same writer, has neither. check_smoke.py asserts that the first fills the
+#     TSVs' cells from its columns, that the second runs, warns, records the gap in its
+#     manifest and leaves the cells empty, and that the two score and quantify byte for byte
+#     alike.
+echo "=== smoke: protein annotations in the library"
+mkdir -p "$work/lib_cols" "$work/lib_bare"
+"$PY" - "$work/lib_prec.parquet" "$work/lib_cols/lib_precursors.parquet" \
+    "$work/lib_bare/lib_precursors.parquet" <<'PYEOF'
+import sys
+sys.path.insert(0, "scripts")
+import pyarrow as pa
+import pyarrow.parquet as pq
+from _lib_io import (ANNOTATION_COLUMNS, annotations_path, lookup_annotation,
+                     read_protein_annotations)
+src, cols, bare = sys.argv[1:4]
+side = read_protein_annotations(annotations_path(src))
+if not side:
+    sys.exit(f"the fixture library should have its side table beside it, {annotations_path(src)}")
+t = pq.read_table(src)
+keys = [p[6:] if lab == "decoy" and p.startswith("DECOY_") else p
+        for p, lab in zip(t.column("protein").to_pylist(), t.column("label").to_pylist())]
+cells = [lookup_annotation(side, k) for k in keys]
+annotated = t
+for j, c in enumerate(ANNOTATION_COLUMNS):
+    annotated = annotated.append_column(c, pa.array([x[j] for x in cells], pa.string()))
+pq.write_table(annotated, cols, compression="snappy")
+pq.write_table(t, bare, compression="snappy")
+print(f"protein annotations: {len(side)} entries written into {cols}")
+PYEOF
+for arm in cols bare; do
+    cp "$work/lib_frag.parquet" "$work/lib_$arm/lib_fragments.parquet"
+    "$BIN" run --lib-precursors "$work/lib_$arm/lib_precursors.parquet" \
+        --lib-fragments "$work/lib_$arm/lib_fragments.parquet" --mzml "$work/fixture.mzML" \
+        --out-dir "$work/out_lib_$arm" --config "$cfg" --threads 2 > "$work/run_lib_$arm.log" 2>&1 \
+        || { tail -20 "$work/run_lib_$arm.log"; echo "the library run ($arm) failed"; exit 1; }
+done
+
 # 6. Assertions.
 echo "=== smoke: assertions"
 #
@@ -1837,7 +1880,8 @@ echo "=== smoke: assertions"
     --compare-peptides "$work/out2/peptides.tsv" --experiment "$work/exp" \
     --experiment-named "$work/exp_named" --plain-report "$work/report_plain" \
     --annotated-report "$work/report_annotated" --loose-report "$work/report_q1" \
-    --min-assertions 202
+    --library-columns-run "$work/out_lib_cols" --library-bare-run "$work/out_lib_bare" \
+    --min-assertions 218
 
 echo "=== smoke: also check inspect and report run standalone"
 "$BIN" inspect "$work/out/psms_scored.parquet" > /dev/null

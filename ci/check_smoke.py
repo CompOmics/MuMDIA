@@ -140,6 +140,12 @@ def main() -> int:
     ap.add_argument("--plain-report", default=None,
                     help="the run's TSVs rewritten by `mumdia report` without protein "
                          "annotations")
+    ap.add_argument("--library-columns-run", default=None,
+                    help="a `run --lib-precursors` on a copy of the fixture library that "
+                         "carries its protein annotations in its own columns (#299)")
+    ap.add_argument("--library-bare-run", default=None,
+                    help="the same run on the same library without annotation columns and "
+                         "without a protein_annotations.parquet beside it")
     ap.add_argument("--annotated-report", default=None,
                     help="the run's TSVs rewritten by `mumdia report` from the scored "
                          "table in the run directory, which finds the annotations there")
@@ -466,21 +472,93 @@ def main() -> int:
                  "entry names", str(bad[:1]))
     c.ok(all(checked[n] > 0 for n in ("peptides.tsv", "precursors.tsv", "proteins.tsv")),
          "the annotation cells were checked on rows of all three files", str(dict(checked)))
+    def emptied(lines):
+        """TSV lines with their three annotation cells emptied (the header kept)."""
+        return lines[:1] + [ln.rsplit("\t", 3)[0] + "\t\t\t" for ln in lines[1:]]
+
     if a.plain_report:
+        # Without annotations the three columns are still there, and empty (#299): one
+        # layout whatever the library, and a warning instead of a silent gap.
         plain = Path(a.plain_report)
         for name in ("peptides.tsv", "precursors.tsv", "proteins.tsv"):
             mine = (out / name).read_text(encoding="utf-8").splitlines()
             other = (plain / name).read_text(encoding="utf-8").splitlines()
-            c.ok(len(mine) == len(other) and all(
-                    m.rsplit("\t", 3)[0] == o for m, o in zip(mine, other)),
-                 f"{name} without the annotation table is the annotated file minus its three "
-                 "last columns", f"{len(mine)} vs {len(other)} lines")
+            c.ok(len(mine) == len(other) and emptied(mine) == other,
+                 f"{name} without the annotation table is the annotated file with its three "
+                 "last cells empty", f"{len(mine)} vs {len(other)} lines")
+        log = (plain.parent / "report_plain.log")
+        c.ok(log.is_file() and "no protein annotations" in log.read_text(encoding="utf-8"),
+             "`mumdia report` without annotations warns that the columns are empty")
     if a.annotated_report:
         rep = Path(a.annotated_report)
         same = [n for n in ("peptides.tsv", "precursors.tsv", "proteins.tsv")
                 if (rep / n).read_bytes() == (out / n).read_bytes()]
         c.ok(len(same) == 3, "`mumdia report --psms-scored` finds the annotation table beside "
              "the scored table and reproduces the run's TSVs", ", ".join(same))
+
+    # ----------------------------------------------- protein annotations in the library
+    # #299: a library carries its annotations in three optional precursor-table columns.
+    # The same library with and without them must find and quantify the same, the first
+    # filling the annotation cells from its columns, the second warning, recording the gap
+    # in its manifest and leaving the cells empty.
+    if a.library_columns_run and a.library_bare_run:
+        print()
+        print("protein annotations in the library")
+        cols, bare = Path(a.library_columns_run), Path(a.library_bare_run)
+        man_c = json.loads((cols / "manifest.json").read_text(encoding="utf-8"))
+        man_b = json.loads((bare / "manifest.json").read_text(encoding="utf-8"))
+        rec = man_c.get("artifacts", {}).get("protein_annotations", {})
+        c.ok(rec.get("producing_stage") == "library-columns"
+             and (cols / "protein_annotations.parquet").is_file(),
+             "a library with annotation columns has them read and written into its output "
+             "directory", str(rec.get("producing_stage")))
+        c.ok("lib_annotations" not in man_c.get("inputs", {}),
+             "the library's own columns are covered by its lib_precursors hash, not a second "
+             "input", ", ".join(man_c.get("inputs", {})))
+        c.ok("protein_annotations_missing" not in man_c,
+             "an annotated library search records no annotation gap")
+        log_c = (cols.parent / "run_lib_cols.log").read_text(encoding="utf-8")
+        c.ok("from the library's own protein_ids, protein_names and genes columns" in log_c,
+             "the search says where its annotations come from")
+        checked = collections.Counter()
+        for name, key in (("peptides.tsv", "protein"), ("precursors.tsv", "protein"),
+                          ("proteins.tsv", "protein_group")):
+            with (cols / name).open(encoding="utf-8", newline="") as fh:
+                reader = csv.DictReader(fh, delimiter="\t")
+                got = list(reader)
+                hdr = reader.fieldnames or []
+            checked[name] += len(got)
+            bad = [r for r in got if [r["protein_ids"], r["protein_names"], r["genes"]]
+                   != expected_cells(r[key])]
+            c.ok(hdr[-3:] == ANNOTATION_COLUMNS and not bad,
+                 f"{name}: the library's columns fill every row's accessions and entry names",
+                 str(bad[:1]))
+        c.ok(checked["peptides.tsv"] > 0 and checked["precursors.tsv"] > 0,
+             "the library run reported rows to check", str(dict(checked)))
+
+        gap = man_b.get("protein_annotations_missing") or {}
+        c.ok(gap.get("lib_precursors", "").endswith("lib_precursors.parquet")
+             and "no protein annotations" in gap.get("warning", ""),
+             "a library without annotations records the gap and its warning in the manifest",
+             str(gap)[:160])
+        c.ok(not (bare / "protein_annotations.parquet").exists()
+             and "protein_annotations" not in man_b.get("artifacts", {}),
+             "a library without annotations leaves no annotation table")
+        log_b = (bare.parent / "run_lib_bare.log").read_text(encoding="utf-8")
+        warns = [ln for ln in log_b.splitlines() if "WARN" in ln and "no protein annotations" in ln]
+        c.ok(len(warns) >= 2, "it warns when the search starts and again at the report",
+             f"{len(warns)} warning line(s)")
+        for name in ("peptides.tsv", "precursors.tsv", "proteins.tsv"):
+            a_lines = (cols / name).read_text(encoding="utf-8").splitlines()
+            b_lines = (bare / name).read_text(encoding="utf-8").splitlines()
+            c.ok(emptied(a_lines) == b_lines,
+                 f"{name}: the same rows, the annotation cells empty without annotations",
+                 f"{len(a_lines)} vs {len(b_lines)} lines")
+        same = [n for n in ("psms_scored.parquet", "peptide_quant.parquet",
+                            "protein_group_quant.parquet")
+                if (cols / n).read_bytes() == (bare / n).read_bytes()]
+        c.ok(len(same) == 3, "the annotation columns change no score, q value or quantity",
+             ", ".join(same))
 
     # ---------------------------------------------------------------- determinism
     if a.compare_peptides:

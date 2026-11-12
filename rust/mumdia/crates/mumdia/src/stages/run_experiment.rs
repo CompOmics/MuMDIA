@@ -1529,7 +1529,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // surfaced minutes later as a stage failure naming one artifact (`storage`).
     crate::storage::prepare_output(p.out_dir, cfg)?;
     let d = |name: &str| format!("{}/{}", p.out_dir, name);
-    // The library's protein annotation table, which only the report reads, as in `run`.
+    // The library's protein annotations, which only the report reads, as in `run`; a library
+    // with none is warned about here and at the report.
     let lib_annotations =
         crate::protein_annotations::resolve_input(p.lib_annotations, p.lib_precursors)?;
 
@@ -1551,7 +1552,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         ("fasta", p.fasta),
         ("lib_precursors", p.lib_precursors),
         ("lib_fragments", p.lib_fragments),
-        ("lib_annotations", lib_annotations.as_deref()),
+        (
+            "lib_annotations",
+            lib_annotations.as_ref().and_then(|s| s.hashed_input()),
+        ),
     ] {
         if let Some(path) = path {
             hash_order.push((role.to_string(), path.to_string()));
@@ -3021,21 +3025,27 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     });
     // The cross-run precursor matrix `quant-lfq` writes next to the protein matrix.
     let prec_lfq = quant::precursor_lfq_sibling(&lfq);
-    // The protein annotations, at the experiment root for `mumdia report --experiment-dir`.
-    let annotations = match crate::protein_annotations::search_source(
-        lib_annotations.as_deref(),
+    // The protein annotations, at the experiment root for `mumdia report --experiment-dir`,
+    // with the producer the manifest records them under. Without any the TSVs' three
+    // annotation columns are empty, which is said again here and recorded in the manifest
+    // (`experiment.protein_annotations_missing`).
+    let published = match crate::protein_annotations::search_source(
+        lib_annotations.as_ref(),
         p.lib_precursors,
         p.out_dir,
     ) {
         Some(src) => Some(crate::protein_annotations::publish_recorded(
-            &src,
-            p.out_dir,
-            p.lib_precursors.is_some(),
-            &ch,
-            None,
+            &src, p.out_dir, &ch, None,
         )?),
-        None => None,
+        None => {
+            warn!(
+                "report: {}",
+                crate::protein_annotations::missing_warning(p.lib_precursors.unwrap_or_default())
+            );
+            None
+        }
     };
+    let annotations = published.as_ref().map(|(path, _)| path.clone());
     let rep_counts = report::run_experiment_localised(
         report::ExperimentReportParams {
             scored: &scored_for_quant,
@@ -3135,6 +3145,14 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // other manifest keeps its bytes; `mumdia report --experiment-dir` reads it from here.
     if let (Some(a), Some(m)) = (&annotations, manifest.as_object_mut()) {
         m.insert("protein_annotations".to_string(), json!(a));
+    }
+    // Why the TSVs' annotation columns are empty, only for a library without annotations, so
+    // every other manifest keeps its bytes.
+    if let (None, Some(lib), Some(m)) = (&annotations, p.lib_precursors, manifest.as_object_mut()) {
+        m.insert(
+            "protein_annotations_missing".to_string(),
+            json!(crate::protein_annotations::missing_gap(lib)),
+        );
     }
     // The condition of each run (run name -> condition), only when any run has one, so every
     // other manifest keeps its keys.
@@ -3360,16 +3378,12 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             None,
         ));
     }
-    if let Some(a) = &annotations {
+    if let Some((a, producer)) = &published {
         artifacts.push((
             artifact::PROTEIN_ANNOTATIONS.0.to_string(),
             artifact::PROTEIN_ANNOTATIONS,
             a.clone(),
-            if p.lib_precursors.is_some() {
-                "library-input"
-            } else {
-                "digest"
-            },
+            *producer,
             None,
         ));
     }

@@ -30,7 +30,7 @@ ci/smoke.sh
 
 It builds a small synthetic library from `test_data/fixture.fasta`, generates a
 matching mzML, runs the full single-run pipeline over it twice, runs `run-experiment` over two
-copies of it, and asserts 202 things about the result, including that the two
+copies of it, and asserts 218 things about the result, including that the two
 single runs are byte-identical and that the by-run split of the pooled rescore
 accounts for every row. It needs a
 built `mumdia` binary (found automatically, or set `MUMDIA_BIN`) and a Python with
@@ -208,7 +208,10 @@ gitignored (large binaries kept on disk).
 The precursor and fragment schemas match the library-input contract consumed by
 the fragment index (`rust/mumdia/crates/mumdia/src/index.rs:55-71`):
 `candidate_id, peptidoform_id, base_peptide_id, peptidoform, charge,
-precursor_mz, predicted_irt, label, protein, n_fragments` for precursors, and
+precursor_mz, predicted_irt, label, protein, n_fragments` for precursors (a library imported
+now also carries `protein_ids, protein_names, genes`, the protein annotations the reports'
+last three columns are filled from; this one predates them, so a search on it warns and
+leaves those cells empty), and
 `candidate_id, mz, predicted_intensity, name, ion_type, ordinal, frag_charge`
 for fragments. `candidate_id` is contiguous and precursors are sorted by
 `precursor_mz`, the preconditions the index build checks on load.
@@ -397,7 +400,7 @@ Verify the requested sidecars through their logs and
 Treat the Section 4 counts as regression targets on
 `LFQ_Orbitrap_AIF_Ecoli_01.mzML`:
 
-- The fixture smoke test (`ci/smoke.sh`), which needs no external data: 202
+- The fixture smoke test (`ci/smoke.sh`), which needs no external data: 218
   assertions. Run this first; it fails faster and more specifically than any count
   below.
 - Native FASTA run (`--profile dia`): approximately 1,213 precursor-shaped
