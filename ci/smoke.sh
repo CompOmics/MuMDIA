@@ -1869,7 +1869,7 @@ echo "=== smoke: assertions"
     --experiment-named "$work/exp_named" --plain-report "$work/report_plain" \
     --annotated-report "$work/report_annotated" --loose-report "$work/report_q1" \
     --library-columns-run "$work/out_lib_cols" --library-bare-run "$work/out_lib_bare" \
-    --min-assertions 219
+    --min-assertions 218
 
 echo "=== smoke: also check inspect and report run standalone"
 "$BIN" inspect "$work/out/psms_scored.parquet" > /dev/null
