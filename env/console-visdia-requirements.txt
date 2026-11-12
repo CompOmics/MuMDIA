@@ -31,5 +31,14 @@
 # Checked on 2026-11-06: a fresh pip install of this file resolved duckdb 1.5.6 and the
 # viewer served a three-run experiment with run folders named after their inputs and a
 # twelve-run diaPASEF experiment pruned to the viewer tier.
+# 8459ff2 adds to cb8b5bc the SCIEX ZT Scan DIA views (CompOmics/visDIA#15): the
+# precursor page of a ZT Scan run draws each XIC as one value per Q1 cycle instead of the
+# per-step sawtooth, marks each fragment with the engine's Q1 class and adds a Q1 sweep card
+# (each fragment's RT x Q1-step patch around the apex, the Q1 profile against the calibrated
+# transmission); the ZT Scan schema versions of 0.12.0 (spectra_ms2 v3, psms_extracted v6
+# and v8), which cb8b5bc refused, are read, and every other run is shown as before.
+# Checked on 2026-11-12: a fresh pip install of this file resolved duckdb 1.5.6 and the
+# viewer served a 0.12.0 ZT Scan run (K562 REP01, 3.34 billion MS2 peaks) with cycle-level
+# XICs and the Q1 sweep card.
 # Move the pin together with a check of that kind.
-mumdia-viewer @ https://github.com/CompOmics/visDIA/archive/cb8b5bcb2e98d223275a52eeb8a8717acf2ca1c3.zip
+mumdia-viewer @ https://github.com/CompOmics/visDIA/archive/8459ff2ef6d7011e87e2346b78310aa8c056ff36.zip
