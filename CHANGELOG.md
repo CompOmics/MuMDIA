@@ -225,6 +225,18 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **The desktop application pins visDIA at 36eef08, which shows SCIEX ZT Scan DIA runs**
+  (CompOmics/visDIA#15). The pinned viewer refused a ZT Scan run's `spectra_ms2` v3 and
+  `psms_extracted` v6 and v8, so its precursor page had no spectra and drew each XIC through
+  every Q1 step, a sawtooth. The precursor page of a ZT Scan run now draws each XIC as one
+  value per Q1 cycle, the transmission-weighted collapse of the cycle's steps that
+  `quant.q1_fragments` uses, with the steps faint behind it or alone on request; it marks
+  each fragment with the engine's Q1 decision (`q1f_frag_class`) and adds a Q1 sweep card:
+  each fragment's retention time x Q1-step patch around the apex with its expected, fitted
+  and own Q1 centres, the Q1 profile of the shown cycle against the calibrated transmission
+  with the precursor's own isotopes in MS2, and the engine's `q1f_*` columns. Every other run
+  is shown as before. An existing visDIA environment is reported outdated and the Setup
+  screen offers the update (env/console-visdia-requirements.txt).
 - **`peptides.tsv`, `precursors.tsv` and `proteins.tsv` end with `protein_ids`,
   `protein_names` and `genes` with or without annotations (#299).** Without annotations
   their cells are empty, with a warning, where from 0.10.0 to 0.12.0 the columns were left
