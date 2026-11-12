@@ -1980,7 +1980,38 @@ function renderLocation(loc) {
   show(where, true);
 }
 
-async function refreshComponents() {
+// One call at a time for each refresh of the Setup screen. Their commands start
+// processes (Python, the converter, DIA-NN) or walk the environments, and take seconds:
+// a tab clicked repeatedly, or a poll tick while a call was still running, stacked calls
+// in the application until the window froze. A request that arrives while one runs asks
+// for one more run after it, so the screen still ends on a fresh state.
+const refreshing = new Map();
+function oneAtATime(key, run) {
+  const current = refreshing.get(key);
+  if (current) {
+    current.again = true;
+    return current.done;
+  }
+  const entry = { again: false, done: null };
+  refreshing.set(key, entry);
+  entry.done = (async () => {
+    try {
+      do {
+        entry.again = false;
+        await run();
+      } while (entry.again);
+    } finally {
+      refreshing.delete(key);
+    }
+  })();
+  return entry.done;
+}
+
+function refreshComponents() {
+  return oneAtATime("components", refreshComponentsNow);
+}
+
+async function refreshComponentsNow() {
   let c;
   try {
     c = await invoke("components_status");
@@ -2322,7 +2353,11 @@ function renderManaged(m) {
 
 // Sizing the folder walks every file in it, so this runs when the screen is opened
 // and after a removal -- never on the installation poll, which ticks every 900 ms.
-async function refreshManaged() {
+function refreshManaged() {
+  return oneAtATime("managed", refreshManagedNow);
+}
+
+async function refreshManagedNow() {
   try {
     renderManaged(await invoke("components_removable"));
   } catch (e) {
@@ -2407,7 +2442,11 @@ async function chooseStorage() {
 // DeepLC and torch; it can only drive a copy the user licensed themselves. The
 // notice is shown here because that distinction is invisible from a screen whose
 // other cards do install things.
-async function refreshDiann() {
+function refreshDiann() {
+  return oneAtATime("diann", refreshDiannNow);
+}
+
+async function refreshDiannNow() {
   let r;
   try {
     r = await invoke("diann_status");
@@ -2556,7 +2595,11 @@ async function locateDiann() {
   refreshDiann();
 }
 
-async function refreshThermo() {
+function refreshThermo() {
+  return oneAtATime("thermo", refreshThermoNow);
+}
+
+async function refreshThermoNow() {
   let t;
   try {
     t = await invoke("thermo_status");

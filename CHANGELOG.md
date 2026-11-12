@@ -195,6 +195,16 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **The desktop application no longer stops responding on the Setup screen.** Its status
+  commands ran on the thread that draws the window: the components' status starts Python up
+  to nine times, the managed-data card walks every file of the environments, and the Thermo
+  and DIA-NN checks run those programs. The screen polls the first every 900 ms while
+  anything installs or is tested, and a new call started before the last had finished, so
+  calls piled up and Windows reported the window as not responding, for minutes after three
+  environments had been installed; clicking between tabs quickly did the same. These four
+  commands now run off that thread, and the screen runs each refresh one at a time: a
+  request made while one runs gives one more run after it.
+
 - **A search from a spectral library has its protein accessions, entry names and gene names
   wherever the library goes (#299).** The annotations lived only in
   `protein_annotations.parquet`, found beside the library's precursor table, so a library

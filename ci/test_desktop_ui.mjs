@@ -267,6 +267,31 @@ test("the poll follows the installation through the load check to installed", as
   assert.match(f.el("install-log").textContent, /done$/);
 });
 
+test("a refresh asked for while one runs waits for it and gives one more run", async () => {
+  // The Setup tab clicked repeatedly, or a poll tick during a slow call: each used to
+  // start another components_status in the application, and the calls stacked up.
+  const f = load();
+  const pending = [];
+  f.answers.components_status = () => new Promise((resolve) => pending.push(resolve));
+  const asked = () => f.calls.filter(([n]) => n === "components_status").length;
+  const settle = () => new Promise((r) => setImmediate(r));
+  const all = [1, 2, 3, 4].map(() => f.api.refreshComponents());
+  await settle();
+  assert.equal(asked(), 1, "a second call started while the first was running");
+  pending.shift()(status());
+  await settle();
+  assert.equal(asked(), 2, "the requests made meanwhile must give exactly one more run");
+  pending.shift()(status());
+  await Promise.all(all);
+  assert.equal(asked(), 2);
+  // Once nothing runs, the next request starts at once.
+  const next = f.api.refreshComponents();
+  await settle();
+  assert.equal(asked(), 3);
+  pending.shift()(status());
+  await next;
+});
+
 test("clicking Install gives feedback before the backend answers", async () => {
   for (const key of ["visdia", "ms2pip", "primary"]) {
     const f = load();

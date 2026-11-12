@@ -48,12 +48,18 @@ async fn visdia_open(
 ///
 /// MuMDIA does not install DIA-NN. See `diann::LICENCE_NOTICE` for why this is a
 /// detection rather than an installation like the Python components.
+///
+/// Off the interface thread: detecting DIA-NN runs it.
 #[tauri::command]
-fn diann_status() -> serde_json::Value {
-    serde_json::json!({
-        "status": diann::detect(),
-        "notice": diann::LICENCE_NOTICE,
+async fn diann_status() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        serde_json::json!({
+            "status": diann::detect(),
+            "notice": diann::LICENCE_NOTICE,
+        })
     })
+    .await
+    .map_err(|e| format!("the DIA-NN check stopped unexpectedly: {e}"))
 }
 
 /// Remember a DIA-NN the user pointed at, or forget it when `path` is absent.
@@ -115,9 +121,14 @@ fn diann_install_state(state: tauri::State<'_, AppState>) -> diann::InstallState
 }
 
 /// Whether the Thermo `.raw` converter is installed, and the last install's progress.
+///
+/// Off the interface thread: once the converter is installed, this runs it.
 #[tauri::command]
-fn thermo_status(state: tauri::State<'_, AppState>) -> thermo::Status {
-    state.thermo.refresh()
+async fn thermo_status(state: tauri::State<'_, AppState>) -> Result<thermo::Status, String> {
+    let thermo = Arc::clone(&state.thermo);
+    tauri::async_runtime::spawn_blocking(move || thermo.refresh())
+        .await
+        .map_err(|e| format!("the converter check stopped unexpectedly: {e}"))
 }
 
 /// Download and unpack ThermoRawFileParser.
@@ -205,38 +216,52 @@ fn engine_info() -> Result<engine::Info, String> {
 }
 
 /// The state of the managed Python environment.
+///
+/// Off the interface thread, like every command here that starts a process: a command
+/// without `async` runs on the thread that draws the window, and this one starts Python
+/// up to three times per environment. The Setup screen polls it every 900 ms while
+/// anything installs or is tested; on that thread, nine Python starts per call stacked
+/// up until Windows reported the window as not responding.
 #[tauri::command]
-fn components_status(state: tauri::State<'_, AppState>) -> serde_json::Value {
-    let primary = state.installer.refresh(components::Env::Primary);
-    // Reported separately because it is optional and cannot share the primary
-    // environment: MS2PIP and DeepLC pin incompatible sqlalchemy majors.
-    let ms2pip = state.installer.refresh(components::Env::Ms2pip);
-    // Optional, for "Open in visDIA" on the Results and History screens.
-    let visdia = state.installer.refresh(components::Env::Visdia);
-    // Whether to offer "Install Visual C++ runtime": on Windows, when a real import failed
-    // on a torch DLL. Read from the statuses above, so it cannot disagree with the cards.
-    let vc_needed = mumdia_console::vcruntime::available()
-        && [&primary, &ms2pip, &visdia]
-            .iter()
-            .any(|s| mumdia_console::vcruntime::applies(s.load_error.as_deref()));
-    // Where the components are, so the screen can say so, and whether changing them needs
-    // an administrator (the program folder, from a window that cannot write to it).
-    let layout = mumdia_console::storage::layout();
-    serde_json::json!({
-        "primary": primary,
-        "ms2pip": ms2pip,
-        "visdia": visdia,
-        "location": {
-            "scope": layout.scope,
-            "dir": layout.tools.display().to_string(),
-            "needs_administrator": components::needs_administrator(&layout),
-        },
-        "vc_runtime": {
-            "available": mumdia_console::vcruntime::available(),
-            "needed": vc_needed,
-            "state": state.vcruntime.snapshot(),
-        },
+async fn components_status(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let installer = Arc::clone(&state.installer);
+    let vcruntime = Arc::clone(&state.vcruntime);
+    tauri::async_runtime::spawn_blocking(move || {
+        let primary = installer.refresh(components::Env::Primary);
+        // Reported separately because it is optional and cannot share the primary
+        // environment: MS2PIP and DeepLC pin incompatible sqlalchemy majors.
+        let ms2pip = installer.refresh(components::Env::Ms2pip);
+        // Optional, for "Open in visDIA" on the Results and History screens.
+        let visdia = installer.refresh(components::Env::Visdia);
+        // Whether to offer "Install Visual C++ runtime": on Windows, when a real import
+        // failed on a torch DLL. Read from the statuses above, so it cannot disagree with
+        // the cards.
+        let vc_needed = mumdia_console::vcruntime::available()
+            && [&primary, &ms2pip, &visdia]
+                .iter()
+                .any(|s| mumdia_console::vcruntime::applies(s.load_error.as_deref()));
+        // Where the components are, so the screen can say so, and whether changing them
+        // needs an administrator (the program folder, from a window that cannot write to
+        // it).
+        let layout = mumdia_console::storage::layout();
+        serde_json::json!({
+            "primary": primary,
+            "ms2pip": ms2pip,
+            "visdia": visdia,
+            "location": {
+                "scope": layout.scope,
+                "dir": layout.tools.display().to_string(),
+                "needs_administrator": components::needs_administrator(&layout),
+            },
+            "vc_runtime": {
+                "available": mumdia_console::vcruntime::available(),
+                "needed": vc_needed,
+                "state": vcruntime.snapshot(),
+            },
+        })
     })
+    .await
+    .map_err(|e| format!("the component check stopped unexpectedly: {e}"))
 }
 
 /// Create the managed environment and install the analysis packages into it.
@@ -346,14 +371,21 @@ fn managed_work_in_progress(state: &AppState) -> Option<String> {
 ///
 /// Nothing else can tell the user this. The installer removes what it placed under the
 /// program folder; every item here is written at runtime and survives an uninstall.
+///
+/// Off the interface thread: measuring the sizes walks every file of the environments
+/// (tens of thousands) and asks the engine about its caches.
 #[tauri::command]
-fn components_removable() -> serde_json::Value {
-    serde_json::json!({
-        "dir": components::data_dir().display().to_string(),
-        "components_dir": components::tools_dir().display().to_string(),
-        "scope": components::scope(),
-        "items": components::removable(),
+async fn components_removable() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        serde_json::json!({
+            "dir": components::data_dir().display().to_string(),
+            "components_dir": components::tools_dir().display().to_string(),
+            "scope": components::scope(),
+            "items": components::removable(),
+        })
     })
+    .await
+    .map_err(|e| format!("measuring the managed data stopped unexpectedly: {e}"))
 }
 
 /// The storage folder: where it is, how much room it has, and whether it can be written
