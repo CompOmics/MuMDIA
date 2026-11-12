@@ -128,8 +128,10 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
     // the `cal.json` just written. Like retrace, the RT bootstrap pass, which only collects
     // anchors, skips it, unless that pass's extract decides per fragment
     // (`extract.q1_fragments`), which reads the calibration and the tolerances it learns.
-    let q1_dec = cfg.extract.q1_deconvolved || cfg.features.q1_deconvolved;
-    if cfg.rt_im_train.q1_calibrate && (retrace_allowed || cfg.extract.q1_fragments || q1_dec) {
+    let q1_dec = cfg.extract.q1_deconvolved || cfg.features.q1_deconvolved.on();
+    if cfg.rt_im_train.q1_calibrate.on()
+        && (retrace_allowed || cfg.extract.q1_fragments.on() || q1_dec)
+    {
         info!(stage = %"q1-calibrate", "run: stage start");
         let mass_cal = format!("{seed}.masscal.json");
         crate::stages::q1cal::run(crate::stages::q1cal::Q1CalParams {
@@ -140,7 +142,7 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
             q_max: rt_cfg.q_train,
             frag_tol_fallback_ppm: cfg.extract.frag_tol_ppm,
             out_cal: &d("cal.json"),
-            fragment_decision: cfg.extract.q1_fragments,
+            fragment_decision: cfg.extract.q1_fragments.on(),
             deconvolution: q1_dec,
         })?;
     }
@@ -179,14 +181,14 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
     // The per-fragment Q1 decision (`extract.q1_fragments`) reads the calibrated window and
     // the tolerances the Q1 calibration just wrote; the re-pick (`retrace.q1_repick`) runs
     // inside extract.
-    if cfg.extract.q1_fragments || cfg.extract.q1_deconvolved {
+    if cfg.extract.q1_fragments.on() || cfg.extract.q1_deconvolved {
         ext_cfg.q1_model = Some(crate::stages::q1frag::read_model_opts(
             &d("cal.json"),
-            cfg.extract.q1_fragments,
+            cfg.extract.q1_fragments.on(),
         )?);
     }
-    if cfg.extract.q1_fragments {
-        ext_cfg.q1_repick = cfg.retrace.q1_repick;
+    if cfg.extract.q1_fragments.on() {
+        ext_cfg.q1_repick = cfg.retrace.q1_repick.on();
         ext_cfg.q1_repick_peaks = cfg.retrace.q1_repick_peaks;
     }
     // `extract.q1_deconvolved` / `features.q1_deconvolved`: the tolerance the Q1 calibration
@@ -200,9 +202,9 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
     ext_cfg.ms1_envelope = cfg.features.ms1_envelope;
     // `features.q1_precursor` / `features.q1_multiscale`: extract reads the scores on
     // the per-fragment decision's patches.
-    ext_cfg.q1_precursor = cfg.features.q1_precursor;
-    ext_cfg.q1_multiscale = cfg.features.q1_multiscale;
-    ext_cfg.q1_dec_features = cfg.features.q1_deconvolved;
+    ext_cfg.q1_precursor = cfg.features.q1_precursor.on();
+    ext_cfg.q1_multiscale = cfg.features.q1_multiscale.on();
+    ext_cfg.q1_dec_features = cfg.features.q1_deconvolved.on();
     let (wpsm, wchr) = extract::run_hashed(extract::ExtractParams {
         precursor_span: None,
         fragment_offset: None,
@@ -308,6 +310,8 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
         config_hash: ch,
         // Retrace's `imc_ref_w`, when this pass retraced under `retrace.apex_features`.
         imc_ref_w: raw.is_some() && cfg.retrace.apex_features,
+        // The tolerances extract decided with, for `features.q1_consistency`.
+        q1_tolerances: ext_cfg.q1_model.as_ref().map(|m| m.tolerances),
     })?;
     keep(
         &mut manifest,

@@ -148,7 +148,7 @@ of section 7 (`im_method`, `im_n_train`, `im_global`, `im_per_charge`, `w_im`, `
 docs/15 has the table; under `im_window_sizing = seed_decoy_corrected`, the default, also the
 `im_window_sizing` block of section 7), and the report's stats gain `im_n_train` and `w_im`.
 A 3D `cal.json` is unchanged. Under `rt_im_train.q1_calibrate` (scanning-quadrupole spectra,
-default off) the chain adds a `q1_calibration` block after the stage has written the file
+automatic for ZT Scan files) the chain adds a `q1_calibration` block after the stage has written the file
 (section 4h).
 
 Every "median" among the three is the nearest-rank `percentile(.., 0.5)`
@@ -900,7 +900,7 @@ No anchor cap is added: `--max-ref` takes the first N reference rows in table or
 search anchors, precursor m/z), the engine never passes it, and the alpha was erratic across
 subset sizes without a cap preventing the failure.
 
-### 4h. Q1 calibration of scanning-quadrupole spectra (`q1_calibrate`, default off)
+### 4h. Q1 calibration of scanning-quadrupole spectra (`q1_calibrate`, automatic for ZT Scan files)
 
 `rt_im_train.q1_calibrate` (`stages::q1cal`, called by `chain::extract_to_compete` right
 after the RT fit; the RT bootstrap pass skips it, as it skips retrace) calibrates the Q1
@@ -1427,7 +1427,7 @@ though the enum variant still exists.
 | `finetune_deeplc` | `false` | Enable the DeepLC multitask fine-tune pre-step in `run` (run.rs:265). Requires `predict_frag.deeplc_python` (preflight, run.rs:62-67). On one measured run it was not needed per file once the library iRT had been fine-tuned once: the per-run LOESS reached the same residuals for much less wall clock (see the fine-tune section for the scope of that measurement). |
 | `multihead_anchors` | `auto` | Anchors of the multi-head calibration on the run that adapts the library. `search` refits it on the confident targets (`precursor_q <= q_train`, observed RT = `apex_rt`) of a bootstrap search of that run in `<run>/rt_bootstrap/`, and falls back to the seed-anchored library with a warning when that is not possible; refused with `finetune_deeplc`, `multihead_calibration = 0` and `groups.window_groups > 1`. `seed` never does. `auto` is `search` on a run whose seed found fewer than `multihead_search_below` anchors (or only at a relaxed q), else `seed` (section 4f). |
 | `multihead_search_below` | `2500` | `auto`'s threshold on the seed anchor count (distinct target base peptides at `q_train`). |
-| `q1_calibrate` | `false` | Scanning-quadrupole spectra only: calibrate the Q1 window (centre offset, half-width, edge width) on the seed fragments and write `q1_calibration` to `cal.json`; changes no other artifact (section 4h). |
+| `q1_calibrate` | `"auto"` | On for a ZT Scan search, off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Scanning-quadrupole spectra only: calibrate the Q1 window (centre offset, half-width, edge width) on the seed fragments and write `q1_calibration` to `cal.json`; changes no other artifact (section 4h). |
 | `finetune_epochs` | `25` | Fine-tune epoch cap (`--epochs`); early stopping usually halts sooner. Used only when `finetune_deeplc`. |
 | `finetune_patience` | `10` | Early-stopping patience (`--patience`): epochs without val-loss improvement before stopping. |
 | `finetune_batch` | `0` | Fine-tune batch size (`--batch`). `0` auto-scales to the seed size so each epoch has ~30+ steps (config.rs:473-477); a fixed large batch underfits small seeds. |

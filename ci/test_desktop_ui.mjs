@@ -91,7 +91,12 @@ function load() {
   const els = new Map();
   const timers = new Set();
   const calls = [];
-  const answers = { components_status: () => status() };
+  // A working, acknowledged DIA-NN: the Search screen asks for it whenever the library
+  // settings change (the ZT Scan analysis sets them).
+  const answers = {
+    components_status: () => status(),
+    diann_status: () => ({ status: { runs: true, licence_acknowledged: true } }),
+  };
   const document = {
     getElementById(id) {
       if (!els.has(id)) els.set(id, element(id));
@@ -441,31 +446,50 @@ function ztProbe(path, over = {}) {
   };
 }
 
-const RECIPE = {
-  "convert.isolation_half_width": 1.9,
-  "extract.q1_fragments": true,
-  "quant.q1_cycle_halfwidth": 4,
+// What `ztscan_off` returns: the keys of the ZT Scan analysis, off.
+const OFF = {
+  "extract.q1_fragments": false,
+  "quant.q1_cycle_halfwidth": 0,
+  "rt_im_train.q1_calibrate": false,
 };
 
-test("a ZT Scan mzML is explained, its half-width filled and the recipe offered", async () => {
+test("a ZT Scan mzML is explained, its half-width shown and the analysis left to the engine", async () => {
   const f = load();
   const { state } = f.api;
   f.answers.scanning_probe = ({ mzml }) => mzml.map((p) => ztProbe(p));
-  f.answers.ztscan_recipe = () => RECIPE;
+  f.answers.ztscan_off = () => OFF;
   state.picks.mzml = ["/d/REP01.mzML", "/d/REP02.mzML"];
   await f.api.refreshZtscanNote();
   assert.equal(f.el("ztscan-note").hidden, false);
   assert.match(f.el("ztscan-body").textContent, /2 of the 2 selected files are a scanning-quadrupole/);
   assert.match(f.el("ztscan-body").textContent, /663 positions from 394\.3 to 898\.3 m\/z/);
   assert.equal(f.el("ztscan-hw").value, "1.9");
-  assert.equal(f.el("ztscan-recipe").disabled, false);
-  // The half-width alone without the recipe; with it, the recipe and the confirmed width.
-  assert.deepEqual({ ...f.api.ztscanOverrides() }, { "convert.isolation_half_width": 1.9 });
-  f.el("ztscan-recipe").checked = true;
-  // What the input listener records when the user types.
+  assert.equal(f.el("ztscan-analysis").disabled, false);
+  // The analysis is ticked for ZT Scan files until the user changes it, and the engine runs
+  // it, with the census's half-width, by itself: nothing is written.
+  assert.equal(f.el("ztscan-analysis").checked, true);
+  assert.deepEqual({ ...f.api.ztscanOverrides() }, {});
+  // What the checkbox listener records when the user clears it: the analysis's keys, off, and
+  // a re-render keeps their choice.
+  f.el("ztscan-analysis").checked = false;
+  state.ztscan.analysisTouched = true;
+  await f.api.refreshZtscanNote();
+  assert.equal(f.el("ztscan-analysis").checked, false);
+  assert.deepEqual({ ...f.api.ztscanOverrides() }, OFF);
+  assert.match(f.el("ztscan-analysis-note").textContent, /half-width alone/);
+  // Off with no known way to turn it off: the search is not started.
+  state.ztscan.off = null;
+  assert.ok([...f.api.searchProblems()].some((s) => /could not be turned off/.test(s)));
+  state.ztscan.off = OFF;
+  f.el("ztscan-analysis").checked = true;
+  assert.ok(![...f.api.searchProblems()].some((s) => /could not be turned off/.test(s)));
+  // What the input listener records when the user types: their half-width is written.
   f.el("ztscan-hw").value = "2.1";
   state.ztscan.hwTyped = true;
-  assert.deepEqual({ ...f.api.ztscanOverrides() }, { ...RECIPE, "convert.isolation_half_width": 2.1 });
+  assert.deepEqual({ ...f.api.ztscanOverrides() }, { "convert.isolation_half_width": 2.1 });
+  f.el("ztscan-analysis").checked = false;
+  assert.deepEqual({ ...f.api.ztscanOverrides() }, { ...OFF, "convert.isolation_half_width": 2.1 });
+  f.el("ztscan-analysis").checked = true;
   // Each file is asked once, and a typed half-width survives the re-render.
   const probes = () => f.calls.filter(([n]) => n === "scanning_probe").length;
   assert.equal(probes(), 1);
@@ -477,7 +501,47 @@ test("a ZT Scan mzML is explained, its half-width filled and the recipe offered"
   assert.ok([...f.api.searchProblems()].some((s) => /Q1 half-width/.test(s)));
 });
 
-test("the ZT Scan recipe is held back for a mixed selection, and other files need nothing", async () => {
+test("the ZT Scan analysis is held back for a mixed selection, and other files need nothing", async () => {
+  const f = load();
+  const { state } = f.api;
+  f.answers.scanning_probe = ({ mzml }) =>
+    mzml.map((p) =>
+      p.includes("orbi")
+        ? ztProbe(p, { convert_refuses: false, scanning_quadrupole: false, target_only: 0 })
+        : p.includes("fixed")
+          ? ztProbe(p, { scanning_quadrupole: false, suggested_half_width: null })
+          : ztProbe(p)
+    );
+  f.answers.ztscan_off = () => OFF;
+  // A ZT Scan file with an Orbitrap file and a vendor file: the engine reads the ZT Scan file
+  // with the census's half-width and leaves the analysis out; nothing is written, and the
+  // vendor file is not probed.
+  state.picks.mzml = ["/d/REP01.mzML", "/d/orbi.mzML", "/d/run.raw"];
+  await f.api.refreshZtscanNote();
+  const asked = f.calls.filter(([n]) => n === "scanning_probe").flatMap(([, a]) => a.mzml);
+  assert.deepEqual([...asked], ["/d/REP01.mzML", "/d/orbi.mzML"]);
+  assert.equal(f.el("ztscan-note").hidden, false);
+  assert.equal(f.el("ztscan-analysis").disabled, true);
+  assert.equal(f.el("ztscan-analysis").checked, false);
+  assert.match(f.el("ztscan-analysis-note").textContent, /leaves the analysis out/);
+  assert.deepEqual({ ...f.api.ztscanOverrides() }, {});
+  // Only files with offsets: nothing to say and nothing added.
+  state.picks.mzml = ["/d/orbi.mzML"];
+  await f.api.refreshZtscanNote();
+  assert.equal(f.el("ztscan-note").hidden, true);
+  assert.deepEqual({ ...f.api.ztscanOverrides() }, {});
+  assert.ok(![...f.api.searchProblems()].some((s) => /Q1 half-width/.test(s)));
+  // A file that names targets without offsets in a fixed-window layout: the engine has no
+  // half-width for it, so the one the user enters is written.
+  state.picks.mzml = ["/d/fixed.mzML"];
+  await f.api.refreshZtscanNote();
+  assert.equal(f.el("ztscan-hw").value, "");
+  assert.ok([...f.api.searchProblems()].some((s) => /Q1 half-width/.test(s)));
+  f.el("ztscan-hw").value = "12.5";
+  assert.deepEqual({ ...f.api.ztscanOverrides() }, { "convert.isolation_half_width": 12.5 });
+});
+
+test("the ZT Scan analysis sets the library's search space and takes back what it set", async () => {
   const f = load();
   const { state } = f.api;
   f.answers.scanning_probe = ({ mzml }) =>
@@ -486,23 +550,93 @@ test("the ZT Scan recipe is held back for a mixed selection, and other files nee
         ? ztProbe(p, { convert_refuses: false, scanning_quadrupole: false, target_only: 0 })
         : ztProbe(p)
     );
-  f.answers.ztscan_recipe = () => RECIPE;
-  // A ZT Scan file with an Orbitrap file and a vendor file: the half-width only, no recipe,
-  // and the vendor file is not probed.
-  state.picks.mzml = ["/d/REP01.mzML", "/d/orbi.mzML", "/d/run.raw"];
-  await f.api.refreshZtscanNote();
-  const asked = f.calls.filter(([n]) => n === "scanning_probe").flatMap(([, a]) => a.mzml);
-  assert.deepEqual([...asked], ["/d/REP01.mzML", "/d/orbi.mzML"]);
-  assert.equal(f.el("ztscan-note").hidden, false);
-  assert.equal(f.el("ztscan-recipe").disabled, true);
-  f.el("ztscan-recipe").checked = true;
-  assert.deepEqual({ ...f.api.ztscanOverrides() }, { "convert.isolation_half_width": 1.9 });
-  // Only files with offsets: nothing to say and nothing added.
+  f.answers.ztscan_off = () => OFF;
+  // The Search space card as the page starts it, with the default modifications.
+  const start = { "d-minlen": "7", "d-maxlen": "30", "d-minz": "2", "d-maxz": "3", "d-maxvar": "1", "d-prmin": "", "d-prmax": "" };
+  const fields = () => Object.fromEntries(Object.keys(start).map((id) => [id, f.el(id).value]));
+  for (const [id, v] of Object.entries(start)) f.el(id).value = v;
+  state.mods = new Map([["Carbamidomethyl|C", "fix"], ["Oxidation|M", "var"]]);
+  const acetyl = "Acetyl|*|protein_n_term";
+  // A selection without ZT Scan files changes nothing.
   state.picks.mzml = ["/d/orbi.mzML"];
   await f.api.refreshZtscanNote();
-  assert.equal(f.el("ztscan-note").hidden, true);
-  assert.deepEqual({ ...f.api.ztscanOverrides() }, {});
-  assert.ok(![...f.api.searchProblems()].some((s) => /Q1 half-width/.test(s)));
+  assert.deepEqual(fields(), start);
+  assert.equal(state.ztscan.lib, null);
+  // A ZT Scan file: the analysis is ticked, and with it the measured search space, the
+  // precursors inside the swept range (394.256 - 1.9 to 898.271 + 1.9, rounded outward).
+  state.picks.mzml = ["/d/REP01.mzML"];
+  await f.api.refreshZtscanNote();
+  assert.equal(f.el("ztscan-analysis").checked, true);
+  assert.deepEqual(fields(), {
+    "d-minlen": "6", "d-maxlen": "40", "d-minz": "1", "d-maxz": "4", "d-maxvar": "2", "d-prmin": "392", "d-prmax": "901",
+  });
+  assert.equal(state.mods.get(acetyl), "var");
+  assert.equal(state.mods.get("Oxidation|M"), "var");
+  assert.equal(state.mods.get("Carbamidomethyl|C"), "fix");
+  assert.match(f.el("ztscan-library-note").textContent, /charges 1 to 4, lengths 6 to 40/);
+  assert.match(f.el("ztscan-library-note").textContent, /from 392 to 901 m\/z/);
+  // The range follows the half-width while the analysis set it.
+  f.el("ztscan-hw").value = "3.0";
+  state.ztscan.hwTyped = true;
+  await f.api.refreshZtscanNote();
+  assert.equal(f.el("d-prmin").value, "391");
+  assert.equal(f.el("d-prmax").value, "902");
+  // A value the user edits is theirs: it is neither replaced nor taken back.
+  f.el("d-maxlen").value = "35";
+  await f.api.refreshZtscanNote();
+  assert.equal(f.el("d-maxlen").value, "35");
+  // Clearing the analysis takes back the rest, and the modification it added.
+  f.el("ztscan-analysis").checked = false;
+  state.ztscan.analysisTouched = true;
+  await f.api.refreshZtscanNote();
+  assert.deepEqual(fields(), { ...start, "d-maxlen": "35" });
+  assert.equal(state.mods.has(acetyl), false);
+  assert.equal(state.mods.get("Oxidation|M"), "var");
+  assert.equal(f.el("ztscan-library-note").textContent, "");
+  // Ticking it again applies it again; removing the ZT Scan file takes it back.
+  f.el("ztscan-analysis").checked = true;
+  await f.api.refreshZtscanNote();
+  assert.equal(f.el("d-minz").value, "1");
+  assert.equal(state.mods.get(acetyl), "var");
+  state.picks.mzml = ["/d/orbi.mzML"];
+  await f.api.refreshZtscanNote();
+  assert.equal(f.el("d-minz").value, "2");
+  assert.equal(state.mods.has(acetyl), false);
+  // A modification the user had chosen before is left alone when the analysis goes.
+  state.mods.set(acetyl, "var");
+  state.picks.mzml = ["/d/REP01.mzML"];
+  await f.api.refreshZtscanNote();
+  state.picks.mzml = ["/d/orbi.mzML"];
+  await f.api.refreshZtscanNote();
+  assert.equal(state.mods.get(acetyl), "var");
+});
+
+test("a deamidation choice for a ZT Scan run is warned about on the card", async () => {
+  const f = load();
+  const { state } = f.api;
+  f.answers.scanning_probe = ({ mzml }) =>
+    mzml.map((p) =>
+      p.includes("orbi")
+        ? ztProbe(p, { convert_refuses: false, scanning_quadrupole: false, target_only: 0 })
+        : ztProbe(p)
+    );
+  f.answers.ztscan_off = () => OFF;
+  state.mods = new Map([["Carbamidomethyl|C", "fix"], ["Oxidation|M", "var"]]);
+  state.picks.mzml = ["/d/REP01.mzML"];
+  await f.api.refreshZtscanNote();
+  assert.equal(f.el("ztscan-mods-note").textContent, "");
+  state.mods.set("Deamidated|N", "var");
+  await f.api.refreshZtscanNote();
+  assert.match(f.el("ztscan-mods-note").textContent, /13C isotope/);
+  // Deamidation of R is not the N/Q alias; another instrument's file needs no warning.
+  state.mods.delete("Deamidated|N");
+  state.mods.set("Deamidated|R", "var");
+  await f.api.refreshZtscanNote();
+  assert.equal(f.el("ztscan-mods-note").textContent, "");
+  state.mods.set("Deamidated|Q", "var");
+  state.picks.mzml = ["/d/orbi.mzML"];
+  await f.api.refreshZtscanNote();
+  assert.equal(f.el("ztscan-mods-note").textContent, "");
 });
 
 let failed = 0;

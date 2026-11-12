@@ -1425,6 +1425,15 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // spectra will carry 1/K0 (`instrument::input_has_im`, as the library build decides),
     // so every run is scored with one feature schema and the pooled rescore accepts them.
     resolved.resolve_im_features(p.mzmls.iter().any(|m| crate::instrument::input_has_im(m)));
+    // The ZT Scan analysis resolves once for the experiment as well, so every run is scored
+    // with one feature set: on when every run is a SCIEX ZT Scan DIA run, off otherwise, with a
+    // warning when only some are (`ztscan`, docs/37_ztscan.md, "Automatic for ZT Scan files").
+    crate::ztscan::resolve(
+        &mut resolved,
+        p.mzmls,
+        p.lib_precursors.is_some(),
+        "run-experiment",
+    )?;
     crate::stages::retrace::refuse_inputs_without_raw_events(&resolved, p.mzmls)?;
     pre.step("resolve_interpreters");
     // The run names and conditions are resolved before the configuration is hashed: under

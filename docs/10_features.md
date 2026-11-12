@@ -42,6 +42,7 @@ recipe use `Extended`.
 | `rust/mumdia/crates/mumdia/src/stages/features/peak_scans.rs` | Extended family: peak-scan count / window-degeneracy indicator (2 names) |
 | `rust/mumdia/crates/mumdia/src/stages/features/apex_dispersion.rs` | Extended family: fragment apex dispersion + consensus peak shape (13 names) |
 | `rust/mumdia/crates/mumdia/src/stages/features/mass_uncertainty.rs` | Extended family: fragment mass-error dispersion + evidence breadth (10 names) |
+| `rust/mumdia/crates/mumdia/src/stages/q1consist.rs` | the Q1-consistency family of scanning-quadrupole spectra (`features.q1_consistency`, automatic for ZT Scan files, 16 names): the per-fragment Q1 decisions against each fragment's expected Q1 centre |
 | `rust/mumdia/crates/mumdia/src/stats.rs` | shared `pearson`/`cosine`/`spectral_angle` kernels used by every family |
 | `rust/mumdia/crates/mumdia-core/src/config.rs:578` | `FeaturesConfig` |
 
@@ -833,7 +834,8 @@ Scanning-quadrupole spectra only, needs `extract.q1_fragments`; appended after `
 ### q1_deconvolved (5; `features.q1_deconvolved`)
 
 Scanning-quadrupole spectra only, needs `extract.q1_fragments` (and with it the Q1
-calibration, which learns the tolerance); appended last (`Q1D_FEATURES`). Every MS2 peak's Q1
+calibration, which learns the tolerance); appended after `q1_multiscale`, before
+`q1_consistency` when that is on (`Q1D_FEATURES`). Every MS2 peak's Q1
 centroid along the sweep against the expected Q1 centre of the library fragment it matches, in
 the apex cycle and the two either side: `q1d_n_frag`, `q1d_n_incons`, `q1d_share`,
 `q1d_pred_share`, `q1d_apex_share` (docs/09_extract.md, section 14). The extraction is not
@@ -846,6 +848,76 @@ value is read from the spectra and the library; nothing reads a label, and among
 untrained `prelim_score` is below the decoys' median the Kolmogorov-Smirnov statistic of decoys
 against targets is at most 0.008 for every one of the 25 features (the reference features
 0.0005-0.006). What they measured, alone and together, is in docs/37_ztscan.md, section 10.
+
+### q1_consistency (16; `features.q1_consistency`)
+
+Scanning-quadrupole spectra (SCIEX ZT Scan DIA) only. In the battery only when
+`features.q1_consistency` is on (`false` by default), which needs `extract.q1_fragments`:
+the per-fragment Q1 decisions of psms_extracted v6 (`q1f_frag_class`, `q1f_frag_offset`,
+`q1f_frag_corr2d`, library order) read against each fragment's EXPECTED Q1 centre rather
+than the centre its candidate's fragments share (`stages/q1consist.rs`), appended after every
+other column of the `extended` set (`Q1C_FEATURES`, after `ms1_envelope`, `q1_precursor`,
+`q1_multiscale` and `q1_deconvolved` when they are on);
+`minimal` and `rich` ignore the switch.
+
+**Why.** A fragment belongs (`q1_fragments`) when its own Q1 centre lies within the offset
+tolerance of the shared centre and its 2D correlation reaches the floor. The shared centre is
+a least-squares fit over the fragments present, so an interferer that dominates the fit moves
+it, the 2D correlations of the candidate's own fragments fall, and none belongs:
+`q1f_n_belong` reads 0 for a precursor whose strongest fragments sit where its m/z says they
+should. On the ZT Scan K562 REP01 run (entrapment library), 6,301 precursors that another
+engine accepted at 1% were scored above 1% here, 83% with the apex within 6 s of the other
+engine's and 60% with no fragment that belongs; their combined entrapment FDP was 4.9%, so
+they are mostly real. At a matched classifier score (40 bins of their NN score), every
+existing feature separated them from decoys with an AUC between 0.36 and 0.64, while the share of
+predicted intensity in fragments within the offset tolerance of their expected centre gave
+0.74 against decoys and against entrapment targets alike, and 0.50 between decoys and
+entrapment targets.
+
+| feature | meaning |
+|---|---|
+| `q1c_n` | consistent fragments: present, with their own Q1 centre within the learned offset tolerance of their expected centre |
+| `q1c_n_corr` | consistent fragments whose 2D correlation also reaches the learned floor |
+| `q1c_pred_share`, `q1c_obs_share` | the consistent fragments' share of the predicted intensity and of the observed intensity of all library fragments |
+| `q1c_entropy`, `q1c_cosine` | spectral-entropy similarity and cosine of the square-rooted observed intensities, the inconsistent fragments set to 0, against the square-rooted predictions of every fragment |
+| `q1c_top3` | consistent fragments among the three most intense predicted |
+| `q1c_entropy_corr` | `q1c_entropy` over the consistent fragments that reach the 2D correlation floor |
+| `q1c_soft_pred`, `q1c_soft_obs`, `q1c_soft_entropy` | the two shares and the entropy similarity with each present fragment weighted by a Gaussian in its offset (SD a third of the tolerance) instead of the cut |
+| `q1c_n_tight`, `q1c_n_loose` | present fragments within half and within twice the offset tolerance |
+| `q1c_corr2d_mean` | the mean 2D correlation of the consistent fragments |
+| `q1c_offset_wmean` | the predicted-intensity-weighted mean \|offset\| of the present fragments, steps (capped at 6; 6 without any) |
+| `q1c_offset_top3` | the mean \|offset\| of the three most intense predicted fragments (6 for one absent or without a profile) |
+
+The observed intensity of a fragment is its trace summed over the elution peak this stage
+bounds (`elution_lo`..`elution_hi`). The tolerances are the run's learned decision tolerances
+(`cal.json`, `q1_calibration.fragment_decision.tolerances`: `offset_steps`, `corr2d_min`):
+`run`, `run-experiment` and their second passes hand over the ones extract decided with, and a
+standalone `mumdia features` reads them with `--q1-cal`; without them the stage is an error.
+A row whose lists do not have one entry per chromatogram fragment row reads 0, and the stage
+logs how many did (none on the K562 runs). `q1consist::ALL` computes eight more scores the
+classifier is not given (the cosine within the consistent fragments, their log intensity,
+whether the most intense predicted fragment is consistent, and the same similarity scores over
+the fragments that belong); in the screen below they added nothing. Nothing reads a label,
+and the schema id changes only with the family on.
+
+Measured on ZT Scan REP01 with the recipe (`configs/examples/ztscan.json`), four NN seeds per
+arm, every arm of a library on one host with one binary (docs/37_ztscan.md, section 5, has the
+screen of every candidate family and the three-run experiment): on the entrapment library
++2.28% human precursors at the base arm's measured FDP (99,718 against 97,493; seed ranges
+99,341-99,999 and 97,247-97,809) and +2.22% at a measured FDP of 1.0%, the combined FDP at a
+reported 1% falling from 1.28% to 1.20%; on the human library +1.85% precursors (101,446
+against 99,605; 101,222-101,602 and 99,331-99,817), +2.1% peptides, +0.7% protein groups. With
+four of the columns in the rescore prefilter, which `rescore::prefilter_columns` adds when the
+competed table carries them (docs/11, "the prefilter and feature families appended to the
+vector"), +2.97% and +2.48% (100,394 human precursors at the matched FDP, 102,077 precursors).
+Leakage: over all 5.8 million rows of the entrapment run, at a matched `prelim_score`, the AUC
+of entrapment targets (false) against decoys is 0.4997-0.5008 for every `q1c_*` column
+(0.4927-0.5015 for `n_matched_fragments`, `frag_corr`, `log_apex_intensity`,
+`coelution_mean`, `rt_error_abs`, the `q1f_*` columns); among the rows below the decoys'
+median `prelim_score` the Kolmogorov-Smirnov statistic of decoys against targets is
+0.0027-0.0079 (0.0004-0.0059 for the same references). Cost: the features pass +3.5% (83 s
+against 80 s), rescore peak +0.5 GB. Automatic for ZT Scan files (docs/37_ztscan.md, "Automatic for
+ZT Scan files"); in the ZT Scan recipe.
 
 ## The Percolator PIN (`write_pin`, `features.rs:1537`)
 
@@ -967,7 +1039,8 @@ variant no longer exists).
 | `ms1_envelope` | false | the `ms1_envelope` family (nine `ms1e_*` features of the MS1 isotope envelope around the apex), whose evidence extract reads under the same key (psms_extracted v7); appended last under `extended`, after the Q1 families. Refused on 1/K0 spectra and grouped runs. Omitted from the canonical configuration at its default |
 | `q1_precursor` | false | the `q1_precursor` family (eight `q1p_*` features of the unfragmented precursor in the MS2 steps), whose evidence extract reads under the same key (psms_extracted v8); needs `extract.q1_fragments`; appended after `ms1_envelope`. Omitted from the canonical configuration at its default |
 | `q1_multiscale` | false | the `q1_multiscale` family (nine `q1m*` features at 3, 7 and 11 Q1 steps, twelve with `q1_precursor`), psms_extracted v8; needs `extract.q1_fragments`; appended after `q1_precursor`. Omitted from the canonical configuration at its default |
-| `q1_deconvolved` | false | the `q1_deconvolved` family (five `q1d_*` features of the per-peak Q1 centroids at the apex), psms_extracted v8; needs `extract.q1_fragments`; appended last. Omitted from the canonical configuration at its default |
+| `q1_deconvolved` | false | the `q1_deconvolved` family (five `q1d_*` features of the per-peak Q1 centroids at the apex), psms_extracted v8; needs `extract.q1_fragments`; appended after `q1_multiscale`. Omitted from the canonical configuration at its default |
+| `q1_consistency` | false | the `q1_consistency` family (sixteen `q1c_*` features: the per-fragment Q1 decisions read against each fragment's expected Q1 centre), which needs `extract.q1_fragments` and the run's Q1 calibration tolerances (`mumdia features --q1-cal`); appended last under `extended`, after `ms1_envelope` and the other Q1 families. Omitted from the canonical configuration at its default |
 | `im_features` | `off` | the `ion_mobility` family (`off`, `on`, `auto` = on when the spectra carry 1/K0). `run` and `run-experiment` resolve it once (`Config::resolve_im_features`) and hand every stage `on` or `off`; a standalone `mumdia features` resolves `auto` from the reader extract recorded in the chromatograms report. On a 4D run it also makes extract write the chromatograms' per-point 1/K0 (v3/v4). Omitted from the canonical configuration at its default |
 
 Note that the fragment tolerance used inside `mass_accuracy` is a hardcoded

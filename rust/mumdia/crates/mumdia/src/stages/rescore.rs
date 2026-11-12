@@ -1120,7 +1120,7 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
                 rt_s: p.cfg.shadow_rt_s,
                 region: p.cfg.shadow_region,
                 im_tol: p.cfg.shadow_im_tolerance,
-                q1: p.cfg.shadow_q1,
+                q1: p.cfg.shadow_q1.on(),
             },
         )?;
         let floor = scores
@@ -3207,6 +3207,30 @@ const DEFAULT_PREFILTER_FEATURES: &[&str] = &[
     "n_peak_scans",
 ];
 
+/// The prefilter's columns: `rescore.prefilter_features`, or unset the default list, followed by
+/// the Q1-consistency columns of `q1consist::PREFILTER` that the competed table carries
+/// (`features.q1_consistency` on). Without them the prefilter removes real PSMs whose strongest
+/// evidence is the Q1 consistency of their fragments before the classifier sees it: on ZT Scan
+/// REP01, four NN seeds, adding them gave +0.7 points of human precursors at a matched
+/// entrapment FDP on top of the family (docs/37_ztscan.md, section 5). A table without the
+/// family has none of them, so its list is the default.
+fn prefilter_columns(cfg: &RescoreConfig, available: &[String]) -> Vec<String> {
+    match &cfg.prefilter_features {
+        Some(v) => v.clone(),
+        None => DEFAULT_PREFILTER_FEATURES
+            .iter()
+            .copied()
+            .chain(
+                super::q1consist::PREFILTER
+                    .iter()
+                    .copied()
+                    .filter(|c| available.iter().any(|a| a == c)),
+            )
+            .map(|s| s.to_string())
+            .collect(),
+    }
+}
+
 /// The rows `rescore.prefilter_keep_decoys` keeps, or `None` when the prefilter cannot run (no
 /// prefilter column in the table, a non-finite value, which the full validation reports, or
 /// too few confident targets to fit on); the rescore then keeps every PSM and says why.
@@ -3229,13 +3253,7 @@ fn prefilter_mask(
         );
         return Ok(None);
     }
-    let wanted: Vec<String> = match &p.cfg.prefilter_features {
-        Some(v) => v.clone(),
-        None => DEFAULT_PREFILTER_FEATURES
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
-    };
+    let wanted = prefilter_columns(p.cfg, available);
     let cols: Vec<String> = wanted
         .iter()
         .filter(|n| available.contains(n))
@@ -4175,6 +4193,39 @@ mod tests {
             feature_preset: FeaturePreset::All,
             ..Default::default()
         }
+    }
+
+    /// The prefilter's default columns gain the Q1-consistency columns only when the competed
+    /// table carries them; an explicit `rescore.prefilter_features` is taken as it is.
+    #[test]
+    fn the_prefilter_default_gains_the_q1c_columns_only_when_present() {
+        let base: Vec<String> = DEFAULT_PREFILTER_FEATURES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let cfg = RescoreConfig::default();
+        assert_eq!(prefilter_columns(&cfg, &base), base);
+        let mut with = base.clone();
+        with.extend(["q1c_n", "q1c_offset_wmean", "q1c_pred_share"].map(String::from));
+        let mut want = base.clone();
+        want.extend(["q1c_pred_share", "q1c_offset_wmean"].map(String::from));
+        assert_eq!(prefilter_columns(&cfg, &with), want);
+        let all_q1c: Vec<String> = base
+            .iter()
+            .cloned()
+            .chain(super::super::q1consist::NAMES.iter().map(|s| s.to_string()))
+            .collect();
+        let got = prefilter_columns(&cfg, &all_q1c);
+        assert_eq!(&got[..base.len()], &base[..]);
+        assert_eq!(&got[base.len()..], super::super::q1consist::PREFILTER);
+        let explicit = RescoreConfig {
+            prefilter_features: Some(vec!["a".to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            prefilter_columns(&explicit, &all_q1c),
+            vec!["a".to_string()]
+        );
     }
 
     #[test]

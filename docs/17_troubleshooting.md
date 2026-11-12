@@ -254,13 +254,17 @@ Cause: the SCIEX MS Data Converter writes every Q1 bin of the sweep as an MS2 sp
 carrying its target and no offsets, and the engine read a window without offsets as
 all-ion, the whole m/z range, so the run had one window that every candidate shared.
 
-Fix: give the half-width of the method's Q1 window,
+Fix: since 0.12.0 a scanning quadrupole that names its targets alone (SCIEX ZT Scan DIA) is
+read with the half-width its isolation census suggests (five steps of the sweep) and searched
+with the ZT Scan analysis without any key (docs/37_ztscan.md, "Automatic for ZT Scan files"),
+so the message above now means a file of another layout, which needs its half-width set; a ZT
+Scan method whose window is not five steps wide needs it set too:
 
 ```json
 {"convert": {"isolation_half_width": 1.9}}
 ```
 
-and search with a library restricted to the precursor range the method scanned. Each bin
+Search with a library restricted to the precursor range the method scanned. Each bin
 is then a window of its own; docs/04_convert.md, "SCIEX ZT Scan DIA", has the measurements,
 and docs/37_ztscan.md the guide and the recipe (`configs/examples/ztscan.json`). To know
 before a run, `mumdia peak-census --mzml <run> --max-spectra 10000` prints an `isolation`

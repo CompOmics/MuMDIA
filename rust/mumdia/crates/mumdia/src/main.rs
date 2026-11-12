@@ -483,6 +483,10 @@ enum Cmd {
         out: String,
         #[arg(long)]
         out_pin: String,
+        /// The run's `cal.json` with its Q1 calibration, whose per-fragment decision
+        /// tolerances `features.q1_consistency` reads the Q1 decisions against.
+        #[arg(long)]
+        q1_cal: Option<String>,
         #[arg(long)]
         config: Option<String>,
     },
@@ -816,9 +820,11 @@ enum Cmd {
     ///
     /// For an mzML the `isolation` block says how `convert` reads the MS2 isolation windows
     /// of the spectra counted: with offsets, without isolation, or a target and no offsets.
-    /// A scanning-quadrupole file of the last kind (SCIEX ZT Scan DIA) is refused without
-    /// `convert.isolation_half_width`; the block names the layout of its targets and a
-    /// half-width to start from (docs/37_ztscan.md).
+    /// A file of the last kind needs a half-width (`convert_refuses`). A scanning quadrupole
+    /// of that kind (`scanning_quadrupole`: SCIEX ZT Scan DIA) is the one input `run`,
+    /// `run-experiment` and `convert` read with the half-width the block suggests unless
+    /// `convert.isolation_half_width` is set, and search with the ZT Scan analysis; any other
+    /// file of that kind is refused without the key (docs/37_ztscan.md).
     PeakCensus {
         #[arg(long)]
         mzml: String,
@@ -1736,6 +1742,18 @@ fn load_config_raw(path: &Option<String>) -> Result<Config> {
 /// `Role::required_by` says this configuration actually uses, and the default
 /// configuration uses none.
 fn load_config(path: &Option<String>) -> Result<Config> {
+    let mut cfg = load_search_config(path)?;
+    // The automatic keys of the ZT Scan analysis are off for a standalone stage: only `run`
+    // and `run-experiment` detect a ZT Scan run and calibrate its Q1 sweep (docs/37_ztscan.md,
+    // "Automatic for ZT Scan files"). A key set explicitly is kept, and what it reads checked.
+    cfg.resolve_ztscan_standalone()
+        .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
+    Ok(cfg)
+}
+
+/// [`load_config`] for `run` and `run-experiment`, which resolve the automatic keys of the
+/// ZT Scan analysis themselves, from their inputs (`mumdia::ztscan`).
+fn load_search_config(path: &Option<String>) -> Result<Config> {
     let mut cfg = load_config_raw(path)?;
     cfg.predict_frag.sidecar_script_dir =
         python::resolve_script_dir(&cfg.predict_frag.sidecar_script_dir, path.as_deref());
@@ -1931,7 +1949,32 @@ fn real_main() -> Result<()> {
             top_peaks_ms2,
             top_peaks_ms1,
         } => {
-            let cfg = load_config(&config)?;
+            let mut cfg = load_config(&config)?;
+            // A vendor file is converted to mzML first; an mzML passes through untouched.
+            // The output directory is the fallback location for the converted file when
+            // the input sits somewhere unwritable.
+            let mzml = mumdia::raw::ensure_mzml(
+                &mzml,
+                &cfg.convert,
+                Some(std::path::Path::new(&out_dir)),
+            )?;
+            // `convert.isolation_half_width` unset is automatic: a SCIEX ZT Scan DIA file is
+            // read with the half-width its isolation census suggests, as `run` reads it
+            // (`mumdia::ztscan`); any other file that names targets without offsets is still
+            // refused.
+            if cfg.convert.isolation_half_width.is_none() {
+                if let mumdia::ztscan::InputKind::ZtScan(l) = mumdia::ztscan::probe(&mzml).kind {
+                    tracing::info!(
+                        "convert: SCIEX ZT Scan DIA input ({} quadrupole positions, {:.4} m/z \
+                         apart): read with the Q1 half-width {} m/z its isolation census \
+                         suggests (convert.isolation_half_width)",
+                        l.positions,
+                        l.step,
+                        l.half_width
+                    );
+                    cfg.convert.isolation_half_width = Some(l.half_width);
+                }
+            }
             // Fold the conversion CLI caps into the convert artifacts' provenance
             // key: they change the spectra output but are not part of the config, so
             // two different caps would otherwise produce an identical config_hash
@@ -1941,14 +1984,6 @@ fn real_main() -> Result<()> {
                 "{}\u{1f}max_spectra={max_spectra}\u{1f}top_peaks_ms2={top_peaks_ms2}\u{1f}top_peaks_ms1={top_peaks_ms1}",
                 cfg.canonical_json()
             ));
-            // A vendor file is converted to mzML first; an mzML passes through untouched.
-            // The output directory is the fallback location for the converted file when
-            // the input sits somewhere unwritable.
-            let mzml = mumdia::raw::ensure_mzml(
-                &mzml,
-                &cfg.convert,
-                Some(std::path::Path::new(&out_dir)),
-            )?;
             stages::convert::run(stages::convert::ConvertParams {
                 mzml: &mzml,
                 out_dir: &out_dir,
@@ -2063,7 +2098,7 @@ fn real_main() -> Result<()> {
                      is still optimistic"
                 );
             }
-            if cfg.rt_im_train.q1_calibrate {
+            if cfg.rt_im_train.q1_calibrate.on() {
                 tracing::warn!(
                     "rt_im_train.q1_calibrate is set but `mumdia rt-im-train` reads no spectra; \
                      only `run`/`run-experiment` calibrate the Q1 sweep"
@@ -2132,18 +2167,20 @@ fn real_main() -> Result<()> {
             // The per-fragment Q1 decision reads the run's calibration; the re-pick runs
             // inside extract.
             let mut ext_cfg = cfg.extract.clone();
-            let q1_dec = ext_cfg.q1_deconvolved || cfg.features.q1_deconvolved;
-            if ext_cfg.q1_fragments || q1_dec {
+            let q1_dec = ext_cfg.q1_deconvolved || cfg.features.q1_deconvolved.on();
+            if ext_cfg.q1_fragments.on() || q1_dec {
                 let cal = q1_cal.as_deref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "extract.q1_fragments and extract.q1_deconvolved need the run's \
                          cal.json with its Q1 calibration: pass --q1-cal"
                     )
                 })?;
-                ext_cfg.q1_model =
-                    Some(stages::q1frag::read_model_opts(cal, ext_cfg.q1_fragments)?);
-                if ext_cfg.q1_fragments {
-                    ext_cfg.q1_repick = cfg.retrace.q1_repick;
+                ext_cfg.q1_model = Some(stages::q1frag::read_model_opts(
+                    cal,
+                    ext_cfg.q1_fragments.on(),
+                )?);
+                if ext_cfg.q1_fragments.on() {
+                    ext_cfg.q1_repick = cfg.retrace.q1_repick.on();
                     ext_cfg.q1_repick_peaks = cfg.retrace.q1_repick_peaks;
                 }
                 if q1_dec {
@@ -2154,9 +2191,9 @@ fn real_main() -> Result<()> {
             ext_cfg.ms1_envelope = cfg.features.ms1_envelope;
             // `features.q1_precursor` / `features.q1_multiscale`: extract reads the scores on
             // the per-fragment decision's patches.
-            ext_cfg.q1_precursor = cfg.features.q1_precursor;
-            ext_cfg.q1_multiscale = cfg.features.q1_multiscale;
-            ext_cfg.q1_dec_features = cfg.features.q1_deconvolved;
+            ext_cfg.q1_precursor = cfg.features.q1_precursor.on();
+            ext_cfg.q1_multiscale = cfg.features.q1_multiscale.on();
+            ext_cfg.q1_dec_features = cfg.features.q1_deconvolved.on();
             stages::extract::run(stages::extract::ExtractParams {
                 precursor_span: None,
                 fragment_offset,
@@ -2323,10 +2360,20 @@ fn real_main() -> Result<()> {
             seed_psms,
             out,
             out_pin,
+            q1_cal,
             config,
         } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            // `features.q1_consistency` reads the decisions against the run's tolerances.
+            let q1_tolerances = match (&q1_cal, cfg.features.q1_consistency.on()) {
+                (Some(cal), _) => Some(stages::q1frag::read_model(cal)?.tolerances),
+                (None, true) => anyhow::bail!(
+                    "features.q1_consistency needs the run's cal.json with its Q1 \
+                     calibration: pass --q1-cal"
+                ),
+                (None, false) => None,
+            };
             stages::features::run(stages::features::FeaturesParams {
                 psms: &psms_extracted,
                 chromatograms: &chromatograms,
@@ -2338,6 +2385,7 @@ fn real_main() -> Result<()> {
                 // `retrace.apex_features` names the column a retraced psms_extracted
                 // carries; it is read only while the ion-mobility family is on.
                 imc_ref_w: cfg.retrace.apex_features,
+                q1_tolerances,
             })?;
         }
         Cmd::Prescan {
@@ -2552,7 +2600,7 @@ fn real_main() -> Result<()> {
             top_peaks_ms2,
             retain,
         } => {
-            let mut cfg = load_config(&config)?;
+            let mut cfg = load_search_config(&config)?;
             if let Some(pf) = &profile {
                 cfg.apply_profile(pf)?;
             }
@@ -2640,7 +2688,7 @@ fn real_main() -> Result<()> {
             top_peaks_ms2,
             retain,
         } => {
-            let mut cfg = load_config(&config)?;
+            let mut cfg = load_search_config(&config)?;
             if let Some(pf) = &profile {
                 cfg.apply_profile(pf)?;
             }
@@ -2731,7 +2779,7 @@ fn real_main() -> Result<()> {
                          v6) and --spectra-ms2 (its spectra_ms2 v3)"
                     ),
                 }
-            } else if cfg.quant.q1_cycle_halfwidth > 0 {
+            } else if cfg.quant.q1_cycles() > 0 {
                 match &spectra_ms2 {
                     Some(sp) => Some(stages::q1quant::Q1QuantInputs {
                         psms_extracted: None,

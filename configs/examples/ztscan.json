@@ -7,7 +7,8 @@
     "q1_fragment_features": true,
     "q1_precursor": true,
     "q1_multiscale": true,
-    "q1_deconvolved": true
+    "q1_deconvolved": true,
+    "q1_consistency": true
   },
   "extract": {
     "apex_rt_prior_s": 120.0,

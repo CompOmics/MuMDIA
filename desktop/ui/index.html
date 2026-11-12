@@ -334,14 +334,18 @@
           </div>
         </div>
         <label class="check">
-          <input type="checkbox" id="ztscan-recipe" />
+          <input type="checkbox" id="ztscan-analysis" />
           <span>
-            <b>Use the ZT Scan recipe</b>: per-fragment Q1 decisions, the two-dimensional
-            apex re-pick, the Q1 term of the shadow test and a quantification window counted
-            in Q1 cycles, on top of the chosen preset.
-            <span class="hint inline" id="ztscan-recipe-note"></span>
+            <b>ZT Scan analysis (recommended)</b>: the engine's default for ZT Scan files, on
+            top of the chosen preset: per-fragment Q1 decisions, the two-dimensional apex
+            re-pick, the Q1 feature families, the Q1 term of the shadow test and a
+            quantification window counted in Q1 cycles, and the ZT Scan search space for a
+            library built from a FASTA.
+            <span class="hint inline" id="ztscan-analysis-note"></span>
           </span>
         </label>
+        <p class="hint" id="ztscan-library-note"></p>
+        <p class="hint" id="ztscan-mods-note"></p>
       </div>
     </div>
 

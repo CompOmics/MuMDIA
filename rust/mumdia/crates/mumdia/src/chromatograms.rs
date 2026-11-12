@@ -1418,6 +1418,7 @@ mod tests {
                 cfg: &fcfg,
                 config_hash: "test",
                 imc_ref_w: false,
+                q1_tolerances: None,
             })
             .unwrap();
             let tf = t.elapsed().as_secs_f64();

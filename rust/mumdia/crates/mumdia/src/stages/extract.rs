@@ -3918,7 +3918,7 @@ impl PsmRows {
         if cfg.q1_profile {
             self.q1.push(r.q1);
         }
-        if cfg.q1_fragments {
+        if cfg.q1_fragments.on() {
             self.q1f.push(r.q1f.unwrap_or_default());
         }
         if cfg.ms1_envelope {
@@ -4047,7 +4047,7 @@ impl PsmRows {
         // psms_extracted v6: the per-fragment Q1 decision, appended last, only under
         // `extract.q1_fragments`: the row's summary, then one list per decision with an entry
         // per library fragment.
-        if cfg.q1_fragments {
+        if cfg.q1_fragments.on() {
             let q = take(&mut self.q1f);
             let col = |f: fn(&q1frag::Q1fRow) -> f64| -> Vec<f64> { q.iter().map(f).collect() };
             cols.push(Col::F64(
@@ -4128,7 +4128,7 @@ impl PsmRows {
         }
         // psms_extracted v8: the unfragmented-precursor evidence and the multi-scale Q1
         // scores, appended last, each only under its key (`stages::q1score`).
-        if cfg.q1_precursor && cfg.q1_fragments {
+        if cfg.q1_precursor && cfg.q1_fragments.on() {
             for (k, name) in crate::stages::q1score::Q1P_COLUMNS.iter().enumerate() {
                 cols.push(Col::F64(
                     (*name).into(),
@@ -4136,7 +4136,7 @@ impl PsmRows {
                 ));
             }
         }
-        if cfg.q1_multiscale && cfg.q1_fragments {
+        if cfg.q1_multiscale && cfg.q1_fragments.on() {
             let names = crate::stages::q1score::q1m_columns(cfg.q1_precursor);
             for (k, name) in names.iter().enumerate() {
                 cols.push(Col::F64(
@@ -4145,7 +4145,7 @@ impl PsmRows {
                 ));
             }
         }
-        if cfg.q1_dec_features && cfg.q1_fragments {
+        if cfg.q1_dec_features && cfg.q1_fragments.on() {
             for (k, name) in crate::stages::q1dec::Q1D_COLUMNS.iter().enumerate() {
                 cols.push(Col::F64(
                     (*name).into(),
@@ -4488,7 +4488,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     // `extract.q1_deconvolved`: every MS2 peak's Q1 centroid (`stages::q1dec`) and each
     // candidate's calibrated expected centre; a hit counts only within the learned tolerance.
     let q1_gate: Option<crate::stages::q1dec::Q1Gate> = if p.cfg.q1_deconvolved
-        || (p.cfg.q1_dec_features && p.cfg.q1_fragments)
+        || (p.cfg.q1_dec_features && p.cfg.q1_fragments.on())
     {
         if has_im {
             anyhow::bail!(
@@ -4680,7 +4680,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     }
     // The unfragmented-precursor and multi-scale Q1 scores (`features.q1_precursor`,
     // `features.q1_multiscale`) are read on the per-fragment decision's patches.
-    if (p.cfg.q1_precursor || p.cfg.q1_multiscale) && !p.cfg.q1_fragments {
+    if (p.cfg.q1_precursor || p.cfg.q1_multiscale) && !p.cfg.q1_fragments.on() {
         anyhow::bail!(
             "extract: features.q1_precursor and features.q1_multiscale are read on the RT x \
              step patches of extract.q1_fragments; set it as well"
@@ -4688,7 +4688,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     }
     // The per-fragment Q1 decision (`extract.q1_fragments`): the sweep spectra_ms2 v3
     // recorded as a cycle x step grid of this stage's scans, and the run's calibrated model.
-    let q1f_grid: Option<q1frag::Q1Grid> = if p.cfg.q1_fragments {
+    let q1f_grid: Option<q1frag::Q1Grid> = if p.cfg.q1_fragments.on() {
         if has_im {
             anyhow::bail!(
                 "extract: extract.q1_fragments decides on a scanning quadrupole's Q1 steps, and \
@@ -6806,9 +6806,9 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             artifact::psms_extracted_q1s(
                 has_im,
                 p.cfg.q1_profile,
-                p.cfg.q1_fragments,
+                p.cfg.q1_fragments.on(),
                 p.cfg.ms1_envelope,
-                p.cfg.q1_fragments
+                p.cfg.q1_fragments.on()
                     && (p.cfg.q1_precursor || p.cfg.q1_multiscale || p.cfg.q1_dec_features),
             ),
             psms_written,
