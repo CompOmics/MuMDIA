@@ -25,6 +25,7 @@ from conftest import (
     assert_library_load_invariants,
     assert_string_columns_utf8,
     read_columns,
+    run_worker,
     run_worker_ok,
 )
 
@@ -527,10 +528,13 @@ def test_an_all_zero_ion_mobility_column_is_not_written(diann_lib, tmp_path):
 # ---------------------------------------------------------------- protein annotations
 
 
-def _with_annotation_columns(diann_lib, tmp_path, cells_by_key):
+ANNOTATION_COLUMNS = ["protein_ids", "protein_names", "genes"]
+
+
+def _with_annotation_columns(diann_lib, tmp_path, cells_by_key, genes=True):
     """The fixture library with `Protein.Ids`, `Protein.Names` and `Genes` set per (modified
     sequence, charge) from `cells_by_key` (ids, names, genes); precursors not named keep
-    their fixture name as names and ids, and no gene."""
+    their fixture name as names and ids, and no gene. `genes=False` leaves out `Genes`."""
     src = pq.read_table(diann_lib)
     modseq = src.column("Modified.Sequence").to_pylist()
     charge = src.column("Precursor.Charge").to_pylist()
@@ -539,8 +543,9 @@ def _with_annotation_columns(diann_lib, tmp_path, cells_by_key):
     i = src.schema.get_field_index("Protein.Names")
     table = src.set_column(i, "Protein.Names", pa.array([c[1] for c in cells], pa.string()))
     table = table.append_column("Protein.Ids", pa.array([c[0] for c in cells], pa.string()))
-    table = table.append_column("Genes", pa.array([c[2] for c in cells], pa.string()))
-    lib = tmp_path / "diann_lib_annotated.parquet"
+    if genes:
+        table = table.append_column("Genes", pa.array([c[2] for c in cells], pa.string()))
+    lib = tmp_path / ("diann_lib_annotated.parquet" if genes else "diann_lib_nogenes.parquet")
     pq.write_table(table, str(lib), compression="snappy")
     return lib
 
@@ -570,99 +575,147 @@ def annotated(diann_lib, tmp_path_factory):
     return {"dir": d, "lib": lib, "prec": prec, "frag": frag, "stdout": out}
 
 
-def _annotation_rows(path):
+def _annotation_rows(prec_path):
+    """{protein: (protein_ids, protein_names, genes)} of a precursor table's columns, every
+    row of one protein checked to agree."""
+    t = read_columns(prec_path)
+    rows = {}
+    for k, i, n, g in zip(t["protein"], t["protein_ids"], t["protein_names"], t["genes"]):
+        assert rows.setdefault(k, (i, n, g)) == (i, n, g), f"rows of {k} disagree"
+    return rows
+
+
+def _side_rows(path):
     t = read_columns(path)
     return {k: (i, n, g) for k, i, n, g in zip(t["protein"], t["protein_ids"],
                                                t["protein_names"], t["genes"])}
 
 
-def test_the_import_writes_accessions_names_and_genes_beside_the_precursors(annotated):
-    """`protein_annotations.parquet` lands beside the precursor table, keyed by the
-    library's `protein` string, with the accessions, entry names and genes of
-    `Protein.Ids` / `Protein.Names` / `Genes`: aligned for one protein, `;`-separated for
-    a shared peptide, empty where the library has no gene."""
-    ann = annotated["dir"] / "protein_annotations.parquet"
-    assert ann.is_file()
+def test_the_import_writes_accessions_names_and_genes_into_the_precursor_table(annotated):
+    """The annotations are columns of the precursor table itself (#299), so the library carries
+    them wherever it is copied: every precursor has the accessions, entry names and genes of
+    its `protein` string from `Protein.Ids` / `Protein.Names` / `Genes`, aligned for one
+    protein, `;`-separated for a shared peptide, empty where the library has no gene. No
+    side table is written."""
+    assert not (annotated["dir"] / "protein_annotations.parquet").exists()
     assert "protein annotations:" in annotated["stdout"]
-    rows = _annotation_rows(ann)
+    rows = _annotation_rows(annotated["prec"])
     assert rows["ALBU_HUMAN"] == ("P02768", "ALBU_HUMAN", "ALB")
     assert rows["ALBU_HUMAN;ALBU_BOVIN"] == ("P02768;P02769", "ALBU_HUMAN;ALBU_BOVIN", "ALB")
     assert rows["ENO1_YEAST"] == ("P06733", "ENO1_YEAST", ""), "a missing gene stays empty"
 
 
-def test_every_library_protein_has_one_annotation_row_and_the_key_is_unchanged(annotated):
-    """The key is the library's `protein` cell exactly, so every reported row joins; the
-    rows are unique, ascend by key, and are utf8 without nulls. Decoys and UNASSIGNED are
-    never annotated (the importer writes targets only)."""
-    ann = annotated["dir"] / "protein_annotations.parquet"
-    t = pq.read_table(str(ann))
-    assert t.column_names == ["protein", "protein_ids", "protein_names", "genes",
-                              "description"]
-    assert all(pa.types.is_string(f.type) and not f.nullable for f in t.schema)
-    keys = t.column("protein").to_pylist()
-    assert keys == sorted(keys) and len(keys) == len(set(keys))
-    lib_proteins = set(read_columns(annotated["prec"])["protein"])
-    assert set(keys) == lib_proteins - {"UNASSIGNED"}
-    assert not any(k.startswith("DECOY_") for k in keys)
+def test_the_columns_are_utf8_without_nulls_and_the_key_is_unchanged(annotated):
+    """The three columns come after every other column, utf8 and never null, so the engine
+    reads them; `protein`, the grouping key, is the library's protein cell exactly. A
+    protein with no annotation (`UNASSIGNED`) has empty cells."""
+    assert_string_columns_utf8(annotated["prec"])
+    t = pq.read_table(str(annotated["prec"]))
+    assert t.column_names[-3:] == ANNOTATION_COLUMNS
+    for c in ANNOTATION_COLUMNS:
+        assert pa.types.is_string(t.schema.field(c).type)
+        assert t.column(c).null_count == 0
+    rows = _annotation_rows(annotated["prec"])
+    assert set(rows) == set(read_columns(annotated["prec"])["protein"])
+    if "UNASSIGNED" in rows:
+        assert rows["UNASSIGNED"] == ("", "", "")
 
 
 def test_a_contaminant_id_gives_its_accessions_and_entry_names(annotated):
     """A `CON_sp|ACC|NAME` id has no UniProt entry name in `Protein.Names` (the description
     word `Keratin,`), so the protein key is the id list; the annotation still names the
     accessions and the entry names, and the description word is not a gene."""
-    rows = _annotation_rows(annotated["dir"] / "protein_annotations.parquet")
+    rows = _annotation_rows(annotated["prec"])
     key = "CON_sp|P02444|KRA33_SHEEP;CON_sp|P02445|KRA34_SHEEP"
     assert rows[key] == ("P02444;P02445", "KRA33_SHEEP;KRA34_SHEEP", "")
 
 
 def test_isoform_ids_under_one_entry_name_are_united_in_file_order(annotated):
-    """Two precursors share the key `TMED2_HUMAN` with different id lists; the row has
+    """Two precursors share the key `TMED2_HUMAN` with different id lists; both rows carry
     every accession once, in the order the library first gives them."""
-    rows = _annotation_rows(annotated["dir"] / "protein_annotations.parquet")
+    rows = _annotation_rows(annotated["prec"])
     assert rows["TMED2_HUMAN"] == ("Q15363;Q15363-2", "TMED2_HUMAN", "TMED2")
 
 
-def test_the_annotation_does_not_change_the_library_tables(annotated, tmp_path):
-    """The side table is the only addition: the precursor and fragment tables are the same
-    bytes with `--no-annotations`, which writes no table."""
+def test_the_annotation_columns_are_the_only_change(annotated, tmp_path):
+    """`--no-annotations` writes the same library without the three columns: every other
+    column is the same, and the fragment table is the same bytes."""
     prec, frag = tmp_path / "lib_precursors.parquet", tmp_path / "lib_fragments.parquet"
     run_worker_ok("import_diann_lib.py", annotated["lib"], prec, frag, "--no-annotations")
     assert not (tmp_path / "protein_annotations.parquet").exists()
-    assert prec.read_bytes() == annotated["prec"].read_bytes()
+    plain = pq.read_table(str(prec))
+    with_ann = pq.read_table(str(annotated["prec"]))
+    assert not set(ANNOTATION_COLUMNS) & set(plain.column_names)
+    assert with_ann.drop(ANNOTATION_COLUMNS).equals(plain)
     assert frag.read_bytes() == annotated["frag"].read_bytes()
 
 
 def test_annotations_path_option_and_a_names_only_library(imported, diann_lib, tmp_path):
-    """`--annotations` writes the table where it is told; a library with `Protein.Names`
-    only is annotated with its entry names and no accessions."""
+    """`--annotations` also writes the annotations as a side table where it is told; a
+    library with `Protein.Names` only is annotated with its entry names and no accessions."""
     prec, frag = tmp_path / "p.parquet", tmp_path / "f.parquet"
     target = tmp_path / "elsewhere.parquet"
     run_worker_ok("import_diann_lib.py", diann_lib, prec, frag, "--annotations", target)
     assert target.is_file() and not (tmp_path / "protein_annotations.parquet").exists()
-    rows = _annotation_rows(target)
-    assert rows["ALBU_HUMAN"] == ("", "ALBU_HUMAN", "")
-    assert (imported["prec"].parent / "protein_annotations.parquet").is_file()
+    assert _side_rows(target)["ALBU_HUMAN"] == ("", "ALBU_HUMAN", "")
+    assert _annotation_rows(prec)["ALBU_HUMAN"] == ("", "ALBU_HUMAN", "")
+    assert _annotation_rows(imported["prec"])["ALBU_HUMAN"] == ("", "ALBU_HUMAN", "")
 
 
-def test_a_stale_table_is_removed_when_the_library_has_no_protein_columns(diann_lib, tmp_path):
-    """A table left in the output directory by another library would annotate this one
-    wrongly; with no protein columns to build one from, the import removes it."""
+def test_a_stale_table_is_removed_and_a_library_without_proteins_gets_no_columns(diann_lib,
+                                                                                 tmp_path):
+    """A side table left in the output directory by an earlier import would annotate a later
+    library wrongly (the engine reads one beside a library without the columns): the import
+    removes it. A library with no protein columns gets no annotation columns, so a search on
+    it warns rather than reporting empty cells as if they were known."""
     src = pq.read_table(diann_lib)
     lib = tmp_path / "noprot.parquet"
     pq.write_table(src.drop(["Protein.Names"]), str(lib), compression="snappy")
     stale = tmp_path / "protein_annotations.parquet"
     stale.write_bytes(b"stale")
-    run_worker_ok("import_diann_lib.py", lib, tmp_path / "p.parquet", tmp_path / "f.parquet")
+    out, _ = run_worker_ok("import_diann_lib.py", lib, tmp_path / "p.parquet",
+                           tmp_path / "f.parquet")
     assert not stale.exists()
+    assert not set(ANNOTATION_COLUMNS) & set(pq.read_schema(str(tmp_path / "p.parquet")).names)
+    assert "a search on this library warns" in out
+
+
+def test_a_fasta_fills_what_the_library_leaves_empty(diann_lib, tmp_path):
+    """`--fasta` completes the annotations from the FASTA headers: a library without `Genes`
+    gets its genes, matched on the accessions and entry names it gives; a value the library
+    gives is kept."""
+    lib = _with_annotation_columns(diann_lib, tmp_path, ANNOTATED, genes=False)
+    fasta = tmp_path / "proteins.fasta"
+    fasta.write_text(
+        ">sp|P02768|ALBU_HUMAN Serum albumin OS=Homo sapiens GN=ALB\nK\n"
+        ">sp|P02769|ALBU_BOVIN Albumin OS=Bos taurus GN=ALB\nK\n"
+        ">sp|P06733|ENO1_YEAST Enolase OS=Saccharomyces GN=ENO1\nK\n"
+        ">sp|Q15363|TMED2_HUMAN Transmembrane OS=Homo sapiens GN=TMED2\nK\n", encoding="utf-8")
+    prec, frag = tmp_path / "p.parquet", tmp_path / "f.parquet"
+    out, _ = run_worker_ok("import_diann_lib.py", lib, prec, frag, "--fasta", fasta)
+    rows = _annotation_rows(prec)
+    assert rows["ALBU_HUMAN"] == ("P02768", "ALBU_HUMAN", "ALB")
+    assert rows["ENO1_YEAST"] == ("P06733", "ENO1_YEAST", "ENO1")
+    assert rows["TMED2_HUMAN"] == ("Q15363;Q15363-2", "TMED2_HUMAN", "TMED2")
+    assert rows["ALBU_HUMAN;ALBU_BOVIN"][2] == "ALB"
+    assert "completed from" in out
+    rc, _, err = run_worker("import_diann_lib.py", lib, prec, frag, "--fasta",
+                            tmp_path / "missing.fasta")
+    assert rc != 0 and "no such file" in err
 
 
 def test_the_decoy_builder_carries_the_annotations_to_its_output(annotated, tmp_path):
     """A documented recipe writes the decoy library elsewhere than the import; the builder
-    copies the table beside its output, byte for byte, so the engine finds it next to the
-    library it is given (the reverse builder: `test_decoy_builders.py`)."""
+    keeps the columns on every target and copies them onto its decoy, so the library it
+    writes carries them (the reverse builder: `test_decoy_builders.py`)."""
     out = tmp_path / "out"
     out.mkdir()
     prec, frag = out / "lib_precursors.parquet", out / "lib_fragments.parquet"
     run_worker_ok("make_shift_decoys.py", annotated["prec"], annotated["frag"], prec, frag)
-    src = annotated["dir"] / "protein_annotations.parquet"
-    assert (out / "protein_annotations.parquet").read_bytes() == src.read_bytes()
+    assert not (out / "protein_annotations.parquet").exists()
+    t = read_columns(prec)
+    target = _annotation_rows(annotated["prec"])
+    for p, lab, i, n, g in zip(t["protein"], t["label"], t["protein_ids"], t["protein_names"],
+                               t["genes"]):
+        key = p[len("DECOY_"):] if lab == "decoy" else p
+        assert (i, n, g) == target[key], (p, lab)

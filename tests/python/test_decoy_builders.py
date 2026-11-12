@@ -476,12 +476,65 @@ def test_reverse_aborts_when_the_library_mz_disagree_with_its_calculator(tmp_pat
     assert not (tmp_path / "prec_out.parquet").exists()
 
 
+ANNOTATION_COLUMNS = ["protein_ids", "protein_names", "genes"]
+
+
+def _annotation(protein):
+    """The fixture's annotation of a `PROT<n>_ECOLI` protein."""
+    n = protein.replace("PROT", "").replace("_ECOLI", "")
+    return (f"P{int(n):05d}", protein, f"gene{n}")
+
+
+def _with_annotation_columns(lib, directory):
+    """`lib` with the three annotation columns, written into `directory`."""
+    t = pq.read_table(str(lib["prec"]))
+    cells = [_annotation(p) for p in t.column("protein").to_pylist()]
+    for j, c in enumerate(ANNOTATION_COLUMNS):
+        t = t.append_column(c, pa.array([x[j] for x in cells], pa.string()))
+    directory.mkdir(parents=True, exist_ok=True)
+    prec = directory / "target_precursors.parquet"
+    pq.write_table(t, str(prec), compression="snappy")
+    return {**lib, "prec": prec}
+
+
+def _assert_decoys_carry_their_targets_annotations(prec_path):
+    """Every row has the annotation columns (utf8, no null); every target has its protein's
+    annotation and every decoy exactly its target's, paired on (peptidoform_id, charge)."""
+    t = pq.read_table(str(prec_path))
+    for c in ANNOTATION_COLUMNS:
+        f = t.schema.field(c)
+        assert pa.types.is_string(f.type), f"{c} is {f.type}, the engine reads utf8 only"
+        assert t.column(c).null_count == 0
+    rows = t.to_pydict()
+    by_pair = {}
+    for i, lab in enumerate(rows["label"]):
+        cell = tuple(rows[c][i] for c in ANNOTATION_COLUMNS)
+        by_pair.setdefault((rows["peptidoform_id"][i], rows["charge"][i]), {})[lab] = cell
+        if lab == "target":
+            assert cell == _annotation(rows["protein"][i])
+    assert by_pair and all(v["decoy"] == v["target"] for v in by_pair.values())
+
+
 @pytest.mark.parametrize("script", ["make_shift_decoys.py", "make_reverse_decoys.py"])
-def test_the_protein_annotations_follow_the_library_to_its_new_directory(script, tmp_path):
-    """The protein annotation table beside the target library is copied, byte for byte,
-    beside the decoy library, so the engine finds it next to the library it is given; with
-    no table beside the input, a stale one at the output belongs to another library and is
-    removed."""
+def test_the_annotation_columns_travel_with_every_target_onto_its_decoy(script, target_library,
+                                                                       tmp_path):
+    """The protein annotations are columns of the precursor table (#299): the builder keeps
+    them on every target and copies them onto its decoy, so the output library carries them
+    wherever it is copied, and writes no side table."""
+    src = _with_annotation_columns(target_library, tmp_path / "in")
+    out = _build(script, src, tmp_path / "out")
+    _assert_decoys_carry_their_targets_annotations(out["prec"])
+    assert_string_columns_utf8(out["prec"])
+    assert not (out["prec"].parent / "protein_annotations.parquet").exists()
+    assert "carried in the library's protein_ids" in out["stdout"]
+
+
+@pytest.mark.parametrize("script", ["make_shift_decoys.py", "make_reverse_decoys.py"])
+def test_a_side_table_beside_an_older_library_becomes_its_columns(script, tmp_path):
+    """A target library imported before the columns existed has its annotations in the side
+    table beside it; the builder writes them into its output's columns, decoys taking their
+    targets' values. With no side table, a stale one at the output belongs to another
+    library and is removed, and the output has no annotation columns."""
     import sys
 
     sys.path.insert(0, str(SCRIPTS))
@@ -489,12 +542,17 @@ def test_the_protein_annotations_follow_the_library_to_its_new_directory(script,
 
     (tmp_path / "in").mkdir()
     src = _write_target_library(tmp_path / "in")
+    proteins = sorted(set(read_columns(src["prec"])["protein"]))
     ann = tmp_path / "in" / "protein_annotations.parquet"
-    write_protein_annotations({"P1": {"protein_ids": "P00001", "genes": "G1"}}, ann)
+    write_protein_annotations(
+        {p: dict(zip(ANNOTATION_COLUMNS, _annotation(p))) for p in proteins}, ann)
     out = _build(script, src, tmp_path / "out")
-    copied = out["prec"].parent / "protein_annotations.parquet"
-    assert copied.read_bytes() == ann.read_bytes()
+    _assert_decoys_carry_their_targets_annotations(out["prec"])
+    stale = out["prec"].parent / "protein_annotations.parquet"
+    assert not stale.exists(), "the output carries columns, not a side table"
 
     ann.unlink()
-    _build(script, src, tmp_path / "out")
-    assert not copied.exists()
+    stale.write_bytes(ann.parent.joinpath("target_precursors.parquet").read_bytes())
+    out = _build(script, src, tmp_path / "out")
+    assert not stale.exists()
+    assert not set(ANNOTATION_COLUMNS) & set(pq.read_schema(str(out["prec"])).names)

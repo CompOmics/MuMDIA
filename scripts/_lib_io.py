@@ -28,8 +28,13 @@ def narrow_type(ty: pa.DataType) -> pa.DataType:
     """Replace the 64-bit-offset arrow types with the 32-bit ones the engine reads.
 
     Recursive: a `large_list<large_string>` has to be narrowed at both levels, and
-    the fragment tables do carry list columns.
+    the fragment tables do carry list columns. A dictionary column (a pandas
+    `Categorical`, which the protein annotation helpers below build to keep a
+    per-row string column cheap in memory) is decoded to its value type: the engine
+    reads plain utf8 columns, and parquet dictionary-encodes them on disk anyway.
     """
+    if pa.types.is_dictionary(ty):
+        return narrow_type(ty.value_type)
     if pa.types.is_large_string(ty):
         return pa.string()
     if pa.types.is_large_binary(ty):
@@ -210,33 +215,45 @@ def sort_fragments_by_candidate(path, buckets: int = 64, tmp_dir=None) -> int:
 
 
 # ---------------------------------------------------------------------------------------
-# Protein annotations: the side table beside a library's precursor table.
+# Protein annotations: in the library itself, and the side table older libraries have.
 #
 # A library's `protein` column is the grouping key every later table inherits (the scored
 # tables' `protein` and `protein_group`, quant, LFQ) and the one the engine reports. It is
 # one string per precursor, `;`-separated for a shared peptide, and for an imported DIA-NN
 # library it holds UniProt entry names (`ALBU_HUMAN`), so the accessions and gene names
-# were lost at import. `protein_annotations.parquet` keeps them without touching the key:
-# one row per distinct `protein` string (or, for a FASTA, per protein), giving its
-# accessions, entry names, genes and description. The engine joins it at report time to add
-# `protein_ids`, `protein_names` and `genes` to the TSVs; every identification and quantity
-# is unchanged. Decoys are never annotated (their `DECOY_` strings are never reported).
+# were lost at import. The annotations keep them without touching the key: per `protein`
+# string, its accessions, entry names and genes. The engine joins them at report time to fill
+# `protein_ids`, `protein_names` and `genes`, the last three columns of the TSVs; every
+# identification and quantity is unchanged.
 #
-# The engine finds the table by convention next to the precursor table it is given
-# (`--lib-precursors`), or through `--lib-annotations`. So every helper that writes a
-# library into another directory carries the table along (`carry_protein_annotations`).
+# Where they live (#299): in three optional columns of the precursor table itself
+# (`ANNOTATION_COLUMNS`), which give every row the annotation of its `protein`, so a library
+# carries them wherever its two tables are copied. The importer writes them, and every helper
+# that writes a library keeps them: the decoy builders copy each target row, columns
+# included, onto its decoy, and a library from before the columns existed gets them from the
+# side table beside it (`embed_annotations`). That side table, `protein_annotations.parquet`
+# (one row per `protein` key), is what the importer wrote beside a library before; the engine
+# still reads it beside a library without the columns, and `mumdia digest` still writes one
+# for a FASTA, which is how a FASTA-built library and the added peptides of
+# `augment_library.py` are annotated.
 # ---------------------------------------------------------------------------------------
 
 PROTEIN_ANNOTATIONS = "protein_annotations.parquet"
-# The columns, in order; all utf8 and non-null (empty when unknown). The key is unique and
-# the rows ascend by it, so the bytes depend only on the content.
+# The side table's columns, in order; all utf8 and non-null (empty when unknown). The key is
+# unique and the rows ascend by it, so the bytes depend only on the content.
 PROTEIN_ANNOTATION_COLUMNS = ("protein", "protein_ids", "protein_names", "genes", "description")
 # The engine's name and version for it (`artifact::PROTEIN_ANNOTATIONS`).
 PROTEIN_ANNOTATIONS_SCHEMA = ("protein_annotations", 1)
+# The optional precursor-table columns: on every row, the annotation of that row's `protein`
+# (utf8, `;`-separated, empty when unknown). All three or none. A decoy row carries its
+# target's values (target and decoy rows stay alike in every column a decoy builder does not
+# rewrite); the engine reads the target rows only (`protein_annotations::LIBRARY_COLUMNS`) and
+# no stage of the search reads them, so they change no identification or quantity.
+ANNOTATION_COLUMNS = ("protein_ids", "protein_names", "genes")
 
 
 def annotations_path(precursors_path) -> str:
-    """Where the protein annotation table of the library at `precursors_path` lives."""
+    """Where the protein annotation side table of the library at `precursors_path` lives."""
     import os
 
     return os.path.join(os.path.dirname(os.path.abspath(str(precursors_path))), PROTEIN_ANNOTATIONS)
@@ -266,8 +283,13 @@ def join_unique(values) -> str:
     return ";".join(seen)
 
 
+def _tokens(cell) -> list:
+    """The `;`-separated values of one annotation cell."""
+    return [t for t in ("" if cell is None else str(cell)).split(";") if t.strip()]
+
+
 def write_protein_annotations(rows, path) -> int:
-    """Write the annotation table: `rows` maps a protein key to the dict of its columns
+    """Write the annotation side table: `rows` maps a protein key to the dict of its columns
     (missing ones empty). Rows ascend by key. Returns the row count."""
     keys = sorted(k for k in rows if k)
     cols = {c: [] for c in PROTEIN_ANNOTATION_COLUMNS}
@@ -284,7 +306,7 @@ def write_protein_annotations(rows, path) -> int:
 
 
 def read_protein_annotations(path) -> dict:
-    """The annotation table at `path` as {protein: {column: value}}, or {} when absent."""
+    """The annotation side table at `path` as {protein: {column: value}}, or {} when absent."""
     import os
 
     if not os.path.isfile(str(path)):
@@ -297,26 +319,180 @@ def read_protein_annotations(path) -> dict:
     return out
 
 
-def carry_protein_annotations(src_precursors, dst_precursors) -> str | None:
-    """Copy the annotation table beside `src_precursors` to beside `dst_precursors`.
+def has_annotation_columns(columns) -> bool:
+    """Whether a precursor table with these column names carries the annotation columns: all
+    three, or none. A table with only some of them is refused, as the engine refuses it."""
+    present = [c for c in ANNOTATION_COLUMNS if c in columns]
+    if present and len(present) < len(ANNOTATION_COLUMNS):
+        missing = [c for c in ANNOTATION_COLUMNS if c not in present]
+        raise SystemExit(f"the library carries the protein annotation column(s) {present} but "
+                         f"not {missing}; the three are written together")
+    return bool(present)
 
-    Byte for byte, and only when the two directories differ. When the source has none (a
-    library from before the table existed), a table already at the destination belongs to
-    another library and is removed. Returns the destination path when one is there
-    afterwards."""
+
+def lookup_annotation(table, protein):
+    """(protein_ids, protein_names, genes) of one `protein` key in an annotation table
+    ({protein: {column: value}}): the key's own row, else the rows of its `;`-separated
+    members, each value once, in member order. The engine's join
+    (`ProteinAnnotations::lookup`)."""
+    row = table.get(protein)
+    if row is not None:
+        return tuple(join_unique(_tokens(row.get(c, ""))) for c in ANNOTATION_COLUMNS)
+    members = [table[m.strip()] for m in str(protein).split(";") if m.strip() in table]
+    return tuple(join_unique(t for r in members for t in _tokens(r.get(c, "")))
+                 for c in ANNOTATION_COLUMNS)
+
+
+def annotate_precursors(df, table):
+    """`df` (a precursor table) with the `ANNOTATION_COLUMNS` set from the annotation table
+    `table` on each row's `protein` (`lookup_annotation`); a decoy row is looked up under its
+    target's key, without the `DECOY_` prefix, so it carries its target's values.
+
+    The columns are pandas `Categorical`s, one category per distinct value, so a library of
+    hundreds of millions of rows costs a code per row here; the writer decodes them to the
+    utf8 columns the engine reads (`narrow_type`), which parquet stores dictionary-encoded.
+    `df` is changed in place and returned."""
+    import numpy as np
+    import pandas as pd
+
+    protein = df["protein"].astype(str)
+    if "label" in df.columns:
+        decoy = (df["label"].astype(str) == "decoy") & protein.str.startswith("DECOY_")
+        if decoy.any():
+            protein = protein.where(~decoy, protein.str.slice(6))
+    codes, keys = pd.factorize(protein, sort=False)
+    cells = [lookup_annotation(table, k) for k in keys]
+    for j, c in enumerate(ANNOTATION_COLUMNS):
+        values = np.array([cell[j] for cell in cells] or [""], dtype=object)
+        cats, inverse = np.unique(values, return_inverse=True)
+        df[c] = pd.Categorical.from_codes(inverse[codes], categories=list(cats))
+    return df
+
+
+def annotation_table_from_precursors(df) -> dict:
+    """The annotation table ({protein: {column: value}}) a precursor table's
+    `ANNOTATION_COLUMNS` amount to, read from its target rows: each key's values in row order,
+    each once; a key whose three values are all empty gets no entry. The engine reads the
+    same (`protein_annotations::from_library`)."""
+    t = df[df["label"].astype(str) == "target"] if "label" in df.columns else df
+    sub = t[["protein", *ANNOTATION_COLUMNS]].astype(str).drop_duplicates()
+    rows = {}
+    for prot, *vals in sub.itertuples(index=False):
+        if not prot or not any(v.strip() for v in vals):
+            continue
+        row = rows.setdefault(prot, {c: "" for c in ANNOTATION_COLUMNS})
+        for c, v in zip(ANNOTATION_COLUMNS, vals):
+            row[c] = join_unique(_tokens(row[c]) + _tokens(v))
+    return rows
+
+
+def embed_annotations(df, precursors_path):
+    """The library read into `df` from `precursors_path`, with its protein annotations in its
+    columns: as it is when it carries them; else with columns taken from the side table beside
+    it (a library imported before the columns existed), a decoy row taking its target's
+    values; else unchanged. Returns (df, how), how being `columns`, `side table` or `none`,
+    and says which."""
+    if has_annotation_columns(df.columns):
+        print("protein annotations: carried in the library's protein_ids, protein_names and "
+              "genes columns", flush=True)
+        return df, "columns"
+    side = read_protein_annotations(annotations_path(precursors_path))
+    if side:
+        print(f"protein annotations: {len(side)} protein entr(ies) from "
+              f"{annotations_path(precursors_path)}, written into the output library's columns",
+              flush=True)
+        return annotate_precursors(df, side), "side table"
+    print("protein annotations: none in the input library (no protein_ids, protein_names and "
+          "genes columns, no protein_annotations.parquet beside it); a search will warn",
+          flush=True)
+    return df, "none"
+
+
+def retire_side_table(src_precursors, dst_precursors) -> None:
+    """After a helper wrote a library at `dst_precursors` from the one at `src_precursors`:
+    remove a `protein_annotations.parquet` beside the output that is not the input's own. It
+    belongs to another library, and the engine reads it beside a library without annotation
+    columns. The output carries its annotations in its columns (`embed_annotations`), so no
+    side table is written for it."""
     import os
-    import shutil
 
     src, dst = annotations_path(src_precursors), annotations_path(dst_precursors)
     if os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst)):
-        return dst if os.path.isfile(dst) else None
-    if not os.path.isfile(src):
-        if os.path.isfile(dst):
-            # A table left by another library would annotate this one wrongly.
-            os.remove(dst)
-            print(f"protein annotations: {src} is absent; removed the stale {dst}")
-        return None
-    tmp = dst + ".tmp"
-    shutil.copyfile(src, tmp)
-    os.replace(tmp, dst)
-    return dst
+        return
+    if os.path.isfile(dst):
+        os.remove(dst)
+        print(f"protein annotations: removed {dst}, left by another library (the output "
+              f"library carries its annotations in its columns)", flush=True)
+
+
+def fasta_annotations(path) -> dict:
+    """The annotation of every protein of a FASTA, keyed by its header's first word (what
+    `mumdia digest` writes as the protein), as `digest` writes them
+    (`protein_annotations::from_fasta_header`): the accession and entry name of a
+    `db|ACCESSION|ENTRY_NAME` word, else the word as the accession; the gene from `GN=`; the
+    description before ` OS=`. The first header of a repeated key wins."""
+    rows = {}
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if not line.startswith(">"):
+                continue
+            header = line[1:].strip()
+            words = header.split()
+            if not words:
+                continue
+            key = words[0]
+            rest = header[len(key):].strip()
+            acc, name = uniprot_fields(key)
+            gene = next((w[3:] for w in rest.split() if w.startswith("GN=")), "")
+            if rest.startswith("OS="):
+                desc = ""
+            else:
+                i = rest.find(" OS=")
+                desc = rest if i < 0 else rest[:i].strip()
+            rows.setdefault(key, {"protein_ids": acc, "protein_names": name, "genes": gene,
+                                  "description": desc})
+    return rows
+
+
+def fasta_index(rows) -> dict:
+    """token -> FASTA key: each header's first word, its accession and its entry name, the
+    first header to give a token winning it."""
+    index = {}
+    for key, r in rows.items():
+        for token in (key, r["protein_ids"], r["protein_names"]):
+            if token:
+                index.setdefault(token, key)
+    return index
+
+
+def complete_from_fasta(table, keys, fasta_rows, index) -> int:
+    """Fill, for every protein key in `keys`, each annotation the table `table` leaves empty
+    from the FASTA proteins its tokens name: the key's `;`-separated members and the
+    accessions the table already gives it, each matched as a header's first word, its
+    accession or its entry name (a `db|ACCESSION|NAME` token also by its accession). A value
+    the table gives is kept as it is. Changes `table` in place; returns how many keys gained
+    a value."""
+    filled = 0
+    for key in keys:
+        row = table.get(key, {})
+        tokens = _tokens(key) + _tokens(row.get("protein_ids", ""))
+        hits = []
+        for t in tokens:
+            t = t.strip()
+            k = index.get(t) or index.get(uniprot_fields(t)[0])
+            if k is not None and k not in hits:
+                hits.append(k)
+        if not hits:
+            continue
+        gained = False
+        for c in ANNOTATION_COLUMNS:
+            if row.get(c, ""):
+                continue
+            v = join_unique(t for k in hits for t in _tokens(fasta_rows[k][c]))
+            if v:
+                row[c] = v
+                gained = True
+        if gained:
+            table[key] = {c: row.get(c, "") for c in ANNOTATION_COLUMNS}
+            filled += 1
+    return filled

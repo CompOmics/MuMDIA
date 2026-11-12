@@ -16,7 +16,7 @@ import pandas as pd
 # The engine rejects `large_string` parquet columns ("column 'peptidoform' is not
 # utf8"), and `to_parquet` picks the width itself: pandas 3.x chooses the large
 # variant, so this helper silently emitted libraries the engine would not load.
-from _lib_io import carry_protein_annotations, write_engine_parquet
+from _lib_io import embed_annotations, retire_side_table, write_engine_parquet
 
 DELTA = 14.015650  # CH2, neutral-mass shift
 
@@ -24,6 +24,9 @@ DELTA = 14.015650  # CH2, neutral-mass shift
 def main():
     inp, inf, outp, outf = sys.argv[1:5]
     prec = pd.read_parquet(inp)
+    # The protein annotations travel in the precursor table's columns; each decoy copies its
+    # target's row, values included (`_lib_io.embed_annotations`).
+    prec, _ = embed_annotations(prec, inp)
     frag = pd.read_parquet(inf)
 
     # Keep only targets as the basis.
@@ -74,8 +77,8 @@ def main():
     # statistics. Stable, so each candidate's fragments keep their stored order.
     allf = allf.sort_values("candidate_id", kind="stable").reset_index(drop=True)
     write_engine_parquet(allf, outf)
-    # The targets' protein annotations, beside the output library (decoys have none).
-    carry_protein_annotations(inp, outp)
+    # A side table beside the output belongs to another library: this one carries its own.
+    retire_side_table(inp, outp)
     print(f"targets={len(tprec)} decoys={len(dprec)} total_prec={len(allp)} total_frag={len(allf)}")
 
 

@@ -12,15 +12,22 @@ an entrapment FASTA, it writes the first description word (`Keratin,`) or nothin
 would merge distinct proteins into one group or leave them UNASSIGNED. The import prints how
 many protein entries fell back to their ids.
 
-Protein annotations: `protein_annotations.parquet` is written beside the precursor table,
-one row per distinct `protein` string: its accessions (`Protein.Ids`, with the accession
-field of a `db|ACCESSION|ENTRY_NAME` id), its entry names (the entry names in
-`Protein.Names`, then those of such ids) and its genes (`Genes`, without description words),
-each `;`-separated in first-occurrence order. The engine joins it at report time to add
-`protein_ids`, `protein_names` and `genes` to the TSVs; `protein` itself, the grouping key,
-is unchanged. `--annotations <path>` writes it elsewhere, `--no-annotations` not at all
-(the decoy prediction's own import). A library with neither `Protein.Ids` nor
-`Protein.Names` gets none.
+Protein annotations: the precursor table carries three more columns, `protein_ids`,
+`protein_names` and `genes`, which give every precursor the annotation of its `protein`
+string: its accessions (`Protein.Ids`, with the accession field of a `db|ACCESSION|ENTRY_NAME`
+id), its entry names (the entry names in `Protein.Names`, then those of such ids) and its
+genes (`Genes`, without description words), each `;`-separated in first-occurrence order over
+every precursor of that string. They are in the library itself, so a search finds them
+wherever the two tables are copied (#299); the engine joins them at report time to fill the
+last three columns of the TSVs, and `protein` itself, the grouping key, is unchanged.
+`--fasta <path>` fills what the library leaves empty (a gene DIA-NN did not parse, a library
+without `Genes`) from the FASTA headers: each protein's members and accessions are looked up
+as a header's first word, accession or entry name, and a value the library gives is kept.
+`--annotations <path>` also writes them as a side table (`protein_annotations.parquet`, one
+row per `protein` string) at that path; `--no-annotations` writes no columns (the decoy
+prediction's own import). A library with neither `Protein.Ids` nor `Protein.Names` gets none,
+and a search on it warns. A `protein_annotations.parquet` beside the output, which an earlier
+import wrote for another library, is removed.
 
 Kept modifications, by default: Carbamidomethyl (UniMod:4), Oxidation (35), and the
 three cysteine prenylations Farnesyl (44), GeranylGeranyl (48), Hydroxyfarnesyl (376).
@@ -39,7 +46,7 @@ non-positive values are null. A library without such a value, such as one predic
 instrument without ion mobility, gets no column and is the version-1 table.
 
 Usage: python import_diann_lib.py <diann_lib.parquet> <out_precursors.parquet> <out_fragments.parquet>
-              [--charge-by-basic-residues] [--keep-unimod <id,id,...>]
+              [--charge-by-basic-residues] [--keep-unimod <id,id,...>] [--fasta <proteins.fasta>]
               [--annotations <out_annotations.parquet> | --no-annotations]
 
 The library is read one parquet row group at a time, twice: a first pass collects the
@@ -66,8 +73,10 @@ import pyarrow.parquet as pq
 # The engine rejects `large_string` parquet columns ("column 'peptidoform' is not
 # utf8"), and `to_parquet` picks the width itself: pandas 3.x chooses the large
 # variant, so this helper silently emitted libraries the engine would not load.
-from _lib_io import (annotations_path, join_unique, narrow_table, sort_fragments_by_candidate,
-                    uniprot_fields, write_engine_parquet, write_protein_annotations)
+from _lib_io import (annotate_precursors, annotations_path, complete_from_fasta,
+                    fasta_annotations, fasta_index, join_unique, narrow_table,
+                    sort_fragments_by_candidate, uniprot_fields, write_engine_parquet,
+                    write_protein_annotations)
 from _unimod import NAME_BY_UNIMOD
 
 
@@ -332,12 +341,20 @@ def main():
     charge_by_basic = "--charge-by-basic-residues" in args
     no_annotations = "--no-annotations" in args
     out_annotations = None
-    if "--annotations" in args:
-        i = args.index("--annotations")
-        if i + 1 >= len(args):
-            raise SystemExit("--annotations needs a path")
-        out_annotations = args[i + 1]
-        del args[i:i + 2]
+    fasta = None
+    for flag in ("--annotations", "--fasta"):
+        if flag in args:
+            i = args.index(flag)
+            if i + 1 >= len(args):
+                raise SystemExit(f"{flag} needs a path")
+            if flag == "--annotations":
+                out_annotations = args[i + 1]
+            else:
+                fasta = args[i + 1]
+            del args[i:i + 2]
+    if no_annotations and (out_annotations or fasta):
+        raise SystemExit("--no-annotations writes no annotations; it cannot be combined with "
+                         "--annotations or --fasta")
     if "--keep-unimod" in args:
         i = args.index("--keep-unimod")
         if i + 1 >= len(args):
@@ -346,8 +363,8 @@ def main():
         del args[i:i + 2]
     args = [a for a in args if not a.startswith("--")]
     inp, outp, outf = args[0:3]
-    if out_annotations is None and not no_annotations:
-        out_annotations = annotations_path(outp)
+    if fasta is not None and not os.path.isfile(fasta):
+        raise SystemExit(f"--fasta {fasta}: no such file")
 
     pf = pq.ParquetFile(inp)
     present = set(pf.schema_arrow.names)
@@ -359,7 +376,7 @@ def main():
     prot_cache, prot_stats = {}, {"fallback": set()}
     im_col = next((c for c in ("IM", "IonMobility") if c in present), None)
     read_cols = _META_COLS + _FRAG_COLS + optional
-    annotate = out_annotations is not None and bool(prot_cols)
+    annotate = not no_annotations and bool(prot_cols)
     read_cols_1 = read_cols + ([c for c in _ANNOTATION_COLS if c in present] if annotate else [])
     annotations = _Annotations()
 
@@ -489,17 +506,41 @@ def main():
         print("ion mobility: " + (f"no finite positive value in {im_col}" if im_col
                                   else "no IM column in the library")
               + "; written without predicted_im")
+    # Protein annotations, in the precursor table's own columns (#299): one table per distinct
+    # protein string, from the library's protein cells, completed from the FASTA when one is
+    # given, then looked up for every precursor.
+    table = None
+    if annotate:
+        table = annotations.table()
+        if fasta is not None:
+            fasta_rows = fasta_annotations(fasta)
+            proteins = sorted(set(prec["protein"]) - {"UNASSIGNED"})
+            n_fill = complete_from_fasta(table, proteins, fasta_rows, fasta_index(fasta_rows))
+            print(f"protein annotations: {n_fill} protein entr(ies) completed from {fasta} "
+                  f"({len(fasta_rows)} FASTA proteins)")
+        annotate_precursors(prec, table)
+        n_genes = sum(1 for r in table.values() if r.get("genes"))
+        print(f"protein annotations: {len(table)} protein entr(ies) with accessions, entry names "
+              f"and genes ({n_genes} with a gene), in the protein_ids, protein_names and genes "
+              f"columns of {outp}")
+    elif not no_annotations:
+        print("protein annotations: none (the library has neither Protein.Ids nor Protein.Names"
+              + ("; --fasta cannot name proteins the library does not map" if fasta else "")
+              + "); a search on this library warns and leaves the TSVs' protein_ids, "
+              "protein_names and genes empty")
     write_engine_parquet(prec, outp)
-    if out_annotations is not None:
-        if annotate:
-            n_ann = write_protein_annotations(annotations.table(), out_annotations)
-            print(f"protein annotations: {n_ann} protein entr(ies) with accessions, entry names "
-                  f"and genes -> {out_annotations}")
-        elif os.path.isfile(out_annotations):
-            # Left by another library, it would annotate this one wrongly.
-            os.remove(out_annotations)
-            print(f"protein annotations: none (no Protein.Ids or Protein.Names); removed the "
-                  f"stale {out_annotations}")
+    if not no_annotations:
+        beside = annotations_path(outp)
+        if out_annotations is not None:
+            n_ann = write_protein_annotations(table or {}, out_annotations)
+            print(f"protein annotations: {n_ann} protein entr(ies) also written as a side table "
+                  f"-> {out_annotations}")
+        if (os.path.isfile(beside) and (out_annotations is None or os.path.normcase(
+                os.path.abspath(out_annotations)) != os.path.normcase(beside))):
+            # Written by an earlier import for another library; the engine reads it beside a
+            # library without the columns, so it would annotate a later library wrongly.
+            os.remove(beside)
+            print(f"protein annotations: removed {beside}, left by an earlier import")
     key_index = pd.Index(keys["key"])
     del prec_parts, count_parts, nfrag
 
