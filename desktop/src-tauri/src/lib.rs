@@ -16,6 +16,7 @@ pub mod predictors;
 pub mod preflight;
 pub mod run;
 pub mod settings;
+pub mod setups;
 pub mod sizing;
 pub mod storage;
 pub mod thermo;

@@ -345,3 +345,26 @@ details.advanced > summary .hint { font-weight: 400; margin-left: 8px; }
 .chip:hover { border-color: var(--accent); }
 .chip.var { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
 .chip.fix { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+
+/* ── setups ───────────────────────────────────────────────────────────── */
+/* The name field and the four actions on one line that wraps on a narrow window. */
+.setups-sub { max-width: none; margin: 0 0 12px; }
+.setups-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; margin-bottom: 12px; }
+.setups-bar label { font-size: 12.5px; color: var(--ink-soft); }
+.setups-bar input[type="text"], .dconfirm input[type="text"] {
+  font: inherit; font-size: 12.5px; padding: 5px 9px; min-width: 220px; flex: 1 1 220px;
+  border: 1px solid var(--rule); border-radius: 5px; background: var(--panel); color: var(--ink);
+}
+.dconfirm input[type="text"] { width: 100%; margin-bottom: 4px; }
+/* What a setup would change, shown in place before Apply: the same sunk frame as a nested
+   log, so it reads as part of this card rather than a second one. */
+.setup-review {
+  background: var(--sunk); border: 1px solid var(--rule-strong); border-radius: var(--radius);
+  padding: 12px 14px; margin-bottom: 12px;
+}
+.setup-review .card-sub { margin: 0 0 10px; max-width: none; }
+.setup-changes {
+  margin: 0 0 4px; padding-left: 18px; font-size: 12.5px; line-height: 1.6;
+  max-height: 260px; overflow-y: auto; word-break: break-word;
+}
+.setup-changes li { font-variant-numeric: tabular-nums; }

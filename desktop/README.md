@@ -807,7 +807,8 @@ N-homocysteinylation of K) and `HCysteinyl` (UniMod 1271, S-homocysteinylation o
 fixed modifications on one residue, or a fixed and a variable one, are reported as the
 selection is made and refused at Start, because the peptidoform stage would refuse them
 mid-run. A DIA-NN build carries the whole selection (see below). The selection is
-remembered between sessions in browser storage, as a convenience only.
+remembered between sessions in browser storage, as a convenience only; a setup keeps it
+reliably, with the rest of the search (see "Setups").
 
 A modification whose catalogue entry lists `termini` also has a terminal chip: Acetyl
 offers "Prot N-term", protein N-terminal acetylation, and the quick set "Protein
@@ -963,7 +964,10 @@ run with no `--config` is always blocked. With no presets to offer, the packaged
 application could not start anything: the blocker told the user to choose a preset
 that uses retention-time modelling while the list was empty. A copy beside the
 executable, or in the repository during development, still wins over the compiled-in
-ones.
+ones. From the folder they are written to, only the compiled-in names are offered: "My
+settings" and a search's derived configuration are written to the same folder
+(`settings::config_dir`), and until #297 a packaged application offered them as presets
+after the first search.
 
 Saving writes only the difference from the defaults. `Config` is
 `deny_unknown_fields` with serde defaults, so that is a valid configuration, and it
@@ -989,6 +993,181 @@ choices. Selecting another preset re-seeds the form and says so. Fields the engi
 accepts but does not act on yet (the schema marks them `not yet wired`: the
 match-between-runs tiers) are shown with that label and cannot be edited; a value
 typed there would have been saved, validated and then ignored by the run.
+
+"Save and use" with no setting different from the preset the form started from selects
+that preset itself rather than writing an identical "My settings", so the search reads the
+preset file as it would had nothing been edited (since #297; see "Setups").
+
+## Setups
+
+A setup is how a search is set up, kept under a name (Phospho, Label-free) or saved to a
+file to use it on another computer or send it to a colleague (#297). The Setups card at the
+top of the Settings screen saves the current one in **My setups** or to a file, loads one
+from a file, and lists the saved ones with Load, Rename, Save to a file and Delete. The
+backend owns the file (`src/setups.rs`: the envelope, the format version and its migration,
+the named setups); the frontend reads the content from the two screens and puts it back
+(`captureSearch`, `captureEngine` and `applySetup` in `app.js`), because that is where their
+state lives, and checks it there against the screens' own choices, the modification
+catalogue, the cleavage presets and the settings schema.
+
+### What a setup holds, and what it leaves out
+
+| part | what it holds |
+|---|---|
+| `engine` | the built-in preset the Settings screen's values start from (`preset`; `null` for the engine defaults), the settings changed from it (`changes`, nested like a configuration file) and the preset's settings returned to the engine default (`reset`, by name) |
+| `search_space` | From a FASTA or from a spectral library; MuMDIA tables or a DIA-NN library to convert; DIA-NN or the built-in predictors for a library built from a FASTA; Library for |
+| `digest` | the cleavage and a custom rule, missed cleavages, peptide lengths, charges, and the precursor and fragment m/z limits (`null`: no limit) |
+| `modifications` | the fixed and the variable sites in the engine's form (`{"residue": "S", "name": "Phospho"}`, a terminal site with `"residue": "*"` and its `position`), and the variable maximum per peptide |
+| `experiment` | One experiment or Search each separately, and the normalisation |
+| `prescreen` | when, and how strongly |
+| `bands` | Automatic, Off or Custom, and the custom counts |
+| `ztscan` | whether the ZT Scan analysis runs for ZT Scan files (`true`, the default) and a Q1 half-width the user typed (`null`: each file's own) |
+
+Left out, because they belong to a dataset or to a computer rather than to a search: the
+spectra, the FASTA, the library tables and every folder; the conditions of the files; the
+Threads and DIA-NN threads counts; and the engine settings that say where programs and
+caches are or how much of the computer a search may take (`LOCAL_SETTINGS` in `app.js`):
+`convert.thermo_raw_parser`, `convert.msconvert`, `predict_frag.sidecar_script_dir`,
+`rescore.percolator_bin`, `rescore.features_file`, the two cache locations
+(`predict_frag.library_cache`, `rt_im_train.deeplc_projection_cache`), the parallelism and
+memory limits (`convert.parallel_conversions`, `extract.windows_in_flight`,
+`extract.max_footprint_gib`, `features.chrom_loaders`, `rescore.max_feature_matrix_gib`,
+`rt_im_train.deeplc_predict_shards`, `experiment.parallel_runs`,
+`experiment.overlap_front_threads`) and `experiment.conditions` (conditions by run name).
+
+The interpreters (`INTERPRETER_SETTINGS`: `predict_frag.ms2pip_python`, `peptdeep_python`,
+`deeplc_python`, `im2deep_python`, `rescore.python`, `mbr.python`) are carried as `"auto"`
+instead of a path. A path is this computer's, but a search that needs an interpreter cannot
+do without one: the engine refuses `rescore.classifier = nn_torch` without
+`rescore.python`, and MS2PIP, DeepLC and IM2Deep without theirs, so leaving them out would
+have made a setup started from the engine defaults unusable elsewhere. `"auto"` finds the
+receiving computer's interpreter.
+
+Saving says which settings it left out and which paths it wrote as `"auto"`, and loading a
+setup keeps the receiving computer's own values of both kinds, an interpreter path it named
+included. History is not part of a setup: it is this computer's list of results folders.
+
+Bands are kept as chosen. Automatic plans the search for the computer it runs on, and is
+the choice to share; Off and a Custom count are the sender's decisions, which the
+receiver's memory may not hold.
+
+### The file
+
+```json
+{
+  "format": "mumdia-desktop-settings",
+  "version": 1,
+  "name": "Phospho",
+  "created_by": "MuMDIA 0.12.0",
+  "created": "2026-11-12T09:30:00Z",
+  "settings": {
+    "engine": {
+      "preset": "diann-library",
+      "changes": { "rescore": { "seeds": 3 } },
+      "reset": ["extract.apex_rt_prior_s"]
+    },
+    "modifications": {
+      "fixed": [{ "residue": "C", "name": "Carbamidomethyl" }],
+      "variable": [
+        { "residue": "S", "name": "Phospho" },
+        { "residue": "T", "name": "Phospho" },
+        { "residue": "Y", "name": "Phospho" }
+      ],
+      "max_variable": 3
+    },
+    "...": "and the other parts in the table above"
+  }
+}
+```
+
+JSON, so a setup can be read and reviewed. `format` identifies it; `version` is the
+version of this format, not of the application, and changes only when a setting is renamed
+or reshaped. The engine part is the difference from a named preset rather than every
+value, for the reason saved settings are the difference from the defaults: a later
+release that improves the preset still reaches a setup saved today, and the file says in
+two lines what was changed.
+
+**Backward compatibility.** A file written in an older format is brought up to date one
+version at a time before it is checked (`setups::STEPS`, one step per older version, which
+a format change adds; version 1 is the first, so there are none yet, and a test runs the
+hook with two made-up steps). A file saved by this version therefore keeps loading in later
+ones. A file from a newer format is read as far as this version understands it, with a
+warning that says so, and never refused for its version alone.
+
+### Loading
+
+Load from a file, or Load in My setups, reads and checks the setup and shows what it would
+change, one line per setting (`Missed cleavages: 1 → 2`, `rescore.seeds: the engine
+default (1) → 3`, `Preset: the preset "diann-library" → the preset "fasta-sidecars"`), with
+whatever there is to know first. Nothing changes until Apply; Cancel changes nothing.
+
+- **A value this version cannot use refuses the whole setup**, and the message names the
+  field: `settings.digest.missed_cleavages (Missed cleavages) must be a whole number of 0 or
+  more, not "two".` So do a modification the catalogue does not have, a cleavage
+  `enzymes.json` does not have, a preset this version does not offer, an engine setting of
+  the wrong type or outside its choices, and a site both fixed and variable. When the
+  engine settings change, the engine checks them first (`check_settings`: `doctor` on a
+  scratch file, never the file a search uses), and a configuration it refuses refuses the
+  setup with its message.
+- **A setting this version does not know is listed and left out**, never dropped silently;
+  for a file from a newer format the list says the settings come from the newer version.
+- **A machine setting in a file** (written by hand, or by another tool) is listed and left
+  out, and this computer's own value is kept; an interpreter path in a file is read as
+  `"auto"`, and an interpreter this computer named is kept.
+- Edits on the Settings screen that were not saved and used are replaced, and the summary
+  says so; a library built with DIA-NN that DIA-NN cannot build on this computer yet is
+  said too (the built-in predictors are used until it can, as for a new search).
+
+A setup that holds only some settings (one written by hand) sets those and leaves the rest
+as they are. Loading from a file also keeps it in My setups, unless that box is cleared.
+The engine settings that are exactly the preset's select the preset itself; changed ones
+are saved as "My settings", as "Save and use" saves them, and used by the next search.
+
+### Saving
+
+"Save in My setups" and "Save to a file…" take the name in the Name field. Edits on the
+Settings screen that were not saved and used yet are saved and used first, so a setup is
+always what the next search here runs, and saving says so. A name already in My setups
+(compared without case, as Windows and macOS folders compare file names) is replaced only
+when the user confirms. What is saved is checked with the rules of a load, so whatever is
+saved loads.
+
+Named setups are kept in `setups/` in the default folder (`%LOCALAPPDATA%\MuMDIA\setups`,
+`~/.local/share/MuMDIA/setups`, or under `MUMDIA_DATA_DIR`), beside `storage.json`, one
+file per setup in the format above, so one can also be copied out by hand. Not in the
+storage folder: that folder holds what can be built or downloaded again, a change of
+storage folder copies nothing, and its `configs/` is offered for removal on the Managed data
+card, while a setup is the user's own work. Uninstalling does not remove them; the card
+says where they are.
+
+### The same search on the other computer
+
+Loading a setup on a fresh profile reproduces the configuration a search there passes to
+the engine. `ci/test_desktop_ui.mjs` saves setups on one profile and loads them on another,
+with the real settings schema, modification catalogue, cleavage presets and example
+presets, and compares the configuration each search would hand the engine (the Search
+screen's `runOverrides` merged onto the preset or onto "My settings", as `settings::derive`
+merges them): identical, except the left-out machine settings, which are each computer's
+own. The cases are a phospho search from a FASTA with a custom cleavage, a terminal
+modification, the prescreen, custom bands, the ZT Scan analysis off and a typed Q1
+half-width; edits without a machine setting (identical "My settings" and configuration); a
+preset used as it is (the preset file on both sides, nothing written); ZT Scan files with
+the analysis on; and the neural rescorer from the engine defaults, whose interpreter is
+carried as `"auto"` (the emulated `check_settings` applies the engine's rule that it needs
+one). `src/setups.rs` tests the file: what is written reads back as the same settings, the
+refusals, a newer and an older format, names and the store.
+
+The ZT Scan analysis sets the library's search space while it is on (docs/37_ztscan.md,
+"The library for a ZT Scan search"). A setup holds the user's own values: for a setting the
+analysis set and the user has not changed since, the value it replaced. Loaded where ZT
+Scan files are selected, the analysis sets its values over them again, so the search is the
+same; loaded without, they are the user's own. A value the user changed after the analysis
+set it is stored as theirs, and the analysis sets its own again when such a setup is loaded
+for ZT Scan files: the one case in which the loaded search differs, and the user changes
+it again.
+
+The card has not been clicked through in a packaged application: the Rust and frontend
+tests above drive it, as they drive the other screens.
 
 ## Testing
 
