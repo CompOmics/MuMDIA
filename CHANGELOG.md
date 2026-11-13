@@ -7,6 +7,16 @@ All notable changes to MuMDIA are recorded here. The format follows
 `0.1.0` is the first tagged release of the Rust engine. The superseded
 Python implementation remains available at the tag `legacy-python-v1`.
 
+`0.13.0` is a minor release: it changes what the reports of a library search contain. A
+library imported with `scripts/import_diann_lib.py` now carries its protein accessions, entry
+names and gene names in its own precursor table, so they go wherever the library goes, and
+`peptides.tsv`, `precursors.tsv` and `proteins.tsv` always end with `protein_ids`,
+`protein_names` and `genes`. A search without annotations leaves those cells empty, warns when
+it starts and at its report, and records `protein_annotations_missing` in its manifest instead
+of leaving the columns out. Identifications, q values and quantities are the same as with
+`0.12.0`. The desktop application keeps search setups under a name or in a file, and the visDIA
+it installs shows SCIEX ZT Scan DIA runs.
+
 `0.12.0` is a minor release: it reads a new kind of data. SCIEX ZT Scan DIA runs, in which the
 quadrupole sweeps the precursor range instead of stepping through fixed windows, are recognised
 before a search and read with the half-width of their quadrupole window, and they are searched
@@ -191,7 +201,60 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
-## [Unreleased]
+## [0.13.0] - 2026-11-12
+
+### Added
+
+- **Setups in the desktop application: a search setup saved under a name, or to a file
+  (#314, issue #297).** The Setups card on the Settings screen keeps the current setup in My setups
+  (load, rename, save to a file, delete) or saves it to a file of the user's choice, and
+  loads one from a file, so a setup for phospho and one for label-free data can be kept side
+  by side, moved to another computer or sent to a colleague. A setup holds the Search
+  screen's choices (search space and library source, digest, modifications, experiment mode
+  and normalisation, prescreen, bands, the ZT Scan analysis and a typed Q1 half-width) and the
+  Settings screen's engine settings as the preset they start from plus the changes to it. It
+  leaves out what belongs to a dataset or a computer: files, folders, conditions, thread
+  counts, and the engine settings that name programs and caches or limit the computer's
+  processors and memory, which loading keeps as the receiving computer's own; an interpreter
+  path is carried as `"auto"`, because a search that needs an interpreter cannot do without
+  one. The
+  file is JSON with a format id and a format version (`mumdia-desktop-settings`, version 1)
+  and a migration step per later version, so a file saved now keeps loading. Loading checks
+  the setup first and lists what it would change before Apply: a value this version cannot
+  use refuses it, naming the field, and a setting it does not know, or from a newer version,
+  is listed and left out. Loaded on a fresh profile, a setup gives a search the same
+  configuration as on the computer that saved it (desktop/README.md, "Setups"). "Save and
+  use" with nothing changed from the preset now uses the preset itself.
+
+### Changed
+
+- **The desktop application pins visDIA at 36eef08, which shows SCIEX ZT Scan DIA runs**
+  (#316, CompOmics/visDIA#15). The pinned viewer refused a ZT Scan run's `spectra_ms2` v3 and
+  `psms_extracted` v6 and v8, so its precursor page had no spectra and drew each XIC through
+  every Q1 step, a sawtooth. The precursor page of a ZT Scan run now draws each XIC as one
+  value per Q1 cycle, the transmission-weighted collapse of the cycle's steps that
+  `quant.q1_fragments` uses, with the steps faint behind it or alone on request; it marks
+  each fragment with the engine's Q1 decision (`q1f_frag_class`) and adds a Q1 sweep card:
+  each fragment's retention time x Q1-step patch around the apex with its expected, fitted
+  and own Q1 centres, the Q1 profile of the shown cycle against the calibrated transmission
+  with the precursor's own isotopes in MS2, and the engine's `q1f_*` columns. Every other run
+  is shown as before. An existing visDIA environment is reported outdated and the Setup
+  screen offers the update (env/console-visdia-requirements.txt).
+- **`peptides.tsv`, `precursors.tsv` and `proteins.tsv` end with `protein_ids`,
+  `protein_names` and `genes` with or without annotations (#315, issue #299).** Without annotations
+  their cells are empty, with a warning, where from 0.10.0 to 0.12.0 the columns were left
+  out: the files have one layout whatever the library, and a search without annotations is
+  never silent. A FASTA search, which always has them, writes the same bytes; a library
+  search without them gains three empty columns.
+- **The library importer and the decoy builders write no `protein_annotations.parquet`
+  beside the library they write (#315)**; the annotations are in its precursor table. A side table
+  found beside the output, which belongs to another library, is removed, as before. The
+  engine still reads a side table beside a library imported from 0.10.0 to 0.12.0, and a
+  FASTA search and a FASTA-built library still write theirs. `--annotations <path>` on the
+  importer still writes the side table, now in addition to the columns.
+- The manifest records a search's annotation table with the producer `library-columns`
+  when it was read from the library's columns (`library-input` remains a copied side
+  table, `digest` a FASTA search's own) (#315).
 
 ### Added
 
@@ -219,7 +282,7 @@ than a number. Both are recorded in every run's `manifest.json`.
 ### Fixed
 
 - **A search from a spectral library has its protein accessions, entry names and gene names
-  wherever the library goes (#299).** The annotations lived only in
+  wherever the library goes (#315, issue #299).** The annotations lived only in
   `protein_annotations.parquet`, found beside the library's precursor table, so a library
   whose two tables were copied without it, or one imported before 0.10.0 (a library the
   desktop application had cached among them), gave TSVs without the `protein_ids`,
@@ -240,51 +303,11 @@ than a number. Both are recorded in every run's `manifest.json`.
   searches one library with and without them and finds byte-identical scored and quant
   tables. A FASTA search, and its library, are unchanged byte for byte (docs/15,
   "protein_annotations").
-- **`import_diann_lib.py --fasta <path>` fills what a DIA-NN library leaves empty** (a gene
+- **`import_diann_lib.py --fasta <path>` fills what a DIA-NN library leaves empty (#315)** (a gene
   DIA-NN did not parse, a library without `Genes`) from the FASTA headers, matching each
   protein's members and accessions to a header's first word, accession or entry name, and
   keeps every value the library gives. The desktop application's library build passes the
   FASTA it predicted from; an import of an existing library has none and needs none.
-
-### Changed
-
-- **`peptides.tsv`, `precursors.tsv` and `proteins.tsv` end with `protein_ids`,
-  `protein_names` and `genes` with or without annotations (#299).** Without annotations
-  their cells are empty, with a warning, where from 0.10.0 to 0.12.0 the columns were left
-  out: the files have one layout whatever the library, and a search without annotations is
-  never silent. A FASTA search, which always has them, writes the same bytes; a library
-  search without them gains three empty columns.
-- **The library importer and the decoy builders write no `protein_annotations.parquet`
-  beside the library they write**; the annotations are in its precursor table. A side table
-  found beside the output, which belongs to another library, is removed, as before. The
-  engine still reads a side table beside a library imported from 0.10.0 to 0.12.0, and a
-  FASTA search and a FASTA-built library still write theirs. `--annotations <path>` on the
-  importer still writes the side table, now in addition to the columns.
-- The manifest records a search's annotation table with the producer `library-columns`
-  when it was read from the library's columns (`library-input` remains a copied side
-  table, `digest` a FASTA search's own).
-### Added
-
-- **Setups in the desktop application: a search setup saved under a name, or to a file
-  (#297).** The Setups card on the Settings screen keeps the current setup in My setups
-  (load, rename, save to a file, delete) or saves it to a file of the user's choice, and
-  loads one from a file, so a setup for phospho and one for label-free data can be kept side
-  by side, moved to another computer or sent to a colleague. A setup holds the Search
-  screen's choices (search space and library source, digest, modifications, experiment mode
-  and normalisation, prescreen, bands, the ZT Scan analysis and a typed Q1 half-width) and the
-  Settings screen's engine settings as the preset they start from plus the changes to it. It
-  leaves out what belongs to a dataset or a computer: files, folders, conditions, thread
-  counts, and the engine settings that name programs and caches or limit the computer's
-  processors and memory, which loading keeps as the receiving computer's own; an interpreter
-  path is carried as `"auto"`, because a search that needs an interpreter cannot do without
-  one. The
-  file is JSON with a format id and a format version (`mumdia-desktop-settings`, version 1)
-  and a migration step per later version, so a file saved now keeps loading. Loading checks
-  the setup first and lists what it would change before Apply: a value this version cannot
-  use refuses it, naming the field, and a setting it does not know, or from a newer version,
-  is listed and left out. Loaded on a fresh profile, a setup gives a search the same
-  configuration as on the computer that saved it (desktop/README.md, "Setups"). "Save and
-  use" with nothing changed from the preset now uses the preset itself.
 
 ## [0.12.0] - 2026-11-11
 
