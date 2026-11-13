@@ -19,7 +19,7 @@
   the module before it is merged.
 
 .EXAMPLE
-  pwsh ci/check_msi_runtime.ps1 -Msi desktop/dist/MuMDIA_0.12.0_x64_en-US.msi
+  pwsh ci/check_msi_runtime.ps1 -Msi desktop/dist/MuMDIA_0.13.0_x64_en-US.msi
 #>
 param(
     [Parameter(Mandatory = $true)][string]$Msi,

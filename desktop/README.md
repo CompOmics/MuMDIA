@@ -1058,7 +1058,7 @@ receiver's memory may not hold.
   "format": "mumdia-desktop-settings",
   "version": 1,
   "name": "Phospho",
-  "created_by": "MuMDIA 0.12.0",
+  "created_by": "MuMDIA 0.13.0",
   "created": "2026-11-12T09:30:00Z",
   "settings": {
     "engine": {
