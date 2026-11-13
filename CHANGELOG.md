@@ -201,6 +201,34 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
+## [Unreleased]
+
+### Added
+
+- **SCIEX ZT Scan DIA: the traces on Q1 cycles, written for every ZT Scan run, and a separable
+  model of each candidate's RT x step patch, opt-in (docs/37_ztscan.md, section 15).** A ZT Scan
+  chromatogram interleaves about five Q1 steps a cycle, a sawtooth when drawn. `extract.q1_traces` writes every accepted
+  candidate's traces once more with one point per cycle, each fragment's covering steps
+  collapsed to their least-squares amplitude under its calibrated Q1 profile at the expected
+  centre, into `chromatograms_q1.parquet` beside the chromatograms, with each fragment's Q1
+  decision as a `q1_class` column (chromatograms schema 5 in layout 1, 6 in layout 2), for drawing
+  and analysis; no stage reads it. `features.q1_separable` fits each row's decision patch as one
+  elution profile shared by the fragments times each fragment's calibrated transmission, with an
+  amplitude and a floor per fragment, and writes ten `q1s_*` features and per-row lists of the
+  profile, its cycles' retention times and each fragment's amplitude, R^2 and interference share
+  (psms_extracted v9). `extract.q1_traces` is part of the automatic ZT Scan analysis (`"auto"`: on
+  for ZT Scan files, off for every other search, `false` turns it off, as the desktop
+  application's cleared "ZT Scan analysis" box does); it changes no other table and costs about 3%
+  of a run's wall time and 7.7 GB on a 15 min run, and a ZT Scan search's configuration hash now
+  includes it. `features.q1_separable` is opt-in. Both are refused when asked for on any input that
+  is not a ZT Scan run, so every other search is unchanged byte for byte. Measured on the K562 ZT Scan run with four NN
+  seeds on two libraries: reading elution on cycles instead of the interleaved steps (the
+  features, and the apex, the gate and the re-pick) lost 1.2-4.7% of the identifications, which is
+  why the cycle traces are a separate table; the separable features are inside the seed spread
+  (+0.34% human precursors at a matched entrapment FDP, -0.17% precursors on the human library)
+  and quantifying from its amplitudes raised the replicate CV from 0.104 to 0.165, so it is not
+  part of the automatic ZT Scan analysis.
+
 ## [0.13.0] - 2026-11-12
 
 ### Added
@@ -255,32 +283,6 @@ than a number. Both are recorded in every run's `manifest.json`.
 - The manifest records a search's annotation table with the producer `library-columns`
   when it was read from the library's columns (`library-input` remains a copied side
   table, `digest` a FASTA search's own) (#315).
-
-### Added
-
-- **SCIEX ZT Scan DIA: the traces on Q1 cycles, written for every ZT Scan run, and a separable
-  model of each candidate's RT x step patch, opt-in (docs/37_ztscan.md, section 15).** A ZT Scan chromatogram interleaves
-  about five Q1 steps a cycle, a sawtooth when drawn. `extract.q1_traces` writes every accepted
-  candidate's traces once more with one point per cycle, each fragment's covering steps
-  collapsed to their least-squares amplitude under its calibrated Q1 profile at the expected
-  centre, into `chromatograms_q1.parquet` beside the chromatograms, with each fragment's Q1
-  decision as a `q1_class` column (chromatograms schema 5 in layout 1, 6 in layout 2), for drawing
-  and analysis; no stage reads it. `features.q1_separable` fits each row's decision patch as one
-  elution profile shared by the fragments times each fragment's calibrated transmission, with an
-  amplitude and a floor per fragment, and writes ten `q1s_*` features and per-row lists of the
-  profile, its cycles' retention times and each fragment's amplitude, R^2 and interference share
-  (psms_extracted v9). `extract.q1_traces` is part of the automatic ZT Scan analysis (`"auto"`: on
-  for ZT Scan files, off for every other search, `false` turns it off, as the desktop
-  application's cleared "ZT Scan analysis" box does); it changes no other table and costs about 3%
-  of a run's wall time and 7.7 GB on a 15 min run, and a ZT Scan search's configuration hash now
-  includes it. `features.q1_separable` is opt-in. Both are refused when asked for on any input that
-  is not a ZT Scan run, so every other search is unchanged byte for byte. Measured on the K562 ZT Scan run with four NN
-  seeds on two libraries: reading elution on cycles instead of the interleaved steps (the
-  features, and the apex, the gate and the re-pick) lost 1.2-4.7% of the identifications, which is
-  why the cycle traces are a separate table; the separable features are inside the seed spread
-  (+0.34% human precursors at a matched entrapment FDP, -0.17% precursors on the human library)
-  and quantifying from its amplitudes raised the replicate CV from 0.104 to 0.165, so it is not
-  part of the automatic ZT Scan analysis.
 
 ### Fixed
 
