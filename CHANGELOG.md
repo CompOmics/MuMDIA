@@ -193,6 +193,29 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Added
+
+- **SCIEX ZT Scan DIA: the traces on Q1 cycles, and a separable model of each candidate's RT x
+  step patch, both opt-in (docs/37_ztscan.md, section 15).** A ZT Scan chromatogram interleaves
+  about five Q1 steps a cycle, a sawtooth when drawn. `extract.q1_traces` writes every accepted
+  candidate's traces once more with one point per cycle, each fragment's covering steps
+  collapsed to their least-squares amplitude under its calibrated Q1 profile at the expected
+  centre, into `chromatograms_q1.parquet` beside the chromatograms, with each fragment's Q1
+  decision as a `q1_class` column (chromatograms schema 5 in layout 1, 6 in layout 2), for drawing
+  and analysis; no stage reads it. `features.q1_separable` fits each row's decision patch as one
+  elution profile shared by the fragments times each fragment's calibrated transmission, with an
+  amplitude and a floor per fragment, and writes ten `q1s_*` features and per-row lists of the
+  profile, its cycles' retention times and each fragment's amplitude, R^2 and interference share
+  (psms_extracted v9). Both are refused on any input that is not a ZT Scan run, off by default and
+  omitted from the canonical configuration, so every other search, and a ZT Scan search with the
+  automatic analysis, is unchanged byte for byte. Measured on the K562 ZT Scan run with four NN
+  seeds on two libraries: reading elution on cycles instead of the interleaved steps (the
+  features, and the apex, the gate and the re-pick) lost 1.2-4.7% of the identifications, which is
+  why the cycle traces are a separate table; the separable features are inside the seed spread
+  (+0.34% human precursors at a matched entrapment FDP, -0.17% precursors on the human library)
+  and quantifying from its amplitudes raised the replicate CV from 0.104 to 0.165, so neither is
+  part of the automatic ZT Scan analysis.
+
 ### Fixed
 
 - **A search from a spectral library has its protein accessions, entry names and gene names

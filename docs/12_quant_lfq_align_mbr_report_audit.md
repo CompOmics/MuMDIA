@@ -1047,6 +1047,13 @@ which `run-experiment` does once.
 
 #### Quantification from the fragments that belong (`quant.q1_fragments`, ZT Scan DIA)
 
+Two further readings of a ZT Scan run were measured for quantification on the K562 three-run
+experiment (docs/37_ztscan.md, section 15): the traces collapsed to one value a cycle measure the
+replicate CV of the 4-cycle window on the interleaved traces (0.104 both), and quantities from the
+amplitudes of the separable RT x step model (`features.q1_separable`) times its elution profile
+measured 0.165, so that option was not kept. The cycle traces of `extract.q1_traces` are written
+for drawing; quant does not read them.
+
 Opt-in, off by default (`stages/q1quant.rs`). A SCIEX ZT Scan DIA run read with
 `convert.isolation_half_width` has one window per Q1 step, 663 steps a cycle 0.76 m/z apart,
 and a precursor is in the windows of about five consecutive steps (1.3 ms apart) once a
