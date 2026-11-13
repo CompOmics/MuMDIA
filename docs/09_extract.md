@@ -1446,10 +1446,12 @@ reads a label (docs/37, section 10, has the decoy against low-target comparison)
 ### 15. Cycle traces and the separable model (scanning quadrupole, opt-in)
 
 A ZT Scan chromatogram interleaves the covering steps of every cycle: about five Q1 steps, 1.3 ms
-apart, then a gap of about a second to the next cycle. Two opt-in keys read the sweep's elution
+apart, then a gap of about a second to the next cycle. Two keys read the sweep's elution
 another way. Both need `extract.q1_fragments`, whose calibrated model and grid they use, both are
-refused on any input that is not a ZT Scan run (`Config::ztscan_keys_on`), and both are off by
-default and omitted from the canonical configuration, so every other search is byte-identical.
+refused on any input that is not a ZT Scan run when asked for (`Config::ztscan_keys_on`), and both
+are omitted from the canonical configuration unless on, so every other search is byte-identical.
+`extract.q1_traces` is automatic for ZT Scan files (`"auto"`, docs/37_ztscan.md, "Automatic for ZT
+Scan files"); `features.q1_separable` is opt-in (default false).
 
 **`extract.q1_traces`** (`stages::q1trace`, `cycle_groups`): after the gate, the re-pick and the
 chromatogram rows of an accepted candidate, the groups its traces read (on its grid, padded or
@@ -1610,7 +1612,7 @@ here for one index.
 | `retrace.q1_repick` (automatic for ZT Scan files, needs `extract.q1_fragments`) | `q1f_apex_moved_s`; moves the rank-0 apex to the 2D apex of the fragments that belong (section 12) | ZT Scan REP01, on top of the decision: +2.96% precursors, +2.92% human precursors at a matched FDP (four NN seeds); 60% of the accepted targets' apexes move, by one cycle; extract +40-75% |
 | `features.ms1_envelope` (default false) | psms_extracted v7: 16 F64 cols `ms1e_*`; nine features (section 13) | ZT Scan REP01, four NN seeds: human precursors at a matched entrapment FDP +0.01%, precursors on the human library +0.05%, both inside the seed range; label-blind (decoy against low-target KS at most 0.005); keep off |
 | `features.q1_precursor`, `features.q1_multiscale`, `features.q1_deconvolved` (automatic for ZT Scan files, need `extract.q1_fragments`) | psms_extracted v8: 8 `q1p_*`, 9 or 12 `q1m*`, 5 `q1d_*` F64 cols; as many features (section 14) | ZT Scan REP01, four NN seeds, the three on top of the recipe: +0.76% precursors, +1.38% human precursors at a matched entrapment FDP, beyond the seed spread on both libraries; each alone inside it except `q1_deconvolved`; in `configs/examples/ztscan.json`; one acquisition |
-| `extract.q1_traces` (default false, ZT Scan only) | `chromatograms_q1.parquet`: the traces on Q1 cycles with `q1_class` (chromatograms v5/v6, section 15) | no table read by a later stage changes; reading elution on cycles instead of the steps measured -1.2% to -4.7%, so it is a separate table |
+| `extract.q1_traces` (automatic for ZT Scan files, off otherwise) | `chromatograms_q1.parquet`: the traces on Q1 cycles with `q1_class` (chromatograms v5/v6, section 15) | no table read by a later stage changes; reading elution on cycles instead of the steps measured -1.2% to -4.7%, so it is a separate table |
 | `features.q1_separable` (default false, ZT Scan only) | psms_extracted v9: 10 `q1s_*` F64 and 5 list columns (section 15) | ZT Scan REP01, four NN seeds: +0.34% / -0.17% (entrapment at matched FDP / human library), inside the seed spread |
 | `extract.q1_deconvolved`, `search_seed.q1_deconvolved` (default false) | none; only Q1-consistent peaks are counted (section 14) | ZT Scan REP01: -25.6% precursors (extract, learned 1.0-step tolerance), -8.4% at 2 steps, -2.5% (seed), -38% (both); keep off |
 | `rescore.shadow_q1` (automatic for ZT Scan files, needs `extract.q1_fragments`) | none; the shadow test co-isolates by m/z and counts shared fragments by their Q1 centre (docs/11) | ZT Scan REP01: no count change (inside the seed range), fewer entrapment precursors at 1%; with the other three keys +3.02% precursors, +3.17% at a matched FDP, measured FDP at 1% 1.22% against 1.39%, +2.3% in a three-run experiment |

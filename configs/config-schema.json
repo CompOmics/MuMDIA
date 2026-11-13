@@ -2308,14 +2308,19 @@
       "path": "extract.q1_traces",
       "name": "q1_traces",
       "section": "extract",
-      "rust_type": "bool",
-      "kind": "bool",
+      "rust_type": "ZtSwitch",
+      "kind": "enum",
       "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "Scanning-quadrupole spectra: write every accepted candidate's traces once more, on Q1 cycles, into `chromatograms_q1.parquet` beside the chromatograms (`stages::q1trace`): one point per cycle per fragment, the least-squares amplitude of its covering steps under its calibrated expected Q1 profile, at the retention time of the cycle's step nearest the precursor's expected Q1 centre, with each fragment's Q1 decision as a `q1_class` column (chromatograms schema 5 in layout 1, 6 in layout 2). For drawing and for analysis: no stage reads it, so every other table is unchanged (reading elution on cycles instead of the interleaved steps measured 1.2-4.7% fewer identifications, docs/37_ztscan.md). Needs `extract.q1_fragments`; refused on any input that is not a ZT Scan run. Default false (it costs a second chromatogram write; docs/37_ztscan.md, section 15). Omitted from the canonical configuration at its default.",
+      "default": "auto",
+      "default_text": "`auto`",
+      "help": "Scanning-quadrupole spectra: write every accepted candidate's traces once more, on Q1 cycles, into `chromatograms_q1.parquet` beside the chromatograms (`stages::q1trace`): one point per cycle per fragment, the least-squares amplitude of its covering steps under its calibrated expected Q1 profile, at the retention time of the cycle's step nearest the precursor's expected Q1 centre, with each fragment's Q1 decision as a `q1_class` column (chromatograms schema 5 in layout 1, 6 in layout 2). For drawing and for analysis: no stage reads it, so every other table is unchanged (reading elution on cycles instead of the interleaved steps measured 1.2-4.7% fewer identifications, docs/37_ztscan.md, section 15). It costs about 3% of a run's wall time and 7.7 GB on a 15 min ZT Scan run. Needs `extract.q1_fragments`. `\"auto\"` (the default): on for a ZT Scan search with `extract.q1_fragments` on, off for every other search (`ZtSwitch`, docs/37_ztscan.md, \"Automatic for ZT Scan files\"). Omitted from the canonical configuration unless on.",
       "gates": [],
-      "source_struct": "ExtractConfig"
+      "source_struct": "ExtractConfig",
+      "choices": [
+        "auto",
+        "true",
+        "false"
+      ]
     },
     {
       "path": "extract.q1_deconvolved",

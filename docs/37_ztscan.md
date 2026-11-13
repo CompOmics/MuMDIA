@@ -54,6 +54,7 @@ column unless the configuration rules it out, and on every other search it is of
 | `convert.isolation_half_width` | the census's suggestion: 2.5 steps, rounded to 0.05 m/z (1.9 for the K562 method) | (a value set is kept) |
 | `rt_im_train.q1_calibrate` | on | `groups.window_groups > 1`; nothing reads it (`extract.q1_fragments = false`, or `extract.q1_cycles`, and `extract.q1_deconvolved` off) |
 | `extract.q1_fragments` | on | the calibration is off; `extract.q1_cycles` |
+| `extract.q1_traces` (the cycle-trace table `chromatograms_q1.parquet`, section 15) | on | `extract.q1_fragments` is off |
 | `features.q1_fragment_features`, `q1_precursor`, `q1_multiscale`, `q1_deconvolved`, `q1_consistency` | on | `extract.q1_fragments` is off; `features.set` other than `extended` |
 | `retrace.q1_repick` (`q1_repick_peaks` stays 5) | on | `extract.q1_fragments` is off; `extract.promote_top_peaks > 1`, `extract.apex_refine_intensity` or `retrace.repick` |
 | `rescore.shadow_q1` | on | `extract.q1_fragments` is off; `rescore.shadow_min_shared = 0` |
@@ -66,9 +67,8 @@ canonical configuration of `ztscan.json`, and so the same configuration hash and
 tables (section 12). What stays opt-in, as before: the classifier's sensitivity settings
 (section 4), the counts of Q1-consistent peaks (`extract.q1_deconvolved`,
 `search_seed.q1_deconvolved`, section 10.3), `features.ms1_envelope`, `quant.q1_fragments`,
-`extract.q1_cycles`, `extract.q1_profile`, `features.q1_features`, the cycle-trace table
-(`extract.q1_traces`) and the separable model (`features.q1_separable`) of section 15, and the MS1
-calibration keys of docs/09 section 11.
+`extract.q1_cycles`, `extract.q1_profile`, `features.q1_features`, the separable model
+(`features.q1_separable`) of section 15, and the MS1 calibration keys of docs/09 section 11.
 
 **Spelling, and the configuration hash.** Each switch takes `"auto"`, `true` or `false`;
 `quant.q1_cycle_halfwidth` a number of cycles (0 is off), `"auto"` or `null`;
@@ -239,7 +239,7 @@ files"). The others stay opt-in.
 | score each fragment's Q1 centre against its expected one | `features.q1_consistency` | docs/10, "q1_consistency" | on top of the four: +2.97% human precursors at the measured FDP and +2.48% precursors on the human library (the family alone, its columns kept out of the rescore prefilter: +2.28% and +1.85%) | yes |
 | the library's search space: charges 1-4, lengths 6-40, protein N-terminal acetylation, two variable modifications | the library build (`digest.*`, `peptidoforms.*`, or the predictor of an imported library) | section 11 below | +3.47% precursors, +4.09% human precursors at matched FDP, the measured FDP 1.18% against 1.22%; two missed cleavages -1.0% | the desktop sets it with the analysis; `run` names what differs for a FASTA library |
 | the sensitivity rescore | `rescore.folds` 5, `rescore.train_margin_frac` 0.75, `rescore.seeds` 3 | docs/28, section 21; section 11 below | on the section 11 library +1.24% / +0.57% at matched FDP; on top of the released recipe +0.82% / +0.78% (section 12), for 2-6x the rescore time | no (an option for a final pass, section 4) |
-| write the traces once more on Q1 cycles, beside the chromatograms | `extract.q1_traces` | docs/09, section 15; section 15 below | no identification changes (no stage reads the table); in place of the interleaved traces -1.2% to -4.7% | no |
+| write the traces once more on Q1 cycles, beside the chromatograms | `extract.q1_traces` | docs/09, section 15; section 15 below | no identification changes (no stage reads the table), +2.9% wall, +7.7 GB; in place of the interleaved traces -1.2% to -4.7% | yes (for drawing; since 2026-11-13) |
 | the separable model of the RT x step patch (one elution profile, each fragment's transmission) | `features.q1_separable` | docs/09, section 15; section 15 below | +0.34% human precursors at matched FDP, -0.17% precursors, inside the seed spread; quantifying from its amplitudes: replicate CV 0.165 against 0.104 (dropped) | no |
 | N/Q deamidation in the library | the library build | section 13 below | precursors +80%, half of them isotope aliases of co-eluting unmodified peptides, at a decoy and entrapment FDP that read as valid; peptides -11%, protein groups -7% | no (leave it out; the desktop warns) |
 
@@ -680,8 +680,8 @@ byte; 2 is the setting to take when extract's time matters more than half a perc
 - `quant.q1_cycle_halfwidth` without the scan form of the fixed window or with
   `fixed_scan_halfwidth_scale`; `mumdia quant` with it and no `--spectra-ms2`.
 - `features.ms1_envelope` on spectra with 1/K0 and with window groups.
-- `extract.q1_traces` and `features.q1_separable` on any input that is not a ZT Scan run, and
-  without `extract.q1_fragments`.
+- `extract.q1_traces` set to `true` and `features.q1_separable` on any input that is not a ZT
+  Scan run, and either without `extract.q1_fragments`.
 - `features.q1_precursor`, `features.q1_multiscale` and `features.q1_deconvolved` without
   `extract.q1_fragments`; `extract.q1_deconvolved` without `rt_im_train.q1_calibrate` or with
   `extract.q1_cycles`; `search_seed.q1_deconvolved` with `count_fragments_once`; both
@@ -1317,7 +1317,12 @@ the sweep. With `features.q1_separable` 1,328 s, 39.8 GB, extract 614 s (the fit
 of extract; the walls differ by the host's noise), psms_extracted 3.1 GB against 1.9 GB.
 
 **Decisions.** `extract.q1_traces` writes the cycle traces beside the chromatograms rather than in
-their place, because in their place they cost identifications; it is opt-in (it costs a second
-chromatogram write, above). `features.q1_separable` is opt-in (inside the seed spread). Quantifying
+their place, because in their place they cost identifications. It is automatic for ZT Scan files
+(the user's decision, 2026-11-13: the traces are for drawing, at about 3% of a run's wall time and
+7.7 GB, and change no identification); `false` turns it off, and the desktop application's "ZT Scan
+analysis" box, cleared, writes it off with the other keys. A ZT Scan search with the automatic
+analysis therefore writes the same tables as 0.12.0 plus `chromatograms_q1.parquet`, and its
+configuration hash changes (the resolved key is part of it). `features.q1_separable` is opt-in
+(inside the seed spread). Quantifying
 from the separable amplitudes, the apex, gate and re-pick on cycles and the separable elution window
 were measured, lost, and are not in the code.

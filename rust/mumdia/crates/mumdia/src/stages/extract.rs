@@ -4896,13 +4896,13 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     // `extract.q1_traces` (`stages::q1trace`): every accepted candidate's traces once more on Q1
     // cycles, into `chromatograms_q1.parquet`, collapsed with the decision's calibrated model
     // and grid; `features.q1_separable` fits the decision's patches.
-    if (p.cfg.q1_traces || p.cfg.q1_separable) && q1f_ctx.is_none() {
+    if (p.cfg.q1_traces.on() || p.cfg.q1_separable) && q1f_ctx.is_none() {
         anyhow::bail!(
             "extract: extract.q1_traces and features.q1_separable read the Q1 sweep through the \
              per-fragment decision's grid and calibrated model; set extract.q1_fragments as well"
         );
     }
-    let q1t = p.cfg.q1_traces;
+    let q1t = p.cfg.q1_traces.on();
     let q1t_path = q1_trace_path(p.out_chrom);
     if q1t {
         mumdia_io::refuse_output_over_input(&q1t_path, &inputs)?;

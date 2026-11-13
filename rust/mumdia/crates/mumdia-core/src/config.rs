@@ -2408,12 +2408,13 @@ pub struct ExtractConfig {
     /// precursor's expected Q1 centre, with each fragment's Q1 decision as a `q1_class` column
     /// (chromatograms schema 5 in layout 1, 6 in layout 2). For drawing and for analysis: no
     /// stage reads it, so every other table is unchanged (reading elution on cycles instead of
-    /// the interleaved steps measured 1.2-4.7% fewer identifications, docs/37_ztscan.md).
-    /// Needs `extract.q1_fragments`; refused on any input that is not a ZT Scan run. Default
-    /// false (it costs a second chromatogram write; docs/37_ztscan.md, section 15). Omitted from
-    /// the canonical configuration at its default.
-    #[serde(skip_serializing_if = "is_false")]
-    pub q1_traces: bool,
+    /// the interleaved steps measured 1.2-4.7% fewer identifications, docs/37_ztscan.md, section
+    /// 15). It costs about 3% of a run's wall time and 7.7 GB on a 15 min ZT Scan run. Needs
+    /// `extract.q1_fragments`. `"auto"` (the default): on for a ZT Scan search with
+    /// `extract.q1_fragments` on, off for every other search ([`ZtSwitch`], docs/37_ztscan.md,
+    /// "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on.
+    #[serde(skip_serializing_if = "ZtSwitch::omitted")]
+    pub q1_traces: ZtSwitch,
     /// What `stages::q1frag` read from the run's `cal.json` (`q1_calibration`) under
     /// `q1_fragments`: the calibrated window and the decision tolerances, set by `run` /
     /// `run-experiment` (and `mumdia extract --q1-cal`) before extract. Never read from a
@@ -3028,7 +3029,7 @@ impl Default for ExtractConfig {
             q1_profile: false,
             q1_gate_max_offset: None,
             q1_fragments: ZtSwitch::Auto,
-            q1_traces: false,
+            q1_traces: ZtSwitch::Auto,
             q1_model: None,
             q1_repick: false,
             q1_repick_peaks: Q1_REPICK_PEAKS,
@@ -5792,6 +5793,7 @@ impl Config {
                 "rt_im_train.q1_calibrate",
             ),
             (ex.q1_fragments.on(), "extract.q1_fragments"),
+            (ex.q1_traces.on(), "extract.q1_traces"),
             (f.q1_fragment_features.on(), "features.q1_fragment_features"),
             (f.q1_precursor.on(), "features.q1_precursor"),
             (f.q1_multiscale.on(), "features.q1_multiscale"),
@@ -5808,7 +5810,6 @@ impl Config {
             (ex.q1_profile, "extract.q1_profile"),
             (f.q1_features, "features.q1_features"),
             (ex.q1_deconvolved, "extract.q1_deconvolved"),
-            (ex.q1_traces, "extract.q1_traces"),
             (f.q1_separable, "features.q1_separable"),
             (
                 self.search_seed.q1_deconvolved,
@@ -5828,6 +5829,7 @@ impl Config {
     pub fn resolve_ztscan_off(&mut self) {
         self.rt_im_train.q1_calibrate.resolve(false);
         self.extract.q1_fragments.resolve(false);
+        self.extract.q1_traces.resolve(false);
         let f = &mut self.features;
         for k in [
             &mut f.q1_fragment_features,
@@ -5982,6 +5984,14 @@ impl Config {
         }
         self.extract.q1_fragments.resolve(frag_why.is_none());
         let frag = self.extract.q1_fragments.on();
+        if !frag {
+            hold(
+                self.extract.q1_traces,
+                "extract.q1_traces",
+                "it needs extract.q1_fragments",
+            );
+        }
+        self.extract.q1_traces.resolve(frag);
         let family_why = if !frag {
             Some("it needs extract.q1_fragments")
         } else if self.features.set != FeatureSet::Extended {
@@ -7513,14 +7523,14 @@ impl Config {
                 )));
             }
         }
-        if ex.q1_traces && !decided {
+        if ex.q1_traces.on() && !decided {
             return Err(Invalid(
                 "extract.q1_traces collapses each cycle's steps with the calibrated Q1 model of \
                  extract.q1_fragments; set it as well"
                     .into(),
             ));
         }
-        if ex.q1_traces && ex.q1_cycles {
+        if ex.q1_traces.on() && ex.q1_cycles {
             return Err(Invalid(
                 "extract.q1_traces and extract.q1_cycles each put one point a cycle on the \
                  traces; set one of them"
@@ -9054,13 +9064,13 @@ mod tests {
         );
     }
 
-    /// `extract.q1_traces` and `features.q1_separable` are opt-in: omitted from the canonical
-    /// configuration at their default, part of it when set, never turned on by the automatic
-    /// analysis, and refused without the per-fragment decision they read.
+    /// `extract.q1_traces` is automatic (on for ZT Scan input, off otherwise, `false` kept) and
+    /// `features.q1_separable` opt-in: both omitted from the canonical configuration unless on,
+    /// and refused without the per-fragment decision they read.
     #[test]
-    fn the_cycle_trace_and_separable_keys_are_opt_in() {
+    fn the_cycle_trace_key_is_automatic_and_the_separable_one_opt_in() {
         let d = Config::default();
-        assert!(!d.extract.q1_traces && !d.features.q1_separable);
+        assert!(d.extract.q1_traces.is_auto() && !d.features.q1_separable);
         let canon = d.canonical_json();
         assert!(!canon.contains("q1_traces") && !canon.contains("q1_separable"));
         let on =
@@ -9071,7 +9081,15 @@ mod tests {
         let mut auto = Config::default();
         auto.resolve_ztscan(ZtScanInputs::All { half_width: 1.9 })
             .unwrap();
-        assert!(!auto.extract.q1_traces && !auto.features.q1_separable);
+        assert!(auto.extract.q1_traces.on() && !auto.features.q1_separable);
+        let mut none = Config::default();
+        none.resolve_ztscan(ZtScanInputs::None).unwrap();
+        assert!(none.extract.q1_traces.is_off());
+        assert_eq!(none.canonical_json(), canon);
+        let mut off = Config::from_json(r#"{"extract":{"q1_traces":false}}"#).unwrap();
+        off.resolve_ztscan(ZtScanInputs::All { half_width: 1.9 })
+            .unwrap();
+        assert!(off.extract.q1_traces.is_off() && off.extract.q1_fragments.on());
         for json in [
             r#"{"extract":{"q1_fragments":false,"q1_traces":true}}"#,
             r#"{"extract":{"q1_fragments":false},"features":{"q1_separable":true}}"#,
@@ -9083,7 +9101,7 @@ mod tests {
                 .unwrap();
         zt.resolve_ztscan(ZtScanInputs::All { half_width: 1.9 })
             .unwrap();
-        assert!(zt.extract.q1_traces && zt.extract.q1_fragments.on());
+        assert!(zt.extract.q1_traces.on() && zt.extract.q1_fragments.on());
     }
 
     /// A search without a ZT Scan input resolves every automatic key off and keeps the
@@ -9175,6 +9193,7 @@ mod tests {
             [
                 "rt_im_train.q1_calibrate",
                 "extract.q1_fragments",
+                "extract.q1_traces",
                 "features.q1_fragment_features",
                 "features.q1_precursor",
                 "features.q1_multiscale",
@@ -9191,7 +9210,8 @@ mod tests {
         assert_eq!(own.convert.isolation_half_width, Some(2.3));
         // Everything off by request: the reading of section 2 of docs/37, the half-width
         // alone, which hashes as the half-width alone always did.
-        let off = r#"{"rt_im_train":{"q1_calibrate":false},"extract":{"q1_fragments":false},
+        let off = r#"{"rt_im_train":{"q1_calibrate":false},"extract":{"q1_fragments":false,
+            "q1_traces":false},
             "features":{"set":"extended","q1_fragment_features":false,"q1_precursor":false,
                 "q1_multiscale":false,"q1_deconvolved":false,"q1_consistency":false},
             "retrace":{"q1_repick":false},"rescore":{"shadow_q1":false},
