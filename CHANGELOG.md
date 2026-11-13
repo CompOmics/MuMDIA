@@ -201,6 +201,19 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
+## [Unreleased]
+
+### Changed
+
+- **The desktop application pins visDIA at 0ce3224, which reads the ZT Scan cycle traces from
+  `chromatograms_q1.parquet`** (CompOmics/visDIA#16). Under `extract.q1_traces` the engine
+  writes a ZT Scan run's traces on Q1 cycles to `chromatograms_q1.parquet` beside
+  `chromatograms.parquet` (`second_pass/<run>/` for a second pass), and `chromatograms.parquet`
+  keeps the per-step traces. The precursor page draws the engine's cycle values from that
+  table, with the per-step samples behind them on request and each fragment's `q1_class`. A
+  candidate the table does not hold, and every run without it, keeps the viewer's own
+  collapse of the steps.
+
 ## [0.13.0] - 2026-11-12
 
 ### Added
