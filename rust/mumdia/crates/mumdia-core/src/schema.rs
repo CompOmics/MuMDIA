@@ -102,6 +102,14 @@ pub mod artifact {
     /// and the multi-scale Q1 scores `q1m3_*`, `q1m7_*` and `q1m11_*` (Float64), each
     /// family only under its key. Readers select columns by name.
     pub const PSMS_EXTRACTED_V8: (&str, u32) = ("psms_extracted", 8);
+    /// v9, written only under `features.q1_separable` (scanning-quadrupole spectra under
+    /// `extract.q1_fragments`, which carry no 1/K0): the table of v6, v7 or v8 plus, appended
+    /// last, the separable model of each row's Q1 patch (`stages::q1trace`): the `q1s_*` feature
+    /// values (Float64) and five Float32 lists, `q1s_elution` and `q1s_cycle_rt` (the elution
+    /// profile, maximum 1, and the retention time of each patch cycle), and `q1s_frag_amp`,
+    /// `q1s_frag_r2` and `q1s_frag_interf` with one entry per library fragment in the library's
+    /// order. Readers select columns by name.
+    pub const PSMS_EXTRACTED_V9: (&str, u32) = ("psms_extracted", 9);
     /// v1: every row stores its whole `rt` axis and its whole `intensity` trace.
     pub const CHROMATOGRAMS: (&str, u32) = ("chromatograms", 1);
     /// v2, the default (`extract.chromatogram_schema = 2`): the axis once per candidate
@@ -117,6 +125,15 @@ pub mod artifact {
     /// `intensity_trimmed` keeps (the same `trace_offset`, the same length). Written under
     /// the same condition as v3; otherwise the table is v2.
     pub const CHROMATOGRAMS_V4: (&str, u32) = ("chromatograms", 4);
+    /// v5: v1 whose traces hold one point per Q1 cycle (`extract.q1_traces`, scanning-
+    /// quadrupole spectra, which carry no 1/K0): each fragment's steps of one cycle collapsed to
+    /// the least-squares amplitude under its calibrated Q1 profile, at the retention time of the
+    /// cycle's step nearest the precursor's expected Q1 centre; plus `q1_class` (Float32): the
+    /// row's fragment's Q1 decision at the candidate's apex (0 absent, 1 belongs, 2 interfered;
+    /// NaN on the MS1 rows). The columns of v1 otherwise, so every reader reads it.
+    pub const CHROMATOGRAMS_V5: (&str, u32) = ("chromatograms", 5);
+    /// v6: v2 with the cycle traces and `q1_class` of v5.
+    pub const CHROMATOGRAMS_V6: (&str, u32) = ("chromatograms", 6);
     /// v2: the feature columns are Float32 except the few `F64_FEATURE_COLUMNS` of
     /// `stages/features.rs`; v1 stored every feature as Float64. Every reader accepts both.
     pub const FEATURES: (&str, u32) = ("features", 2);
@@ -262,6 +279,16 @@ pub mod artifact {
         }
     }
 
+    /// [`chromatograms`], or [`CHROMATOGRAMS_V5`] / [`CHROMATOGRAMS_V6`] when the traces hold
+    /// one point per Q1 cycle (`extract.q1_traces`), which extract refuses on spectra with 1/K0.
+    pub fn chromatograms_q1t(schema: u32, has_im: bool, q1t: bool) -> (&'static str, u32) {
+        match (q1t && !has_im, schema == CHROMATOGRAMS_V2.1) {
+            (true, false) => CHROMATOGRAMS_V5,
+            (true, true) => CHROMATOGRAMS_V6,
+            (false, _) => chromatograms(schema, has_im),
+        }
+    }
+
     /// The `fragment_quant` schema a quant writes: [`FRAGMENT_QUANT_V6`] under the cross-run
     /// export of a pattern rule, [`FRAGMENT_QUANT_V5`] under any other cross-run export,
     /// else [`FRAGMENT_QUANT`].
@@ -353,6 +380,23 @@ pub mod artifact {
             PSMS_EXTRACTED_V8
         } else {
             psms_extracted_ms1e(has_im, q1, q1f, ms1e)
+        }
+    }
+
+    /// [`psms_extracted_q1s`], or [`PSMS_EXTRACTED_V9`] when the table carries the separable
+    /// model's columns (`features.q1_separable`), which extract refuses on spectra with 1/K0.
+    pub fn psms_extracted_sep(
+        has_im: bool,
+        q1: bool,
+        q1f: bool,
+        ms1e: bool,
+        q1s: bool,
+        sep: bool,
+    ) -> (&'static str, u32) {
+        if sep && !has_im {
+            PSMS_EXTRACTED_V9
+        } else {
+            psms_extracted_q1s(has_im, q1, q1f, ms1e, q1s)
         }
     }
 

@@ -25,6 +25,7 @@ pub mod q1dec;
 pub mod q1frag;
 pub mod q1quant;
 pub mod q1score;
+pub mod q1trace;
 pub mod quant;
 pub mod quant_norm;
 pub mod quant_pattern;

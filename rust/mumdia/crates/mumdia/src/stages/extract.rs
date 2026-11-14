@@ -39,6 +39,7 @@ use crate::matchers::fragindex::NarrowedProbe;
 use crate::matchers::fragindex::{BinnedProbe, FragIndex, LocalIndex, WindowNarrow};
 use crate::spectra::{load_ms1, load_ms2, Ms1Scan};
 use crate::stages::q1frag;
+use crate::stages::q1trace;
 use crate::stages::rt_im_train::RtWindows;
 use mumdia_core::config::MatcherKind;
 use mumdia_core::types::{Ms2Scan, WindowKey};
@@ -842,6 +843,7 @@ impl ChromChunk {
         offset: u32,
         layout: crate::chromatograms::Layout,
         with_im: bool,
+        with_q1_class: bool,
     ) -> Vec<Col> {
         if offset != 0 {
             for c in &mut self.rows.cid {
@@ -850,6 +852,7 @@ impl ChromChunk {
         }
         let opt = crate::chromatograms::Optional {
             im: with_im,
+            q1_class: with_q1_class,
             ..crate::chromatograms::Optional::ALL
         };
         self.rows.into_cols(layout, opt)
@@ -1170,6 +1173,126 @@ impl ScanGroups {
         }
         g
     }
+}
+
+/// One candidate's groups on Q1 cycles (`extract.q1_traces`, [`q1trace`]): one group per cycle
+/// at the retention time of the cycle's representative step, and the cycle of each group.
+struct CycleGroups {
+    groups: ScanGroups,
+    rt: Vec<f64>,
+    /// The cycle of each group (read by the tests; the traces need only the retention times).
+    #[cfg_attr(not(test), allow(dead_code))]
+    cycle: Vec<u32>,
+}
+
+/// `groups` (ascending in retention time, each a scan of the candidate's grid) collapsed to
+/// one group per Q1 cycle ([`q1trace`]): a fragment's value in a cycle is the least-squares
+/// amplitude of its values in the cycle's groups (0 where it is absent) under its expected Q1
+/// profile at each group's step target and the expected centre (`cand`, `model`), and it is
+/// present when it is present in any of them. The cycle's group sits at the retention time of
+/// its step nearest the expected centre. `None` when a group is not a scan of the sweep.
+fn cycle_groups(
+    groups: &ScanGroups,
+    scans: &[Ms2Scan],
+    grid: &q1frag::Q1Grid,
+    pm: f64,
+    cand: &q1frag::CandQ1,
+    model: &mumdia_core::config::Q1FragModel,
+) -> Option<CycleGroups> {
+    let mut place: Vec<(u32, f64)> = Vec::with_capacity(groups.len());
+    for i in 0..groups.len() {
+        let si = scan_at_rt(scans, groups.rt(i), pm)?;
+        let c = *grid.scan_cycle.get(si)?;
+        place.push((c, scans[si].window.target_mz));
+    }
+    let spans = q1trace::CycleSpans::of(&place, cand.centre)?;
+    let width = groups.width;
+    // The weights, once per distinct step target and fragment.
+    let mut keys: Vec<i64> = place.iter().map(|p| q1frag::step_key(p.1)).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let key_of: Vec<usize> = place
+        .iter()
+        .map(|p| {
+            keys.binary_search(&q1frag::step_key(p.1))
+                .expect("the key of every place")
+        })
+        .collect();
+    let mut wtab = vec![0.0f64; keys.len() * width];
+    for (k, &key) in keys.iter().enumerate() {
+        let t = key as f64 / 1e4;
+        for f in 0..width.min(cand.frags.len()) {
+            wtab[k * width + f] = cand.expected(model, f, t, 0.0, 1.0);
+        }
+    }
+    let rt: Vec<f64> = spans.rep.iter().map(|&i| groups.rt(i)).collect();
+    let mut out = ScanGroups::empty_on(&rt, width);
+    for (k, &(a, b)) in spans.spans.iter().enumerate() {
+        for f in 0..width {
+            let mut any = false;
+            let v = q1trace::ls_amplitude((a..b).map(|i| {
+                let w = wtab[key_of[i] * width + f];
+                let x = match groups.get(i, f as u16) {
+                    Some(x) => {
+                        any = true;
+                        x as f64
+                    }
+                    None => 0.0,
+                };
+                (x, w)
+            }));
+            if any {
+                out.insert(k, f as u16, v as f32);
+            }
+        }
+    }
+    let cycle = spans.spans.iter().map(|&(a, _)| place[a].0).collect();
+    Some(CycleGroups {
+        groups: out,
+        rt,
+        cycle,
+    })
+}
+
+/// The path of the cycle-trace table (`extract.q1_traces`) beside a run's chromatogram table:
+/// `chromatograms_q1.parquet` in the same directory.
+pub fn q1_trace_path(out_chrom: &str) -> String {
+    let p = std::path::Path::new(out_chrom);
+    match p.parent() {
+        Some(d) if !d.as_os_str().is_empty() => {
+            d.join(Q1_TRACE_TABLE).to_string_lossy().to_string()
+        }
+        _ => Q1_TRACE_TABLE.to_string(),
+    }
+}
+
+/// The file name of the cycle-trace table (`extract.q1_traces`).
+pub const Q1_TRACE_TABLE: &str = "chromatograms_q1.parquet";
+
+/// The manifest record of the cycle-trace table extract wrote beside `out_chrom`, from its
+/// report (rows and content hash); `None` when there is none.
+pub fn q1_trace_record(
+    out_chrom: &str,
+    config_hash: &str,
+) -> Result<Option<mumdia_core::manifest::ArtifactRecord>> {
+    let path = q1_trace_path(out_chrom);
+    let report = format!("{path}.report.json");
+    if !std::path::Path::new(&path).exists() || !std::path::Path::new(&report).exists() {
+        return Ok(None);
+    }
+    let r: serde_json::Value = mumdia_io::json::read_json(&report)?;
+    let rows = r["rows"].as_u64().unwrap_or(0);
+    let hash = r["content_hash"].as_str().unwrap_or("").to_string();
+    let version = r["schema_version"].as_u64().unwrap_or(0) as u32;
+    Ok(Some(mumdia_io::record_artifact_with_hash(
+        "chromatograms_q1",
+        (artifact::CHROMATOGRAMS.0, version),
+        &path,
+        rows,
+        "extract",
+        config_hash,
+        hash,
+    )))
 }
 
 /// Index of the value in ascending `rts` nearest to `t` (binary search), the earlier one
@@ -3498,7 +3621,10 @@ pub fn psms_schema(path: &str) -> Result<(&'static str, u32)> {
     let q1s = cols
         .iter()
         .any(|c| c == "q1p_n_iso" || c == "q1m3_corr_best" || c == "q1d_n_frag");
-    Ok(artifact::psms_extracted_q1s(has_im, q1, q1f, ms1e, q1s))
+    let sep = cols.iter().any(|c| c == "q1s_r2");
+    Ok(artifact::psms_extracted_sep(
+        has_im, q1, q1f, ms1e, q1s, sep,
+    ))
 }
 
 /// The apex 1/K0 of every row of a `psms_extracted` table that has one, keyed by
@@ -3794,6 +3920,11 @@ struct CandOut {
     ms1e: Option<crate::stages::ms1env::Ms1Env>,
     /// (cid, frag_name, frag_mz, frag_obs_mz, predicted_intensity, rt, intensity, im)
     chrom: Vec<ChromOutputRow>,
+    /// Under `extract.q1_traces`: the same rows on Q1 cycles (`chromatograms_q1.parquet`), and
+    /// one Q1 class per row (the fragment's decision at the row's apex, NaN on the MS1 rows);
+    /// empty otherwise.
+    chrom_q1: Vec<ChromOutputRow>,
+    chrom_q1_class: Vec<f32>,
     /// Top-K retained peak groups (sensitivity_plan P1.1/P1.2), populated only
     /// when `retain_top_peaks > 1`. Each: (rank, apex_rt, start_rt, end_rt,
     /// evidence_count, area). Ranked by co-eluting fragment breadth (not
@@ -4044,6 +4175,11 @@ impl PsmRows {
         let mut q1p_rows: Vec<Vec<f64>> = Vec::new();
         let mut q1m_rows: Vec<Vec<f64>> = Vec::new();
         let mut q1d_rows: Vec<Vec<f64>> = Vec::new();
+        // The separable model's values and lists (v9), taken out the same way.
+        let sep = cfg.q1_separable && cfg.q1_fragments.on();
+        let mut sep_rows: Vec<Vec<f64>> = Vec::new();
+        let (mut sep_el, mut sep_rt, mut sep_amp, mut sep_r2, mut sep_if) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         // psms_extracted v6: the per-fragment Q1 decision, appended last, only under
         // `extract.q1_fragments`: the row's summary, then one list per decision with an entry
         // per library fragment.
@@ -4109,6 +4245,14 @@ impl PsmRows {
                 if cfg.q1_dec_features {
                     q1d_rows.push(r.q1d);
                 }
+                if sep {
+                    sep_rows.push(r.q1s);
+                    sep_el.push(r.q1s_elution);
+                    sep_rt.push(r.q1s_cycle_rt);
+                    sep_amp.push(r.q1s_amp);
+                    sep_r2.push(r.q1s_r2);
+                    sep_if.push(r.q1s_interf);
+                }
             }
             cols.push(Col::ListF32("q1f_frag_class".into(), cl));
             cols.push(Col::ListF32("q1f_frag_offset".into(), of));
@@ -4152,6 +4296,21 @@ impl PsmRows {
                     q1d_rows.iter().map(|v| v[k]).collect(),
                 ));
             }
+        }
+        // psms_extracted v9: the separable model of each row's Q1 patch, appended last, only
+        // under `features.q1_separable` (`stages::q1trace`).
+        if sep {
+            for (k, name) in q1trace::Q1S_COLUMNS.iter().enumerate() {
+                cols.push(Col::F64(
+                    (*name).into(),
+                    sep_rows.iter().map(|v| v[k]).collect(),
+                ));
+            }
+            cols.push(Col::ListF32("q1s_elution".into(), sep_el));
+            cols.push(Col::ListF32("q1s_cycle_rt".into(), sep_rt));
+            cols.push(Col::ListF32("q1s_frag_amp".into(), sep_amp));
+            cols.push(Col::ListF32("q1s_frag_r2".into(), sep_r2));
+            cols.push(Col::ListF32("q1s_frag_interf".into(), sep_if));
         }
         cols
     }
@@ -4734,6 +4893,22 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         scans,
         tol_ppm: frag_tol,
     });
+    // `extract.q1_traces` (`stages::q1trace`): every accepted candidate's traces once more on Q1
+    // cycles, into `chromatograms_q1.parquet`, collapsed with the decision's calibrated model
+    // and grid; `features.q1_separable` fits the decision's patches.
+    if (p.cfg.q1_traces.on() || p.cfg.q1_separable) && q1f_ctx.is_none() {
+        anyhow::bail!(
+            "extract: extract.q1_traces and features.q1_separable read the Q1 sweep through the \
+             per-fragment decision's grid and calibrated model; set extract.q1_fragments as well"
+        );
+    }
+    let q1t = p.cfg.q1_traces.on();
+    let q1t_path = q1_trace_path(p.out_chrom);
+    if q1t {
+        mumdia_io::refuse_output_over_input(&q1t_path, &inputs)?;
+        info!(path = %q1t_path, "extract: traces on Q1 cycles (extract.q1_traces)");
+    }
+    let q1t_failed = std::sync::atomic::AtomicU64::new(0);
 
     // The fragment index, built with the library above at this same learned tolerance,
     // when a path needs the global one; and the geometry the streamed path's task-local
@@ -5019,6 +5194,12 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             chrom_writer.with_row_groups_in_flight(crate::chromatograms::ROW_GROUPS_IN_FLIGHT);
     }
     let mut chrom_encoder = crate::chromatograms::Encoder::new(chrom_rg_rows);
+    // `extract.q1_traces`: the cycle-trace table, in the same layout, through its own writer
+    // and encoder.
+    let q1t_writer = q1t.then(|| {
+        crate::chromatograms::writer(&q1t_path, chrom_rg_rows, chrom_layout).with_content_hash()
+    });
+    let mut q1t_encoder = crate::chromatograms::Encoder::new(chrom_rg_rows);
 
     // Deterministic output order (a HashMap's iteration order is randomized,
     // and downstream floating-point sums in the rescorer are order-sensitive).
@@ -5790,6 +5971,31 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                     if p.cfg.q1_multiscale {
                         row.q1m = q1score::multiscale(pt, cand, d, x.model, env.as_deref());
                     }
+                    // `features.q1_separable`: the separable model of the patch
+                    // (`stages::q1trace`), with the retention time of each patch cycle (its
+                    // step nearest the expected centre).
+                    if p.cfg.q1_separable {
+                        let s = q1trace::fit(pt, d, cand, x.model);
+                        let c0 = x.grid.scan_cycle[*si];
+                        let aci = pt.cycles.iter().position(|&c| c == c0).unwrap_or(d.apex_ci);
+                        row.q1s = q1trace::values(&s, d, cand, aci);
+                        let mid = x.grid.nearest_step(cand.centre);
+                        row.q1s_cycle_rt = pt
+                            .cycles
+                            .iter()
+                            .map(|&c| {
+                                x.grid
+                                    .scan(c, mid)
+                                    .map_or(f32::NAN, |k| x.scans[k].rt_seconds as f32)
+                            })
+                            .collect();
+                        let f32s =
+                            |v: &[f64]| -> Vec<f32> { v.iter().map(|&y| y as f32).collect() };
+                        row.q1s_elution = f32s(&s.elution);
+                        row.q1s_amp = f32s(&s.amp);
+                        row.q1s_r2 = f32s(&s.r2);
+                        row.q1s_interf = f32s(&s.interf);
+                    }
                     // `features.q1_deconvolved`: the deconvolved evidence at the apex scan.
                     if let (true, Some(g)) = (p.cfg.q1_dec_features, q1_gate.as_ref()) {
                         let targets: Vec<f64> = cand.frags.iter().map(|f| f.target_mz).collect();
@@ -5818,6 +6024,13 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                     }
                     if p.cfg.q1_dec_features {
                         row.q1d = crate::stages::q1dec::empty_evidence();
+                    }
+                    if p.cfg.q1_separable {
+                        let n = cand.frags.len();
+                        row.q1s = q1trace::empty_values();
+                        row.q1s_amp = vec![f32::NAN; n];
+                        row.q1s_r2 = vec![f32::NAN; n];
+                        row.q1s_interf = vec![f32::NAN; n];
                     }
                     row
                 }
@@ -6191,6 +6404,114 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             }
         }
 
+        // `extract.q1_traces`: the same rows on Q1 cycles (`chromatograms_q1.parquet`), from the
+        // groups the traces read (padded or not), with each fragment's Q1 class at the row's
+        // apex. The weights come from the candidate's calibrated model at its predicted
+        // retention time; a candidate whose grid is not in the sweep (none on a regular sweep)
+        // writes no cycle rows and is counted.
+        let (mut chrom_q1, mut chrom_q1_class): (Vec<ChromOutputRow>, Vec<f32>) =
+            (Vec::new(), Vec::new());
+        if let (true, Some(x)) = (q1t, q1f_ctx.as_ref()) {
+            let (fm, fi, fnm) = lib.cand_frags(cid);
+            let mzs: Vec<f64> = fm.iter().map(|&v| v as f64).collect();
+            let preds: Vec<f64> = fi.iter().map(|&v| v as f64).collect();
+            let zs: Vec<i32> = fnm
+                .iter()
+                .map(|&n| q1frag::frag_charge_of(lib.frag_name_str(n)))
+                .collect();
+            let rc = rt_cal[cid as usize];
+            let rt_ref = if rc.is_finite() && rc > 0.0 {
+                rc
+            } else {
+                0.5 * (lo_c + hi_c)
+            };
+            let cw = q1frag::CandQ1::new(
+                x.model,
+                c.precursor_mz,
+                c.charge,
+                rt_ref,
+                &mzs,
+                &zs,
+                &preds,
+                &|mz| mass_off.factor_at(mz),
+            );
+            match cycle_groups(t_groups, scans, x.grid, c.precursor_mz, &cw, x.model) {
+                Some(cg) => {
+                    let crt: Vec<f32> = cg
+                        .rt
+                        .iter()
+                        .map(|&r| trace_rt(r, lo_c, hi_c, is_padded))
+                        .collect();
+                    let cls = q1f_out.as_ref().map(|r| &r.class);
+                    for fi in 0..fmzs.len() {
+                        let frag = fi as u16;
+                        let (sm, sw) = wsum[fi];
+                        let obs_mz = if sw > 0.0 { sm / sw } else { fmzs[fi] as f64 };
+                        let (rts, ints): (Vec<f32>, Vec<f32>) = if observed.contains(frag) {
+                            (
+                                crt.clone(),
+                                (0..cg.groups.len())
+                                    .map(|i| cg.groups.or_zero(i, frag))
+                                    .collect(),
+                            )
+                        } else {
+                            (Vec::new(), Vec::new())
+                        };
+                        chrom_q1.push((
+                            cid,
+                            lib.frag_name_str(fnames[fi]).to_string(),
+                            fmzs[fi] as f64,
+                            obs_mz,
+                            fints[fi],
+                            rts,
+                            ints,
+                            Vec::new(),
+                        ));
+                        chrom_q1_class
+                            .push(cls.and_then(|v| v.get(fi).copied()).unwrap_or(f32::NAN));
+                    }
+                    if !ms1_scans.is_empty() {
+                        let sp = ISOTOPE_SPACING / c.charge as f64;
+                        let tol = p.cfg.prec_tol_ppm;
+                        let varies = p.cfg.ms1_shift_varies();
+                        for (nm, dmz) in
+                            [("ms1_mono", 0.0), ("ms1_iso1", sp), ("ms1_iso2", 2.0 * sp)]
+                        {
+                            let lib_mz = c.precursor_mz + dmz;
+                            let mz = lib_mz * p.cfg.ms1_shift(lib_mz, apex_rt);
+                            let ints: Vec<f32> = cg
+                                .rt
+                                .iter()
+                                .map(|&r| {
+                                    let j = nearest_index(&ms1_rts, r);
+                                    let at = if varies {
+                                        lib_mz * p.cfg.ms1_shift(lib_mz, r)
+                                    } else {
+                                        mz
+                                    };
+                                    ms1_near(ms1_scans, j, p.cfg.ms1_scan_halfwidth, at, tol)
+                                })
+                                .collect();
+                            chrom_q1.push((
+                                cid,
+                                nm.to_string(),
+                                mz,
+                                mz,
+                                0.0,
+                                crt.clone(),
+                                ints,
+                                Vec::new(),
+                            ));
+                            chrom_q1_class.push(f32::NAN);
+                        }
+                    }
+                }
+                None => {
+                    q1t_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+
         // Top-K peak retention (opt-in; sensitivity_plan P1.1/P1.2). Enumerate peak
         // groups over the per-scan distinct-fragment COUNT profile (co-eluting
         // breadth, interference-resistant per the intensity-is-chimeric argument),
@@ -6266,6 +6587,8 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             ms1e: ms1e_at(row_apex_rt, q1f_out.as_ref()),
             q1f: q1f_out,
             chrom: chrom_rows,
+            chrom_q1,
+            chrom_q1_class,
             peaks,
         };
         skeleton_rows.fetch_add(skel_rows, std::sync::atomic::Ordering::Relaxed);
@@ -6364,6 +6687,8 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 q1f: a_q1f,
                 ms1e: a_ms1e,
                 chrom: Vec::new(), // shared per-candidate via the rank-0 row
+                chrom_q1: Vec::new(),
+                chrom_q1_class: Vec::new(),
                 peaks: Vec::new(),
             });
             rank += 1;
@@ -6405,8 +6730,20 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     // the stage means the serial encoder bounds extract; a small one means it does not.
     let mut chrom_send_blocked = std::time::Duration::ZERO;
     let mut chrom_chunks_sent = 0u64;
+    let mut q1t_written: Option<Written> = None;
     let chrom_written = std::thread::scope(|sc| -> Result<Written> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<Col>>(2);
+        // `extract.q1_traces`: the cycle-trace table's writer, on a thread of its own.
+        let (qtx, qrx) = std::sync::mpsc::sync_channel::<Vec<Col>>(2);
+        let q1t_thread = q1t_writer.map(|w0| {
+            sc.spawn(move || -> Result<TableWriter> {
+                let mut w = w0;
+                for cols in qrx {
+                    w.write_cols(cols)?;
+                }
+                Ok(w)
+            })
+        });
         // The writer is handed back unclosed: whether the table is published depends on
         // how the loop ended (`close_chromatograms`), which only this side knows.
         let writer = sc.spawn(move || -> Result<(TableWriter, std::time::Duration)> {
@@ -6431,6 +6768,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                     .map(|(cid, hits)| per_candidate(*cid, hits))
                     .collect();
                 let mut ch = ChromChunk::default();
+                let mut chq = ChromChunk::default();
                 for mut r in outs.into_iter().flatten() {
                     n_accepted += 1;
                     let rcid = r.cid;
@@ -6454,9 +6792,40 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                         }
                     }
                     let chrom = std::mem::take(&mut r.chrom);
+                    let chrom_q1 = std::mem::take(&mut r.chrom_q1);
+                    let chrom_q1_class = std::mem::take(&mut r.chrom_q1_class);
                     if let Err(e) = psms.push(r, p.cfg) {
                         psms_err = Some(e);
                         return false;
+                    }
+                    // The cycle rows, in the sidecar's layout.
+                    let qrows = &mut chq.rows;
+                    for ((cc, nm, fmz, omz, pint, rt, it, _), cl) in
+                        chrom_q1.into_iter().zip(chrom_q1_class)
+                    {
+                        qrows.cid.push(cc);
+                        qrows.name.push(nm);
+                        qrows.frag_mz.push(fmz);
+                        qrows.frag_obs_mz.push(omz);
+                        qrows.predicted_intensity.push(pint);
+                        qrows.q1_class.push(cl);
+                        if chrom_layout == crate::chromatograms::Layout::V2 {
+                            match q1t_encoder.encode(cc, rt, it) {
+                                Ok(e) => {
+                                    qrows.rt.push(e.rt);
+                                    qrows.intensity.push(e.intensity);
+                                    qrows.trace_offset.push(e.trace_offset);
+                                    qrows.trace_len.push(e.trace_len);
+                                }
+                                Err(e) => {
+                                    psms_err = Some(e);
+                                    return false;
+                                }
+                            }
+                        } else {
+                            qrows.rt.push(rt);
+                            qrows.intensity.push(it);
+                        }
                     }
                     let rows = &mut ch.rows;
                     for (cc, nm, fmz, omz, pint, rt, it, im) in chrom {
@@ -6512,7 +6881,13 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 // the writer failed; its error surfaces at the join below. The columns are
                 // built before the clock starts, so the timer holds only the wait for a
                 // free channel slot.
-                let cols = ch.cols(chrom_offset, chrom_layout, chrom_im);
+                if q1t {
+                    let qcols = chq.cols(chrom_offset, chrom_layout, false, true);
+                    if qtx.send(qcols).is_err() {
+                        return false;
+                    }
+                }
+                let cols = ch.cols(chrom_offset, chrom_layout, chrom_im, false);
                 let t_send = Instant::now();
                 let sent = tx.send(cols);
                 chrom_send_blocked += t_send.elapsed();
@@ -6644,13 +7019,27 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         // A final empty chunk fixes the schema when no candidate was accepted at all. Not
         // after a failed psms_extracted write, whose table is abandoned below.
         if psms_err.is_none() {
-            let _ = tx.send(ChromChunk::default().cols(0, chrom_layout, chrom_im));
+            let _ = tx.send(ChromChunk::default().cols(0, chrom_layout, chrom_im, false));
+            if q1t {
+                let _ = qtx.send(ChromChunk::default().cols(0, chrom_layout, false, true));
+            }
         }
         drop(tx);
+        drop(qtx);
         let (w, mut writer_busy) = writer
             .join()
             .map_err(|_| anyhow::anyhow!("chromatogram writer thread panicked"))??;
         let t_close = Instant::now();
+        // The cycle-trace table is published (or abandoned) exactly as the chromatograms are.
+        if let Some(h) = q1t_thread {
+            let qw = h
+                .join()
+                .map_err(|_| anyhow::anyhow!("cycle-trace writer thread panicked"))??;
+            match &psms_err {
+                Some(_) => drop(qw),
+                None => q1t_written = Some(qw.close_hashed()?),
+            }
+        }
         let n = close_chromatograms(w, psms_err.take())?;
         writer_busy += t_close.elapsed();
         crate::memlog::report(
@@ -6803,13 +7192,14 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     for (path, schema, file) in [
         (
             p.out_psms,
-            artifact::psms_extracted_q1s(
+            artifact::psms_extracted_sep(
                 has_im,
                 p.cfg.q1_profile,
                 p.cfg.q1_fragments.on(),
                 p.cfg.ms1_envelope,
                 p.cfg.q1_fragments.on()
                     && (p.cfg.q1_precursor || p.cfg.q1_multiscale || p.cfg.q1_dec_features),
+                p.cfg.q1_fragments.on() && p.cfg.q1_separable,
             ),
             psms_written,
         ),
@@ -6885,6 +7275,27 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                             "multiscale": p.cfg.q1_multiscale,
                             "scales_steps": crate::stages::q1score::SCALES,
                             "deconvolved_evidence": p.cfg.q1_dec_features,
+                        }),
+                    );
+                }
+                // The separable model (`features.q1_separable`), only when on.
+                if p.cfg.q1_separable {
+                    obj.insert(
+                        "q1_separable".into(),
+                        json!({
+                            "iterations": q1trace::SEP_ITERS,
+                            "bound_frac": q1trace::SEP_BOUND_FRAC,
+                        }),
+                    );
+                }
+                // The cycle-trace table (`extract.q1_traces`), only when on.
+                if q1t {
+                    obj.insert(
+                        "q1_traces".into(),
+                        json!({
+                            "table": Q1_TRACE_TABLE,
+                            "candidates_without_cycles": q1t_failed
+                                .load(std::sync::atomic::Ordering::Relaxed),
                         }),
                     );
                 }
@@ -6977,6 +7388,30 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         written.push(report.written());
     }
 
+    // `extract.q1_traces`: the cycle-trace table's report (chromatograms v5 or v6).
+    if let Some(qw) = &q1t_written {
+        let report = ArtifactReport {
+            logical_name: "chromatograms_q1".to_string(),
+            schema_name: artifact::CHROMATOGRAMS.0.to_string(),
+            schema_version: artifact::chromatograms_q1t(chrom_layout.version(), false, true).1,
+            stage: "extract".to_string(),
+            rows: qw.rows,
+            content_hash: qw.content_hash.clone(),
+            params: json!({
+                "q1_traces": {
+                    "of": p.out_chrom,
+                    "candidates_without_cycles": q1t_failed.load(std::sync::atomic::Ordering::Relaxed),
+                    "estimator": "least-squares amplitude of the covering steps under the calibrated Q1 profile at the expected centre",
+                    "trace_pad_s": trace_pad_s,
+                },
+            }),
+            stats: stats.clone(),
+            model_identity: None,
+            elapsed_ms: elapsed,
+        };
+        report.write_for(&q1t_path)?;
+        info!(rows = qw.rows, path = %q1t_path, "extract: cycle-trace table written");
+    }
     info!(
         accepted = n_accepted,
         chromatograms = n_chrom,
@@ -8180,6 +8615,8 @@ mod psms_stream_tests {
             q1f: None,
             ms1e: None,
             chrom: Vec::new(),
+            chrom_q1: Vec::new(),
+            chrom_q1_class: Vec::new(),
             peaks: Vec::new(),
         }
     }
@@ -8672,5 +9109,72 @@ mod q1_tests {
             q1_profile_of(&own, &l, &cover, pm, 4 + Q1_PROFILE_CYCLES + 1),
             Q1Profile::default()
         );
+    }
+
+    /// `extract.q1_traces`: a candidate's groups on the covering steps of every cycle become one
+    /// group per cycle, at the retention time of the step nearest the expected Q1 centre, each
+    /// fragment the least-squares amplitude of its steps under its expected profile (exact for a
+    /// trace that is the profile times a height) and present when any step had it.
+    #[test]
+    fn the_steps_of_a_cycle_collapse_to_one_group_at_its_central_step() {
+        let scans = sweep(3, 60);
+        let sweep_cols = crate::spectra::Q1SweepCols {
+            scan_index: (0..scans.len() as u32).collect(),
+            cycle: (0..scans.len()).map(|i| (i / 60) as u32).collect(),
+            step: (0..scans.len()).map(|i| (i % 60) as u32).collect(),
+        };
+        let grid = q1frag::Q1Grid::build(&scans, &sweep_cols).unwrap();
+        let model = mumdia_core::config::Q1FragModel {
+            step_mz: STEP,
+            half_width_mz: 2.57,
+            edge_width_mz: 4.0,
+            offset_terms: Vec::new(),
+            tolerances: Default::default(),
+        };
+        let pm = target(20) + 0.1;
+        let cand = q1frag::CandQ1::new(
+            &model,
+            pm,
+            2,
+            1.0,
+            &[300.0, 450.0],
+            &[1, 1],
+            &[1.0, 0.5],
+            &|_| 1.0,
+        );
+        // The covering steps 18..=22 of each cycle, as extract's grid holds them.
+        let s = |c: usize, b: usize| c * 60 + b;
+        let rts: Vec<f64> = (0..3)
+            .flat_map(|c| (18..=22).map(move |b| (c, b)))
+            .map(|(c, b)| scans[s(c, b)].rt_seconds)
+            .collect();
+        let mut g = ScanGroups::empty_on(&rts, 2);
+        // Fragment 0 in every step of cycle 1 at ten times its profile; fragment 1 in step 20 of
+        // cycle 2 alone.
+        for (k, b) in (18..=22).enumerate() {
+            let w = cand.expected(&model, 0, target(b), 0.0, 1.0);
+            g.insert(5 + k, 0, (10.0 * w) as f32);
+        }
+        g.insert(12, 1, 4.0);
+        let cg = cycle_groups(&g, &scans, &grid, pm, &cand, &model).expect("cycles");
+        assert_eq!(cg.cycle, vec![0, 1, 2]);
+        assert_eq!(cg.groups.len(), 3);
+        // The representative step is the one nearest the expected centre.
+        let rep = grid.nearest_step(cand.centre) as usize;
+        assert_eq!(cg.rt[1], scans[s(1, rep)].rt_seconds);
+        assert!(cg.groups.get(0, 0).is_none() && cg.groups.get(0, 1).is_none());
+        let v = cg.groups.get(1, 0).expect("present in cycle 1");
+        assert!((v - 10.0).abs() < 1e-4, "{v}");
+        assert!(cg.groups.get(1, 1).is_none());
+        // One step of five: present, at the least-squares amplitude of a lone sample.
+        let w: Vec<f64> = (18..=22)
+            .map(|b| cand.expected(&model, 1, target(b), 0.0, 1.0))
+            .collect();
+        let want = 4.0 * w[2] / w.iter().map(|x| x * x).sum::<f64>();
+        let v = cg.groups.get(2, 1).expect("present in cycle 2");
+        assert!((v as f64 - want).abs() < 1e-5, "{v} {want}");
+        // A group that is not a scan of the sweep: no cycles.
+        let off = ScanGroups::empty_on(&[0.123456], 2);
+        assert!(cycle_groups(&off, &scans, &grid, pm, &cand, &model).is_none());
     }
 }

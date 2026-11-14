@@ -84,6 +84,8 @@ pub const IM: &str = "im";
 /// The v2 list column holding a row's per-point 1/K0 on 4D data, cut like
 /// `intensity_trimmed` (schema v4).
 pub const IM_TRIMMED: &str = "im_trimmed";
+/// The per-row Q1 decision of a table with cycle traces (`extract.q1_traces`, v5 and v6).
+pub const Q1_CLASS: &str = "q1_class";
 
 /// Rows per parquet row group of a chromatogram table written by extract: about 64k rows of
 /// two ~60-point traces, ~30 MB uncompressed in v1, which bounds the encoder's in-progress
@@ -559,6 +561,8 @@ pub struct Optional {
     pub frag_obs_mz: bool,
     /// The per-point 1/K0 list of a 4D table (`im` in v1, `im_trimmed` in v2).
     pub im: bool,
+    /// The per-row Q1 decision of a table with cycle traces ([`Q1_CLASS`], v5 and v6).
+    pub q1_class: bool,
 }
 
 impl Optional {
@@ -567,6 +571,7 @@ impl Optional {
         frag_mz: true,
         frag_obs_mz: true,
         im: false,
+        q1_class: false,
     };
 
     pub fn of(tf: &TableFile) -> Optional {
@@ -574,6 +579,7 @@ impl Optional {
             frag_mz: tf.has_column("frag_mz"),
             frag_obs_mz: tf.has_column("frag_obs_mz"),
             im: tf.has_column(IM) || tf.has_column(IM_TRIMMED),
+            q1_class: tf.has_column(Q1_CLASS),
         }
     }
 }
@@ -608,14 +614,17 @@ pub fn window_span(rt: &[f32], lo: f64, hi: f64) -> std::ops::Range<usize> {
     a..b
 }
 
-/// The (name, version) a chromatogram table records: its layout and whether it carries
-/// per-point ion mobility ([`mumdia_core::schema::artifact::chromatograms`]).
+/// The (name, version) a chromatogram table records: its layout, whether it carries
+/// per-point ion mobility, and whether its traces hold one point per Q1 cycle (the
+/// `q1_class` column; [`mumdia_core::schema::artifact::chromatograms_q1t`]).
 pub fn recorded_schema(path: &str) -> Result<(&'static str, u32)> {
     let tf = TableFile::open(path)?;
     let layout = Layout::of(&tf)?;
-    Ok(mumdia_core::schema::artifact::chromatograms(
+    let opt = Optional::of(&tf);
+    Ok(mumdia_core::schema::artifact::chromatograms_q1t(
         layout.version(),
-        Optional::of(&tf).im,
+        opt.im,
+        opt.q1_class,
     ))
 }
 
@@ -635,6 +644,8 @@ pub struct Rows {
     pub trace_len: Vec<u32>,
     /// Per-point 1/K0, one list per row, only on a 4D table (`Optional::im`).
     pub im: Vec<Vec<f32>>,
+    /// The row's Q1 decision, only on a table with cycle traces (`Optional::q1_class`).
+    pub q1_class: Vec<f32>,
 }
 
 impl Rows {
@@ -675,6 +686,9 @@ impl Rows {
         if opt.im {
             cols.push(Col::LargeListF32(layout.im_column().into(), self.im));
         }
+        if opt.q1_class {
+            cols.push(Col::F32(Q1_CLASS.into(), self.q1_class));
+        }
         cols
     }
 }
@@ -706,6 +720,8 @@ pub struct DenseRow<'a> {
     pub intensity: &'a [f32],
     /// Per-point 1/K0 of a 4D table, as long as `intensity`; `None` on a 3D table.
     pub im: Option<&'a [f32]>,
+    /// The row's Q1 decision of a table with cycle traces; `None` without the column.
+    pub q1_class: Option<f32>,
 }
 
 /// Call `f` with every row of `tf`, in table order and in its v1 form, whichever layout the
@@ -724,6 +740,9 @@ pub fn for_each_row(tf: &TableFile, mut f: impl FnMut(&DenseRow) -> Result<()>) 
     cols.extend_from_slice(layout.trace_columns());
     if opt.im {
         cols.push(layout.im_column());
+    }
+    if opt.q1_class {
+        cols.push(Q1_CLASS);
     }
     let (rt_col, int_col, im_col) = (
         layout.rt_column(),
@@ -779,6 +798,16 @@ pub fn for_each_row(tf: &TableFile, mut f: impl FnMut(&DenseRow) -> Result<()>) 
         } else {
             None
         };
+        let q1c = if opt.q1_class {
+            Some(
+                col(Q1_CLASS)?
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .ok_or_else(|| anyhow!("chromatograms column '{Q1_CLASS}' is not f32"))?,
+            )
+        } else {
+            None
+        };
         let trace = match layout {
             Layout::V1 => None,
             Layout::V2 => Some(TraceCols::of(&b)?),
@@ -811,6 +840,7 @@ pub fn for_each_row(tf: &TableFile, mut f: impl FnMut(&DenseRow) -> Result<()>) 
                 rt: rt_k,
                 intensity: int_k,
                 im: im_k,
+                q1_class: q1c.map(|a| a.value(k)),
             })?;
         }
     }
@@ -854,6 +884,9 @@ fn rewrite_into(
         rows.frag_mz.push(r.frag_mz.unwrap_or(0.0));
         rows.frag_obs_mz.push(r.frag_obs_mz.unwrap_or(0.0));
         rows.predicted_intensity.push(r.predicted_intensity);
+        if opt.q1_class {
+            rows.q1_class.push(r.q1_class.unwrap_or(f32::NAN));
+        }
         match layout {
             Layout::V1 => {
                 rows.rt.push(r.rt.to_vec());
@@ -888,6 +921,70 @@ fn rewrite_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cycle-trace table (`extract.q1_traces`) records chromatograms v5 (layout 1) or v6
+    /// (layout 2) by its `q1_class` column, and a rewrite into the other layout keeps every
+    /// row's class.
+    #[test]
+    fn a_table_with_q1_class_records_v5_or_v6_and_keeps_it_through_a_rewrite() {
+        let rows = || -> Rows {
+            let mut r = Rows::default();
+            for k in 0..40u32 {
+                r.cid.push(k / 4);
+                r.name.push(format!("y{}", k % 4));
+                r.frag_mz.push(300.0 + k as f64);
+                r.frag_obs_mz.push(300.0 + k as f64);
+                r.predicted_intensity.push(1.0);
+                r.rt.push(vec![10.0, 11.0, 12.0]);
+                r.intensity.push(vec![0.0, k as f32, 1.0]);
+                r.q1_class
+                    .push(if k % 4 == 3 { f32::NAN } else { (k % 3) as f32 });
+            }
+            r
+        };
+        let opt = Optional {
+            q1_class: true,
+            ..Optional::ALL
+        };
+        let src = scratch("q1c_v1.parquet");
+        let mut w = writer(&src, 16, Layout::V1);
+        w.write_cols(rows().into_cols(Layout::V1, opt)).unwrap();
+        w.close().unwrap();
+        assert_eq!(
+            recorded_schema(&src).unwrap(),
+            mumdia_core::schema::artifact::CHROMATOGRAMS_V5
+        );
+        let v2 = scratch("q1c_v2.parquet");
+        rewrite(&src, &v2, Layout::V2, 16).unwrap();
+        assert_eq!(
+            recorded_schema(&v2).unwrap(),
+            mumdia_core::schema::artifact::CHROMATOGRAMS_V6
+        );
+        let back = scratch("q1c_back.parquet");
+        rewrite(&v2, &back, Layout::V1, 16).unwrap();
+        let mut seen: Vec<(f32, Vec<f32>)> = Vec::new();
+        for_each_row(&TableFile::open(&back).unwrap(), |r| {
+            seen.push((r.q1_class.unwrap(), r.intensity.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        let want = rows();
+        assert_eq!(seen.len(), want.cid.len());
+        for (k, (c, it)) in seen.iter().enumerate() {
+            assert_eq!(c.to_bits(), want.q1_class[k].to_bits(), "row {k}");
+            assert_eq!(it, &want.intensity[k]);
+        }
+        // A table without the column records the plain layout, as before.
+        let plain = scratch("q1c_plain.parquet");
+        let mut w = writer(&plain, 16, Layout::V1);
+        w.write_cols(rows().into_cols(Layout::V1, Optional::ALL))
+            .unwrap();
+        w.close().unwrap();
+        assert_eq!(
+            recorded_schema(&plain).unwrap(),
+            mumdia_core::schema::artifact::CHROMATOGRAMS
+        );
+    }
 
     fn scratch(name: &str) -> String {
         let dir = std::env::temp_dir().join(format!("mumdia_chromatograms_{}", std::process::id()));

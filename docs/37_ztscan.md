@@ -10,7 +10,8 @@ section 5 what was measured, section 6 the quantification window in Q1 cycles, s
 gate on the fragments that belong that was measured and not added, section 8 where time and
 memory go, section 9 what is refused, section 10 the unfragmented precursor, multi-scale Q1
 scores and Q1-deconvolved evidence, section 11 the library, section 12 the recipe as released,
-measured, section 13 why deamidation must be left out, and section 14 what is open. Since 0.12.0
+measured, section 13 why deamidation must be left out, section 14 what is open, and section 15
+the cycle traces and the separable model of the RT x step patch, measured and kept opt-in. Since 0.12.0
 a search of ZT Scan files reads them with the half-width their isolation census suggests and
 runs the ZT Scan analysis, the keys of section 3 that measured positive, by default, whatever
 configuration it starts from; no other search does, and every other search runs exactly as
@@ -53,6 +54,7 @@ column unless the configuration rules it out, and on every other search it is of
 | `convert.isolation_half_width` | the census's suggestion: 2.5 steps, rounded to 0.05 m/z (1.9 for the K562 method) | (a value set is kept) |
 | `rt_im_train.q1_calibrate` | on | `groups.window_groups > 1`; nothing reads it (`extract.q1_fragments = false`, or `extract.q1_cycles`, and `extract.q1_deconvolved` off) |
 | `extract.q1_fragments` | on | the calibration is off; `extract.q1_cycles` |
+| `extract.q1_traces` (the cycle-trace table `chromatograms_q1.parquet`, section 15) | on | `extract.q1_fragments` is off |
 | `features.q1_fragment_features`, `q1_precursor`, `q1_multiscale`, `q1_deconvolved`, `q1_consistency` | on | `extract.q1_fragments` is off; `features.set` other than `extended` |
 | `retrace.q1_repick` (`q1_repick_peaks` stays 5) | on | `extract.q1_fragments` is off; `extract.promote_top_peaks > 1`, `extract.apex_refine_intensity` or `retrace.repick` |
 | `rescore.shadow_q1` | on | `extract.q1_fragments` is off; `rescore.shadow_min_shared = 0` |
@@ -65,8 +67,8 @@ canonical configuration of `ztscan.json`, and so the same configuration hash and
 tables (section 12). What stays opt-in, as before: the classifier's sensitivity settings
 (section 4), the counts of Q1-consistent peaks (`extract.q1_deconvolved`,
 `search_seed.q1_deconvolved`, section 10.3), `features.ms1_envelope`, `quant.q1_fragments`,
-`extract.q1_cycles`, `extract.q1_profile`, `features.q1_features`, and the MS1 calibration keys
-of docs/09 section 11.
+`extract.q1_cycles`, `extract.q1_profile`, `features.q1_features`, the separable model
+(`features.q1_separable`) of section 15, and the MS1 calibration keys of docs/09 section 11.
 
 **Spelling, and the configuration hash.** Each switch takes `"auto"`, `true` or `false`;
 `quant.q1_cycle_halfwidth` a number of cycles (0 is off), `"auto"` or `null`;
@@ -237,6 +239,8 @@ files"). The others stay opt-in.
 | score each fragment's Q1 centre against its expected one | `features.q1_consistency` | docs/10, "q1_consistency" | on top of the four: +2.97% human precursors at the measured FDP and +2.48% precursors on the human library (the family alone, its columns kept out of the rescore prefilter: +2.28% and +1.85%) | yes |
 | the library's search space: charges 1-4, lengths 6-40, protein N-terminal acetylation, two variable modifications | the library build (`digest.*`, `peptidoforms.*`, or the predictor of an imported library) | section 11 below | +3.47% precursors, +4.09% human precursors at matched FDP, the measured FDP 1.18% against 1.22%; two missed cleavages -1.0% | the desktop sets it with the analysis; `run` names what differs for a FASTA library |
 | the sensitivity rescore | `rescore.folds` 5, `rescore.train_margin_frac` 0.75, `rescore.seeds` 3 | docs/28, section 21; section 11 below | on the section 11 library +1.24% / +0.57% at matched FDP; on top of the released recipe +0.82% / +0.78% (section 12), for 2-6x the rescore time | no (an option for a final pass, section 4) |
+| write the traces once more on Q1 cycles, beside the chromatograms | `extract.q1_traces` | docs/09, section 15; section 15 below | no identification changes (no stage reads the table), +2.9% wall, +7.7 GB; in place of the interleaved traces -1.2% to -4.7% | yes (for drawing; since 2026-11-13) |
+| the separable model of the RT x step patch (one elution profile, each fragment's transmission) | `features.q1_separable` | docs/09, section 15; section 15 below | +0.34% human precursors at matched FDP, -0.17% precursors, inside the seed spread; quantifying from its amplitudes: replicate CV 0.165 against 0.104 (dropped) | no |
 | N/Q deamidation in the library | the library build | section 13 below | precursors +80%, half of them isotope aliases of co-eluting unmodified peptides, at a decoy and entrapment FDP that read as valid; peptides -11%, protein groups -7% | no (leave it out; the desktop warns) |
 
 The four decision keys of the recipe are the phase-2 set, measured together: +3.0%
@@ -676,6 +680,8 @@ byte; 2 is the setting to take when extract's time matters more than half a perc
 - `quant.q1_cycle_halfwidth` without the scan form of the fixed window or with
   `fixed_scan_halfwidth_scale`; `mumdia quant` with it and no `--spectra-ms2`.
 - `features.ms1_envelope` on spectra with 1/K0 and with window groups.
+- `extract.q1_traces` set to `true` and `features.q1_separable` on any input that is not a ZT
+  Scan run, and either without `extract.q1_fragments`.
 - `features.q1_precursor`, `features.q1_multiscale` and `features.q1_deconvolved` without
   `extract.q1_fragments`; `extract.q1_deconvolved` without `rt_im_train.q1_calibrate` or with
   `extract.q1_cycles`; `search_seed.q1_deconvolved` with `count_fragments_once`; both
@@ -1177,6 +1183,146 @@ ZT Scan card when deamidation of N or Q is selected for a ZT Scan run; nothing r
   separate the two (0.49), so `features.q1_consistency` lowers the measured FDP at a reported
   1% only slightly (1.28% to 1.20% the family alone); the borrowed co-elution is the next
   target for a feature.
+- **What the cycle traces could still give** (section 15): on cycles 96 features separate the
+  accepted targets better one by one and the classifier still loses with them; a feature set built
+  for one point a cycle (fewer points, no within-cycle structure) rather than the interleaved
+  samples' was not tried.
 - **The family on other scanning-quadrupole methods.** It reads the per-fragment decisions and
   is measured on one method; whether the offset tolerance learned there carries the same
   information on 5 and 10 Da ZT Scan methods needs the second acquisition above.
+
+## 15. Cycle traces and the separable model (measured 2026-11-12, opt-in)
+
+A ZT Scan chromatogram as extract writes it interleaves the covering steps of every cycle: about
+five Q1 steps 1.3 ms apart, then a gap of a second (section 1). Drawn as one series it is a
+sawtooth, and every rule that counts samples reads it as one series. This section measured whether
+reading elution on Q1 cycles instead, or modelling each candidate's RT x step patch as one elution
+profile times each fragment's transmission, gets more out of the runs. Neither went into the
+automatic set: both keys are opt-in, ZT Scan input only, and every other search is byte-identical.
+
+**What the sawtooth is** (REP01, the released analysis, human library; 6,000 candidates a class;
+A = targets at a precursor q of 1%, D = decoys, L = targets scored below the decoys' median):
+
+- Over the apex +-3 cycles the share of a fragment trace's variance that lies within cycles is 0.16
+  for the accepted targets (IQR 0.08-0.26) and 0.40 for the decoys (0.33-0.46). The calibrated
+  transmission explains almost none of it (0.15 and 0.40 remain once each cycle's least-squares
+  amplitude times the transmission is taken out): over the five covering steps the transmission
+  varies only from about 0.76 to 1, so the sawtooth is counting noise and stray matches, not Q1
+  modulation.
+- The features stage's elution-peak window (the walk down the smoothed top-3 trace, docs/10)
+  stops at the first low step of a neighbouring cycle: 10 samples (IQR 9-14) over 2.0 s (1.0-2.0 s)
+  for the accepted targets, about two cycles of a peak three to six cycles wide; on a Q Exactive AIF
+  run the same window holds the whole peak (9 samples, 23 s). So every chromatographic feature of a
+  ZT Scan run is computed over the apex cycle and one neighbour.
+- Against the same features on the Q Exactive AIF run, the ones that count scans or correlate MS2
+  with MS1 over time lose their separation on ZT Scan (A against D: `wf2_scans_ge3` 0.88 -> 0.51,
+  `coelution_run` 0.79 -> 0.56, `ms1_ms2_time_corr` 0.86 -> 0.54, `ms1_mono_gaussianity` 0.86 ->
+  0.49; the MS1 traces are sampled at the step retention times, so five steps of a cycle read one MS1
+  scan), while single-point and within-window features separate better (`frag_corr` 0.68 -> 0.86).
+- Collapsed to one value a cycle (below), the apex spectrum separates slightly better (AUC 0.867 ->
+  0.872) and the over-the-peak correlations slightly worse (mean pairwise Pearson 0.942 -> 0.929,
+  fragment against reference 0.914 -> 0.909): the within-cycle structure carries separation of its
+  own, and 35 interleaved points give steadier correlations than 7 cycle points.
+
+**The two keys** (docs/09_extract.md, section 15, has the mechanisms):
+
+- `extract.q1_traces`: every accepted candidate's traces once more on Q1 cycles, each fragment's
+  covering steps of a cycle collapsed to their least-squares amplitude under its calibrated Q1
+  profile at the expected centre (the estimator of `quant.q1_fragments`), at the retention time of
+  the cycle's step nearest that centre, into `chromatograms_q1.parquet` (chromatograms schema 5 or
+  6, with each fragment's Q1 decision as `q1_class`). No stage reads the table; it is for drawing and
+  analysis.
+- `features.q1_separable`: each row's decision patch fitted as `x[f, c, s] = A_f E_c T_f(s) + b_f`
+  (one elution profile shared by the fragments that belong, each fragment's calibrated transmission
+  at the shared centre, an amplitude and a floor per fragment), ten `q1s_*` features and, per row,
+  the profile, its cycles' retention times and each fragment's amplitude, R^2 and interference share
+  (psms_extracted v9).
+
+**Measured.** REP01, the section 11 libraries, the v0.12.0 release binary as the base (its runs
+reproduce the released arms of section 12 byte for byte: 105,788 precursors on the human library
+over four seeds, the experiment 119,932), four NN seeds per arm (seeds 1-3 rescore the run's competed
+table), the human library on one host and the entrapment library on another, 64 threads, every arm
+of a library on its host. Matched FDP as in section 5 (here 1.141%, the base arm's mean at a reported
+1%). The replacement arms were run with development builds in which the cycle traces replaced the
+interleaved ones in `chromatograms.parquet` (and, where said, the apex, the gate and the re-pick read
+the cycle groups); the shipped key writes them to the separate table instead.
+
+| arm | human library: precursors at 1%, mean (range) | vs base | entrapment: human at matched FDP, mean (range) | vs base | FDP at a reported 1% |
+|---|---|---|---|---|---|
+| base (v0.12.0, the automatic analysis) | 105,788 (105,400-106,059) | | 103,028 (102,796-103,232) | | 1.09-1.17% |
+| features on cycle traces (apex, gate and re-pick on the steps) | 104,400 (104,122-104,682) | -1.31% | 101,766 (101,462-102,060) | -1.22% | 1.09-1.13% |
+| + apex, gate (+-1 cycle) and re-pick on cycles, apex counted once a cycle | 100,786 (100,582-101,142) | -4.73% | 98,763 (98,571-99,003) | -4.14% | 1.00-1.08% |
+| the same, gate on the apex cycle alone | 100,548 (100,355-100,801) | -4.95% | 98,312 (98,164-98,436) | -4.58% | 1.06-1.11% |
+| + apex, gate and re-pick on cycles, apex counted per step | 104,056 (103,757-104,584) | -1.64% | 102,300 (101,912-102,568) | -0.71% | 1.03-1.09% |
+| the same, gate on the apex cycle alone | 104,498 (104,106-104,739) | -1.22% | 102,161 (101,928-102,328) | -0.84% | 1.00-1.11% |
+| interleaved traces, elution window from the separable profile | 103,838 (103,551-104,120) | -1.84% | 101,529 (101,217-101,983) | -1.45% | 1.05-1.14% |
+| base + the cycle versions of 96 / 97 features that separate better on cycles, appended | 105,562 (105,055-105,960) | -0.21% | 102,962 (102,385-103,456) | -0.06% | 1.13-1.20% |
+| `features.q1_separable` | 105,606 (105,344-105,817) | -0.17% | 103,379 (103,063-103,736) | +0.34% | 1.13-1.15% |
+| the separable features on top of the cycle traces with apex on cycles | 100,949 (100,830-101,105) | -4.57% | 98,649 (98,224-99,158) | -4.25% | 1.03-1.12% |
+
+At a combined FDP of 1.0% the order is the same (`features.q1_separable` +0.29%, the cycle traces
+-0.94%). Decoy fraction 0.0100 in every arm. What it says, plainly:
+
+- **Replacing the interleaved traces with cycle traces loses identifications** on both libraries,
+  beyond the seed spread: -1.2% to -1.3% for the features alone, although 96 of the features
+  separate the accepted targets from the decoys better on the cycle traces one by one (the elution
+  window then covers the peak: 4 cycles, 3.0 s). The classifier gets more from the within-cycle
+  structure of the interleaved samples (the apex cycle's Q1 steps read as five near-coincident
+  points) than from cleaner elution shapes.
+- **The apex on cycles** loses most when a cycle counts each fragment once (a stray match in one step
+  of five counts as much as a fragment in all five): the lost precursors' apexes moved, 68% by more
+  than a cycle, against 8% of the precursors kept. Counted per step, the apex on cycles costs
+  nothing beyond what the cycle traces cost (-1.2% to -1.6% and -0.7% to -0.8% together).
+- **Widening the interleaved window to the true elution span** (bounds from the separable profile)
+  loses 1.5-1.8%, for the same reason: the short window is the useful one.
+- **Adding the cycle versions** of the features that separate better on cycles changes nothing
+  (-0.21% / -0.06%, inside the seed spread), as the cycle-shape screen of section 5 found.
+- **The separable model's features** are inside the seed spread on both libraries (+0.34% on the
+  entrapment library at the matched FDP, -0.17% on the human library), with the measured FDP
+  unchanged; they are label-blind (low-score decoys against low-score targets, two-sample KS
+  0.0010-0.0053, against 0.0016-0.0052 for `n_matched_fragments`, `frag_corr`,
+  `log_apex_intensity`, `coelution_mean` and `rt_error_abs`) and separate the accepted targets
+  strongly (median shared-fit R^2 0.85 against 0.18 for decoys, prediction-weighted interference
+  share 0.33 against 0.73, cosine of the amplitudes with the prediction 0.94 against 0.64, profile
+  FWHM 1.7 cycles): the information is real, and the vector has it already.
+- The three runs as one experiment with `features.q1_separable` (one seed): 120,076 precursors,
+  95,514 peptides against 119,932 and 95,345 (+0.12%, +0.18%).
+
+**Quantification.** The three-run experiment with `features.q1_separable`, quantified again with
+`mumdia quant` on its own scored tables (identifications byte-identical between arms; CV = sample
+SD over mean of a precursor's three normalised quantities, precursors quantified in all three runs;
+protein CV from the cross-run MaxLFQ):
+
+| quantification | median precursor CV (normalised) | CV < 20% | median protein CV | complete 3 of 3 |
+|---|---|---|---|---|
+| base experiment (v0.12.0) | 0.104 | 83.7% | 0.045 | 91.3% |
+| the separable experiment, the recipe (`q1_cycle_halfwidth` 4) | 0.104 | 83.7% | 0.045 | 91.5% |
+| amplitudes of the separable model times its profile (development build) | 0.165 | 60.3% | 0.075 | 91.5% |
+| collapse to one value a cycle (`quant.q1_fragments`, `q1_min_belonging` 1000) | 0.104 | 83.7% | 0.044 | 91.5% |
+| collapse and only the fragments that belong (`quant.q1_fragments`) | 0.119 | 73.8% | 0.053 | 91.5% |
+
+Quantifying from the separable model's amplitudes is much less precise (0.165 against 0.104): the
+amplitude of each run is fitted on that run's seven-cycle patch, and its profile is renormalised per
+run. The option was dropped. The cycle collapse measures what the 4-cycle window on the interleaved
+traces measures (0.104 both), as in section 6: for quantification the span is what matters. No
+known-ratio ZT Scan data could be converted (section 14), so whether any of these removes ratio
+bias is not measured.
+
+**Cost and identity.** REP01, the human library, thestral (otherwise idle), 32 threads, one run
+after the other: the base (the v0.12.0 binary) 1,398 s at a 39.5 GB peak, extract 638 s; with
+`extract.q1_traces` 1,439 s (+2.9%), 39.4 GB, extract 672 s (+5.3%), and every table of the run
+(spectra to quantification) byte-identical to the base's; the cycle-trace table holds 73.2 million
+rows in 7.7 GB beside the 11 GB of `chromatograms.parquet`, and no candidate failed to be placed in
+the sweep. With `features.q1_separable` 1,328 s, 39.8 GB, extract 614 s (the fit is a few seconds
+of extract; the walls differ by the host's noise), psms_extracted 3.1 GB against 1.9 GB.
+
+**Decisions.** `extract.q1_traces` writes the cycle traces beside the chromatograms rather than in
+their place, because in their place they cost identifications. It is automatic for ZT Scan files
+(the user's decision, 2026-11-13: the traces are for drawing, at about 3% of a run's wall time and
+7.7 GB, and change no identification); `false` turns it off, and the desktop application's "ZT Scan
+analysis" box, cleared, writes it off with the other keys. A ZT Scan search with the automatic
+analysis therefore writes the same tables as 0.12.0 plus `chromatograms_q1.parquet`, and its
+configuration hash changes (the resolved key is part of it). `features.q1_separable` is opt-in
+(inside the seed spread). Quantifying
+from the separable amplitudes, the apex, gate and re-pick on cycles and the separable elution window
+were measured, lost, and are not in the code.

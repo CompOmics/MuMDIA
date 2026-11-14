@@ -2305,6 +2305,24 @@
       ]
     },
     {
+      "path": "extract.q1_traces",
+      "name": "q1_traces",
+      "section": "extract",
+      "rust_type": "ZtSwitch",
+      "kind": "enum",
+      "optional": false,
+      "default": "auto",
+      "default_text": "`auto`",
+      "help": "Scanning-quadrupole spectra: write every accepted candidate's traces once more, on Q1 cycles, into `chromatograms_q1.parquet` beside the chromatograms (`stages::q1trace`): one point per cycle per fragment, the least-squares amplitude of its covering steps under its calibrated expected Q1 profile, at the retention time of the cycle's step nearest the precursor's expected Q1 centre, with each fragment's Q1 decision as a `q1_class` column (chromatograms schema 5 in layout 1, 6 in layout 2). For drawing and for analysis: no stage reads it, so every other table is unchanged (reading elution on cycles instead of the interleaved steps measured 1.2-4.7% fewer identifications, docs/37_ztscan.md, section 15). It costs about 3% of a run's wall time and 7.7 GB on a 15 min ZT Scan run. Needs `extract.q1_fragments`. `\"auto\"` (the default): on for a ZT Scan search with `extract.q1_fragments` on, off for every other search (`ZtSwitch`, docs/37_ztscan.md, \"Automatic for ZT Scan files\"). Omitted from the canonical configuration unless on.",
+      "gates": [],
+      "source_struct": "ExtractConfig",
+      "choices": [
+        "auto",
+        "true",
+        "false"
+      ]
+    },
+    {
       "path": "extract.q1_deconvolved",
       "name": "q1_deconvolved",
       "section": "extract",
@@ -3326,6 +3344,19 @@
         "true",
         "false"
       ]
+    },
+    {
+      "path": "features.q1_separable",
+      "name": "q1_separable",
+      "section": "features",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "The separable model of scanning-quadrupole spectra (`q1s_*`, `stages::q1trace`): each row's Q1 patch (the per-fragment decision's RT x step patch, which it needs) fitted as one elution profile shared by the decision's fragments times each fragment's calibrated Q1 transmission, with an amplitude and a floor per fragment. Ten `q1s_*` columns (the set's R^2, the predicted-intensity-weighted R^2 and interference share of the present fragments, the explained and floor shares, the amplitudes' agreement with the prediction, the fragments fitted, the profile's width and its apex against the row's) appended to the `extended` set after the `q1d_*` columns (before `q1_consistency`'s), and per row the profile, its cycles' retention times and each fragment's amplitude, R^2 and interference share as lists (psms_extracted v9). Needs `extract.q1_fragments`; refused on any input that is not a ZT Scan run. Default false: measured within the seed spread (docs/37_ztscan.md, section 15). Omitted from the canonical configuration at its default.",
+      "gates": [],
+      "source_struct": "FeaturesConfig"
     },
     {
       "path": "compete.group_by",
