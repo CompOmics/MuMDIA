@@ -40,5 +40,14 @@
 # Checked on 2026-11-12: a fresh pip install of this file resolved duckdb 1.5.6 and the
 # viewer served a 0.12.0 ZT Scan run (K562 REP01, 3.34 billion MS2 peaks) with cycle-level
 # XICs and the Q1 sweep card.
+# 0ce3224 adds to 36eef08 the engine's ZT Scan cycle traces from their own table
+# (CompOmics/visDIA#16): `extract.q1_traces` writes them to chromatograms_q1.parquet beside
+# chromatograms.parquet (second_pass/<run>/ for a second pass), and the precursor page
+# draws them as the engine's cycle values with the per-step samples of
+# chromatograms.parquet behind them; a run without the table is drawn as before.
+# Checked on 2026-11-13 on horntail: a fresh pip install of this file resolved duckdb 1.5.6
+# and the viewer read a ZT Scan run with chromatograms_q1.parquet v6 (200 of 200 sampled
+# targets drawn from it, values equal to the viewer's own collapse of the steps) and the
+# same run without it (the fallback).
 # Move the pin together with a check of that kind.
-mumdia-viewer @ https://github.com/CompOmics/visDIA/archive/36eef08a2f3c7f87bc0de35d634407eb987288dd.zip
+mumdia-viewer @ https://github.com/CompOmics/visDIA/archive/0ce3224fe29ab0577d088918057c6fe636890b7c.zip
