@@ -209,13 +209,7 @@ impl ScanImCalibration {
 #[derive(Clone)]
 enum TofMzCalibration {
     Model {
-        timebase: f64,
-        delay: f64,
-        c0: f64,
-        beta: f64,
-        c2: f64,
-        c3: f64,
-        c4: f64,
+        model: MzModel,
         /// m/z of every integer TOF index below the digitizer's sample count, so that the
         /// per-point conversion of centroiding is a lookup.
         table: std::sync::Arc<Vec<f64>>,
@@ -223,21 +217,28 @@ enum TofMzCalibration {
     Linear(Tof2MzConverter),
 }
 
-/// `ModelType, DigitizerTimebase, DigitizerDelay, T1, T2, dC1, dC2, C0, C1, C2, C3, C4` of
-/// one `MzCalibration` row.
-type MzCalibrationRow = (i64, [f64; 11]);
+/// The solved form of one `MzCalibration` row (temperature factor applied).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MzModel {
+    timebase: f64,
+    delay: f64,
+    c0: f64,
+    beta: f64,
+    c2: f64,
+    c3: f64,
+    c4: f64,
+}
 
-impl TofMzCalibration {
-    /// The model's m/z at a fractional TOF index (Newton on the cubic; it starts from the
-    /// square-law solution and converges in a few steps, the quadratic and cubic terms
-    /// being small).
-    fn model_mz(timebase: f64, delay: f64, c0: f64, beta: f64, c2: f64, c3: f64, c4: f64, tof_index: f64) -> f64 {
-        let tof = tof_index.mul_add(timebase, delay);
-        let mut s = (tof - c0) / beta;
-        if c2 != 0.0 || c3 != 0.0 {
+impl MzModel {
+    /// m/z at a fractional TOF index. Newton on the cubic, from the square-law solution; the
+    /// quadratic and cubic terms are small, so it converges in a few steps.
+    fn mz(&self, tof_index: f64) -> f64 {
+        let tof = tof_index.mul_add(self.timebase, self.delay);
+        let mut s = (tof - self.c0) / self.beta;
+        if self.c2 != 0.0 || self.c3 != 0.0 {
             for _ in 0..12 {
-                let f = c0 + beta * s + c2 * s * s + c3 * s * s * s - tof;
-                let d = beta + 2.0 * c2 * s + 3.0 * c3 * s * s;
+                let f = self.c0 + self.beta * s + self.c2 * s * s + self.c3 * s * s * s - tof;
+                let d = self.beta + 2.0 * self.c2 * s + 3.0 * self.c3 * s * s;
                 if d == 0.0 {
                     break;
                 }
@@ -248,28 +249,47 @@ impl TofMzCalibration {
                 }
             }
         }
-        s * s - c4
+        s * s - self.c4
     }
 
-    fn from_parts(row: Option<MzCalibrationRow>, t1: f64, t2: f64, n_samples: usize, linear: Tof2MzConverter) -> Self {
+    /// The fractional TOF index of an m/z (closed form).
+    fn tof(&self, mz: f64) -> f64 {
+        let s = (mz + self.c4).max(0.0).sqrt();
+        (self.c0 + self.beta * s + self.c2 * s * s + self.c3 * s * s * s - self.delay) / self.timebase
+    }
+}
+
+/// `ModelType, DigitizerTimebase, DigitizerDelay, T1, T2, dC1, dC2, C0, C1, C2, C3, C4` of
+/// one `MzCalibration` row.
+type MzCalibrationRow = (i64, [f64; 11]);
+
+impl TofMzCalibration {
+    /// The model of a row at the run's frame temperatures `t1`, `t2`, or the linear form
+    /// when there is no usable row (model type 1 or 2, positive `C1` and time base).
+    fn from_parts(
+        row: Option<MzCalibrationRow>,
+        t1: f64,
+        t2: f64,
+        n_samples: usize,
+        linear: Tof2MzConverter,
+    ) -> Self {
         match row {
-            Some((model, [timebase, delay, t1_cal, t2_cal, dc1, dc2, c0, c1, c2, c3, c4]))
-                if (model == 1 || model == 2) && c1 > 0.0 && timebase > 0.0 =>
+            Some((kind, [timebase, delay, t1_cal, t2_cal, dc1, dc2, c0, c1, c2, c3, c4]))
+                if (kind == 1 || kind == 2) && c1 > 0.0 && timebase > 0.0 =>
             {
                 let cf = 1.0 + (dc1 * (t1_cal - t1) + dc2 * (t2_cal - t2)) / 1.0e6;
-                let beta = (1.0e12 / (c1 * cf)).sqrt();
-                let c2 = c2 / cf;
-                let table = (0..n_samples)
-                    .map(|i| Self::model_mz(timebase, delay, c0, beta, c2, c3, c4, i as f64))
-                    .collect();
-                TofMzCalibration::Model {
+                let model = MzModel {
                     timebase,
                     delay,
                     c0,
-                    beta,
-                    c2,
+                    beta: (1.0e12 / (c1 * cf)).sqrt(),
+                    c2: c2 / cf,
                     c3,
                     c4,
+                };
+                let table = (0..n_samples).map(|i| model.mz(i as f64)).collect();
+                TofMzCalibration::Model {
+                    model,
                     table: std::sync::Arc::new(table),
                 }
             }
@@ -284,29 +304,34 @@ impl TofMzCalibration {
         }
     }
 
-    fn read(path: &str, linear: Tof2MzConverter) -> Result<Self> {
+    /// The row most frames reference, the median frame temperatures and the digitizer's
+    /// sample count. A file without the table or columns gives no row (the linear form).
+    fn read_row(path: &str) -> Result<(Option<MzCalibrationRow>, f64, f64, usize)> {
         let db = format!("{path}/analysis.tdf");
         let con =
             rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .with_context(|| format!("open {db}"))?;
-        // The row most frames reference (ties: the lowest id).
         let used: Vec<(i64, i64)> = con
-            .prepare("SELECT MzCalibration, COUNT(*) FROM Frames GROUP BY MzCalibration ORDER BY 2 DESC, 1")?
+            .prepare(
+                "SELECT MzCalibration, COUNT(*) FROM Frames GROUP BY MzCalibration \
+                 ORDER BY 2 DESC, 1",
+            )?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
         if used.len() > 1 {
             warn!(
                 rows = used.len(),
-                "convert: frames reference several MzCalibration rows; using the most referenced for every frame"
+                "convert: frames reference several MzCalibration rows; using the most \
+                 referenced for every frame"
             );
         }
         let Some(&(id, _)) = used.first() else {
-            return Ok(Self::from_parts(None, 0.0, 0.0, 0, linear));
+            return Ok((None, 0.0, 0.0, 0));
         };
         let row: Option<MzCalibrationRow> = con
             .prepare(
-                "SELECT ModelType, DigitizerTimebase, DigitizerDelay, T1, T2, dC1, dC2, C0, C1, C2, C3, C4 \
-                 FROM MzCalibration WHERE Id = ?1",
+                "SELECT ModelType, DigitizerTimebase, DigitizerDelay, T1, T2, dC1, dC2, \
+                 C0, C1, C2, C3, C4 FROM MzCalibration WHERE Id = ?1",
             )?
             .query_map([id], |r| {
                 let mut c = [0.0; 11];
@@ -320,11 +345,13 @@ impl TofMzCalibration {
             .filter(|(_, c)| c.iter().all(|v| v.is_finite()));
         let median = |col: &str| -> Result<f64> {
             let mut v: Vec<f64> = con
-                .prepare(&format!("SELECT {col} FROM Frames WHERE MzCalibration = ?1 AND {col} IS NOT NULL"))?
+                .prepare(&format!(
+                    "SELECT {col} FROM Frames WHERE MzCalibration = ?1 AND {col} IS NOT NULL"
+                ))?
                 .query_map([id], |r| r.get::<_, f64>(0))?
                 .collect::<rusqlite::Result<_>>()?;
             v.sort_by(|a, b| a.total_cmp(b));
-            Ok(if v.is_empty() { f64::NAN } else { v[v.len() / 2] })
+            Ok(v.get(v.len() / 2).copied().unwrap_or(f64::NAN))
         };
         let (t1, t2) = (median("T1")?, median("T2")?);
         let n_samples: usize = con
@@ -336,7 +363,7 @@ impl TofMzCalibration {
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(0);
-        // A frame without a temperature leaves the factor at the calibration's own (cf = 1).
+        // A missing frame temperature leaves the factor at the calibration's own (cf = 1).
         let row = row.map(|(m, mut c)| {
             if !t1.is_finite() {
                 c[4] = 0.0;
@@ -346,23 +373,28 @@ impl TofMzCalibration {
             }
             (m, c)
         });
-        Ok(Self::from_parts(
-            row,
-            if t1.is_finite() { t1 } else { 0.0 },
-            if t2.is_finite() { t2 } else { 0.0 },
-            n_samples,
-            linear,
-        ))
+        let t = |x: f64| if x.is_finite() { x } else { 0.0 };
+        Ok((row, t(t1), t(t2), n_samples))
+    }
+
+    fn read(path: &str, linear: Tof2MzConverter) -> Self {
+        match Self::read_row(path) {
+            Ok((row, t1, t2, n)) => Self::from_parts(row, t1, t2, n, linear),
+            Err(e) => {
+                warn!(error = %e, "convert: MzCalibration not readable");
+                Self::from_parts(None, 0.0, 0.0, 0, linear)
+            }
+        }
     }
 
     /// m/z of a fractional TOF index.
     fn mz(&self, tof: f64) -> f64 {
         match self {
-            TofMzCalibration::Model { timebase, delay, c0, beta, c2, c3, c4, table } => {
+            TofMzCalibration::Model { model, table } => {
                 if tof >= 0.0 && tof.fract() == 0.0 && (tof as usize) < table.len() {
                     table[tof as usize]
                 } else {
-                    Self::model_mz(*timebase, *delay, *c0, *beta, *c2, *c3, *c4, tof)
+                    model.mz(tof)
                 }
             }
             TofMzCalibration::Linear(l) => l.convert(tof),
@@ -372,18 +404,17 @@ impl TofMzCalibration {
     /// m/z of an integer TOF index (centroiding).
     fn mz_u32(&self, tof: u32) -> f64 {
         match self {
-            TofMzCalibration::Model { table, .. } if (tof as usize) < table.len() => table[tof as usize],
+            TofMzCalibration::Model { table, .. } if (tof as usize) < table.len() => {
+                table[tof as usize]
+            }
             _ => self.mz(tof as f64),
         }
     }
 
-    /// The fractional TOF index of an m/z (closed form for the model).
+    /// The fractional TOF index of an m/z.
     fn tof(&self, mz: f64) -> f64 {
         match self {
-            TofMzCalibration::Model { timebase, delay, c0, beta, c2, c3, c4, .. } => {
-                let s = (mz + c4).max(0.0).sqrt();
-                (c0 + beta * s + c2 * s * s + c3 * s * s * s - delay) / timebase
-            }
+            TofMzCalibration::Model { model, .. } => model.tof(mz),
             TofMzCalibration::Linear(l) => l.invert(mz),
         }
     }
@@ -772,7 +803,6 @@ impl RawTdf {
         self.im.name()
     }
 
-
     pub(crate) fn open(path: &str) -> Result<Self> {
         let meta = MetadataReader::new(path).map_err(|e| anyhow!("{path}: {e}"))?;
         let reader = FrameReader::new(path).map_err(|e| anyhow!("{path}: {e}"))?;
@@ -787,7 +817,7 @@ impl RawTdf {
         }
         Ok(Self {
             im: ScanImCalibration::read(path, meta.im_converter)?,
-            mz: TofMzCalibration::read(path, meta.mz_converter)?,
+            mz: TofMzCalibration::read(path, meta.mz_converter),
             empty: empty_frames(path, &reader)?,
             reader,
         })
@@ -910,12 +940,31 @@ mod tests {
     /// warmer than the calibration): index 0 at m/z 99.990834, index 636,029 at 1,700.005.
     #[test]
     fn mz_calibration_model_matches_the_reference_row() {
-        let row = (2, [0.125, 25741.0, 20.9410989491122, 0.0, 20.0, 0.0, 286.065160463331, 154317.348188993, 0.0, 0.0, 0.0]);
+        let row = (
+            2,
+            [
+                0.125,
+                25741.0,
+                20.9410989491122,
+                0.0,
+                20.0,
+                0.0,
+                286.065160463331,
+                154317.348188993,
+                0.0,
+                0.0,
+                0.0,
+            ],
+        );
         let linear = Tof2MzConverter::from_boundaries(100.0, 1700.0, 636030);
         let c = TofMzCalibration::from_parts(Some(row), 20.9455139021767, 0.0, 636_030, linear);
         assert_eq!(c.name(), "MzCalibration model");
         assert!((c.mz_u32(0) - 99.990834).abs() < 1e-3, "{}", c.mz_u32(0));
-        assert!((c.mz_u32(636_029) - 1700.005).abs() < 1e-3, "{}", c.mz_u32(636_029));
+        assert!(
+            (c.mz_u32(636_029) - 1700.005).abs() < 1e-3,
+            "{}",
+            c.mz_u32(636_029)
+        );
         // table and direct evaluation agree; tof() inverts mz()
         for t in [0u32, 1, 12_345, 400_000, 636_029] {
             assert!((c.mz_u32(t) - c.mz(t as f64 + 0.0)).abs() < 1e-9);
@@ -928,15 +977,37 @@ mod tests {
     /// the square law; the cubic solve still inverts exactly.
     #[test]
     fn mz_calibration_model_with_quadratic_and_offset_terms() {
-        let row = (1, [0.2, 24888.4, 25.082415568717185, 20.33742811348631, 0.0, 0.0, 300.80436361188765, 157290.6485284086, -0.005015829952769195, 0.0, 0.09391436164385845]);
+        let row = (
+            1,
+            [
+                0.2,
+                24888.4,
+                25.082415568717185,
+                20.33742811348631,
+                0.0,
+                0.0,
+                300.80436361188765,
+                157290.6485284086,
+                -0.005015829952769195,
+                0.0,
+                0.09391436164385845,
+            ],
+        );
         let linear = Tof2MzConverter::from_boundaries(95.0, 1705.0, 397_605);
         let c = TofMzCalibration::from_parts(Some(row), 25.078, 20.157, 397_605, linear);
         let lin = TofMzCalibration::Linear(linear);
         assert!((c.mz_u32(0) - 95.0).abs() < 0.01, "{}", c.mz_u32(0));
-        assert!((c.mz_u32(397_604) - 1705.0).abs() < 0.01, "{}", c.mz_u32(397_604));
+        assert!(
+            (c.mz_u32(397_604) - 1705.0).abs() < 0.01,
+            "{}",
+            c.mz_u32(397_604)
+        );
         let t400 = c.tof(400.0);
         let ppm = (lin.mz(t400) - 400.0) / 400.0 * 1e6;
-        assert!((-90.0..-70.0).contains(&ppm), "linear form at m/z 400: {ppm} ppm");
+        assert!(
+            (-90.0..-70.0).contains(&ppm),
+            "linear form at m/z 400: {ppm} ppm"
+        );
         for mz in [150.0, 400.0, 999.0, 1600.0] {
             assert!((c.mz(c.tof(mz)) - mz).abs() < 1e-7, "{mz}");
         }
@@ -947,7 +1018,10 @@ mod tests {
     fn mz_calibration_without_a_row_is_linear() {
         let linear = Tof2MzConverter::from_boundaries(100.0, 1700.0, 1000);
         let c = TofMzCalibration::from_parts(None, 0.0, 0.0, 1000, linear);
-        assert_eq!(c.name(), "sqrt(m/z) linear between the acquisition range bounds");
+        assert_eq!(
+            c.name(),
+            "sqrt(m/z) linear between the acquisition range bounds"
+        );
         assert!((c.mz(0.0) - 100.0).abs() < 1e-9);
         assert!((c.mz_u32(1000) - 1700.0).abs() < 1e-6);
     }
