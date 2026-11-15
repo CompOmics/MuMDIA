@@ -255,7 +255,8 @@ impl MzModel {
     /// The fractional TOF index of an m/z (closed form).
     fn tof(&self, mz: f64) -> f64 {
         let s = (mz + self.c4).max(0.0).sqrt();
-        (self.c0 + self.beta * s + self.c2 * s * s + self.c3 * s * s * s - self.delay) / self.timebase
+        (self.c0 + self.beta * s + self.c2 * s * s + self.c3 * s * s * s - self.delay)
+            / self.timebase
     }
 }
 
