@@ -66,8 +66,12 @@ DIA-NN's version affects the library it predicts, and therefore affects your \
 results. Record the version you used.";
 
 /// Where a located DIA-NN, and the acknowledgement, are remembered.
+///
+/// Per-user in both scopes (`crate::storage::Layout::user_tools`): the licence answer is
+/// the user's own, and in the machine scope the components folder beside which this file
+/// sits in the user scope is shared and read-only.
 fn state_file() -> PathBuf {
-    crate::components::tools_dir().join(STATE_FILE_NAME)
+    crate::storage::user_tools_dir().join(STATE_FILE_NAME)
 }
 
 /// Names under the data directory, shared with `components::inventory` so that the
@@ -107,7 +111,7 @@ fn load() -> Saved {
 }
 
 fn store(s: &Saved) -> Result<(), String> {
-    let dir = crate::components::tools_dir();
+    let dir = crate::storage::user_tools_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let text = serde_json::to_string_pretty(s).map_err(|e| e.to_string())?;
     std::fs::write(state_file(), text)
@@ -786,7 +790,11 @@ pub fn install(installer: Arc<Installer>) -> Result<(), String> {
     }
 
     std::thread::spawn(move || {
-        let dir = crate::components::tools_dir();
+        // The user's own folder in both scopes. On Windows this is the vendor's installer,
+        // which installs DIA-NN where it chooses and asks for its own permission, so nothing
+        // here needs the program folder; the Linux archive is unpacked into `managed_dir`,
+        // and Linux has no machine scope.
+        let dir = crate::storage::user_tools_dir();
         if let Err(e) = std::fs::create_dir_all(&dir) {
             installer.fail(format!("cannot create {}: {e}", dir.display()));
             return;
@@ -2686,6 +2694,17 @@ mod tests {
         let disk = o["disk_bytes"].as_u64().unwrap();
         assert!(dl > 100_000_000, "the real asset is over 100 MB");
         assert!(disk >= dl, "disk cost is never less than the download");
+    }
+
+    #[test]
+    fn the_state_file_is_the_users_own() {
+        // In the user scope beside the components, as it always was, so an existing
+        // licence answer and located path are still found.
+        assert_eq!(
+            state_file(),
+            crate::components::tools_dir().join(STATE_FILE_NAME)
+        );
+        assert!(state_file().starts_with(crate::storage::user_tools_dir()));
     }
 
     #[test]

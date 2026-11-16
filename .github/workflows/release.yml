@@ -552,6 +552,9 @@ jobs:
           # loads at 14.40 or newer, and their placement in the 64-bit system directory.
           & ./ci/check_msi_runtime.ps1 -Msi $msi
           if ($LASTEXITCODE -ne 0) { exit 1 }
+          # The installer's choice of where the analysis components go.
+          & ./ci/check_msi_scope.ps1 -Msi $msi
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Verify the bundle contents (Linux)
         if: runner.os == 'Linux'

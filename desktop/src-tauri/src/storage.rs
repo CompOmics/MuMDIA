@@ -33,10 +33,22 @@
 //!
 //! An exported variable never overrides one the user set before starting the application:
 //! a `MUMDIA_CACHE_DIR` in the environment is a deliberate choice.
+//!
+//! # Components in the program folder
+//!
+//! When the installer recorded the machine scope (`crate::scope`), the Python environments
+//! and ThermoRawFileParser are not in any user's folder: they are in `components\` beside
+//! the application, shared by every user, and neither the storage folder nor
+//! `MUMDIA_DATA_DIR` moves them. Everything else this module describes stays per-user. So
+//! does the DIA-NN state file (the located DIA-NN and the user's licence answer), which sits
+//! beside the components in the user scope and in the default folder in the machine scope
+//! ([`Layout::user_tools`]).
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::scope::Scope;
 
 /// The file in the default folder that records the storage folder.
 pub const BOOTSTRAP_NAME: &str = "storage.json";
@@ -72,11 +84,18 @@ pub struct Layout {
     pub default_root: PathBuf,
     /// Libraries, saved settings, caches, temporary files, model downloads.
     pub storage: PathBuf,
-    /// Python environments, ThermoRawFileParser, DIA-NN.
+    /// Python environments, ThermoRawFileParser, DIA-NN: the program folder's
+    /// `components` in the machine scope.
     pub tools: PathBuf,
+    /// The user's own files that sit beside the tools in the user scope (the DIA-NN state,
+    /// a downloaded DIA-NN installer): `tools` in the user scope, the default folder in the
+    /// machine scope, where `tools` is shared and a standard user cannot write to it.
+    pub user_tools: PathBuf,
     /// Whether a storage folder other than the default was chosen.
     pub configured: bool,
     pub move_environments: bool,
+    /// Where the components are: each user's folder, or the program folder.
+    pub scope: Scope,
 }
 
 /// The default folder, from a variable lookup: `MUMDIA_DATA_DIR` when it is set to an
@@ -132,24 +151,43 @@ fn save_to(root: &Path, b: &Bootstrap) -> Result<(), String> {
     })
 }
 
-fn layout_of(default_root: PathBuf, b: &Bootstrap) -> Layout {
+/// The folders for the default folder `default_root`, the setting `b`, and `machine`, the
+/// program folder's components folder in the machine scope (`crate::scope`).
+///
+/// In the machine scope the components are the program folder's whatever `b` says: moving
+/// them with the storage folder would put a shared installation in one user's folder.
+fn layout_of(default_root: PathBuf, b: &Bootstrap, machine: Option<PathBuf>) -> Layout {
     let storage = b
         .folder
         .clone()
         .filter(|f| f.is_absolute())
         .unwrap_or_else(|| default_root.clone());
     let configured = storage != default_root;
+    if let Some(components) = machine {
+        return Layout {
+            tools: components,
+            user_tools: default_root.clone(),
+            storage,
+            default_root,
+            configured,
+            move_environments: false,
+            scope: Scope::Machine,
+        };
+    }
     let move_environments = configured && b.move_environments;
+    let tools = if move_environments {
+        storage.clone()
+    } else {
+        default_root.clone()
+    };
     Layout {
-        tools: if move_environments {
-            storage.clone()
-        } else {
-            default_root.clone()
-        },
+        user_tools: tools.clone(),
+        tools,
         storage,
         default_root,
         configured,
         move_environments,
+        scope: Scope::User,
     }
 }
 
@@ -158,7 +196,7 @@ fn layout_of(default_root: PathBuf, b: &Bootstrap) -> Layout {
 pub fn layout() -> Layout {
     let root = default_root();
     let b = load_from(&root);
-    layout_of(root, &b)
+    layout_of(root, &b, crate::scope::machine_components_dir())
 }
 
 /// Libraries, saved settings, caches, temporary files and model downloads.
@@ -169,6 +207,11 @@ pub fn storage_dir() -> PathBuf {
 /// The Python environments and the downloaded tools.
 pub fn tools_dir() -> PathBuf {
     layout().tools
+}
+
+/// The user's own files that accompany the tools ([`Layout::user_tools`]).
+pub fn user_tools_dir() -> PathBuf {
+    layout().user_tools
 }
 
 /// Where the application's own temporary files go: `temp/` in a chosen storage folder,
@@ -375,6 +418,10 @@ pub fn validate(folder: &str) -> Result<PathBuf, String> {
 /// environments move with it. Saved in `storage.json` in the default folder.
 pub fn set(folder: Option<&str>, move_environments: bool) -> Result<Layout, String> {
     let root = default_root();
+    let machine = crate::scope::machine_components_dir();
+    if machine.is_some() && move_environments {
+        return Err(MACHINE_ENVIRONMENTS_STAY.into());
+    }
     let chosen = match folder {
         Some(f) => Some(validate(f)?),
         None => None,
@@ -396,8 +443,14 @@ pub fn set(folder: Option<&str>, move_environments: bool) -> Result<Layout, Stri
         _ => Bootstrap::default(),
     };
     save_to(&root, &b)?;
-    Ok(layout_of(root, &b))
+    Ok(layout_of(root, &b, machine))
 }
+
+/// Why the environments cannot move with the storage folder in the machine scope.
+pub const MACHINE_ENVIRONMENTS_STAY: &str =
+    "The analysis components on this computer are in the program folder, shared by every \
+     user, so they do not move with your storage folder. Your libraries, settings, caches \
+     and temporary files do.";
 
 /// The storage folder as the Setup screen shows it.
 #[derive(Serialize, Clone, Debug)]
@@ -416,6 +469,9 @@ pub struct Info {
     pub warnings: Vec<String>,
     /// Whether `MUMDIA_DATA_DIR` decides the default folder.
     pub data_dir_env: bool,
+    /// Where the components are (`crate::scope`): in the machine scope `environments` is
+    /// the program folder's and the storage folder does not move it.
+    pub scope: Scope,
 }
 
 /// What the Setup screen shows about the storage folder.
@@ -438,6 +494,7 @@ pub fn info() -> Info {
         error: check.err(),
         warnings,
         data_dir_env: std::env::var_os("MUMDIA_DATA_DIR").is_some_and(|v| !v.is_empty()),
+        scope: l.scope,
     }
 }
 
@@ -544,7 +601,7 @@ mod tests {
         };
         save_to(&root, &b).unwrap();
         assert_eq!(load_from(&root), b);
-        let l = layout_of(root.clone(), &b);
+        let l = layout_of(root.clone(), &b, None);
         assert!(l.configured && l.move_environments);
         assert_eq!(
             (l.storage.clone(), l.tools.clone()),
@@ -555,7 +612,7 @@ mod tests {
             folder: Some(chosen.clone()),
             move_environments: false,
         };
-        let l = layout_of(root.clone(), &keep);
+        let l = layout_of(root.clone(), &keep, None);
         assert_eq!((l.storage, l.tools), (chosen.clone(), root.clone()));
         // Back to the default: the file is removed.
         save_to(&root, &Bootstrap::default()).unwrap();
@@ -572,10 +629,80 @@ mod tests {
                     folder: f,
                     move_environments: true,
                 },
+                None,
             );
             assert!(!l.configured && !l.move_environments, "{l:?}");
             assert_eq!(l.tools, root);
         }
+    }
+
+    #[test]
+    fn the_user_scope_keeps_the_components_and_their_state_together() {
+        let root = scratch("user-scope");
+        let chosen = scratch("user-scope-chosen");
+        let l = layout_of(root.clone(), &Bootstrap::default(), None);
+        assert_eq!(l.scope, Scope::User);
+        assert_eq!(
+            (l.tools.clone(), l.user_tools.clone()),
+            (root.clone(), root.clone())
+        );
+        // Moved with the storage folder, the state moves with the environments, as it did
+        // before the machine scope existed.
+        let moved = Bootstrap {
+            folder: Some(chosen.clone()),
+            move_environments: true,
+        };
+        let l = layout_of(root.clone(), &moved, None);
+        assert_eq!((l.tools, l.user_tools), (chosen.clone(), chosen));
+    }
+
+    #[test]
+    fn the_machine_scope_shares_the_components_and_keeps_the_rest_per_user() {
+        let root = scratch("machine-scope");
+        let chosen = scratch("machine-scope-chosen");
+        let program = if cfg!(windows) {
+            PathBuf::from(r"C:\Program Files\MuMDIA")
+        } else {
+            PathBuf::from("/opt/MuMDIA")
+        };
+        let components = crate::scope::machine_dir(Some("machine"), Some(&program)).unwrap();
+        assert_eq!(components, program.join(crate::scope::COMPONENTS_DIR_NAME));
+
+        let l = layout_of(
+            root.clone(),
+            &Bootstrap::default(),
+            Some(components.clone()),
+        );
+        assert_eq!(l.scope, Scope::Machine);
+        assert_eq!(
+            l.tools, components,
+            "the environments are the program folder's"
+        );
+        assert_eq!(
+            l.user_tools, root,
+            "the DIA-NN state stays in the user's own folder"
+        );
+        assert_eq!(l.storage, root);
+        assert!(!l.configured && !l.move_environments);
+
+        // A storage folder moves the user's data and never the shared components, even with
+        // the option ticked (an older storage.json, or one written in the user scope).
+        let moved = Bootstrap {
+            folder: Some(chosen.clone()),
+            move_environments: true,
+        };
+        let l = layout_of(root.clone(), &moved, Some(components.clone()));
+        assert_eq!(l.tools, components);
+        assert_eq!(l.storage, chosen);
+        assert_eq!(
+            l.user_tools, root,
+            "the state file stays where storage.json is"
+        );
+        assert!(l.configured && !l.move_environments);
+        // So the engine and uv get the storage folder's caches, and not its interpreters.
+        let env = child_env_of(&l, &|_: &str| false);
+        assert!(env.iter().any(|(k, _)| *k == "MUMDIA_CACHE_DIR"));
+        assert!(env.iter().all(|(k, _)| *k != "UV_PYTHON_INSTALL_DIR"));
     }
 
     #[test]
@@ -620,12 +747,14 @@ mod tests {
         let root = PathBuf::from(if cfg!(windows) { r"C:\d" } else { "/d" });
         let chosen = PathBuf::from(if cfg!(windows) { r"E:\s" } else { "/s" });
         let none = |_: &str| false;
-        assert!(child_env_of(&layout_of(root.clone(), &Bootstrap::default()), &none).is_empty());
+        assert!(
+            child_env_of(&layout_of(root.clone(), &Bootstrap::default(), None), &none).is_empty()
+        );
         let b = Bootstrap {
             folder: Some(chosen.clone()),
             move_environments: false,
         };
-        let env = child_env_of(&layout_of(root.clone(), &b), &none);
+        let env = child_env_of(&layout_of(root.clone(), &b, None), &none);
         let names: Vec<&str> = env.iter().map(|(k, _)| *k).collect();
         assert_eq!(
             names,
@@ -640,14 +769,14 @@ mod tests {
         assert_eq!(env[2].1, chosen.join(MODELS_SUBDIR));
         // A variable the user set is left to the user.
         let set = |k: &str| k == "MUMDIA_CACHE_DIR";
-        let env = child_env_of(&layout_of(root.clone(), &b), &set);
+        let env = child_env_of(&layout_of(root.clone(), &b, None), &set);
         assert!(env.iter().all(|(k, _)| *k != "MUMDIA_CACHE_DIR"));
         // Moving the environments moves uv's interpreters too.
         let moved = Bootstrap {
             folder: Some(chosen.clone()),
             move_environments: true,
         };
-        let env = child_env_of(&layout_of(root, &moved), &none);
+        let env = child_env_of(&layout_of(root, &moved, None), &none);
         assert!(env
             .iter()
             .any(|(k, v)| *k == "UV_PYTHON_INSTALL_DIR" && *v == chosen.join(UV_PYTHON_SUBDIR)));

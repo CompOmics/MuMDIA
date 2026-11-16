@@ -633,7 +633,10 @@ end-to-end and non-Rust checks:
 - `desktop` and `desktop-windows`: the console's own workspace on Linux (fmt, clippy,
   unit tests, the frontend checks) and on Windows (clippy, unit tests, the Visual C++
   runtime installer end to end, then the MSI built, checked, installed and
-  uninstalled).
+  uninstalled, and installed again with each components scope: the choice written,
+  remembered and refused when unknown, and the application finding and changing the
+  program folder's components; desktop/README.md, "Where the components are
+  installed").
 - `sidecar-imports`: a real conda environment per sidecar, only when the sidecars,
   their environments or the Dockerfile change, and always on the schedule.
 - `sidecars` (python sidecars + configs), one `ubuntu-latest` runner with Python 3.12:
@@ -663,7 +666,7 @@ forever. The classes:
 | `docs/23_cli_reference.md` | as above, plus the Linux smoke, which checks it against `--help` |
 | `scripts/` | as above, plus the Linux build + test (the engine's tests `include_str!` workers), the Linux smoke, the Linux desktop job and `sidecar-imports` |
 | `desktop/`, `env/console-*`, `configs/config-schema.json` | the desktop jobs, plus the Linux build + test and smoke |
-| `ci/check_desktop_ui.py`, `ci/test_desktop_ui.mjs` / the two MSI scripts in `ci/` | the Linux / the Windows desktop job |
+| `ci/check_desktop_ui.py`, `ci/test_desktop_ui.mjs` / the three MSI scripts in `ci/` | the Linux / the Windows desktop job |
 | anything else (`rust/`, `configs/examples/`, `test_data/`, the smoke scripts, any path the script does not know) | everything, including the Linux desktop job, but not the MSI |
 | `.github/workflows/ci.yml` or `ci/ci_scope.sh` | everything |
 

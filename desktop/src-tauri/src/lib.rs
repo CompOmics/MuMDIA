@@ -7,6 +7,7 @@
 pub mod childio;
 pub mod components;
 pub mod diann;
+pub mod elevate;
 pub mod engine;
 pub mod enzymes;
 pub mod library;
@@ -15,6 +16,7 @@ pub mod mods;
 pub mod predictors;
 pub mod preflight;
 pub mod run;
+pub mod scope;
 pub mod settings;
 pub mod setups;
 pub mod sizing;

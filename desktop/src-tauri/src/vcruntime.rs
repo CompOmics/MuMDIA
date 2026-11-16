@@ -673,6 +673,12 @@ pub mod win {
     /// Run `file` with `ARGUMENTS`, elevated, and wait for it. Windows shows its
     /// permission prompt; declining it is `NotStarted(1223)`.
     pub fn run_elevated(file: &Path) -> Launch {
+        run_elevated_with(file, ARGUMENTS)
+    }
+
+    /// Run `file` with the command line `parameters`, elevated, and wait for it
+    /// (`run_elevated`; `crate::elevate` starts this application this way).
+    pub fn run_elevated_with(file: &Path, parameters: &str) -> Launch {
         use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
         use windows_sys::Win32::System::Com::{
             CoInitializeEx, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
@@ -688,7 +694,7 @@ pub mod win {
 
         let verb = wide("runas".as_ref());
         let path = wide(file.as_os_str());
-        let params = wide(ARGUMENTS.as_ref());
+        let params = wide(parameters.as_ref());
         // SAFETY: plain FFI. Every pointer in `info` points into a buffer that outlives
         // the call; the struct is zero-initialised as the API documents, and the process
         // handle it returns is closed exactly once below.

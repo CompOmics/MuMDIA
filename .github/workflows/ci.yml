@@ -663,7 +663,7 @@ jobs:
   # else builds the MSI before a release rehearsal does.
   #
   # Gated on a change under desktop/ or to what the application compiles in (or this
-  # workflow, or the two MSI scripts; ci/ci_scope.sh): a cold Windows build of the
+  # workflow, or the three MSI scripts; ci/ci_scope.sh): a cold Windows build of the
   # application and the bundler costs about twenty minutes, which a change to the engine
   # alone should not pay.
   desktop-windows:
@@ -810,6 +810,16 @@ jobs:
           & ./ci/check_msi_runtime.ps1 -Msi $msi
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # The installer's choice of where the analysis components go (wix/components-scope.wxs):
+      # every table row the page, the property and the registry value need.
+      - name: The MSI carries the components scope choice
+        if: steps.scope.outputs.run == 'true'
+        shell: pwsh
+        run: |
+          $msi = (Get-ChildItem desktop/target/release/bundle/msi/*.msi | Select-Object -First 1).FullName
+          & ./ci/check_msi_scope.ps1 -Msi $msi
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # Install and uninstall it for real. The runner's runtime is at least as new as
       # the module's, which is the case that must not fail: Windows Installer keeps the
       # newer files and the installation succeeds. Uninstalling must leave the runtime
@@ -844,6 +854,101 @@ jobs:
             if (-not (Test-Path $path)) { Write-Error "uninstalling MuMDIA removed the shared $f"; exit 1 }
             Write-Output ("{0} after uninstall: {1}" -f $f, (Get-Item $path).VersionInfo.FileVersion)
           }
+
+      # The components scope, installed for real (the runner is elevated, as an administrator
+      # running the installer is): an unknown value is refused before anything is installed;
+      # the default is the user scope; the machine scope is written in one spelling, the
+      # application finds the program folder's components and changes them (the elevated
+      # helper an administrator scripts), and uninstalling leaves the components it did not
+      # place; a reinstallation without the property keeps the remembered choice, which is
+      # what an upgrade does. The permission prompt itself is not shown on a hosted runner.
+      - name: The components scope is chosen, remembered and found
+        if: steps.scope.outputs.run == 'true'
+        timeout-minutes: 20
+        shell: pwsh
+        run: |
+          $msi = (Get-ChildItem desktop/target/release/bundle/msi/*.msi | Select-Object -First 1).FullName
+          $key = "HKLM:\Software\CompOmics\MuMDIA"
+          $prog = Join-Path $env:ProgramFiles "MuMDIA"
+          $components = Join-Path $prog "components"
+          $n = 0
+          function Install([string[]]$props) {
+            $script:n++
+            $log = Join-Path $env:RUNNER_TEMP "msi-scope-$script:n.log"
+            $a = @("/i", "`"$msi`"", "/qn", "/norestart", "/l*v", "`"$log`"") + $props
+            $p = Start-Process msiexec.exe -ArgumentList $a -Wait -PassThru
+            # Write-Host: anything written to the output stream would be returned with the code.
+            Write-Host "msiexec /i $($props -join ' ') exited $($p.ExitCode)"
+            return @($p.ExitCode, $log)
+          }
+          function Uninstall {
+            $u = Start-Process msiexec.exe -ArgumentList @("/x", "`"$msi`"", "/qn", "/norestart") -Wait -PassThru
+            Write-Output "msiexec /x exited $($u.ExitCode)"
+            if ($u.ExitCode -ne 0 -and $u.ExitCode -ne 3010) { Write-Error "the MSI did not uninstall"; exit 1 }
+          }
+          function Scope { (Get-ItemProperty -Path $key -Name ComponentsScope -ErrorAction SilentlyContinue).ComponentsScope }
+          function Expect($want, $what) {
+            $got = Scope
+            Write-Output "ComponentsScope after ${what}: '$got'"
+            if ($got -ne $want) { Write-Error "expected '$want' after $what, found '$got'"; exit 1 }
+          }
+
+          # Refused, with nothing installed.
+          $r = Install @("COMPONENTS_SCOPE=everyone")
+          if ($r[0] -ne 1603) { Get-Content $r[1] -Tail 40; Write-Error "an unknown scope was not refused"; exit 1 }
+          if (Test-Path (Join-Path $prog "mumdia-console.exe")) { Write-Error "a refused installation installed files"; exit 1 }
+          Expect $null "a refused installation"
+
+          # The default.
+          $r = Install @()
+          if ($r[0] -ne 0 -and $r[0] -ne 3010) { Get-Content $r[1] -Tail 60; Write-Error "the MSI did not install"; exit 1 }
+          Expect "user" "a default installation"
+          Uninstall
+          Expect $null "uninstalling"
+
+          # The program folder, written in one spelling.
+          $r = Install @("COMPONENTS_SCOPE=Machine")
+          if ($r[0] -ne 0 -and $r[0] -ne 3010) { Get-Content $r[1] -Tail 60; Write-Error "the MSI did not install"; exit 1 }
+          Expect "machine" "COMPONENTS_SCOPE=Machine"
+
+          # The application reads the choice and works on the program folder's components:
+          # a planted environment is removed by the helper, which logs where it worked.
+          New-Item -ItemType Directory -Force (Join-Path $components "python") | Out-Null
+          Set-Content (Join-Path $components "python\pyvenv.cfg") "home = planted by CI"
+          $h = Start-Process (Join-Path $prog "mumdia-console.exe") -ArgumentList @("--remove-components", "primary") -Wait -PassThru
+          Write-Output "mumdia-console.exe --remove-components primary exited $($h.ExitCode)"
+          Get-ChildItem (Join-Path $components "logs") -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName }
+          if ($h.ExitCode -ne 0) { Write-Error "the helper did not remove the program folder's environment"; exit 1 }
+          if (Test-Path (Join-Path $components "python")) { Write-Error "the planted environment is still there"; exit 1 }
+          $logs = @(Get-ChildItem (Join-Path $components "logs") -Filter "remove-*.log" -ErrorAction SilentlyContinue)
+          if ($logs.Count -eq 0 -or -not (Select-String -Path $logs[0].FullName -Pattern "program folder" -Quiet)) {
+            Write-Error "the helper did not log its work in the program folder"; exit 1
+          }
+          # A command line it does not understand is refused with its own exit code.
+          $h = Start-Process (Join-Path $prog "mumdia-console.exe") -ArgumentList @("--install-components", "nothing") -Wait -PassThru
+          if ($h.ExitCode -ne 2) { Write-Error "an unknown component gave exit code $($h.ExitCode), not 2"; exit 1 }
+
+          # Uninstalling removes what the MSI wrote and leaves what it did not place.
+          Set-Content (Join-Path $components "kept.txt") "installed after the MSI"
+          Uninstall
+          Expect $null "uninstalling"
+          if (-not (Test-Path (Join-Path $components "kept.txt"))) { Write-Error "uninstalling removed the components folder"; exit 1 }
+
+          # Remembered: a reinstallation (or an upgrade) without the property keeps it.
+          New-Item -Path $key -Force | Out-Null
+          New-ItemProperty -Path $key -Name ComponentsScope -Value "machine" -PropertyType String -Force | Out-Null
+          $r = Install @()
+          if ($r[0] -ne 0 -and $r[0] -ne 3010) { Get-Content $r[1] -Tail 60; Write-Error "the MSI did not install"; exit 1 }
+          Expect "machine" "a reinstallation without the property"
+          # And a value on the command line wins over the remembered one.
+          Uninstall
+          New-Item -Path $key -Force | Out-Null
+          New-ItemProperty -Path $key -Name ComponentsScope -Value "machine" -PropertyType String -Force | Out-Null
+          $r = Install @("COMPONENTS_SCOPE=user")
+          if ($r[0] -ne 0 -and $r[0] -ne 3010) { Get-Content $r[1] -Tail 60; Write-Error "the MSI did not install"; exit 1 }
+          Expect "user" "COMPONENTS_SCOPE=user over a remembered machine"
+          Uninstall
+          Remove-Item -Recurse -Force $prog -ErrorAction SilentlyContinue
 
       - name: Upload the MSI
         if: steps.scope.outputs.run == 'true'
