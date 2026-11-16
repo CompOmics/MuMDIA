@@ -74,7 +74,15 @@ native reader.
 
 `stages::convert::tdf` reads frames with timsrust 0.4.2 (`tdf` feature only):
 
-- **Calibration.** TOF index to m/z uses timsrust's converter. TIMS scan to 1/K0 uses Bruker's
+- **Calibration.** TOF index to m/z uses the run's `MzCalibration` row (`TofMzCalibration`): the
+  TOF time solves a cubic in the square root of m/z with the row's constant, linear (with the
+  frame-temperature factor of `dC1`, `dC2`, at the median `T1`, `T2` of the run's frames), quadratic
+  and cubic terms, and `C4` is subtracted from m/z; the row most frames reference is used. Before
+  2026-11-15 the reader used timsrust's square-law interpolation between the acquisition range
+  bounds, which is exact only without a quadratic term or m/z offset: on a 2020 timsTOF Pro
+  (`C2` = -0.005, `C4` = 0.094) it put fragments -98 ppm off at m/z 300 and -21 ppm at 1,000, and
+  its runs gave no seed PSM; on Ultra and Ultra 2 files the two forms differ by 0-4 ppm. Without a
+  usable row the square-law form is used, with a warning. TIMS scan to 1/K0 uses Bruker's
   `TimsCalibration` model 2 when present (`ScanImCalibration`), because timsrust's linear
   interpolation between the acquisition range bounds is off by up to 0.030 1/K0 at the
   high-mobility end of the Ultra 2 benchmark run, the width of a calibrated 1/K0 window. Without a
