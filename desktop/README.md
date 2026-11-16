@@ -698,6 +698,27 @@ The output folder is the user's, not the content-addressed library cache: the in
 file the user already has, and converting it again is a choice, not a cache miss. The DIA-NN
 threads field of the FASTA tab sets the threads, as for a build.
 
+### A spectral library + a predicted library (#320)
+
+The third spectral-library input, "Spectral library + predicted library", merges two MuMDIA
+libraries into one pair of tables before the search (`diann::merge`, the `diann_merge`
+command, `scripts/merge_libraries.py`; docs/13). Choose the empirical library's two tables
+(a DIA-NN library converted with the option above), the predicted library's two tables (built
+from a FASTA with "Build library only", or converted), an empty output folder and which
+library an entry in both takes its spectrum and retention time from (the empirical one by
+default), then "Merge the libraries". Every predicted entry is searched, with the empirical
+spectrum and retention time where the empirical library has the entry, and the entries only
+the empirical library has are added; the empirical retention times are mapped onto the
+predicted scale through the shared entries. The decoys of the merged targets are built again
+and predicted by DIA-NN, so the merge needs DIA-NN 2.x with its licence acknowledged and is
+refused without it, as a conversion is. On success the merged tables are selected under
+"MuMDIA library tables"; `mumdia-library-complete.json` records the inputs and the
+precedence, and `merge_summary.json` the counts and the retention-time fit. The option is
+there for users who have an empirical library; it is not a sensitivity default. Measured on
+the E. coli + human entrapment run (docs/13, "merge_libraries"), the merged library reported
+5.2% more precursors at q 1% at a measured FDP of 1.43%, and found 0.8% fewer than the
+predicted library alone at a measured FDP of 1%; the screen's hint says so.
+
 ### Which predictors the built-in path uses
 
 The built-in path derives the run's configuration from the selected preset, and until
