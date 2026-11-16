@@ -31,7 +31,7 @@ policy for tuning and validation.
   - `mumdia-core`: typed config, schemas, manifest, masses/constants.
   - `mumdia-io`: Arrow/Parquet table layer, hashes, JSON, artifact reports.
   - `mumdia`: CLI/library, fragment index, FDR/rescoring, and stages.
-- `scripts/`: twenty scripts and three shared modules. Nine workers are launched by
+- `scripts/`: twenty-one scripts and three shared modules. Nine workers are launched by
   the engine (`ms2pip_worker.py`, `peptdeep_worker.py`, `deeplc_worker.py`,
   `deeplc_finetune.py`, `im2deep_worker.py`, `mokapot_worker.py`, `nn_rescore_worker.py`,
   `entrapment_worker.py`, `mbr_worker.py`); six are imported-library helpers
