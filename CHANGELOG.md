@@ -203,6 +203,16 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **timsTOF: m/z from the run's `MzCalibration` model (docs/35_diapasef.md, "The native reader").**
+  The native diaPASEF reader converted TOF to m/z with a square law fitted to the acquisition range
+  bounds, which ignores the quadratic term and the m/z offset of Bruker's calibration. Where these are
+  not zero the error depends on m/z: -98 ppm at m/z 300 to -11 ppm at 1,200 on the 2020 timsTOF Pro
+  single-cell runs of the benchmark collection, +30 to +8 ppm on a 2021 timsTOF Pro HYE set, -31 to
+  -6 ppm on a 2022 DIA-ME set, -22 to -25 ppm on a 2024 timsTOF SCP immunopeptidomics set; 0-4 ppm
+  on Ultra and Ultra 2 files. The reader now solves the calibration model per run.
+
 ### Added
 
 - **The Windows installer can put the desktop application's analysis components in the
