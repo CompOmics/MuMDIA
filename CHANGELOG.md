@@ -280,6 +280,21 @@ than a number. Both are recorded in every run's `manifest.json`.
   same during an import, and the desktop application's DIA-NN library conversion offers it
   ("Re-map to a FASTA…", under the Search screen's cleavage choice). Without the option nothing
   changes (docs/13, "remap_library").
+- **A spectral library and a predicted library can be searched as one (#320).**
+  `scripts/merge_libraries.py` merges an empirical library (such as one a DIA-NN search wrote,
+  imported) with a predicted one: every predicted entry, with the empirical spectrum,
+  retention time and 1/K0 where the empirical library has the entry (`--precedence`), the
+  entries only the empirical library has added, the empirical retention times mapped onto the
+  predicted scale by a monotone curve through the shared entries (`--rt calibrate`), ids,
+  counts and fragment cardinality recomputed, and the decoys of the merged targets rebuilt as
+  reversed sequences whose spectra DIA-NN predicts, each trimmed to its target's fragment
+  count. The desktop application offers it as a third spectral-library input, "Spectral
+  library + predicted library". It is opt-in and its reported FDR is optimistic when the
+  empirical library carries false identifications: on the E. coli + human entrapment run the
+  merged library reported 5.2% more precursors at q 1% at a measured FDP of 1.43% (the
+  predicted library alone: 1.00%), and 0.8% fewer at a measured FDP of 1% (docs/13,
+  "merge_libraries").
+
 ### Changed
 
 - **The desktop application pins visDIA at 0ce3224, which reads the ZT Scan cycle traces from

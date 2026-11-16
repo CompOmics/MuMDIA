@@ -19,17 +19,19 @@ only the rescore sidecars fall back to a native rescorer, and only when
 strict gate, so a crashed MS2PIP, AlphaPeptDeep, DeepLC, IM2Deep, or DeepLC fine-tune aborts the
 whole run. The matrix in **Failure behavior** below is authoritative.
 
-The 21 scripts split into six groups. Nine are launched by the engine:
+The 22 scripts split into six groups. Nine are launched by the engine:
 **predictors** (`ms2pip_worker`, `peptdeep_worker`, `deeplc_worker`, `deeplc_finetune`,
 `im2deep_worker`) feed the run-independent library; **rescorers** (`mokapot_worker`,
 `nn_rescore_worker`, `entrapment_worker`) score the competed PSMs in Stage F; **MBR**
-(`mbr_worker`) transfers identifications across runs (Stage D3). Twelve are run by hand:
+(`mbr_worker`) transfers identifications across runs (Stage D3). Thirteen are run by hand:
 the **DIA-NN recipe** (`import_diann_lib`, `make_reverse_decoys`, `predict_decoys`,
-`make_shift_decoys`, `augment_library`, `remap_library`) is an offline, one-time toolchain
-that builds MuMDIA's target+decoy library schema from a user-produced DIA-NN library, with
+`make_shift_decoys`, `augment_library`, `remap_library`, `merge_libraries`) is an offline,
+one-time toolchain that builds MuMDIA's target+decoy library schema from a user-produced
+DIA-NN library, with
 `augment_library` filling an imported library with the tryptic FASTA peptides it is
-missing (a completeness fix) before decoy generation, and `remap_library` mapping any
-library's peptides to the proteins of another FASTA; the **library-scale recipes**
+missing (a completeness fix) before decoy generation, `remap_library` mapping any
+library's peptides to the proteins of another FASTA, and `merge_libraries` merging an
+empirical library with a predicted one; the **library-scale recipes**
 (`sort_fragments`, `mz_range_survivors`, `assemble_survivors`, `shard_parquet`,
 `mh_shard_predict`) reshape very large tables (docs/32); the **post-run tool**
 (`prune_outputs`) reduces a finished output directory to a retention tier (docs/01, "Output
@@ -103,6 +105,7 @@ For the mapping from each conda environment to the config field that points at i
 | `scripts/make_shift_decoys.py` | Recipe: fragment-shift (CH2) decoys, DIA-NN-style terminal shift |
 | `scripts/augment_library.py` | Recipe: augment an imported library with its missing tryptic FASTA peptides, then hand off to a decoy builder |
 | `scripts/remap_library.py` | Recipe: map a library's peptides to the proteins of another FASTA (I/L-aware, cleavage-specific, Met excision and protein N-terminal groups as the digest), decoys following their targets; drops or keeps as `UNASSIGNED` what the FASTA lacks (#319) |
+| `scripts/merge_libraries.py` | Recipe: merge an empirical library with a predicted one (empirical spectrum and RT where both have an entry, RT calibrated onto the predicted scale), then rebuild and predict the decoys of the merged targets (#320) |
 | `scripts/sort_fragments.py` | Recipe: rewrite a fragment table in `candidate_id` order (streaming bucket sort, in place); the writers above do this themselves since the range load, this is for tables written before |
 | `scripts/mz_range_survivors.py` | Recipe: candidate ids inside the run's isolation range, as a prescan-style survivors table (docs/32) |
 | `scripts/assemble_survivors.py` | Recipe: survivors table -> renumbered library, target/decoy pair kept together on `peptidoform_id`, fragments streamed (docs/21, docs/32) |
@@ -340,6 +343,64 @@ desktop import call its `remap_files`)
 - Annotations come from the FASTA headers (`_lib_io.fasta_annotations`); a side table beside
   the output that is not the input's is removed. `--summary <json>` writes the counts. A
   0.85M-target library against a 31,470-protein FASTA takes about 30 s.
+
+**merge_libraries** (offline; the desktop's "Spectral library + predicted library" input
+runs it)
+- IN two MuMDIA libraries, `--empirical-precursors/--empirical-fragments` (an empirical
+  library imported with `import_diann_lib`, such as the `report-lib.parquet` a DIA-NN search
+  writes) and `--predicted-precursors/--predicted-fragments` (imported or FASTA-built). Only
+  their targets are read; the decoys are rebuilt for the merged targets.
+- Entries are keyed on `(peptidoform, charge)`. An entry in both takes the spectrum,
+  retention time and 1/K0 of `--precedence` (`empirical`, the default, or `predicted`) and
+  the predicted library's protein; an empirical-only entry is kept (`--empirical-only drop`
+  removes it) with its own protein. `remap_library.py` maps the result to one FASTA when the
+  proteins disagree.
+- `--rt calibrate` (default) maps the empirical iRT onto the predicted scale with the
+  monotone binned-median curve of the second-pass consensus (docs/12), fitted on the shared
+  entries (`--rt-min-shared`, default 50), and reports the median and p95 absolute residual;
+  `--rt keep` leaves it. Under the default `rt_im_train.library_irt = auto` with a DeepLC
+  interpreter the search re-predicts every entry's retention time anyway, so only the
+  spectra differ; `library_irt = library` keeps the merged values.
+- Intensities max-normalised per precursor, `base_peptide_id` from the stripped sequence and
+  `peptidoform_id` from the peptidoform over the merged set, `candidate_id` contiguous in
+  `precursor_mz` order, `n_fragments` and `cardinality` recomputed.
+- Decoys: `--decoys diann --diann <exe>` (default) runs `make_reverse_decoys.py` and
+  `predict_decoys.py build`; there is no copied-intensity path. `--decoy-fragments match`
+  (default) then trims each decoy to its target's fragment count (most intense first), so an
+  empirical target with few observed fragments and its predicted decoy keep equal counts;
+  `all` keeps every predicted decoy fragment. `--decoys none` writes the targets only.
+- Memory: both target tables are held in pandas (fragments included), which is fine for
+  libraries of a few million precursors and not for the 1e8-row libraries of docs/32. The
+  merge of a 12.6k-entry empirical library into the 1.21M-target entrapment library took
+  10.4 min at a 6.9 GB peak, most of it the DIA-NN prediction of the 1.21M decoys.
+- Measured 2026-11-16 (single run `LFQ_Orbitrap_AIF_Ecoli_01`, the E. coli + human
+  entrapment library `ecoli-human-entrap_tryp_diann-2.7_revpred_mz390-1010` of the benchmark
+  collection, NN seeds 0-2, default configuration; empirical library: a DIA-NN search of the
+  replicates `Ecoli_02` and `Ecoli_03` with that library, its `report-lib.parquet`, 12,618
+  target precursors, every one also in the predicted library). Real precursors at
+  `precursor_q <= 0.01`, entrapment FDP there, real precursors at a measured FDP of 1%
+  (`(ratio * n_entrap + 1) / n_real`, ratio 0.5735), means over the seeds:
+
+  | library | real at q 1% | FDP at q 1% | real at FDP 1% |
+  |---|---|---|---|
+  | predicted | 12,347 | 1.00% | 12,354 |
+  | merged, decoys trimmed (default) | 12,984 | 1.43% | 12,252 |
+  | merged, `--decoy-fragments all` | 13,039 | 1.47% | 12,170 |
+  | predicted, `library_irt = library` | 12,073 | 0.84% | 12,273 |
+  | merged, `library_irt = library` | 12,479 | 1.37% | 11,030 |
+
+  The merged library reports 5.2% more precursors at q 1%, but the reported 1% is not
+  calibrated: the measured FDP is 1.43%, and at a measured FDP of 1% it finds 0.8% fewer
+  real precursors than the predicted library alone. The excess is in the empirical entries:
+  the accepted entrapment precursors that the empirical library holds rose from 103 to 204
+  per seed, those it does not hold stayed at 104-129. An empirical library is the accepted
+  list of an earlier search, so it carries that search's false identifications (here 293 of
+  its 12,618 targets are entrapment peptides) with spectra and retention times observed for
+  them, while their decoys are predicted and were never selected; the target-decoy null then
+  underestimates the false entries among the empirical ones. The decoy trim does not change
+  this (1.47% without it), and keeping the library retention times makes it worse. The merge
+  is therefore opt-in and not a sensitivity default; compare its counts at a measured FDP,
+  and prefer an empirical library from a stricter search (a lower q) or from other samples.
 
 ## How it works
 
