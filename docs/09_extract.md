@@ -1443,6 +1443,52 @@ report records `params.q1_fragments.q1_scores` (which families, the isotopes, th
 cycles read), each only when on. Every value is read from the spectra and the library; nothing
 reads a label (docs/37, section 10, has the decoy against low-target comparison).
 
+### 15. Cycle traces and the separable model (scanning quadrupole, opt-in)
+
+A ZT Scan chromatogram interleaves the covering steps of every cycle: about five Q1 steps, 1.3 ms
+apart, then a gap of about a second to the next cycle. Two keys read the sweep's elution
+another way. Both need `extract.q1_fragments`, whose calibrated model and grid they use, both are
+refused on any input that is not a ZT Scan run when asked for (`Config::ztscan_keys_on`), and both
+are omitted from the canonical configuration unless on, so every other search is byte-identical.
+`extract.q1_traces` is automatic for ZT Scan files (`"auto"`, docs/37_ztscan.md, "Automatic for ZT
+Scan files"); `features.q1_separable` is opt-in (default false).
+
+**`extract.q1_traces`** (`stages::q1trace`, `cycle_groups`): after the gate, the re-pick and the
+chromatogram rows of an accepted candidate, the groups its traces read (on its grid, padded or
+not) are collapsed to one group per Q1 cycle: each fragment's value in a cycle is the
+least-squares amplitude of its covering steps under its expected Q1 profile at the calibrated
+expected centre, `sum(w x) / sum(w^2)` with a step it is absent from read as 0 (the estimator
+`quant.q1_fragments` collapses with, `q1quant::collapse_trace`), present when any step had it, at
+the retention time of the cycle's representative step (the covering step whose target is nearest
+the expected centre, a scan of the run). The rows (every fragment of the library, then the MS1
+rows sampled at the cycles' retention times) go to `chromatograms_q1.parquet` beside
+`chromatograms.parquet`, through a writer of their own, in the configured layout, with each
+fragment's Q1 decision at the candidate's apex as `q1_class` (chromatograms schema 5 in layout 1,
+6 in layout 2; docs/15_data_dictionary.md). `chromatograms.parquet` and every other table are
+unchanged, and no stage reads the new one: it is for drawing and analysis. The report's
+`params.q1_traces` counts the candidates whose grid could not be placed in the sweep (none on a
+regular sweep; they write no cycle rows); `run` and `run-experiment` record the table in the
+manifest, and `output.retain` keeps it with the chromatograms. In place of the interleaved traces
+(the features, the quantification), and with the apex, the gate and the re-pick on the cycle groups,
+the cycle traces measured 1.2-4.7% fewer identifications (docs/37_ztscan.md, section 15), so the
+engine writes them aside.
+
+**`features.q1_separable`** (`stages::q1trace::fit`, psms_extracted v9): on each row's decision
+patch (the seven cycles around the apex, every step within the window's reach plus two either
+side, section 12) the fragments are fitted as `x[f, c, s] = A_f E_c T_f(s) + b_f`: `T_f` the
+calibrated expected Q1 profile at the decision's shared centre and width, `E` an elution profile
+shared by the decision's fitted set (the fragments that belong, or the present ones when fewer than
+two belong), `A_f >= 0` the fragment's amplitude and `b_f >= 0` its floor. Alternating least
+squares from the set's consensus elution (each fragment normalised to its own total), twelve rounds
+(`SEP_ITERS`), `E` scaled to a maximum of 1 after each; then every library fragment gets its
+amplitude and floor under the final `E`, the `R^2` of its cells under its component and its
+interference share (its observed intensity above the component over its observed intensity).
+Ten `q1s_*` values (`q1trace::Q1S_COLUMNS`) and five lists per row (the profile, the patch cycles'
+retention times, and per library fragment its amplitude, `R^2` and interference share) are
+appended to psms_extracted (v9, docs/15); the features stage reads the ten as a family
+(docs/10_features.md). The report's `params.q1_fragments.q1_separable` records the iterations and
+the bound fraction. Deterministic: every sum runs in fragment, cycle and step order.
+
 ## Key types and functions
 
 | Name | file:line | What it does |
@@ -1566,6 +1612,8 @@ here for one index.
 | `retrace.q1_repick` (automatic for ZT Scan files, needs `extract.q1_fragments`) | `q1f_apex_moved_s`; moves the rank-0 apex to the 2D apex of the fragments that belong (section 12) | ZT Scan REP01, on top of the decision: +2.96% precursors, +2.92% human precursors at a matched FDP (four NN seeds); 60% of the accepted targets' apexes move, by one cycle; extract +40-75% |
 | `features.ms1_envelope` (default false) | psms_extracted v7: 16 F64 cols `ms1e_*`; nine features (section 13) | ZT Scan REP01, four NN seeds: human precursors at a matched entrapment FDP +0.01%, precursors on the human library +0.05%, both inside the seed range; label-blind (decoy against low-target KS at most 0.005); keep off |
 | `features.q1_precursor`, `features.q1_multiscale`, `features.q1_deconvolved` (automatic for ZT Scan files, need `extract.q1_fragments`) | psms_extracted v8: 8 `q1p_*`, 9 or 12 `q1m*`, 5 `q1d_*` F64 cols; as many features (section 14) | ZT Scan REP01, four NN seeds, the three on top of the recipe: +0.76% precursors, +1.38% human precursors at a matched entrapment FDP, beyond the seed spread on both libraries; each alone inside it except `q1_deconvolved`; in `configs/examples/ztscan.json`; one acquisition |
+| `extract.q1_traces` (automatic for ZT Scan files, off otherwise) | `chromatograms_q1.parquet`: the traces on Q1 cycles with `q1_class` (chromatograms v5/v6, section 15) | no table read by a later stage changes; reading elution on cycles instead of the steps measured -1.2% to -4.7%, so it is a separate table |
+| `features.q1_separable` (default false, ZT Scan only) | psms_extracted v9: 10 `q1s_*` F64 and 5 list columns (section 15) | ZT Scan REP01, four NN seeds: +0.34% / -0.17% (entrapment at matched FDP / human library), inside the seed spread |
 | `extract.q1_deconvolved`, `search_seed.q1_deconvolved` (default false) | none; only Q1-consistent peaks are counted (section 14) | ZT Scan REP01: -25.6% precursors (extract, learned 1.0-step tolerance), -8.4% at 2 steps, -2.5% (seed), -38% (both); keep off |
 | `rescore.shadow_q1` (automatic for ZT Scan files, needs `extract.q1_fragments`) | none; the shadow test co-isolates by m/z and counts shared fragments by their Q1 centre (docs/11) | ZT Scan REP01: no count change (inside the seed range), fewer entrapment precursors at 1%; with the other three keys +3.02% precursors, +3.17% at a matched FDP, measured FDP at 1% 1.22% against 1.39%, +2.3% in a three-run experiment |
 | `extract.ms1_calibrate = "surface"` (default `true`) | none; MS1 reads at a per-m/z, per-retention-time offset (section 11) | ZT Scan REP01: +0.2% precursors, +0.2% human precursors on an entrapment library at a combined FDP of 1.39% (one seed); with `prec_tol_auto` and `q1_calibrate` +0.46% (four NN seeds), +0.19% at 1.40% against 1.39%; one acquisition |

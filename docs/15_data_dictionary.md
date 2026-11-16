@@ -496,6 +496,24 @@ whose apex is not in the sweep carries the "no evidence" values given.
 | `q1d_pred_share` | Float64 | no | fraction | the predicted-intensity share of the fragments with a consistent match |
 | `q1d_apex_share` | Float64 | no | fraction | the consistent share in the apex cycle alone |
 
+Conditional columns of v9, appended last under `features.q1_separable` (scanning-quadrupole
+spectra under `extract.q1_fragments`; docs/09_extract.md, section 15): the separable model of each
+row's Q1 patch (`stages::q1trace::fit`). A row whose apex is not in the sweep carries the values of no
+fit (0, a prediction-weighted interference share of 1) and NaN lists.
+
+| column | Arrow type | nullable | units | meaning |
+|---|---|---|---|---|
+| `q1s_r2` | Float64 | no | fraction | `1 - SSE / SST` of the fitted set's cells together (0 without a fit) |
+| `q1s_r2_pred`, `q1s_interf_pred` | Float64 | no | fraction | the predicted-intensity-weighted mean R^2 and interference share of the present fragments |
+| `q1s_explained`, `q1s_bg_share` | Float64 | no | fraction | the share of the present fragments' patch intensity their components explain, and the share their floors take |
+| `q1s_amp_cos`, `q1s_amp_corr` | Float64 | no | similarity | cosine of the square-rooted amplitudes with the square-rooted predictions, and their Pearson correlation, every library fragment (absent ones at 0) |
+| `q1s_n_fit` | Float64 | no | count | fragments in the fitted set |
+| `q1s_fwhm` | Float64 | no | Q1 cycles | the profile's full width at half maximum |
+| `q1s_apex_offset` | Float64 | no | Q1 cycles | the profile's apex (parabola-refined) against the row's apex cycle |
+| `q1s_elution` | List Float32 | no | fraction | the profile over the patch's cycles, maximum 1 (0 without a fit) |
+| `q1s_cycle_rt` | List Float32 | no | s | the retention time of each patch cycle (its step nearest the expected Q1 centre) |
+| `q1s_frag_amp`, `q1s_frag_r2`, `q1s_frag_interf` | List Float32 | no (NaN) | intensity, fraction, fraction | per library fragment, in the library's order: its amplitude under the profile (intensity at the profile's maximum and full transmission), the R^2 of its cells under its component, and the share of its observed intensity above it |
+
 ### chromatograms (`extract.rs:1512-1526`)
 
 One row per predicted transition per accepted candidate, plus MS1 isotope XIC
@@ -619,6 +637,19 @@ retrace succeeds. The report (`stage = "retrace"`) carries extract's parameters,
 and retrace's own under `params.retrace`; its `stats` carry the rebuilt and copied row
 counts, the frames decoded, the raw events summed and the median MS1 mass residual
 (`ms1_mass_residual_ppm_median`).
+
+### chromatograms_q1 (`extract.q1_traces`, ZT Scan only, `extract.rs`, `cycle_groups`)
+
+Written beside `chromatograms.parquet` (`chromatograms_q1.parquet`, `extract::q1_trace_path`) only
+under `extract.q1_traces`, on scanning-quadrupole spectra: the same rows (every accepted candidate,
+library order, then the three MS1 rows) in the same layout, each trace with one point per Q1 cycle,
+and one column more. Report: `logical_name` `chromatograms_q1`, `schema_name` `chromatograms`,
+`schema_version` 5 (layout 1) or 6 (layout 2). No stage reads it.
+
+| column | Arrow type | nullable | units | meaning |
+|---|---|---|---|---|
+| the columns of the layout (`rt`, `intensity`, or `rt_axis`, `intensity_trimmed`, `trace_offset`, `trace_len`) | as `chromatograms` | | | one point per cycle: at the retention time of the cycle's covering step nearest the precursor's expected Q1 centre (a scan of the run), the least-squares amplitude `sum(w x) / sum(w^2)` of the fragment's covering steps under its calibrated Q1 profile at that centre (intensity at full transmission); MS1 rows sampled at the same retention times |
+| `q1_class` | Float32 | no (NaN) | code | the fragment's Q1 decision at the candidate's apex (0 absent, 1 belongs, 2 interfered; `q1f_frag_class`); NaN on the MS1 rows |
 
 ### `<psms>.peaks.parquet`, top-K peak retention (`extract.rs:1532-1543`)
 

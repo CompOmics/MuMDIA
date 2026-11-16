@@ -175,6 +175,7 @@ mod tests {
             [
                 "convert.isolation_half_width",
                 "extract.q1_fragments",
+                "extract.q1_traces",
                 "features.q1_consistency",
                 "features.q1_deconvolved",
                 "features.q1_fragment_features",

@@ -849,6 +849,18 @@ untrained `prelim_score` is below the decoys' median the Kolmogorov-Smirnov stat
 against targets is at most 0.008 for every one of the 25 features (the reference features
 0.0005-0.006). What they measured, alone and together, is in docs/37_ztscan.md, section 10.
 
+### q1_separable (10; `features.q1_separable`)
+
+Scanning-quadrupole spectra only, opt-in (`false` by default, refused on any other input), needs
+`extract.q1_fragments`; appended after `q1_deconvolved`, before `q1_consistency` when that is on
+(`Q1SEP_FEATURES`): the psms_extracted v9 columns of each row's separable model
+(docs/09_extract.md, section 15): `q1s_r2`, `q1s_r2_pred`, `q1s_interf_pred`, `q1s_explained`,
+`q1s_bg_share`, `q1s_amp_cos`, `q1s_amp_corr`, `q1s_n_fit`, `q1s_fwhm`, `q1s_apex_offset`
+(docs/15_data_dictionary.md). Label-blind (low-score decoys against low-score targets, KS
+0.0010-0.0053); measured inside the seed spread on both ZT Scan libraries (+0.34% human precursors
+at the matched entrapment FDP, -0.17% precursors on the human library; docs/37_ztscan.md, section
+15), so not automatic.
+
 ### q1_consistency (16; `features.q1_consistency`)
 
 Scanning-quadrupole spectra (SCIEX ZT Scan DIA) only. In the battery only when

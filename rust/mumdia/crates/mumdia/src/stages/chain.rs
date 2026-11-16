@@ -205,6 +205,7 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
     ext_cfg.q1_precursor = cfg.features.q1_precursor.on();
     ext_cfg.q1_multiscale = cfg.features.q1_multiscale.on();
     ext_cfg.q1_dec_features = cfg.features.q1_deconvolved.on();
+    ext_cfg.q1_separable = cfg.features.q1_separable;
     let (wpsm, wchr) = extract::run_hashed(extract::ExtractParams {
         precursor_span: None,
         fragment_offset: None,
@@ -297,6 +298,11 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
             ch,
         ),
     );
+
+    // `extract.q1_traces`: the cycle-trace table beside the chromatograms.
+    if let Some(r) = extract::q1_trace_record(&chrom, ch)? {
+        keep(&mut manifest, r);
+    }
 
     let feats = d("features.parquet");
     info!(stage = %"features", "run: stage start");

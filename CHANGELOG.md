@@ -7,6 +7,16 @@ All notable changes to MuMDIA are recorded here. The format follows
 `0.1.0` is the first tagged release of the Rust engine. The superseded
 Python implementation remains available at the tag `legacy-python-v1`.
 
+`0.13.0` is a minor release: it changes what the reports of a library search contain. A
+library imported with `scripts/import_diann_lib.py` now carries its protein accessions, entry
+names and gene names in its own precursor table, so they go wherever the library goes, and
+`peptides.tsv`, `precursors.tsv` and `proteins.tsv` always end with `protein_ids`,
+`protein_names` and `genes`. A search without annotations leaves those cells empty, warns when
+it starts and at its report, and records `protein_annotations_missing` in its manifest instead
+of leaving the columns out. Identifications, q values and quantities are the same as with
+`0.12.0`. The desktop application keeps search setups under a name or in a file, and the visDIA
+it installs shows SCIEX ZT Scan DIA runs.
+
 `0.12.0` is a minor release: it reads a new kind of data. SCIEX ZT Scan DIA runs, in which the
 quadrupole sweeps the precursor range instead of stepping through fixed windows, are recognised
 before a search and read with the half-width of their quadrupole window, and they are searched
@@ -193,75 +203,6 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
-### Fixed
-
-- **The desktop application no longer stops responding on the Setup screen.** Its status
-  commands ran on the thread that draws the window: the components' status starts Python up
-  to nine times, the managed-data card walks every file of the environments, and the Thermo
-  and DIA-NN checks run those programs. The screen polls the first every 900 ms while
-  anything installs or is tested, and a new call started before the last had finished, so
-  calls piled up and Windows reported the window as not responding, for minutes after three
-  environments had been installed; clicking between tabs quickly did the same. These four
-  commands now run off that thread, and the screen runs each refresh one at a time: a
-  request made while one runs gives one more run after it.
-
-- **A search from a spectral library has its protein accessions, entry names and gene names
-  wherever the library goes (#299).** The annotations lived only in
-  `protein_annotations.parquet`, found beside the library's precursor table, so a library
-  whose two tables were copied without it, or one imported before 0.10.0 (a library the
-  desktop application had cached among them), gave TSVs without the `protein_ids`,
-  `protein_names` and `genes` columns, and nothing said so. An imported library now carries
-  them in three optional columns of its own precursor table, `protein_ids`,
-  `protein_names` and `genes`, which give every precursor the annotation of its `protein`:
-  `scripts/import_diann_lib.py` writes them from DIA-NN's `Protein.Ids`, `Protein.Names` and
-  `Genes`, as it wrote the side table; the decoy builders (`make_reverse_decoys.py`,
-  `make_shift_decoys.py`, `predict_decoys.py`) keep them on every target and copy them onto
-  its decoy, and write them from the side table beside an input imported before; and
-  `augment_library.py` names the peptides it adds from the FASTA. `run`, `run-experiment` and
-  `mumdia report` take the annotations from `--lib-annotations` / `--protein-annotations`
-  (which now also accept an annotated library precursor table), else the library's columns,
-  else the side table beside it; without any, the search warns when it starts and again at
-  its report and records `protein_annotations_missing` (the library and the warning) in its
-  manifest. The columns are read from the target rows when the report is written and never
-  by a search stage, so every identification, q value and quantity is the same: a smoke arm
-  searches one library with and without them and finds byte-identical scored and quant
-  tables. A FASTA search, and its library, are unchanged byte for byte (docs/15,
-  "protein_annotations").
-- **`import_diann_lib.py --fasta <path>` fills what a DIA-NN library leaves empty** (a gene
-  DIA-NN did not parse, a library without `Genes`) from the FASTA headers, matching each
-  protein's members and accessions to a header's first word, accession or entry name, and
-  keeps every value the library gives. The desktop application's library build passes the
-  FASTA it predicted from; an import of an existing library has none and needs none.
-
-### Changed
-
-- **The desktop application pins visDIA at 36eef08, which shows SCIEX ZT Scan DIA runs**
-  (CompOmics/visDIA#15). The pinned viewer refused a ZT Scan run's `spectra_ms2` v3 and
-  `psms_extracted` v6 and v8, so its precursor page had no spectra and drew each XIC through
-  every Q1 step, a sawtooth. The precursor page of a ZT Scan run now draws each XIC as one
-  value per Q1 cycle, the transmission-weighted collapse of the cycle's steps that
-  `quant.q1_fragments` uses, with the steps faint behind it or alone on request; it marks
-  each fragment with the engine's Q1 decision (`q1f_frag_class`) and adds a Q1 sweep card:
-  each fragment's retention time x Q1-step patch around the apex with its expected, fitted
-  and own Q1 centres, the Q1 profile of the shown cycle against the calibrated transmission
-  with the precursor's own isotopes in MS2, and the engine's `q1f_*` columns. Every other run
-  is shown as before. An existing visDIA environment is reported outdated and the Setup
-  screen offers the update (env/console-visdia-requirements.txt).
-- **`peptides.tsv`, `precursors.tsv` and `proteins.tsv` end with `protein_ids`,
-  `protein_names` and `genes` with or without annotations (#299).** Without annotations
-  their cells are empty, with a warning, where from 0.10.0 to 0.12.0 the columns were left
-  out: the files have one layout whatever the library, and a search without annotations is
-  never silent. A FASTA search, which always has them, writes the same bytes; a library
-  search without them gains three empty columns.
-- **The library importer and the decoy builders write no `protein_annotations.parquet`
-  beside the library they write**; the annotations are in its precursor table. A side table
-  found beside the output, which belongs to another library, is removed, as before. The
-  engine still reads a side table beside a library imported from 0.10.0 to 0.12.0, and a
-  FASTA search and a FASTA-built library still write theirs. `--annotations <path>` on the
-  importer still writes the side table, now in addition to the columns.
-- The manifest records a search's annotation table with the producer `library-columns`
-  when it was read from the library's columns (`library-input` remains a copied side
-  table, `digest` a FASTA search's own).
 ### Added
 
 - **The Windows installer can put the desktop application's analysis components in the
@@ -291,8 +232,58 @@ than a number. Both are recorded in every run's `manifest.json`.
   hashes. `ci/check_msi_scope.ps1` checks the package's tables, and the Windows CI job
   installs it with each choice (desktop/README.md, "Where the components are installed").
 
+- **SCIEX ZT Scan DIA: the traces on Q1 cycles, written for every ZT Scan run, and a separable
+  model of each candidate's RT x step patch, opt-in (docs/37_ztscan.md, section 15).** A ZT Scan
+  chromatogram interleaves about five Q1 steps a cycle, a sawtooth when drawn. `extract.q1_traces` writes every accepted
+  candidate's traces once more with one point per cycle, each fragment's covering steps
+  collapsed to their least-squares amplitude under its calibrated Q1 profile at the expected
+  centre, into `chromatograms_q1.parquet` beside the chromatograms, with each fragment's Q1
+  decision as a `q1_class` column (chromatograms schema 5 in layout 1, 6 in layout 2), for drawing
+  and analysis; no stage reads it. `features.q1_separable` fits each row's decision patch as one
+  elution profile shared by the fragments times each fragment's calibrated transmission, with an
+  amplitude and a floor per fragment, and writes ten `q1s_*` features and per-row lists of the
+  profile, its cycles' retention times and each fragment's amplitude, R^2 and interference share
+  (psms_extracted v9). `extract.q1_traces` is part of the automatic ZT Scan analysis (`"auto"`: on
+  for ZT Scan files, off for every other search, `false` turns it off, as the desktop
+  application's cleared "ZT Scan analysis" box does); it changes no other table and costs about 3%
+  of a run's wall time and 7.7 GB on a 15 min run, and a ZT Scan search's configuration hash now
+  includes it. `features.q1_separable` is opt-in. Both are refused when asked for on any input that
+  is not a ZT Scan run, so every other search is unchanged byte for byte. Measured on the K562 ZT Scan run with four NN
+  seeds on two libraries: reading elution on cycles instead of the interleaved steps (the
+  features, and the apex, the gate and the re-pick) lost 1.2-4.7% of the identifications, which is
+  why the cycle traces are a separate table; the separable features are inside the seed spread
+  (+0.34% human precursors at a matched entrapment FDP, -0.17% precursors on the human library)
+  and quantifying from its amplitudes raised the replicate CV from 0.104 to 0.165, so it is not
+  part of the automatic ZT Scan analysis.
+### Changed
+
+- **The desktop application pins visDIA at 0ce3224, which reads the ZT Scan cycle traces from
+  `chromatograms_q1.parquet`** (CompOmics/visDIA#16). Under `extract.q1_traces` the engine
+  writes a ZT Scan run's traces on Q1 cycles to `chromatograms_q1.parquet` beside
+  `chromatograms.parquet` (`second_pass/<run>/` for a second pass), and `chromatograms.parquet`
+  keeps the per-step traces. The precursor page draws the engine's cycle values from that
+  table, with the per-step samples behind them on request and each fragment's `q1_class`. A
+  candidate the table does not hold, and every run without it, keeps the viewer's own
+  collapse of the steps.
+
+### Fixed
+
+- **The desktop application no longer stops responding on the Setup screen.** Its status
+  commands ran on the thread that draws the window: the components' status starts Python up
+  to nine times, the managed-data card walks every file of the environments, and the Thermo
+  and DIA-NN checks run those programs. The screen polls the first every 900 ms while
+  anything installs or is tested, and a new call started before the last had finished, so
+  calls piled up and Windows reported the window as not responding, for minutes after three
+  environments had been installed; clicking between tabs quickly did the same. These four
+  commands now run off that thread, and the screen runs each refresh one at a time: a
+  request made while one runs gives one more run after it.
+
+## [0.13.0] - 2026-11-12
+
+### Added
+
 - **Setups in the desktop application: a search setup saved under a name, or to a file
-  (#297).** The Setups card on the Settings screen keeps the current setup in My setups
+  (#314, issue #297).** The Setups card on the Settings screen keeps the current setup in My setups
   (load, rename, save to a file, delete) or saves it to a file of the user's choice, and
   loads one from a file, so a setup for phospho and one for label-free data can be kept side
   by side, moved to another computer or sent to a colleague. A setup holds the Search
@@ -311,6 +302,66 @@ than a number. Both are recorded in every run's `manifest.json`.
   is listed and left out. Loaded on a fresh profile, a setup gives a search the same
   configuration as on the computer that saved it (desktop/README.md, "Setups"). "Save and
   use" with nothing changed from the preset now uses the preset itself.
+
+### Changed
+
+- **The desktop application pins visDIA at 36eef08, which shows SCIEX ZT Scan DIA runs**
+  (#316, CompOmics/visDIA#15). The pinned viewer refused a ZT Scan run's `spectra_ms2` v3 and
+  `psms_extracted` v6 and v8, so its precursor page had no spectra and drew each XIC through
+  every Q1 step, a sawtooth. The precursor page of a ZT Scan run now draws each XIC as one
+  value per Q1 cycle, the transmission-weighted collapse of the cycle's steps that
+  `quant.q1_fragments` uses, with the steps faint behind it or alone on request; it marks
+  each fragment with the engine's Q1 decision (`q1f_frag_class`) and adds a Q1 sweep card:
+  each fragment's retention time x Q1-step patch around the apex with its expected, fitted
+  and own Q1 centres, the Q1 profile of the shown cycle against the calibrated transmission
+  with the precursor's own isotopes in MS2, and the engine's `q1f_*` columns. Every other run
+  is shown as before. An existing visDIA environment is reported outdated and the Setup
+  screen offers the update (env/console-visdia-requirements.txt).
+- **`peptides.tsv`, `precursors.tsv` and `proteins.tsv` end with `protein_ids`,
+  `protein_names` and `genes` with or without annotations (#315, issue #299).** Without annotations
+  their cells are empty, with a warning, where from 0.10.0 to 0.12.0 the columns were left
+  out: the files have one layout whatever the library, and a search without annotations is
+  never silent. A FASTA search, which always has them, writes the same bytes; a library
+  search without them gains three empty columns.
+- **The library importer and the decoy builders write no `protein_annotations.parquet`
+  beside the library they write (#315)**; the annotations are in its precursor table. A side table
+  found beside the output, which belongs to another library, is removed, as before. The
+  engine still reads a side table beside a library imported from 0.10.0 to 0.12.0, and a
+  FASTA search and a FASTA-built library still write theirs. `--annotations <path>` on the
+  importer still writes the side table, now in addition to the columns.
+- The manifest records a search's annotation table with the producer `library-columns`
+  when it was read from the library's columns (`library-input` remains a copied side
+  table, `digest` a FASTA search's own) (#315).
+
+### Fixed
+
+- **A search from a spectral library has its protein accessions, entry names and gene names
+  wherever the library goes (#315, issue #299).** The annotations lived only in
+  `protein_annotations.parquet`, found beside the library's precursor table, so a library
+  whose two tables were copied without it, or one imported before 0.10.0 (a library the
+  desktop application had cached among them), gave TSVs without the `protein_ids`,
+  `protein_names` and `genes` columns, and nothing said so. An imported library now carries
+  them in three optional columns of its own precursor table, `protein_ids`,
+  `protein_names` and `genes`, which give every precursor the annotation of its `protein`:
+  `scripts/import_diann_lib.py` writes them from DIA-NN's `Protein.Ids`, `Protein.Names` and
+  `Genes`, as it wrote the side table; the decoy builders (`make_reverse_decoys.py`,
+  `make_shift_decoys.py`, `predict_decoys.py`) keep them on every target and copy them onto
+  its decoy, and write them from the side table beside an input imported before; and
+  `augment_library.py` names the peptides it adds from the FASTA. `run`, `run-experiment` and
+  `mumdia report` take the annotations from `--lib-annotations` / `--protein-annotations`
+  (which now also accept an annotated library precursor table), else the library's columns,
+  else the side table beside it; without any, the search warns when it starts and again at
+  its report and records `protein_annotations_missing` (the library and the warning) in its
+  manifest. The columns are read from the target rows when the report is written and never
+  by a search stage, so every identification, q value and quantity is the same: a smoke arm
+  searches one library with and without them and finds byte-identical scored and quant
+  tables. A FASTA search, and its library, are unchanged byte for byte (docs/15,
+  "protein_annotations").
+- **`import_diann_lib.py --fasta <path>` fills what a DIA-NN library leaves empty (#315)** (a gene
+  DIA-NN did not parse, a library without `Genes`) from the FASTA headers, matching each
+  protein's members and accessions to a header's first word, accession or entry name, and
+  keeps every value the library gives. The desktop application's library build passes the
+  FASTA it predicted from; an import of an existing library has none and needs none.
 
 ## [0.12.0] - 2026-11-11
 

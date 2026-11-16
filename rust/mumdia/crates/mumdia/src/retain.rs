@@ -99,6 +99,8 @@ const RUN_RESULTS: &[&str] = &[
 pub const RUN_EVIDENCE: &[&str] = &[
     "run_windows.parquet",
     "chromatograms.parquet",
+    // `extract.q1_traces`: the same traces on Q1 cycles (SCIEX ZT Scan DIA).
+    "chromatograms_q1.parquet",
     "features.parquet",
     "psms_competed.parquet",
     "psms_extracted.parquet",
