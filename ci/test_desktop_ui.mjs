@@ -166,6 +166,8 @@ function load() {
     "captureSearch",
     "currentSetup",
     "validateSetup",
+    "mzProblems",
+    "libraryParams",
     "planSetup",
     "reviewSetup",
     "applyPendingSetup",
@@ -1330,6 +1332,70 @@ test("a setup's choices are the Search screen's choices", () => {
     assert.ok(paths.has(k), `${k} is not an engine setting`);
   }
   for (const k of api.INTERPRETER_SETTINGS) assert.ok(!api.LOCAL_SETTINGS.has(k), k);
+});
+
+// A highest fragment m/z of 1 reached DIA-NN as `--max-fr-mz 1`: it generated 0 precursors
+// and the build failed in the importer with "python.exe exited with 1". An implausible limit
+// is now refused at Start, by field name and value, and a setup carrying one is refused.
+test("an implausible m/z limit blocks the start and names the field and its value", async () => {
+  const p = await profile();
+  p.api.setMode("fasta");
+  const mz = () => [...p.api.searchProblems()].filter((x) => /m\/z/.test(x));
+  assert.deepEqual(mz(), [], "no limit is no problem");
+  p.el("d-frmax").value = "1";
+  assert.deepEqual(mz(), [
+    "Highest fragment m/z is 1, which is not a plausible fragment m/z: it must be between 200 " +
+      "and 4000, or empty for no limit.",
+  ]);
+  p.el("d-frmax").value = "1800";
+  p.el("d-frmin").value = "150";
+  p.el("d-prmin").value = "400";
+  p.el("d-prmax").value = "1000.5";
+  assert.deepEqual(mz(), []);
+  assert.equal(p.api.libraryParams("x.fasta").max_fr_mz, 1800);
+  p.el("d-prmin").value = "1200";
+  assert.deepEqual(mz(), ["Lowest precursor m/z (1200) must be below Highest precursor m/z (1000.5)."]);
+  p.el("d-prmin").value = "-5";
+  assert.match(mz().join(" "), /^Lowest precursor m\/z is -5, which is not a plausible precursor m\/z/);
+  p.el("d-prmin").value = "";
+  // A field whose text the number input cannot read ("1,800" in a locale with a decimal point)
+  // reports "", which read as no limit; it is refused instead.
+  p.el("d-frmax").value = "";
+  p.el("d-frmax").validity = { badInput: true };
+  assert.match(mz().join(" "), /^Highest fragment m\/z is not a number the field can read/);
+  // A setup is not a search: the limits do not block a library search.
+  p.el("d-frmax").validity = { badInput: false };
+  p.el("d-frmax").value = "1";
+  p.api.setMode("library");
+  assert.deepEqual(mz(), []);
+});
+
+test("a setup with an implausible m/z limit is refused, naming the field and its value", async () => {
+  const p = await profile();
+  const v = p.api.validateSetup({
+    digest: { precursor_mz_min: 900, precursor_mz_max: 400, fragment_mz_min: null, fragment_mz_max: 1 },
+  });
+  assert.deepEqual([...v.errors], [
+    "settings.digest: Lowest precursor m/z (900) must be below Highest precursor m/z (400).",
+    "settings.digest: Highest fragment m/z is 1, which is not a plausible fragment m/z: it must " +
+      "be between 200 and 4000, or empty for no limit.",
+  ]);
+  const ok = p.api.validateSetup({
+    digest: { precursor_mz_min: 400, precursor_mz_max: 1000, fragment_mz_min: 150, fragment_mz_max: 1800 },
+  });
+  assert.deepEqual([...ok.errors], []);
+  // The rule is the backend's (`mzlimits.rs`): the same bounds, the same sentences.
+  const rust = readFileSync(join(ROOT, "desktop", "src-tauri", "src", "mzlimits.rs"), "utf8");
+  for (const [name, value] of [
+    ["FRAGMENT_LOWEST", 50], ["FRAGMENT_HIGHEST", 4000], ["FRAGMENT_MAX_FLOOR", 200],
+    ["PRECURSOR_LOWEST", 100], ["PRECURSOR_HIGHEST", 6000], ["PRECURSOR_MAX_FLOOR", 300],
+  ]) {
+    assert.match(rust, new RegExp(`pub const ${name}: f64 = ${value}\.0;`), name);
+  }
+  // The HTML bounds the fields to the same range, so the stepper never writes a 1 into them.
+  for (const [id, min, max] of [["d-prmin", 100, 6000], ["d-prmax", 100, 6000], ["d-frmin", 50, 4000], ["d-frmax", 50, 4000]]) {
+    assert.match(HTML, new RegExp(`id="${id}" min="${min}" max="${max}"`), id);
+  }
 });
 
 let failed = 0;

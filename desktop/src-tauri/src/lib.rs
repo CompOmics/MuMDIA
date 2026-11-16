@@ -13,6 +13,7 @@ pub mod enzymes;
 pub mod library;
 pub mod loadcheck;
 pub mod mods;
+pub mod mzlimits;
 pub mod predictors;
 pub mod preflight;
 pub mod run;

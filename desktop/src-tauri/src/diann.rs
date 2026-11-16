@@ -958,43 +958,47 @@ pub struct BuildRequest {
 }
 
 impl BuildRequest {
+    /// The four m/z limits of the request.
+    pub fn mz_limits(&self) -> crate::mzlimits::MzLimits {
+        crate::mzlimits::MzLimits {
+            precursor_min: self.min_pr_mz,
+            precursor_max: self.max_pr_mz,
+            fragment_min: self.min_fr_mz,
+            fragment_max: self.max_fr_mz,
+        }
+    }
+
     /// The precursor and fragment m/z limits as DIA-NN arguments, each only when set;
-    /// refused when an end is not a positive number or a range is empty.
+    /// refused when one is not a plausible m/z or a range is empty (`mzlimits`).
     fn mz_args(&self) -> Result<Vec<String>, String> {
+        self.mz_limits().check()?;
         let mut args = Vec::new();
-        for (what, (lo_flag, lo), (hi_flag, hi)) in [
-            (
-                "precursor",
-                ("--min-pr-mz", self.min_pr_mz),
-                ("--max-pr-mz", self.max_pr_mz),
-            ),
-            (
-                "fragment",
-                ("--min-fr-mz", self.min_fr_mz),
-                ("--max-fr-mz", self.max_fr_mz),
-            ),
+        for (flag, v) in [
+            ("--min-pr-mz", self.min_pr_mz),
+            ("--max-pr-mz", self.max_pr_mz),
+            ("--min-fr-mz", self.min_fr_mz),
+            ("--max-fr-mz", self.max_fr_mz),
         ] {
-            for v in [lo, hi].into_iter().flatten() {
-                if !(v.is_finite() && v > 0.0) {
-                    return Err(format!("the {what} m/z limit {v} is not a positive number"));
-                }
-            }
-            if let (Some(a), Some(b)) = (lo, hi) {
-                if a >= b {
-                    return Err(format!(
-                        "the {what} m/z range {a} to {b} is empty; the lower limit must be \
-                         below the upper"
-                    ));
-                }
-            }
-            for (flag, v) in [(lo_flag, lo), (hi_flag, hi)] {
-                if let Some(v) = v {
-                    args.push(flag.to_string());
-                    args.push(v.to_string());
-                }
+            if let Some(v) = v {
+                args.push(flag.to_string());
+                args.push(v.to_string());
             }
         }
         Ok(args)
+    }
+
+    /// The search space of the request, for a message about a library that came out
+    /// empty.
+    fn describe(&self) -> String {
+        format!(
+            "peptide length {} to {}, charge {} to {}, {} missed cleavage(s), {}",
+            self.min_pep_len,
+            self.max_pep_len,
+            self.min_charge,
+            self.max_charge,
+            self.missed_cleavages,
+            self.mz_limits().describe()
+        )
     }
 
     /// The fragment m/z arguments alone, as `predict_decoys.py --diann-arg` values, so the
@@ -1556,9 +1560,14 @@ fn run_step(
     }
 
     // Both streams, on two threads, so a child that writes only to stderr still
-    // shows progress and a full pipe cannot deadlock the child.
+    // shows progress and a full pipe cannot deadlock the child. The last lines of each
+    // are kept apart from the log, for the error message when the step fails.
     let mut joins = Vec::new();
-    for stream in [
+    let tails = [
+        Arc::new(Mutex::new(Tail::default())),
+        Arc::new(Mutex::new(Tail::default())),
+    ];
+    for (stream, tail) in [
         child
             .stdout
             .take()
@@ -1569,14 +1578,20 @@ fn run_step(
             .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
     ]
     .into_iter()
-    .flatten()
+    .zip(tails.iter().cloned())
+    .filter_map(|(s, t)| s.map(|s| (s, t)))
     {
         let sink = Arc::clone(builder);
         joins.push(std::thread::spawn(move || {
             // Lossy and to the end: DIA-NN echoes paths in the OEM code page, and the
             // Python helpers write in the ANSI one; a reader that stopped on such a line
             // closed the pipe under a still-running child.
-            crate::childio::for_each_line_lossy(stream, |line| sink.log(line));
+            crate::childio::for_each_line_lossy(stream, |line| {
+                if let Ok(mut t) = tail.lock() {
+                    t.push(&line);
+                }
+                sink.log(line);
+            });
         }));
     }
     let status = child.wait().map_err(|e| e.to_string())?;
@@ -1590,16 +1605,89 @@ fn run_step(
         return Err("cancelled".into());
     }
     if !status.success() {
-        return Err(format!(
-            "{} exited with {}",
-            exe.file_name().unwrap_or_default().to_string_lossy(),
-            status
-                .code()
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "a signal".into())
+        let [out, err] = tails.map(|t| t.lock().map(|t| t.lines()).unwrap_or_default());
+        return Err(step_failure(
+            exe,
+            args,
+            is_diann,
+            status.code(),
+            // What a failing Python helper says is on stderr (a `SystemExit` message or a
+            // traceback); DIA-NN writes everything to stdout.
+            if err.is_empty() { &out } else { &err },
         ));
     }
     Ok(())
+}
+
+/// How many of a failed step's last lines its error message quotes.
+const TAIL_LINES: usize = 4;
+
+/// The last non-empty lines of one of a child's streams.
+#[derive(Default)]
+struct Tail(std::collections::VecDeque<String>);
+
+impl Tail {
+    fn push(&mut self, line: &str) {
+        let line = line.trim_end();
+        if line.trim().is_empty() {
+            return;
+        }
+        if self.0.len() == TAIL_LINES {
+            self.0.pop_front();
+        }
+        self.0.push_back(line.to_string());
+    }
+
+    fn lines(&self) -> Vec<String> {
+        self.0.iter().cloned().collect()
+    }
+}
+
+/// The error of a step that exited non-zero: what ran (the script, for a Python helper),
+/// its exit code, and the last lines it wrote, so the reason is in the message and not
+/// only in the log on the Progress screen.
+fn step_failure(
+    exe: &Path,
+    args: &[String],
+    is_diann: bool,
+    code: Option<i32>,
+    tail: &[String],
+) -> String {
+    let file = |p: &Path| {
+        p.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    };
+    let program = file(exe);
+    let what = match args.first().map(Path::new) {
+        Some(script)
+            if !is_diann
+                && script
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("py")) =>
+        {
+            format!("{} ({program})", file(script))
+        }
+        _ => program,
+    };
+    let code = code
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "a signal".into());
+    let mut msg = format!("{what} exited with {code}");
+    if tail.is_empty() {
+        msg.push_str(", and wrote nothing.");
+    } else {
+        msg.push_str(". Its last output:");
+        for line in tail {
+            msg.push_str(
+                "
+  ",
+            );
+            msg.push_str(line);
+        }
+    }
+    msg
 }
 
 /// The fragment-level Parquet library, if DIA-NN has written one.
@@ -1767,6 +1855,10 @@ fn predict_args(req: &BuildRequest, plan: &ModPlan, out_lib: &Path) -> Result<Ve
 /// m/z and re-indexes `candidate_id`, both of which the fragment index rejects a library
 /// for lacking. Everything after the prediction is `convert`, which `import` shares.
 pub fn build(builder: Arc<Builder>, req: BuildRequest) -> Result<(), String> {
+    // Before anything runs: an implausible m/z limit (a highest fragment m/z of 1) makes
+    // DIA-NN generate nothing, and the build then failed steps later with a message about
+    // fragment rows.
+    req.mz_limits().check()?;
     let status = detect();
     if !status.licence_acknowledged {
         return Err("the DIA-NN licence notice has not been acknowledged".into());
@@ -1825,6 +1917,12 @@ pub fn build(builder: Arc<Builder>, req: BuildRequest) -> Result<(), String> {
             builder.fail(e);
             return;
         }
+        // DIA-NN exits 0 having generated nothing when the search space is empty; the
+        // re-export and the importer then failed on an empty library.
+        if generated_precursors(&builder.snapshot().log) == Some(0) {
+            builder.fail(empty_build_message(&req));
+            return;
+        }
 
         let conversion = Conversion {
             exe,
@@ -1836,6 +1934,7 @@ pub fn build(builder: Arc<Builder>, req: BuildRequest) -> Result<(), String> {
             decoy_args: req.decoy_diann_args(),
             fasta: Some(PathBuf::from(&req.fasta)),
             remap: None,
+            empty: empty_build_message(&req),
         };
         let result = convert(&builder, &conversion, Source::Predicted(stem));
         // The marker last, after both tables are on disk. Anything that dies before
@@ -1847,6 +1946,157 @@ pub fn build(builder: Arc<Builder>, req: BuildRequest) -> Result<(), String> {
     });
 
     Ok(())
+}
+
+/// The precursor count DIA-NN reported for a library it generated ("N precursors
+/// generated"), the last such line of the log; `None` when it printed none.
+fn generated_precursors(log: &[String]) -> Option<u64> {
+    log.iter().rev().find_map(|line| {
+        let at = line.find("precursors generated")?;
+        let count = line[..at].split_whitespace().last()?;
+        count.replace([',', '\''], "").parse().ok()
+    })
+}
+
+/// The error for a build whose prediction came out empty, with the settings it used.
+fn empty_build_message(req: &BuildRequest) -> String {
+    format!(
+        "DIA-NN generated 0 precursors from the FASTA, so there is no library to search. \
+         Check the digest settings and the m/z limits on the Search screen ({}).",
+        req.describe()
+    )
+}
+
+/// The row count of a Parquet file, from its footer; `None` when it cannot be read.
+///
+/// The footer is a Thrift compact-protocol `FileMetaData`, whose field 3 is `num_rows`.
+/// Fields 1 (`version`) and 2 (`schema`) come before it and are skipped.
+fn parquet_num_rows(path: &Path) -> Option<i64> {
+    footer_num_rows(&parquet_footer(path).ok()?)
+}
+
+fn footer_num_rows(footer: &[u8]) -> Option<i64> {
+    let mut r = Compact {
+        buf: footer,
+        pos: 0,
+    };
+    let mut last = 0i16;
+    loop {
+        let b = r.byte()?;
+        if b == 0 {
+            return None;
+        }
+        let ty = b & 0x0f;
+        let delta = (b >> 4) as i16;
+        let id = if delta == 0 {
+            r.zigzag()? as i16
+        } else {
+            last + delta
+        };
+        last = id;
+        if id == 3 && ty == 6 {
+            return r.zigzag();
+        }
+        r.skip(ty, 0)?;
+    }
+}
+
+/// Just enough of the Thrift compact protocol to skip values.
+struct Compact<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl Compact<'_> {
+    fn byte(&mut self) -> Option<u8> {
+        let b = *self.buf.get(self.pos)?;
+        self.pos += 1;
+        Some(b)
+    }
+
+    fn varint(&mut self) -> Option<u64> {
+        let mut v = 0u64;
+        for shift in (0..64).step_by(7) {
+            let b = self.byte()?;
+            v |= u64::from(b & 0x7f) << shift;
+            if b & 0x80 == 0 {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    fn zigzag(&mut self) -> Option<i64> {
+        let v = self.varint()?;
+        Some((v >> 1) as i64 ^ -((v & 1) as i64))
+    }
+
+    fn advance(&mut self, n: usize) -> Option<()> {
+        let end = self.pos.checked_add(n).filter(|e| *e <= self.buf.len())?;
+        self.pos = end;
+        Some(())
+    }
+
+    /// Skip one value of compact type `ty`. `depth` bounds the recursion on a footer
+    /// that is not what it claims to be.
+    fn skip(&mut self, ty: u8, depth: u32) -> Option<()> {
+        if depth > 32 {
+            return None;
+        }
+        match ty {
+            // A bool field carries its value in the type nibble.
+            1 | 2 => Some(()),
+            3 => self.advance(1),
+            4..=6 => self.varint().map(|_| ()),
+            7 => self.advance(8),
+            8 => {
+                let n = self.varint()? as usize;
+                self.advance(n)
+            }
+            9 | 10 => {
+                let h = self.byte()?;
+                let n = if h >> 4 == 15 {
+                    self.varint()? as usize
+                } else {
+                    (h >> 4) as usize
+                };
+                let et = h & 0x0f;
+                for _ in 0..n {
+                    // A bool element of a list is one byte.
+                    if et == 1 || et == 2 {
+                        self.advance(1)?;
+                    } else {
+                        self.skip(et, depth + 1)?;
+                    }
+                }
+                Some(())
+            }
+            11 => {
+                let n = self.varint()? as usize;
+                if n == 0 {
+                    return Some(());
+                }
+                let kv = self.byte()?;
+                for _ in 0..n {
+                    self.skip(kv >> 4, depth + 1)?;
+                    self.skip(kv & 0x0f, depth + 1)?;
+                }
+                Some(())
+            }
+            12 => loop {
+                let b = self.byte()?;
+                if b == 0 {
+                    return Some(());
+                }
+                // A field id that does not fit the header's delta follows it.
+                if b >> 4 == 0 {
+                    self.zigzag()?;
+                }
+                self.skip(b & 0x0f, depth + 1)?;
+            },
+            _ => None,
+        }
+    }
 }
 
 /// The accessions a built library's import keeps.
@@ -1917,6 +2167,8 @@ struct Conversion {
     /// An import's re-mapping to another FASTA (`--remap-fasta`), which then names every
     /// protein and its annotations; `None` keeps the library's proteins.
     remap: Option<Remap>,
+    /// The error when the DIA-NN library has no rows, refused before the importer runs.
+    empty: String,
 }
 
 /// A DIA-NN library a user chose, by the format it is in.
@@ -2145,6 +2397,11 @@ fn convert(
     source: Source,
 ) -> Result<(PathBuf, PathBuf), String> {
     let predicted = library_parquet(builder, c, source)?;
+    // An empty library made the importer fail with "no target b/y fragment rows survived
+    // the filters", which says nothing about why. Only a footer that reads is trusted.
+    if parquet_num_rows(&predicted) == Some(0) {
+        return Err(c.empty.clone());
+    }
     for (title, args) in conversion_steps(c, &predicted) {
         if let Ok(mut s) = builder.state.lock() {
             s.step = title.into();
@@ -2557,6 +2814,7 @@ pub fn import(builder: Arc<Builder>, req: ImportRequest) -> Result<(), String> {
             decoy_args: Vec::new(),
             fasta: None,
             remap: remap.clone(),
+            empty: format!("the DIA-NN library {} holds no precursors", req.library),
         };
         let result = convert(&builder, &conversion, Source::Chosen(library));
         finish(&builder, result, |dir| {
@@ -3295,11 +3553,130 @@ mod tests {
         bad.max_pr_mz = None;
         bad.min_fr_mz = Some(-1.0);
         assert!(predict_args(&bad, &plan, Path::new("o")).is_err());
+        // The reported case: positive, but not an m/z.
+        bad.min_fr_mz = None;
+        bad.max_fr_mz = Some(1.0);
+        let e = predict_args(&bad, &plan, Path::new("o")).unwrap_err();
+        assert!(e.contains("Highest fragment m/z is 1,"), "{e}");
 
         // An old request without the fields reads as no limit.
         let old: BuildRequest =
             serde_json::from_str(r#"{"fasta": "x.fasta", "out_dir": "o"}"#).unwrap();
         assert_eq!((old.min_pr_mz, old.max_fr_mz), (None, None));
+    }
+
+    /// A build with an implausible m/z limit is refused when it is asked for, before
+    /// DIA-NN is looked for or anything starts, naming the field and its value.
+    #[test]
+    fn a_build_with_an_implausible_mz_limit_is_refused_before_it_starts() {
+        let mut r = a_request("x.fasta");
+        r.max_fr_mz = Some(1.0);
+        let builder = Arc::new(Builder::default());
+        let e = build(Arc::clone(&builder), r).unwrap_err();
+        assert!(e.contains("Highest fragment m/z is 1,"), "{e}");
+        assert_eq!(builder.snapshot().status, "", "nothing started");
+        assert!(builder.snapshot().commands.is_empty());
+    }
+
+    /// DIA-NN's "N precursors generated" is read from the log, the last one counting; a
+    /// log without it says nothing. The message for an empty build names the settings.
+    #[test]
+    fn an_empty_prediction_is_recognised_from_the_log() {
+        let log = |lines: &[&str]| lines.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            generated_precursors(&log(&[
+                "[0:00] Processing FASTA",
+                "[0:01] 0 precursors generated"
+            ])),
+            Some(0)
+        );
+        assert_eq!(
+            generated_precursors(&log(&[
+                "12 precursors generated",
+                "1,234,567 precursors generated"
+            ])),
+            Some(1_234_567)
+        );
+        assert_eq!(
+            generated_precursors(&log(&["== DIA-NN: 2.2.0", "Finished"])),
+            None
+        );
+
+        let mut r = a_request("x.fasta");
+        r.max_fr_mz = Some(1.0);
+        let m = empty_build_message(&r);
+        assert!(
+            m.starts_with("DIA-NN generated 0 precursors from the FASTA"),
+            "{m}"
+        );
+        assert!(
+            m.contains(
+                "peptide length 7 to 30, charge 2 to 4, 1 missed cleavage(s), \
+                        precursor m/z any to any, fragment m/z any to 1"
+            ),
+            "{m}"
+        );
+    }
+
+    /// The row count is read from a Parquet footer (Thrift compact `FileMetaData`, field
+    /// 3), skipping the version and the schema list before it; a footer that does not
+    /// parse gives no count rather than a wrong one.
+    #[test]
+    fn the_row_count_is_read_from_a_parquet_footer() {
+        let footer = |rows: &[u8]| {
+            let mut f = vec![0x15, 0x02]; // 1: version = 1
+            f.extend([0x19, 0x2C]); // 2: list of two structs
+            f.extend([0x48, 6]); // 4: name, binary of 6 bytes
+            f.extend(b"schema");
+            f.extend([0x15, 0x02, 0x21, 0x00]); // 5: i32, 7: bool true, end
+            f.extend([0x18, 4]); // 1: binary of 4 bytes (a field id by delta)
+            f.extend(b"Prot");
+            f.extend([0x06, 0x0E, 0x02, 0x00]); // id 7 (zigzag 14) i64, end
+            f.push(0x16); // 3: num_rows, i64
+            f.extend(rows);
+            f.extend([0x19, 0x0C]); // 4: an empty list of row groups
+            f.push(0x00);
+            f
+        };
+        assert_eq!(footer_num_rows(&footer(&[0x00])), Some(0));
+        assert_eq!(footer_num_rows(&footer(&[0xD8, 0x04])), Some(300));
+        assert_eq!(footer_num_rows(&footer(&[0x00])[..12]), None, "truncated");
+        assert_eq!(footer_num_rows(&[0x15]), None);
+        assert_eq!(footer_num_rows(&[0x00]), None);
+    }
+
+    /// A step that exits non-zero says what it was and what it last wrote: the script of a
+    /// Python helper by name, its exit code, and the tail of its output, not only
+    /// "python.exe exited with 1".
+    #[test]
+    fn a_failed_step_quotes_its_last_output() {
+        let mut t = Tail::default();
+        for line in ["one", "", "two", "three", "   ", "four", "five"] {
+            t.push(line);
+        }
+        assert_eq!(t.lines(), ["two", "three", "four", "five"]);
+
+        let args = [
+            "C:/app/scripts/import_diann_lib.py".to_string(),
+            "lib.parquet".to_string(),
+        ];
+        let tail = [
+            "C:/cache/lib.parquet: no target b/y fragment rows survived the filters".to_string(),
+        ];
+        let m = step_failure(Path::new("C:/env/python.exe"), &args, false, Some(1), &tail);
+        assert_eq!(
+            m,
+            "import_diann_lib.py (python.exe) exited with 1. Its last output:\n  \
+             C:/cache/lib.parquet: no target b/y fragment rows survived the filters"
+        );
+        let m = step_failure(
+            Path::new("/opt/diann/diann-linux"),
+            &["--lib".into()],
+            true,
+            None,
+            &[],
+        );
+        assert_eq!(m, "diann-linux exited with a signal, and wrote nothing.");
     }
 
     /// The cleavage choice reaches DIA-NN's `--cut`; a non-specific rule asks for the
@@ -3786,6 +4163,7 @@ PEPTIDEK
             decoy_args: Vec::new(),
             fasta: None,
             remap: None,
+            empty: String::new(),
         }
     }
 
