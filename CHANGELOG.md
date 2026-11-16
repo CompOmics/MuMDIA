@@ -7,6 +7,17 @@ All notable changes to MuMDIA are recorded here. The format follows
 `0.1.0` is the first tagged release of the Rust engine. The superseded
 Python implementation remains available at the tag `legacy-python-v1`.
 
+`0.14.0` is a minor release: the native timsTOF reader now converts time of flight to m/z with
+each run's own calibration model, so a diaPASEF search read from a Bruker `.d` finds and
+quantifies differently from `0.13.0`, most on instruments whose calibration departs from a
+square law. A library's peptides can be mapped to the proteins of another FASTA, and an
+empirical library can be merged with a predicted one; both helpers are opt-in, and the desktop
+application offers them. A SCIEX ZT Scan DIA search also writes its traces on quadrupole cycles
+to a table of their own, which the visDIA the desktop application installs draws, and the
+Windows installer can put the analysis components in the program folder, shared by every user.
+Searches of other data, and every table a ZT Scan search wrote before, are the same as with
+`0.13.0`.
+
 `0.13.0` is a minor release: it changes what the reports of a library search contain. A
 library imported with `scripts/import_diann_lib.py` now carries its protein accessions, entry
 names and gene names in its own precursor table, so they go wherever the library goes, and
@@ -201,17 +212,7 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
-## [Unreleased]
-
-### Fixed
-
-- **timsTOF: m/z from the run's `MzCalibration` model (docs/35_diapasef.md, "The native reader").**
-  The native diaPASEF reader converted TOF to m/z with a square law fitted to the acquisition range
-  bounds, which ignores the quadratic term and the m/z offset of Bruker's calibration. Where these are
-  not zero the error depends on m/z: -98 ppm at m/z 300 to -11 ppm at 1,200 on the 2020 timsTOF Pro
-  single-cell runs of the benchmark collection, +30 to +8 ppm on a 2021 timsTOF Pro HYE set, -31 to
-  -6 ppm on a 2022 DIA-ME set, -22 to -25 ppm on a 2024 timsTOF SCP immunopeptidomics set; 0-4 ppm
-  on Ultra and Ultra 2 files. The reader now solves the calibration model per run.
+## [0.14.0] - 2026-11-16
 
 ### Added
 
@@ -243,7 +244,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   installs it with each choice (desktop/README.md, "Where the components are installed").
 
 - **SCIEX ZT Scan DIA: the traces on Q1 cycles, written for every ZT Scan run, and a separable
-  model of each candidate's RT x step patch, opt-in (docs/37_ztscan.md, section 15).** A ZT Scan
+  model of each candidate's RT x step patch, opt-in (#318; docs/37_ztscan.md, section 15).** A ZT Scan
   chromatogram interleaves about five Q1 steps a cycle, a sawtooth when drawn. `extract.q1_traces` writes every accepted
   candidate's traces once more with one point per cycle, each fragment's covering steps
   collapsed to their least-squares amplitude under its calibrated Q1 profile at the expected
@@ -266,7 +267,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   and quantifying from its amplitudes raised the replicate CV from 0.104 to 0.165, so it is not
   part of the automatic ZT Scan analysis.
 
-- **A library's peptides can be mapped to the proteins of another FASTA (#319).**
+- **A library's peptides can be mapped to the proteins of another FASTA (#324, issue #319).**
   `scripts/remap_library.py` replaces the `protein` column of any MuMDIA library, imported or
   FASTA-built, with or without decoys, by the proteins of a FASTA that contain each peptide: I
   and L read as one residue, only at occurrences the digest can produce under a cleavage rule
@@ -280,7 +281,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   same during an import, and the desktop application's DIA-NN library conversion offers it
   ("Re-map to a FASTA…", under the Search screen's cleavage choice). Without the option nothing
   changes (docs/13, "remap_library").
-- **A spectral library and a predicted library can be searched as one (#320).**
+- **A spectral library and a predicted library can be searched as one (#325, issue #320).**
   `scripts/merge_libraries.py` merges an empirical library (such as one a DIA-NN search wrote,
   imported) with a predicted one: every predicted entry, with the empirical spectrum,
   retention time and 1/K0 where the empirical library has the entry (`--precedence`), the
@@ -298,7 +299,7 @@ than a number. Both are recorded in every run's `manifest.json`.
 ### Changed
 
 - **The desktop application pins visDIA at 0ce3224, which reads the ZT Scan cycle traces from
-  `chromatograms_q1.parquet`** (CompOmics/visDIA#16). Under `extract.q1_traces` the engine
+  `chromatograms_q1.parquet`** (#321, CompOmics/visDIA#16). Under `extract.q1_traces` the engine
   writes a ZT Scan run's traces on Q1 cycles to `chromatograms_q1.parquet` beside
   `chromatograms.parquet` (`second_pass/<run>/` for a second pass), and `chromatograms.parquet`
   keeps the per-step traces. The precursor page draws the engine's cycle values from that
@@ -307,6 +308,14 @@ than a number. Both are recorded in every run's `manifest.json`.
   collapse of the steps.
 
 ### Fixed
+
+- **timsTOF: m/z from the run's `MzCalibration` model (docs/35_diapasef.md, "The native reader"; #322).**
+  The native diaPASEF reader converted TOF to m/z with a square law fitted to the acquisition range
+  bounds, which ignores the quadratic term and the m/z offset of Bruker's calibration. Where these are
+  not zero the error depends on m/z: -98 ppm at m/z 300 to -11 ppm at 1,200 on the 2020 timsTOF Pro
+  single-cell runs of the benchmark collection, +30 to +8 ppm on a 2021 timsTOF Pro HYE set, -31 to
+  -6 ppm on a 2022 DIA-ME set, -22 to -25 ppm on a 2024 timsTOF SCP immunopeptidomics set; 0-4 ppm
+  on Ultra and Ultra 2 files. The reader now solves the calibration model per run.
 
 - **The desktop application no longer stops responding on the Setup screen (#323).** Its status
   commands ran on the thread that draws the window: the components' status starts Python up
