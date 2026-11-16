@@ -346,7 +346,7 @@ installation passes the property, then installs the components from an elevated 
 deployment tool running as SYSTEM:
 
 ```powershell
-msiexec /i MuMDIA_0.12.0_x64_en-US.msi COMPONENTS_SCOPE=machine /qn
+msiexec /i MuMDIA_0.13.0_x64_en-US.msi COMPONENTS_SCOPE=machine /qn
 $p = Start-Process "C:\Program Files\MuMDIA\mumdia-console.exe" `
        -ArgumentList "--install-components", "primary,thermo" -Wait -PassThru
 $p.ExitCode   # 0 done, 1 failed, 2 bad arguments, 3 not run as administrator
