@@ -145,6 +145,9 @@ function load() {
   const names = [
     "refreshComponents",
     "installComponents",
+    "installOnStart",
+    "renderStorage",
+    "renderManaged",
     "optionalCardView",
     "state",
     "refreshNormOptions",
@@ -199,14 +202,23 @@ function env(over = {}) {
   };
 }
 
-function status({ primary = {}, ms2pip = {}, visdia = {} } = {}) {
+function status({ primary = {}, ms2pip = {}, visdia = {}, location } = {}) {
   return {
     primary: env({ complete: true, load_check: "ok", ...primary }),
     ms2pip: env(ms2pip),
     visdia: env(visdia),
     vc_runtime: { available: false, needed: false, state: {} },
+    ...(location ? { location } : {}),
   };
 }
+
+// Where `components_status` says the components are (`scope.rs`).
+const SHARED = {
+  scope: "machine",
+  dir: "C:\\Program Files\\MuMDIA\\components",
+  needs_administrator: true,
+};
+const OWN = { scope: "user", dir: "C:\\Users\\u\\AppData\\Local\\MuMDIA", needs_administrator: false };
 
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
@@ -253,6 +265,31 @@ test("the poll follows the installation through the load check to installed", as
   assert.equal(f.api.state.visdiaReady, true);
   assert.equal(f.timers.size, 0, "the poll stops once nothing is moving");
   assert.match(f.el("install-log").textContent, /done$/);
+});
+
+test("a refresh asked for while one runs waits for it and gives one more run", async () => {
+  // The Setup tab clicked repeatedly, or a poll tick during a slow call: each used to
+  // start another components_status in the application, and the calls stacked up.
+  const f = load();
+  const pending = [];
+  f.answers.components_status = () => new Promise((resolve) => pending.push(resolve));
+  const asked = () => f.calls.filter(([n]) => n === "components_status").length;
+  const settle = () => new Promise((r) => setImmediate(r));
+  const all = [1, 2, 3, 4].map(() => f.api.refreshComponents());
+  await settle();
+  assert.equal(asked(), 1, "a second call started while the first was running");
+  pending.shift()(status());
+  await settle();
+  assert.equal(asked(), 2, "the requests made meanwhile must give exactly one more run");
+  pending.shift()(status());
+  await Promise.all(all);
+  assert.equal(asked(), 2);
+  // Once nothing runs, the next request starts at once.
+  const next = f.api.refreshComponents();
+  await settle();
+  assert.equal(asked(), 3);
+  pending.shift()(status());
+  await next;
 });
 
 test("clicking Install gives feedback before the backend answers", async () => {
@@ -340,6 +377,99 @@ test("an optional environment that cannot load is named in the banner", async ()
   await f.api.refreshComponents();
   assert.equal(f.el("setup-error").textContent, "MS2PIP: torch cannot load");
   assert.equal(f.el("ms2pip-pill").textContent, "cannot load");
+});
+
+test("components in the program folder are named, and need an administrator", async () => {
+  const f = load();
+  f.answers.components_status = () =>
+    status({ primary: { complete: false, load_check: "", missing: ["deeplc"] }, location: SHARED });
+  await f.api.refreshComponents();
+  const where = f.el("components-where");
+  assert.equal(where.hidden, false);
+  assert.match(where.textContent, /Program Files\\MuMDIA\\components/);
+  assert.match(where.textContent, /shared by every user/);
+  assert.match(where.textContent, /administrator's permission/);
+  assert.match(f.el("setup-sub").textContent, /administrator installs and updates it/);
+  // Install stays offered: it asks Windows for permission rather than failing.
+  assert.equal(f.el("install-primary").textContent, "Install");
+  assert.equal(f.el("install-primary").disabled, false);
+  assert.match(f.el("setup-error").textContent, /Only an administrator can install or update/);
+
+  // An administrator's elevated window changes them directly.
+  f.answers.components_status = () =>
+    status({
+      primary: { complete: false, load_check: "", missing: ["deeplc"] },
+      location: { ...SHARED, needs_administrator: false },
+    });
+  await f.api.refreshComponents();
+  assert.match(f.el("components-where").textContent, /runs as administrator/);
+  // The banner is hidden (its text is left as it was).
+  assert.equal(f.el("setup-error").hidden, true);
+});
+
+test("components in the user's own folder say so, and an older backend shows nothing", async () => {
+  const f = load();
+  f.answers.components_status = () => status({ location: OWN });
+  await f.api.refreshComponents();
+  assert.equal(f.el("components-where").hidden, false);
+  assert.match(f.el("components-where").textContent, /your own folder/);
+  assert.match(f.el("setup-sub").textContent, /needs no administrator rights/);
+
+  const g = load();
+  await g.api.refreshComponents();
+  assert.equal(g.el("components-where").hidden, true);
+});
+
+test("the installer's Finish button installs the required components, once and only when needed", async () => {
+  const cases = [
+    // [location, primary, whether the window opened for it, expected install]
+    [SHARED, { complete: false, load_check: "", missing: ["deeplc"] }, true, true],
+    [SHARED, { complete: false, load_check: "", outdated: ["deeplc 4.4.0 -> 4.5.0"] }, true, true],
+    [SHARED, {}, true, false],
+    [SHARED, { complete: false, load_check: "running" }, true, false],
+    [SHARED, { complete: false, install_status: "installing" }, true, false],
+    [OWN, { complete: false, load_check: "", missing: ["deeplc"] }, true, false],
+    [SHARED, { complete: false, load_check: "", missing: ["deeplc"] }, false, false],
+  ];
+  for (const [location, primary, asked, expected] of cases) {
+    const f = load();
+    f.answers.startup_request = () => ({ install_components: asked });
+    f.answers.components_status = () => status({ primary, location });
+    await f.api.installOnStart();
+    const installs = f.calls.filter(([n]) => n === "components_install");
+    assert.equal(installs.length, expected ? 1 : 0, JSON.stringify([location.scope, primary, asked]));
+    if (expected) {
+      assert.equal(JSON.stringify(installs[0]), JSON.stringify(["components_install", { env: "primary" }]));
+    }
+  }
+});
+
+test("the storage folder does not offer to move components that are shared", () => {
+  const f = load();
+  const info = {
+    folder: "D:\\data\\MuMDIA",
+    default_folder: "C:\\Users\\u\\AppData\\Local\\MuMDIA",
+    configured: true,
+    move_environments: false,
+    environments: SHARED.dir,
+    writable: true,
+    warnings: [],
+    scope: "machine",
+  };
+  f.api.renderStorage(info);
+  assert.equal(f.el("storage-move-envs").disabled, true);
+  assert.equal(f.el("storage-move-envs").checked, false);
+  assert.match(f.el("storage-envs").textContent, /program folder/);
+  f.api.renderStorage({ ...info, scope: "user", environments: info.default_folder });
+  assert.equal(f.el("storage-move-envs").disabled, false);
+  assert.match(f.el("storage-envs").textContent, /^Python environments and downloaded tools/);
+});
+
+test("the managed data paragraph names the shared components folder", () => {
+  const f = load();
+  f.api.renderManaged({ dir: OWN.dir, components_dir: SHARED.dir, scope: "machine", items: [] });
+  assert.match(f.el("managed-sub").textContent, /shared by every user/);
+  assert.match(f.el("managed-sub").textContent, /Program Files/);
 });
 
 test("the normalisation note says what quantification runs under each scope", () => {

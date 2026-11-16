@@ -215,6 +215,33 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Added
 
+- **The Windows installer can put the desktop application's analysis components in the
+  program folder, shared by every user (#323).** The administrator who runs the installer chooses,
+  on a new "Analysis components" page or with `COMPONENTS_SCOPE=user|machine` for a silent
+  installation, where the Python environments and ThermoRawFileParser go: each user's own
+  folder (`%LOCALAPPDATA%\MuMDIA`, the default and what every earlier release did) or
+  `<installation folder>\components` (`C:\Program Files\MuMDIA\components`). In the program
+  folder an administrator installs them once and every user runs them without being able to
+  change them; the installer can open MuMDIA at Finish to install the required environment at
+  once. The choice is recorded in `HKLM\Software\CompOmics\MuMDIA` (`ComponentsScope`), read
+  back by the next installation so an upgrade keeps it, and read by the application when it
+  starts. The Setup screen says which folder holds the components; there, Install, Update,
+  Reinstall and Remove run as administrator through an elevated copy of the application, and
+  Windows asks for permission (a declined prompt is explained, with the command an
+  administrator can run). `mumdia-console.exe --install-components primary,thermo` (or `all`)
+  and `--remove-components` do the same from an elevated prompt or a deployment tool, for a
+  scripted installation and after each upgrade. Changes as administrator run one at a time. An
+  installation into the program folder keeps uv's interpreter there, copies packages rather
+  than hard-linking them, compiles them and the interpreter's standard library, and resets the
+  permissions of that environment and the interpreter to the folder's, so every user can read
+  them. Libraries, settings,
+  setups, caches, temporary files, results, run logs and the DIA-NN path and licence answer
+  stay per-user in both modes. The MSI places no components and deletes none, so an upgrade
+  leaves them as they are and an uninstall leaves them in place; the Managed data card removes
+  them. The user scope is unchanged, and so are the engine, its outputs and configuration
+  hashes. `ci/check_msi_scope.ps1` checks the package's tables, and the Windows CI job
+  installs it with each choice (desktop/README.md, "Where the components are installed").
+
 - **SCIEX ZT Scan DIA: the traces on Q1 cycles, written for every ZT Scan run, and a separable
   model of each candidate's RT x step patch, opt-in (docs/37_ztscan.md, section 15).** A ZT Scan
   chromatogram interleaves about five Q1 steps a cycle, a sawtooth when drawn. `extract.q1_traces` writes every accepted
@@ -248,6 +275,18 @@ than a number. Both are recorded in every run's `manifest.json`.
   table, with the per-step samples behind them on request and each fragment's `q1_class`. A
   candidate the table does not hold, and every run without it, keeps the viewer's own
   collapse of the steps.
+
+### Fixed
+
+- **The desktop application no longer stops responding on the Setup screen (#323).** Its status
+  commands ran on the thread that draws the window: the components' status starts Python up
+  to nine times, the managed-data card walks every file of the environments, and the Thermo
+  and DIA-NN checks run those programs. The screen polls the first every 900 ms while
+  anything installs or is tested, and a new call started before the last had finished, so
+  calls piled up and Windows reported the window as not responding, for minutes after three
+  environments had been installed; clicking between tabs quickly did the same. These four
+  commands now run off that thread, and the screen runs each refresh one at a time: a
+  request made while one runs gives one more run after it.
 
 ## [0.13.0] - 2026-11-12
 

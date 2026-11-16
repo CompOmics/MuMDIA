@@ -28,11 +28,12 @@
   <!-- ─────────────────────────────── Setup ──────────────────────────────── -->
   <section class="screen on" id="screen-setup">
     <h1>Analysis components</h1>
-    <p class="sub">
+    <p class="sub" id="setup-sub">
       MuMDIA needs a small Python environment for retention-time modelling and
       rescoring. It is installed once, into your user folder, and needs no
       administrator rights.
     </p>
+    <p class="hint" id="components-where" hidden></p>
 
     <div id="setup-error" class="banner bad" hidden></div>
 
@@ -222,7 +223,7 @@
     </div>
 
     <h1 class="section-h">Managed data</h1>
-    <p class="sub">
+    <p class="sub" id="managed-sub">
       Everything MuMDIA downloads or builds lives in the storage folder above, and the
       Python environments and downloaded tools in its default folder unless you moved
       them too. Uninstalling MuMDIA does not remove any of it: the installer only removes
