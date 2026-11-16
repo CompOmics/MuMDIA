@@ -531,6 +531,19 @@
             <div class="picked" id="p-diann-lib-out">No folder selected</div>
             <button class="btn quiet" data-pick="diann_lib_out">Output folder…</button>
           </div>
+          <div class="picker">
+            <div class="picked" id="p-diann-remap">No FASTA: the library's own proteins are kept</div>
+            <button class="btn quiet" data-pick="diann_remap_fasta">Re-map to a FASTA…</button>
+            <button class="btn quiet" id="diann-remap-clear" hidden>Clear</button>
+          </div>
+          <p class="hint">
+            Optional. With a FASTA, every peptide is mapped to the proteins of that FASTA
+            instead of the ones the library names, so a library predicted from one database
+            can be searched against another (contaminants or entrapment proteins added, a
+            newer release). An occurrence counts when the Cleavage choice on the Search
+            screen can produce it; I and L are read as one residue. Peptides the FASTA does
+            not contain are removed with their decoys, and the log says how many.
+          </p>
           <div class="actions">
             <button class="btn" id="diann-import">Convert the library</button>
             <span class="hint inline" id="diann-import-note"></span>
@@ -543,8 +556,8 @@
             DIA-NN 2.x with its licence acknowledged on the Setup screen: decoys that copy
             their targets' intensities make the reported FDR optimistic, so there is no
             conversion without it. No FASTA is needed, because the proteins come from the
-            library. Use an empty output folder; the two tables are selected for the search
-            when the conversion finishes.
+            library unless a FASTA to re-map to is chosen. Use an empty output folder; the
+            two tables are selected for the search when the conversion finishes.
           </p>
         </div>
       </div>

@@ -1835,6 +1835,7 @@ pub fn build(builder: Arc<Builder>, req: BuildRequest) -> Result<(), String> {
             keep_unimod: build_keep_unimod(&plan),
             decoy_args: req.decoy_diann_args(),
             fasta: Some(PathBuf::from(&req.fasta)),
+            remap: None,
         };
         let result = convert(&builder, &conversion, Source::Predicted(stem));
         // The marker last, after both tables are on disk. Anything that dies before
@@ -1913,6 +1914,9 @@ struct Conversion {
     /// the DIA-NN library leaves without an accession, entry name or gene; `None` for an
     /// import, whose library names its proteins itself.
     fasta: Option<PathBuf>,
+    /// An import's re-mapping to another FASTA (`--remap-fasta`), which then names every
+    /// protein and its annotations; `None` keeps the library's proteins.
+    remap: Option<Remap>,
 }
 
 /// A DIA-NN library a user chose, by the format it is in.
@@ -2085,7 +2089,14 @@ fn conversion_steps(c: &Conversion, predicted: &Path) -> Vec<(&'static str, Vec<
                 tgt_frag.display().to_string(),
             ];
             a.extend(keep.iter().cloned());
-            if let Some(fasta) = &c.fasta {
+            if let Some(r) = &c.remap {
+                a.extend([
+                    "--remap-fasta".to_string(),
+                    r.fasta.display().to_string(),
+                    "--remap-cleavage-rule".to_string(),
+                    r.rule.clone(),
+                ]);
+            } else if let Some(fasta) = &c.fasta {
                 a.extend(["--fasta".to_string(), fasta.display().to_string()]);
             }
             a
@@ -2185,6 +2196,46 @@ pub struct ImportRequest {
     pub out_dir: String,
     #[serde(default = "d_threads")]
     pub threads: u32,
+    /// A FASTA to map the library's peptides to instead of keeping the proteins the library
+    /// names (#319, `import_diann_lib.py --remap-fasta`); empty or absent keeps them.
+    #[serde(default)]
+    pub remap_fasta: Option<String>,
+    /// The cleavage preset the re-mapping holds an occurrence to (`enzymes.json`), Trypsin/P
+    /// when absent.
+    #[serde(default)]
+    pub remap_enzyme: Option<String>,
+    /// The rule of `remap_enzyme = "custom"`.
+    #[serde(default)]
+    pub remap_cleavage_rule: Option<String>,
+}
+
+/// The FASTA an import re-maps its peptides to, with the cleavage rule (rule text) an
+/// occurrence must satisfy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Remap {
+    fasta: PathBuf,
+    rule: String,
+}
+
+impl ImportRequest {
+    /// The re-mapping this request asks for, checked: `None` without a FASTA.
+    fn remap(&self) -> Result<Option<Remap>, String> {
+        let Some(fasta) = self
+            .remap_fasta
+            .as_deref()
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+        else {
+            return Ok(None);
+        };
+        let path = PathBuf::from(fasta);
+        if !path.is_file() {
+            return Err(format!("the FASTA to re-map to, {fasta}, is not a file"));
+        }
+        let enzyme = self.remap_enzyme.as_deref().unwrap_or("trypsin_p");
+        let rule = crate::enzymes::resolve(enzyme, self.remap_cleavage_rule.as_deref())?;
+        Ok(Some(Remap { fasta: path, rule }))
+    }
 }
 
 /// The columns `import_diann_lib.py` requires of a DIA-NN library (its `_META_COLS` and
@@ -2418,14 +2469,24 @@ fn catalogue_unimod_ids() -> Vec<u32> {
 }
 
 /// The completion marker of an imported library, with where it came from.
-fn mark_import_complete(dir: &Path, library: &str, version: &str, kept: &[u32]) {
-    let body = serde_json::json!({
+fn mark_import_complete(
+    dir: &Path,
+    library: &str,
+    version: &str,
+    kept: &[u32],
+    remap: Option<&Remap>,
+) {
+    let mut body = serde_json::json!({
         "source": "diann-import",
         "diann_library": library,
         "diann_version": version,
         "recipe_version": RECIPE_VERSION,
         "keep_unimod": kept,
     });
+    if let Some(r) = remap {
+        body["remap_fasta"] = serde_json::json!(r.fasta.display().to_string());
+        body["remap_cleavage_rule"] = serde_json::json!(r.rule);
+    }
     if let Ok(text) = serde_json::to_string_pretty(&body) {
         let _ = std::fs::write(dir.join(CACHE_MARKER), text);
     }
@@ -2440,6 +2501,7 @@ fn mark_import_complete(dir: &Path, library: &str, version: &str, kept: &[u32]) 
 pub fn import(builder: Arc<Builder>, req: ImportRequest) -> Result<(), String> {
     // The file first: the check is immediate and says what is wrong with the choice.
     let library = inspect_library(Path::new(&req.library))?;
+    let remap = req.remap()?;
     let status = detect();
     let exe = import_refusal(&status, &library)?;
     let (python, scripts) = conversion_tools()?;
@@ -2457,6 +2519,13 @@ pub fn import(builder: Arc<Builder>, req: ImportRequest) -> Result<(), String> {
         let version = status.version.clone().unwrap_or_default();
         builder.log(format!("== DIA-NN: {version}"));
         builder.log(format!("== importing {}", req.library));
+        if let Some(r) = &remap {
+            builder.log(format!(
+                "== re-mapping the peptides to {} (cleavage rule {})",
+                r.fasta.display(),
+                r.rule
+            ));
+        }
         let kept = catalogue_unimod_ids();
         let conversion = Conversion {
             exe,
@@ -2467,10 +2536,11 @@ pub fn import(builder: Arc<Builder>, req: ImportRequest) -> Result<(), String> {
             keep_unimod: Some(kept.clone()),
             decoy_args: Vec::new(),
             fasta: None,
+            remap: remap.clone(),
         };
         let result = convert(&builder, &conversion, Source::Chosen(library));
         finish(&builder, result, |dir| {
-            mark_import_complete(dir, &req.library, &version, &kept)
+            mark_import_complete(dir, &req.library, &version, &kept, remap.as_ref())
         });
     });
 
@@ -3492,6 +3562,7 @@ PEPTIDEK
             keep_unimod,
             decoy_args: Vec::new(),
             fasta: None,
+            remap: None,
         }
     }
 
@@ -3649,6 +3720,56 @@ PEPTIDEK
         assert_eq!(with[0].1[..n], without[0].1[..]);
         assert_eq!(with[0].1[n..], ["--fasta", "/data/proteome.fasta"]);
         assert_eq!(with[1..], without[1..]);
+    }
+
+    /// An import that re-maps to a FASTA hands the importer that FASTA and the cleavage rule;
+    /// nothing else in the steps changes, and the decoys follow the remapped targets.
+    #[test]
+    fn an_import_can_re_map_its_peptides_to_a_fasta() {
+        let plain = a_conversion(None);
+        let mut c = a_conversion(None);
+        c.remap = Some(Remap {
+            fasta: PathBuf::from("/data/new.fasta"),
+            rule: "K*,R*".into(),
+        });
+        let (with, without) = (
+            conversion_steps(&c, Path::new("/in/lib.parquet")),
+            conversion_steps(&plain, Path::new("/in/lib.parquet")),
+        );
+        let n = without[0].1.len();
+        assert_eq!(with[0].1[..n], without[0].1[..]);
+        assert_eq!(
+            with[0].1[n..],
+            [
+                "--remap-fasta",
+                "/data/new.fasta",
+                "--remap-cleavage-rule",
+                "K*,R*"
+            ]
+        );
+        assert_eq!(with[1..], without[1..]);
+    }
+
+    #[test]
+    fn an_import_request_checks_its_re_mapping() {
+        let mut req: ImportRequest =
+            serde_json::from_str(r#"{"library": "a.parquet", "out_dir": "o"}"#).unwrap();
+        assert_eq!(req.remap().unwrap(), None);
+        req.remap_fasta = Some("  ".into());
+        assert_eq!(req.remap().unwrap(), None);
+        req.remap_fasta = Some("/no/such/proteins.fasta".into());
+        assert!(req.remap().unwrap_err().contains("not a file"));
+        let dir = std::env::temp_dir().join(format!("mumdia-diann-remap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("p.fasta");
+        std::fs::write(&fa, b">P\nPEPTIDEK\n").unwrap();
+        req.remap_fasta = Some(fa.display().to_string());
+        assert_eq!(req.remap().unwrap().unwrap().rule, "K*,R*");
+        req.remap_enzyme = Some("custom".into());
+        assert!(req.remap().is_err());
+        req.remap_cleavage_rule = Some("K*,!*P".into());
+        assert_eq!(req.remap().unwrap().unwrap().rule, "K*,!*P");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3932,6 +4053,9 @@ PEPTIDEK
                 library: tsv.display().to_string(),
                 out_dir: dir.join("out").display().to_string(),
                 threads: 1,
+                remap_fasta: None,
+                remap_enzyme: None,
+                remap_cleavage_rule: None,
             },
         )
         .unwrap_err();

@@ -678,10 +678,21 @@ accession of the modification catalogue (`mods.rs`, the engine's `modifications.
 each modification the engine can name is kept, and only precursors carrying one outside the
 catalogue are dropped, which the importer reports.
 
-**No FASTA is asked for.** The importer takes the protein identifiers from the library's
+**No FASTA is needed.** The importer takes the protein identifiers from the library's
 own `Protein.Names` / `Protein.Ids` columns, and the decoys are reversed target sequences,
 so neither the import nor the decoy prediction reads a FASTA. A library whose protein
 columns are empty is grouped as `UNASSIGNED` by the engine, as for any imported library.
+
+**Re-mapping to a FASTA (optional, #319).** "Re-map to a FASTA…" maps every peptide of the
+library to the proteins of the chosen FASTA instead (`import_diann_lib.py --remap-fasta`,
+the rules of `scripts/remap_library.py`, docs/13): a library predicted from one database is
+then searched against another, such as the same proteome with contaminants or entrapment
+proteins added, or a newer release. An occurrence counts when the Cleavage choice of the
+Search screen can produce it (`--remap-cleavage-rule`, the rule text of that preset or the
+custom rule); I and L are one residue. Peptides the FASTA does not contain are removed with
+their decoys, the protein annotations come from the FASTA's headers, and the log and
+`mumdia-library-complete.json` (`remap_fasta`, `remap_cleavage_rule`) record it. Clear
+returns to the library's own proteins.
 
 The output folder is the user's, not the content-addressed library cache: the input is a
 file the user already has, and converting it again is a choice, not a cache miss. The DIA-NN

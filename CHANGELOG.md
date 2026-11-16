@@ -255,6 +255,21 @@ than a number. Both are recorded in every run's `manifest.json`.
   (+0.34% human precursors at a matched entrapment FDP, -0.17% precursors on the human library)
   and quantifying from its amplitudes raised the replicate CV from 0.104 to 0.165, so it is not
   part of the automatic ZT Scan analysis.
+
+- **A library's peptides can be mapped to the proteins of another FASTA (#319).**
+  `scripts/remap_library.py` replaces the `protein` column of any MuMDIA library, imported or
+  FASTA-built, with or without decoys, by the proteins of a FASTA that contain each peptide: I
+  and L read as one residue, only at occurrences the digest can produce under a cleavage rule
+  (`--enzyme`, default `trypsin_p`, or `--cleavage-rule`; `any` for a non-specific library),
+  N-terminal methionine excision and protein N-terminal groups (`[Acetyl]-`) as the digest
+  treats them, the proteins `;`-joined in FASTA order. Decoys take their target's proteins;
+  peptides the FASTA lacks are dropped with their decoys (`--unmapped keep` writes
+  `UNASSIGNED`), and the protein annotations come from the FASTA's headers. A library predicted
+  from one database is so searched against another, such as the proteome with contaminants or
+  entrapment proteins added or a newer release. `import_diann_lib.py --remap-fasta` does the
+  same during an import, and the desktop application's DIA-NN library conversion offers it
+  ("Re-map to a FASTA…", under the Search screen's cleavage choice). Without the option nothing
+  changes (docs/13, "remap_library").
 ### Changed
 
 - **The desktop application pins visDIA at 0ce3224, which reads the ZT Scan cycle traces from
