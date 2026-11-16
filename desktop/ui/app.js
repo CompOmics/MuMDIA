@@ -47,6 +47,8 @@ const state = {
     lib_fasta: "", lib_out: "",
     // A DIA-NN library to convert into the two tables, and the folder they go in.
     diann_lib: "", diann_lib_out: "",
+    // An optional FASTA the converted library's peptides are re-mapped to (#319).
+    diann_remap_fasta: "",
     // The condition of each spectra file of an experiment, by path
     // (`quant.normalisation_scope = condition`, `run-experiment --condition`).
     conditions: {},
@@ -335,6 +337,7 @@ async function init() {
     r.addEventListener("change", () => selectLibIn(r.value));
   }
   $("diann-import").addEventListener("click", importDiannLibrary);
+  $("diann-remap-clear").addEventListener("click", clearRemapFasta);
   // The built-in path's predictors depend on the preset as well as on the files.
   $("preset").addEventListener("change", scheduleBuiltinPlan);
   for (const b of document.querySelectorAll("[data-pick]")) {
@@ -2780,6 +2783,7 @@ const FILTERS = {
   lib_fasta: [{ name: "FASTA", extensions: ["fasta", "fa", "fas"] }],
   // Parquet (DIA-NN 1.9 and 2.x) or DIA-NN's binary .speclib; a .tsv is not accepted.
   diann_lib: [{ name: "DIA-NN library", extensions: ["parquet", "speclib"] }],
+  diann_remap_fasta: [{ name: "FASTA", extensions: ["fasta", "fa", "fas"] }],
 };
 const LABEL = {
   mzml: "p-mzml",
@@ -2792,6 +2796,7 @@ const LABEL = {
   lib_out: "p-lib-out",
   diann_lib: "p-diann-lib",
   diann_lib_out: "p-diann-lib-out",
+  diann_remap_fasta: "p-diann-remap",
 };
 // Pickers that choose a folder rather than a file.
 // `mzml_dir` is here because Bruker/Agilent `.d` and Waters `.raw` are
@@ -3388,7 +3393,9 @@ async function pick(what) {
   state.picks[what] = path;
   if (what === "fasta") refreshLibSrcNote();
   if (what === "fasta" || what === "lib_precursors") scheduleSpace();
-  if (what === "diann_lib" || what === "diann_lib_out") banner($("diann-import-error"), "");
+  if (what === "diann_lib" || what === "diann_lib_out" || what === "diann_remap_fasta")
+    banner($("diann-import-error"), "");
+  if (what === "diann_remap_fasta") show($("diann-remap-clear"), true);
   const el = $(LABEL[what]);
   // Shown right-to-left so the filename stays visible on a long path; the full
   // path is the tooltip.
@@ -4433,6 +4440,16 @@ async function refreshImportNote() {
   }
 }
 
+// The re-mapping FASTA is optional; Clear returns to the library's own proteins.
+function clearRemapFasta() {
+  state.picks.diann_remap_fasta = "";
+  const el = $("p-diann-remap");
+  el.textContent = "No FASTA: the library's own proteins are kept";
+  el.title = "";
+  el.classList.remove("set");
+  show($("diann-remap-clear"), false);
+}
+
 async function importDiannLibrary() {
   const err = $("diann-import-error");
   banner(err, "");
@@ -4447,6 +4464,12 @@ async function importDiannLibrary() {
   const threads = parseInt($("d-threads").value, 10);
   const req = { library, out_dir: outDir };
   if (Number.isFinite(threads) && threads > 0) req.threads = threads;
+  if (state.picks.diann_remap_fasta) {
+    // The re-mapping holds an occurrence to the Search screen's cleavage choice.
+    req.remap_fasta = state.picks.diann_remap_fasta;
+    req.remap_enzyme = $("d-enzyme").value || "trypsin_p";
+    if (req.remap_enzyme === "custom") req.remap_cleavage_rule = $("d-rule").value || "";
+  }
   try {
     // Refuses at once, with the reason, for a file that is not a DIA-NN library and
     // without a DIA-NN 2.x whose licence is acknowledged.

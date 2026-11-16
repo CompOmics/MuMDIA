@@ -45,8 +45,23 @@ at least one precursor carries a finite, positive value. Missing, non-finite and
 non-positive values are null. A library without such a value, such as one predicted for an
 instrument without ion mobility, gets no column and is the version-1 table.
 
+Re-mapping to another FASTA: `--remap-fasta <path>` maps every imported peptide to the
+proteins of that FASTA instead of keeping the library's own protein column (#319), with
+`remap_library.py`'s rules (substring up to I/L, protein N-terminal groups only at a protein
+start, specific to a cleavage rule, `;`-joined header words in FASTA order) and its
+annotations from that FASTA's headers; `--remap-enzyme` names the rule (a preset of
+`digest.enzyme`, default `trypsin_p`, or `any` for every occurrence) and
+`--remap-cleavage-rule K*,R*,!*P` gives a residue-pair rule instead.
+A library predicted from one FASTA can so be searched against another (contaminants or
+entrapment proteins added, a newer release). `--remap-unmapped drop|keep` (default `drop`)
+removes the peptides the FASTA does not contain, or keeps them as UNASSIGNED; the counts are
+printed. It replaces `--fasta`, and the two are refused together. `remap_library.py` does the
+same on any MuMDIA library, decoys included.
+
 Usage: python import_diann_lib.py <diann_lib.parquet> <out_precursors.parquet> <out_fragments.parquet>
               [--charge-by-basic-residues] [--keep-unimod <id,id,...>] [--fasta <proteins.fasta>]
+              [--remap-fasta <proteins.fasta> [--remap-unmapped drop|keep]
+               [--remap-enzyme trypsin_p|...|any | --remap-cleavage-rule <rule>]]
               [--annotations <out_annotations.parquet> | --no-annotations]
 
 The library is read one parquet row group at a time, twice: a first pass collects the
@@ -73,7 +88,8 @@ import pyarrow.parquet as pq
 # The engine rejects `large_string` parquet columns ("column 'peptidoform' is not
 # utf8"), and `to_parquet` picks the width itself: pandas 3.x chooses the large
 # variant, so this helper silently emitted libraries the engine would not load.
-from _lib_io import (annotate_precursors, annotations_path, complete_from_fasta,
+from _lib_io import (annotate_precursors, annotation_table_from_precursors,
+                    annotations_path, complete_from_fasta,
                     fasta_annotations, fasta_index, join_unique, narrow_table,
                     sort_fragments_by_candidate, uniprot_fields, write_engine_parquet,
                     write_protein_annotations)
@@ -340,21 +356,38 @@ def main():
     args = sys.argv[1:]
     charge_by_basic = "--charge-by-basic-residues" in args
     no_annotations = "--no-annotations" in args
-    out_annotations = None
-    fasta = None
-    for flag in ("--annotations", "--fasta"):
+    values = {}
+    for flag in ("--annotations", "--fasta", "--remap-fasta", "--remap-unmapped",
+                 "--remap-enzyme", "--remap-cleavage-rule"):
         if flag in args:
             i = args.index(flag)
             if i + 1 >= len(args):
-                raise SystemExit(f"{flag} needs a path")
-            if flag == "--annotations":
-                out_annotations = args[i + 1]
-            else:
-                fasta = args[i + 1]
+                raise SystemExit(f"{flag} needs a value")
+            values[flag] = args[i + 1]
             del args[i:i + 2]
-    if no_annotations and (out_annotations or fasta):
+    out_annotations = values.get("--annotations")
+    fasta = values.get("--fasta")
+    remap_fasta = values.get("--remap-fasta")
+    remap_unmapped = values.get("--remap-unmapped", "drop")
+    if no_annotations and (out_annotations or fasta or remap_fasta):
         raise SystemExit("--no-annotations writes no annotations; it cannot be combined with "
-                         "--annotations or --fasta")
+                         "--annotations, --fasta or --remap-fasta")
+    if remap_fasta is not None and fasta is not None:
+        raise SystemExit("--remap-fasta names the proteins and their annotations from its FASTA; "
+                         "it cannot be combined with --fasta")
+    if remap_unmapped not in ("drop", "keep"):
+        raise SystemExit(f"--remap-unmapped must be drop or keep, not {remap_unmapped!r}")
+    for flag in ("--remap-unmapped", "--remap-enzyme", "--remap-cleavage-rule"):
+        if flag in values and remap_fasta is None:
+            raise SystemExit(f"{flag} needs --remap-fasta")
+    remap_rule = None
+    if remap_fasta is not None:
+        # Refused here rather than after an import of hours.
+        from remap_library import cleavage_rule
+        remap_rule = cleavage_rule(values.get("--remap-enzyme", "trypsin_p"),
+                                   values.get("--remap-cleavage-rule"))
+    if remap_fasta is not None and not os.path.isfile(remap_fasta):
+        raise SystemExit(f"--remap-fasta {remap_fasta}: no such file")
     if "--keep-unimod" in args:
         i = args.index("--keep-unimod")
         if i + 1 >= len(args):
@@ -592,6 +625,20 @@ def main():
     sort_fragments_by_candidate(outf)
     if n_written != n_frag_total:
         raise RuntimeError(f"fragment rows: pass 1 counted {n_frag_total}, pass 2 wrote {n_written}")
+
+    if remap_fasta is not None:
+        # The library's own proteins are replaced by the FASTA's (#319). The decoys are added
+        # afterwards and copy their target's protein, so only the targets are mapped here.
+        from remap_library import remap_files
+        summary = remap_files(outp, outf, outp, outf, remap_fasta, unmapped=remap_unmapped,
+                              rule=remap_rule)
+        prec = pd.read_parquet(outp, columns=["protein"])
+        n_written = summary["fragments_out"]
+        if out_annotations is not None:
+            n_ann = write_protein_annotations(
+                annotation_table_from_precursors(pd.read_parquet(outp)), out_annotations)
+            print(f"protein annotations: the side table at {out_annotations} rewritten for the "
+                  f"remapped proteins ({n_ann} entr(ies))")
 
     n_hum = prec.protein.str.contains("_HUMAN").sum()
     n_yea = prec.protein.str.contains("_YEAS").sum()

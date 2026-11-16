@@ -19,16 +19,17 @@ only the rescore sidecars fall back to a native rescorer, and only when
 strict gate, so a crashed MS2PIP, AlphaPeptDeep, DeepLC, IM2Deep, or DeepLC fine-tune aborts the
 whole run. The matrix in **Failure behavior** below is authoritative.
 
-The 20 scripts split into six groups. Nine are launched by the engine:
+The 21 scripts split into six groups. Nine are launched by the engine:
 **predictors** (`ms2pip_worker`, `peptdeep_worker`, `deeplc_worker`, `deeplc_finetune`,
 `im2deep_worker`) feed the run-independent library; **rescorers** (`mokapot_worker`,
 `nn_rescore_worker`, `entrapment_worker`) score the competed PSMs in Stage F; **MBR**
-(`mbr_worker`) transfers identifications across runs (Stage D3). Eleven are run by hand:
+(`mbr_worker`) transfers identifications across runs (Stage D3). Twelve are run by hand:
 the **DIA-NN recipe** (`import_diann_lib`, `make_reverse_decoys`, `predict_decoys`,
-`make_shift_decoys`, `augment_library`) is an offline, one-time toolchain that builds
-MuMDIA's target+decoy library schema from a user-produced DIA-NN library, with
+`make_shift_decoys`, `augment_library`, `remap_library`) is an offline, one-time toolchain
+that builds MuMDIA's target+decoy library schema from a user-produced DIA-NN library, with
 `augment_library` filling an imported library with the tryptic FASTA peptides it is
-missing (a completeness fix) before decoy generation; the **library-scale recipes**
+missing (a completeness fix) before decoy generation, and `remap_library` mapping any
+library's peptides to the proteins of another FASTA; the **library-scale recipes**
 (`sort_fragments`, `mz_range_survivors`, `assemble_survivors`, `shard_parquet`,
 `mh_shard_predict`) reshape very large tables (docs/32); the **post-run tool**
 (`prune_outputs`) reduces a finished output directory to a retention tier (docs/01, "Output
@@ -101,6 +102,7 @@ For the mapping from each conda environment to the config field that points at i
 | `scripts/predict_decoys.py` | Recipe (default since 2026-10-09): replace the reverse decoys' copied intensities with DIA-NN's prediction for their sequences |
 | `scripts/make_shift_decoys.py` | Recipe: fragment-shift (CH2) decoys, DIA-NN-style terminal shift |
 | `scripts/augment_library.py` | Recipe: augment an imported library with its missing tryptic FASTA peptides, then hand off to a decoy builder |
+| `scripts/remap_library.py` | Recipe: map a library's peptides to the proteins of another FASTA (I/L-aware, cleavage-specific, Met excision and protein N-terminal groups as the digest), decoys following their targets; drops or keeps as `UNASSIGNED` what the FASTA lacks (#319) |
 | `scripts/sort_fragments.py` | Recipe: rewrite a fragment table in `candidate_id` order (streaming bucket sort, in place); the writers above do this themselves since the range load, this is for tables written before |
 | `scripts/mz_range_survivors.py` | Recipe: candidate ids inside the run's isolation range, as a prescan-style survivors table (docs/32) |
 | `scripts/assemble_survivors.py` | Recipe: survivors table -> renumbered library, target/decoy pair kept together on `peptidoform_id`, fragments streamed (docs/21, docs/32) |
@@ -254,7 +256,10 @@ code.
   Optional flags, after the three positional arguments: `--fasta <path>` fills what the
   library leaves empty from the FASTA headers; `--annotations <path>` also writes them as a
   side table there; `--no-annotations` writes no columns, which is how `predict_decoys.py`
-  imports DIA-NN's prediction of the decoys. The decoy builders (`make_reverse_decoys.py`,
+  imports DIA-NN's prediction of the decoys. `--remap-fasta <path>` replaces the library's
+  proteins with those of that FASTA (`remap_library`'s rules, below), with
+  `--remap-unmapped drop|keep` and `--remap-enzyme <preset>` / `--remap-cleavage-rule
+  <rule>`; it names the annotations from that FASTA and is refused with `--fasta`. The decoy builders (`make_reverse_decoys.py`,
   `make_shift_decoys.py`, `predict_decoys.py`) and `augment_library.py` keep the columns,
   each decoy carrying its target's values, and write them from the side table beside an
   input library imported before the columns existed (`_lib_io.embed_annotations`). A
@@ -305,6 +310,36 @@ binary and to a decoy builder)
 - FLAGS: `--config` (default None), `--match-level {base_sequence(default),
   peptidoform_charge}`, `--decoy-strategy {shift(default),reverse}`
   (`augment_library.py:67-91`).
+
+**remap_library** (offline; no Rust caller; `import_diann_lib.py --remap-fasta` and the
+desktop import call its `remap_files`)
+- IN `<in_prec> <in_frag>`, any MuMDIA library (imported or FASTA-built, targets only or
+  with decoys), and `--fasta`. OUT `<out_prec> <out_frag>` (may be the input), the same
+  schema: only `protein` and the three annotation columns change, rows are only removed, so
+  the `precursor_mz` order holds and `candidate_id` is renumbered to `0..N`; the fragment
+  table is streamed by row group with its ids renumbered alike. `cardinality` is left as
+  computed for the input.
+- Mapping: a target maps to every FASTA protein containing its stripped sequence, I and L
+  read as one residue, at an occurrence the digest can produce: starting at a protein start
+  or a cut of the cleavage rule and ending at the protein end or a cut, at any number of
+  missed cleavages. The rule is `--enzyme <preset of enzymes.json>` (default `trypsin_p`) or
+  `--cleavage-rule <pairs>`; `any` / `non_specific` counts every occurrence. A protein start
+  is position 0, or position 1 after an initiator `M` (`--no-met-excision` turns that off);
+  a protein N-terminal group (`--protein-n-term-mods`, default `Acetyl`) maps only to the
+  proteins it starts. The protein string is the matched headers' first words in FASTA order
+  (as `mumdia digest`), or their accession or entry-name field (`--protein-key`).
+- Plain substring matching is not the default because short peptides then match proteins
+  they are no digestion product of: the 0.85M-precursor E. coli AIF library mapped to a
+  human, yeast and E. coli FASTA touched 28,950 proteins as substrings and 16,854 under
+  Trypsin/P (all its precursors mapped either way). The script warns when fewer than half
+  of the targets map, the sign of a library of another enzyme.
+- Unmapped targets: `--unmapped drop` (default) removes them with their decoys; `keep`
+  writes `UNASSIGNED`. Decoys take `DECOY_` plus their target's new protein, paired on
+  `(peptidoform_id, charge)` (the reverse/shift/predicted decoys) or else on
+  `base_peptide_id` (the digest's decoys); a decoy without a kept target is dropped.
+- Annotations come from the FASTA headers (`_lib_io.fasta_annotations`); a side table beside
+  the output that is not the input's is removed. `--summary <json>` writes the counts. A
+  0.85M-target library against a 31,470-protein FASTA takes about 30 s.
 
 ## How it works
 
