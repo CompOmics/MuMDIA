@@ -206,7 +206,7 @@ than a number. Both are recorded in every run's `manifest.json`.
 ### Added
 
 - **The Windows installer can put the desktop application's analysis components in the
-  program folder, shared by every user.** The administrator who runs the installer chooses,
+  program folder, shared by every user (#323).** The administrator who runs the installer chooses,
   on a new "Analysis components" page or with `COMPONENTS_SCOPE=user|machine` for a silent
   installation, where the Python environments and ThermoRawFileParser go: each user's own
   folder (`%LOCALAPPDATA%\MuMDIA`, the default and what every earlier release did) or
@@ -268,7 +268,7 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
-- **The desktop application no longer stops responding on the Setup screen.** Its status
+- **The desktop application no longer stops responding on the Setup screen (#323).** Its status
   commands ran on the thread that draws the window: the components' status starts Python up
   to nine times, the managed-data card walks every file of the environments, and the Thermo
   and DIA-NN checks run those programs. The screen polls the first every 900 ms while
