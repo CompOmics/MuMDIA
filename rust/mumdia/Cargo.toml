@@ -91,6 +91,9 @@ rusqlite = { version = "0.41", default-features = false }
 # MuMDIA can take requires libsqlite3-sys >= 0.39.
 [patch.crates-io]
 timsrust = { path = "vendor/timsrust" }
+# The optional Thermo reader's nethost-sys 0.7.3 requires vulnerable zip 6.
+# This manifest-only patch raises zip to >= 9.0.5; remove it when upstream does so.
+nethost-sys = { path = "vendor/nethost-sys" }
 
 [profile.release]
 opt-level = 3

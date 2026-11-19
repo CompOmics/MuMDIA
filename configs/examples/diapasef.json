@@ -16,6 +16,7 @@
   "extract": {
     "apex_rt_prior_s": 120.0,
     "gate_min_score": 0.6,
+    "presence_min_coelution": 1,
     "im_gate": "fragments",
     "retain_top_peaks": 5
   },
