@@ -281,8 +281,9 @@ _`mumdia`:_
   (the bit-identity guard for the new options being off); an empty chromatogram
   table preserves every identification instead of dropping it; and predicted
   selection without that column is a clear error rather than a wrong number.
-- `compete.rs`: `winner_take_all` keeps only the winner; `none`/`features_only`
-  keep all; `margin_gated` keeps close losers and removes distant ones;
+- `compete.rs`: `winner_take_all` keeps only the winner; `none` keeps all and
+  reads the retired `features_only`; `margin_gated` keeps close losers and removes
+  distant ones;
   `unique_evidence` keeps losers with enough unique evidence and falls back to
   winner-take-all without evidence data; `unique_evidence` prefers the Extended
   `peak_contested` fraction when it is present; winner-take-all is deterministic

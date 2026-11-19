@@ -1438,7 +1438,6 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 features: &feats,
                 out: &competed,
                 cfg: &cfg.compete,
-                config_hash: ch,
                 features_hash: Some(&features_written.content_hash),
             })?;
             if keep_records {

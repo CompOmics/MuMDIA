@@ -8706,7 +8706,6 @@ mod tests {
                 features,
                 out,
                 cfg: c,
-                config_hash: "test",
                 features_hash: None,
             })
             .unwrap();

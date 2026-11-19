@@ -41,7 +41,7 @@ use mumdia_io::report::{ArtifactReport, Written};
 use mumdia_io::table::{write_table, BatchWriter, Col, TableFile, WriteOptions};
 use rayon::prelude::*;
 use serde_json::json;
-use timsrust::{Frame, MSLevel};
+use timsrust::MSLevel;
 use tracing::{info, warn};
 
 use crate::chromatograms::{self, Layout, Optional, Rows};
@@ -49,7 +49,7 @@ use crate::masscal::{read_mass_cal, MassOffset};
 use crate::sched::DecoderLease;
 use crate::stages::convert::ms1_denoise::Ms1Denoise;
 use crate::stages::convert::tims_frames::{
-    scan_band, scan_mobilities, slot_scans, sum_events, tof_window, Sum, TofFrame,
+    raw_of_spectra, scan_band, slot_scans, sum_events, tof_window, FrameIndex, Sum, TofFrame,
 };
 use crate::stages::convert::RawTdf;
 use crate::stages::extract::{ms1_neighbours, nearest_index, read_run_windows};
@@ -145,30 +145,12 @@ pub struct RetraceWritten {
 /// Retrace sums raw events, so a run whose spectra came from any other reader (an mzML,
 /// including a timsTOF mzML written by msconvert) is refused with the reason.
 pub fn raw_input(ms2_spectra: &str) -> Result<String> {
-    let prov = crate::instrument::provenance(ms2_spectra);
-    match prov {
-        Some(p) if p.has_im() => {
-            let raw = p.source.ok_or_else(|| {
-                anyhow!(
-                    "retrace.enabled: {ms2_spectra} was read natively from a timsTOF .d, but \
-                     its report does not name the .d (params.mzml)"
-                )
-            })?;
-            if !std::path::Path::new(&raw).is_dir() {
-                bail!(
-                    "retrace.enabled: {ms2_spectra} was converted from {raw}, which is no \
-                     longer there; retrace reads the raw events from it"
-                );
-            }
-            Ok(raw)
-        }
-        _ => bail!(
-            "retrace.enabled needs a diaPASEF .d read by the native timsTOF reader, and \
-             {ms2_spectra} was not (an mzML input, including a timsTOF mzML converted by \
-             msconvert, has no raw events to sum). Set retrace.enabled = false for this \
-             input (docs/35_diapasef.md section 6)"
-        ),
-    }
+    raw_of_spectra(ms2_spectra).map_err(|e| {
+        anyhow!(
+            "retrace.enabled sums the raw events of the .d: {e}. Set retrace.enabled = false \
+             for this input (docs/35_diapasef.md section 6)"
+        )
+    })
 }
 
 /// Refuse `retrace.enabled` before any stage runs when an input will not be read natively
@@ -683,21 +665,6 @@ fn by_candidate(ids: &[u32], vals: impl Iterator<Item = f64>, n: usize) -> Vec<f
     v
 }
 
-/// Median of `v` (NaN when empty), in a total order so it does not depend on the input
-/// order.
-fn median(mut v: Vec<f64>) -> f64 {
-    if v.is_empty() {
-        return f64::NAN;
-    }
-    v.sort_by(f64::total_cmp);
-    let m = v.len() / 2;
-    if v.len() % 2 == 1 {
-        v[m]
-    } else {
-        0.5 * (v[m - 1] + v[m])
-    }
-}
-
 /// What the re-pick reads once per call of the stage (`retrace.repick`): extract's top-K
 /// peak sidecar `(candidate, rank, apex RT)` and every candidate's predicted fragment rows
 /// `(candidate, calibrated m/z, predicted intensity)`, both sorted by candidate.
@@ -1078,36 +1045,15 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
     let (mass_off, frag_tol) = read_mass_cal(p.mass_cal, p.extract.frag_tol_ppm)?;
 
     // Frame index without decoding: RT, MS level, quad settings.
-    let n_frames = raw.reader.len();
-    let heads: Vec<Frame> = (0..n_frames)
-        .into_par_iter()
-        .map(|i| {
-            raw.reader
-                .get_frame_without_coordinates(i)
-                .map_err(|e| anyhow!("{}: frame header {i}: {e}", p.raw))
-        })
-        .collect::<Result<_>>()?;
-    let (mut ms2_rt, mut ms2_fi, mut ms1_rt, mut ms1_fi) = (vec![], vec![], vec![], vec![]);
-    for (i, f) in heads.iter().enumerate() {
-        match f.ms_level {
-            MSLevel::MS1 => {
-                ms1_rt.push(f.rt_in_seconds);
-                ms1_fi.push(i);
-            }
-            MSLevel::MS2 => {
-                ms2_rt.push(f.rt_in_seconds);
-                ms2_fi.push(i);
-            }
-            MSLevel::Unknown => {}
-        }
-    }
-    let ascending = |v: &[f64]| v.windows(2).all(|w| w[0] <= w[1]);
-    if !(ascending(&ms1_rt) && ascending(&ms2_rt)) || ms1_rt.is_empty() || ms2_rt.is_empty() {
-        bail!(
-            "{}: frames are not in RT order, or MS1/MS2 frames are missing",
-            p.raw
-        );
-    }
+    let fx = FrameIndex::read(&raw, p.raw)?;
+    let scan_im = fx.scan_im(&raw, p.raw)?;
+    let FrameIndex {
+        heads,
+        ms1: ms1_fi,
+        ms1_rt,
+        ms2: ms2_fi,
+        ms2_rt,
+    } = fx;
     // The isolation windows of the MS2 frames, for holding them window by window below: the
     // distinct (isolation m/z, width) of every slot as inclusive m/z bounds, and per MS2 frame
     // (in `ms2_fi` order) the windows its slots isolate.
@@ -1137,18 +1083,16 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
         ms2_wins.push(ws);
     }
     drop(win_of);
-    let n_scans = raw
-        .frame(ms1_fi[0])
-        .map_err(|e| anyhow!("{}: frame {}: {e}", p.raw, ms1_fi[0]))?
-        .scan_offsets
-        .len()
-        .saturating_sub(1);
-    let scan_im = scan_mobilities(n_scans, |s| raw.im_of_scan(s), p.raw)?;
     // The MS1 noise filter convert applied (`convert.tdf_ms1_denoise`), on the MS1 frames
     // held here as well, built from the run's diaPASEF windows.
     let ms1_denoise = (p.ms1_denoise && p.cfg.ms1).then(|| {
         let windows = raw.reader.get_dia_windows().unwrap_or_default();
-        Ms1Denoise::new(&windows, n_scans, |m| raw.tof_of(m), |s| raw.im_of_scan(s))
+        Ms1Denoise::new(
+            &windows,
+            scan_im.len(),
+            |m| raw.tof_of(m),
+            |s| raw.im_of_scan(s),
+        )
     });
 
     // Per candidate: precursor m/z, the windows, and the band centre.
@@ -1850,7 +1794,7 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
     // The raw MS1 mass residual against the m/z extract wrote for the MS1 rows, which
     // carries extract's MS1 offset: near 0 when the inherited offset fits the raw events.
     let residual_rows = residuals.len();
-    let ms1_residual = median(residuals);
+    let ms1_residual = super::quant_pattern::median(&mut residuals);
     if ms1_residual.is_finite() && ms1_residual.abs() > 0.5 * p.extract.prec_tol_ppm {
         warn!(
             median_ppm = ms1_residual,
@@ -2079,7 +2023,7 @@ mod tests {
         let im: Vec<f64> = (0..60).map(|s| 1.30 - 0.002 * s as f64).collect();
         // Two fragments (TOF 100 and 200), predicted 4:1. Scans 10-12 (1/K0 ~1.278) carry
         // them 4:1; scans 40-42 (1/K0 ~1.218) carry a brighter 1:4 ion.
-        let mut f = Frame::default();
+        let mut f = timsrust::Frame::default();
         let mut off = vec![0usize];
         for s in 0..60u32 {
             let (a, b) = match s {
@@ -2374,12 +2318,5 @@ mod tests {
         assert!(err.contains("retrace.enabled = false"), "{err}");
         // The chain's own check names the spectra artifact the same way.
         assert!(raw_input("no/such/spectra_ms2.parquet").is_err());
-    }
-
-    #[test]
-    fn the_median_is_order_free() {
-        assert!(median(vec![]).is_nan());
-        assert_eq!(median(vec![3.0, -1.0, 2.0]), 2.0);
-        assert_eq!(median(vec![4.0, 1.0, 2.0, 3.0]), 2.5);
     }
 }

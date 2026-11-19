@@ -3421,12 +3421,12 @@ impl Default for FeaturesConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CompeteConfig {
-    /// Competition grouping: `precursor` collapses charge/modification siblings
-    /// separately within each target/decoy label; targets and decoys therefore do
-    /// not compete directly. `apex` also groups by rounded apex RT;
-    /// `peptidoform_charge` keeps each peptidoform+charge as its own group
-    /// (precursor-level, as DIA-NN/Spectronaut report), so sibling charges of one
-    /// peptide are not collapsed.
+    /// Competition grouping, always within one target/decoy label, so a target never
+    /// competes against its own decoy. `peptidoform_charge` (the default) makes each
+    /// peptidoform + charge its own group, so sibling charge states and modforms of one
+    /// peptide are separate precursors; `base_peptide` collapses every charge and
+    /// modification sibling of one stripped peptide to a single winner; `apex` groups each
+    /// base peptide by rounded apex RT.
     pub group_by: CompeteGroupBy,
     pub apex_rt_tolerance_s: f64,
     /// How within-group competition resolves (sensitivity program, spec 04 §6 /
@@ -3437,9 +3437,9 @@ pub struct CompeteConfig {
     /// Score margin (in `prelim_score` units) required to remove a loser under
     /// `margin_gated`. A loser closer than this to the winner is kept.
     pub margin: f64,
-    /// Minimum distinct unique-fragment count a loser must have to survive under
-    /// `unique_evidence` (needs the `unique_fragment_count` feature; falls back to
-    /// winner-take-all when the column is absent).
+    /// Minimum unique-fragment evidence a loser must have to survive under
+    /// `unique_evidence`: its `n_matched_fragments` x (1 - `peak_contested_frac`), which is
+    /// the matched-fragment count itself unless `extract.emit_contested_features` is on.
     pub unique_evidence_min_fragments: usize,
     /// Diagnostic: when true, write `<out>.compete_audit.parquet` recording every
     /// removed candidate with its group, winner, scores, and removal reason.
@@ -3470,15 +3470,12 @@ pub enum CompetitionMode {
     /// Legacy: keep only the highest `prelim_score` candidate per group.
     #[default]
     WinnerTakeAll,
-    /// Keep every candidate (no within-group removal); FDR handles ambiguity.
+    /// Keep every candidate (no within-group removal); FDR handles ambiguity. The retired
+    /// `features_only`, which kept the same set, is read as this mode.
+    #[serde(alias = "features_only")]
     None,
-    /// Keep every candidate; conflict/contested features (added upstream) carry the
-    /// interference signal into rescoring. Same retained set as `None`; the name
-    /// documents intent for the experiment matrix.
-    FeaturesOnly,
-    /// Keep a loser when it has enough independent evidence
-    /// (`unique_fragment_count >= unique_evidence_min_fragments`); otherwise remove
-    /// it (winner-take-all fallback).
+    /// Keep a loser when its unique-fragment evidence reaches
+    /// `unique_evidence_min_fragments`; otherwise remove it (winner-take-all fallback).
     UniqueEvidence,
     /// Remove a loser only when `winner_score - loser_score >= margin`; otherwise
     /// keep it. Conservative removal for the low-FDR region.
@@ -6786,6 +6783,23 @@ impl Config {
                 self.rescore.shadow_im_tolerance
             )));
         }
+        // A zero or negative tolerance, or an empty region, demotes nothing while the run
+        // still reports the test as on.
+        let r = &self.rescore;
+        if r.shadow_min_shared > 0
+            && !(r.shadow_ppm.is_finite()
+                && r.shadow_ppm > 0.0
+                && r.shadow_rt_s.is_finite()
+                && r.shadow_rt_s > 0.0
+                && r.shadow_region >= 1)
+        {
+            return Err(Invalid(format!(
+                "rescore.shadow_ppm and rescore.shadow_rt_s must be finite and > 0 and \
+                 rescore.shadow_region at least 1 (got {}, {} and {}); \
+                 rescore.shadow_min_shared = 0 turns the shadow test off",
+                r.shadow_ppm, r.shadow_rt_s, r.shadow_region
+            )));
+        }
         if !self.rt_im_train.window_holdout_frac.is_finite()
             || !(0.0..1.0).contains(&self.rt_im_train.window_holdout_frac)
         {
@@ -10057,6 +10071,23 @@ mod tests {
             r#"{"features":{"im_shape_features":true}}"#,
         ] {
             assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
+        }
+    }
+
+    /// A shadow tolerance or region that would demote nothing is refused while the test is
+    /// on, and accepted once `shadow_min_shared = 0` turns it off.
+    #[test]
+    fn a_shadow_test_that_cannot_demote_is_refused() {
+        for bad in [
+            r#""shadow_ppm":0.0"#,
+            r#""shadow_ppm":-5.0"#,
+            r#""shadow_rt_s":-1.0"#,
+            r#""shadow_region":0"#,
+        ] {
+            let on = format!(r#"{{"rescore":{{{bad}}}}}"#);
+            assert!(Config::from_json(&on).is_err(), "{on} must be refused");
+            let off = format!(r#"{{"rescore":{{"shadow_min_shared":0,{bad}}}}}"#);
+            assert!(Config::from_json(&off).is_ok(), "{off} must be accepted");
         }
     }
 

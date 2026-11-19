@@ -472,11 +472,11 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
-| `group_by` | `CompeteGroupBy` | `peptidoform_charge` |  | Competition grouping: `precursor` collapses charge/modification siblings separately within each target/decoy label; targets and decoys therefore do not compete directly. `apex` also groups by rounded apex RT; `peptidoform_charge` keeps each peptidoform+charge as its own group (precursor-level, as DIA-NN/Spectronaut report), so sibling charges of one peptide are not collapsed. |
+| `group_by` | `CompeteGroupBy` | `peptidoform_charge` |  | Competition grouping, always within one target/decoy label, so a target never competes against its own decoy. `peptidoform_charge` (the default) makes each peptidoform + charge its own group, so sibling charge states and modforms of one peptide are separate precursors; `base_peptide` collapses every charge and modification sibling of one stripped peptide to a single winner; `apex` groups each base peptide by rounded apex RT. |
 | `apex_rt_tolerance_s` | `f64` | `5.0` |  |  |
 | `mode` | `CompetitionMode` | `winner_take_all` |  | How within-group competition resolves (sensitivity program, spec 04 §6 / P2.4). `winner_take_all` = legacy (keep only the top `prelim_score` per group). The other modes preserve more candidate evidence for the rescorer/ FDR to arbitrate. Default `winner_take_all` (unchanged behaviour). |
 | `margin` | `f64` | `0.0` | gated | Score margin (in `prelim_score` units) required to remove a loser under `margin_gated`. A loser closer than this to the winner is kept. |
-| `unique_evidence_min_fragments` | `usize` | `2` |  | Minimum distinct unique-fragment count a loser must have to survive under `unique_evidence` (needs the `unique_fragment_count` feature; falls back to winner-take-all when the column is absent). |
+| `unique_evidence_min_fragments` | `usize` | `2` |  | Minimum unique-fragment evidence a loser must have to survive under `unique_evidence`: its `n_matched_fragments` x (1 - `peak_contested_frac`), which is the matched-fragment count itself unless `extract.emit_contested_features` is on. |
 | `emit_competition_audit` | `bool` | `false` | diagnostic | Diagnostic: when true, write `<out>.compete_audit.parquet` recording every removed candidate with its group, winner, scores, and removal reason. |
 
 ## rescore
@@ -740,9 +740,8 @@ Within-group competition resolution (spec 04 §6). Only `WinnerTakeAll` removes 
 | Value | Default | Description |
 |---|---|---|
 | `winner_take_all` | yes | Legacy: keep only the highest `prelim_score` candidate per group. |
-| `none` |  | Keep every candidate (no within-group removal); FDR handles ambiguity. |
-| `features_only` |  | Keep every candidate; conflict/contested features (added upstream) carry the interference signal into rescoring. Same retained set as `None`; the name documents intent for the experiment matrix. |
-| `unique_evidence` |  | Keep a loser when it has enough independent evidence (`unique_fragment_count >= unique_evidence_min_fragments`); otherwise remove it (winner-take-all fallback). |
+| `none` |  | Keep every candidate (no within-group removal); FDR handles ambiguity. The retired `features_only`, which kept the same set, is read as this mode. |
+| `unique_evidence` |  | Keep a loser when its unique-fragment evidence reaches `unique_evidence_min_fragments`; otherwise remove it (winner-take-all fallback). |
 | `margin_gated` |  | Remove a loser only when `winner_score - loser_score >= margin`; otherwise keep it. Conservative removal for the low-FDR region. |
 
 ### `CrossRunNormalisation`

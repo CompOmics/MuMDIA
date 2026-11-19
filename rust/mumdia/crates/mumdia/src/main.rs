@@ -2466,12 +2466,10 @@ fn real_main() -> Result<()> {
             config,
         } => {
             let cfg = load_config(&config)?;
-            let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::compete::run(stages::compete::CompeteParams {
                 features: &features,
                 out: &out,
                 cfg: &cfg.compete,
-                config_hash: &ch,
                 features_hash: None,
             })?;
         }

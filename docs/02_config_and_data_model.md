@@ -431,7 +431,7 @@ listed with its default and effect. Fields marked **default-off**, **inert**, or
 | `ClaimCues` (struct, not an enum) | config.rs:192-248 | `mz_close`, `rt_prior`, `ms1_support`, `reassign`, `apportion_em_iters` + their sigmas | composable per-claimant weight cues for `coelution_multi_cue`; every cue defaults off (weight 1.0) |
 | `GateMode` | config.rs:735-758 | **`apex_pearson`**, `peak_spectral`, `spectral_entropy`, `coelution`, `combined` | which spectral score `gate_min_score` thresholds |
 | `UnknownModPolicy` | config.rs:353-357 | **`error`**, `skip` | unknown-mod behavior |
-| `CompetitionMode` | config.rs:873-890 | **`winner_take_all`**, `none`, `features_only`, `unique_evidence`, `margin_gated` | within-group resolution |
+| `CompetitionMode` | config.rs:873-890 | **`winner_take_all`**, `none`, `unique_evidence`, `margin_gated` | within-group resolution |
 | `CompeteGroupBy` | config.rs:894-901 | `base_peptide`, `apex`, **`peptidoform_charge`** | competition grouping key; `peptidoform_charge` (precursor-level) is the default since 2026-09-06, `base_peptide` was renamed from `precursor`, which named stripped-peptide grouping inaccurately (see below) |
 | `RollupMethod` | config.rs:905-911 | **`top_n_sum`**, `sum` | protein rollup |
 | `PeakWindowMode` | config.rs:916-928 | **`per_candidate`**, `consensus` | quant integration window |
@@ -518,11 +518,10 @@ peak-integrated Pearson >= `gate_min_score` AND co-elution >= `gate_coelution_mi
 
 **`CompetitionMode`** (873-890). `WinnerTakeAll` (default, legacy): keep only the
 top `prelim_score` per group. `None`: keep every candidate (FDR handles
-ambiguity). `FeaturesOnly`: same retained set as `None`, with conflict/contested
-features carrying the interference signal into rescoring (the name documents
-intent for the experiment matrix). `UniqueEvidence`: keep a loser only when
-`unique_fragment_count >= unique_evidence_min_fragments`, else winner-take-all
-fallback (also falls back to WTA when the feature column is absent).
+ambiguity); the retired `features_only`, which kept the same set, is read as `none`.
+`UniqueEvidence`: keep a loser only when its unique-fragment evidence,
+`n_matched_fragments * (1 - peak_contested_frac)`, reaches
+`unique_evidence_min_fragments`, else winner-take-all.
 `MarginGated`: remove a loser only when `winner_score - loser_score >= margin`,
 else keep it (conservative removal for the low-FDR region). Target/decoy labels
 stay in the competition key in every mode, so a target never competes against its
