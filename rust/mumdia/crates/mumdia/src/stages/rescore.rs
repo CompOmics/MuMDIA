@@ -1410,7 +1410,6 @@ fn shadow_demote(
             apex_rt,
             precursor_mz: mz,
             score: scores,
-            is_decoy,
             accepted: &accepted,
             peak_rank,
         },

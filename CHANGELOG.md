@@ -261,7 +261,11 @@ than a number. Both are recorded in every run's `manifest.json`.
   first pass now groups on run, peptidoform and charge, as the demotion is described. One run
   has the same groups and writes the same tables; a pooled rescore (`run` with several
   `--mzml`, `run-experiment`) demotes more shadows in every run, so its scores and counts
-  change. The stage interns peptidoform and charge once instead of twice.
+  change. The stage interns peptidoform and charge once instead of twice, and the shadow
+  test no longer holds an apex 1/K0 and an isolation window for every pooled row (24 bytes a
+  row, about 6 GB at a 259M-row pool): it keeps 1/K0 values only with `shadow_im_tolerance`
+  set and finds the window of the rows it reads, and its rows drop the label it never read,
+  with the same output.
 - **Desktop: "Add folder…" selects several spectra folders at once (#335).** A Bruker or Agilent `.d`
   and a Waters `.raw` are directories, so they are added with "Add folder…", and that dialog took
   one folder at a time: the spectra folder picker shared the single-choice setting of the output
