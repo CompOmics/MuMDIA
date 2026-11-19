@@ -24,13 +24,9 @@ PRED_INTENSITY = 0.9
 def libraries(tmp_path_factory):
     d = tmp_path_factory.mktemp("predict_decoys")
     tgt = _write_target_library(d)
-    out = {}
-    for script, name in (("make_reverse_decoys.py", "rev"), ("make_shift_decoys.py", "shift")):
-        prec, frag = d / f"{name}_prec.parquet", d / f"{name}_frag.parquet"
-        run_worker_ok(script, tgt["prec"], tgt["frag"], prec, frag)
-        out[name] = (prec, frag)
-    out["dir"] = d
-    return out
+    prec, frag = d / "rev_prec.parquet", d / "rev_frag.parquet"
+    run_worker_ok("make_reverse_decoys.py", tgt["prec"], tgt["frag"], prec, frag)
+    return {"rev": (prec, frag), "dir": d}
 
 
 def _fake_prediction(rev_prec, directory, skip=()):
@@ -63,7 +59,18 @@ def _fake_prediction(rev_prec, directory, skip=()):
 
 
 def test_shift_decoys_are_refused(libraries, tmp_path):
-    prec, frag = libraries["shift"]
+    """A decoy that carries its target's own sequence (a fragment-shift decoy) would be
+    predicted as its target's spectrum."""
+    prec, frag = libraries["rev"]
+    t = pq.read_table(str(prec))
+    rows = t.to_pydict()
+    own = {(i, z): pf for i, z, pf, lab in zip(rows["peptidoform_id"], rows["charge"],
+                                              rows["peptidoform"], rows["label"]) if lab == "target"}
+    shifted = ["DECOY_" + own[(i, z)] if lab == "decoy" else pf for i, z, pf, lab in zip(
+        rows["peptidoform_id"], rows["charge"], rows["peptidoform"], rows["label"])]
+    prec = tmp_path / "shift_prec.parquet"
+    pq.write_table(t.set_column(t.schema.get_field_index("peptidoform"), "peptidoform",
+                                pa.array(shifted, pa.string())), str(prec))
     rc, _, err = run_worker("predict_decoys.py", "tsv", prec, frag, tmp_path / "x.tsv")
     assert rc != 0
     assert "own sequence" in err

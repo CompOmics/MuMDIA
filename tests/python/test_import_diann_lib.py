@@ -15,12 +15,17 @@ Carbamidomethyl and quietly search the wrong mass.
 
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
 from conftest import (
+    PROTON,
+    RESIDUE_MASS,
+    WATER,
     assert_engine_readable_parquet,
     assert_library_load_invariants,
     assert_string_columns_utf8,
@@ -36,7 +41,7 @@ PRECURSORS = [
     ("PEPTIDEK", 2, 500.5, 20.0, "ALBU_HUMAN", 0, "noloss", ("y", "b", "y")),
     ("PEPTIDEK", 3, 334.0, 20.0, "ALBU_HUMAN", 0, "noloss", ("y", "b", "y")),
     ("SC(UniMod:4)ENICK", 2, 420.2, 30.0, "ENO1_YEAST", 0, "noloss", ("y", "b", "y")),
-    ("M(UniMod:35)ELLOWK", 2, 480.1, 15.0, "GLYK_ECOLI", 0, "noloss", ("y", "b", "y")),
+    ("M(UniMod:35)ELLAWK", 2, 480.1, 15.0, "GLYK_ECOLI", 0, "noloss", ("y", "b", "y")),
     ("K(UniMod:44)ITTENR", 2, 460.3, 25.0, "PRE1_HUMAN", 0, "noloss", ("y", "b", "y")),
     # dropped: UniMod:21 is not in the mapped set, so its ProForma name is unknown
     ("DROPME(UniMod:21)K", 2, 600.0, 40.0, "XXX_HUMAN", 0, "noloss", ("y", "b", "y")),
@@ -56,7 +61,7 @@ FRAGMENT_SHAPE = ((3, 1), (2, 1), (5, 2))  # (Fragment.Series.Number, Fragment.C
 
 KEPT_KEYS = [
     ("[Carbamidomethyl]-NTERMCK", 2, 610.0),
-    ("M[Oxidation]ELLOWK", 2, 480.1),
+    ("M[Oxidation]ELLAWK", 2, 480.1),
     ("SC[Carbamidomethyl]ENICK", 2, 420.2),
     ("K[Farnesyl]ITTENR", 2, 460.3),
     ("PEPTIDEK", 3, 334.0),
@@ -77,6 +82,28 @@ def _strip_unimod(modseq):
     return "".join(out)
 
 
+# UniMod accession -> monoisotopic delta, for the fixture's modifications.
+UNIMOD_MASS = {"1": 42.010565, "4": 57.021464, "21": 79.966331, "35": 15.994915,
+               "44": 204.187801}
+
+
+def _product_mz(modseq, ion, k, z):
+    """The b/y m/z of a fragment of `modseq` from the independent residue table, so the
+    imported library passes the reverse decoy builder's calculator check. A leading
+    `(UniMod:N)` is the N-terminal group, which every b ion carries; a residue outside the
+    table (only in precursors the importer drops) weighs nothing."""
+    nterm, masses = 0.0, []
+    for uid, aa in re.findall(r"\(UniMod:(\d+)\)|([A-Z])", modseq):
+        if aa:
+            masses.append(RESIDUE_MASS.get(aa, 0.0))
+        elif masses:
+            masses[-1] += UNIMOD_MASS[uid]
+        else:
+            nterm += UNIMOD_MASS[uid]
+    neutral = nterm + sum(masses[:k]) if ion == "b" else sum(masses[len(masses) - k:]) + WATER
+    return (neutral + z * PROTON) / z
+
+
 @pytest.fixture(scope="module")
 def diann_lib(tmp_path_factory):
     """Write a tiny fragment-level DIA-NN speclib in the columns the importer reads."""
@@ -85,10 +112,8 @@ def diann_lib(tmp_path_factory):
         "Precursor.Charge", "Precursor.Mz", "RT", "Stripped.Sequence",
         "Product.Mz", "Relative.Intensity", "Fragment.Series.Number",
         "Fragment.Charge", "Protein.Names")}
-    product = 200.0
     for modseq, z, mz, rt, prot, decoy, loss, ions in PRECURSORS:
         for ion, (series, fz) in zip(ions, FRAGMENT_SHAPE):
-            product += 1.5
             rows["Decoy"].append(decoy)
             rows["Fragment.Loss.Type"].append(loss)
             rows["Fragment.Type"].append(ion)
@@ -97,7 +122,7 @@ def diann_lib(tmp_path_factory):
             rows["Precursor.Mz"].append(mz)
             rows["RT"].append(rt)
             rows["Stripped.Sequence"].append(_strip_unimod(modseq))
-            rows["Product.Mz"].append(product)
+            rows["Product.Mz"].append(_product_mz(modseq, ion, series, fz))
             rows["Relative.Intensity"].append(0.5)
             rows["Fragment.Series.Number"].append(series)
             rows["Fragment.Charge"].append(fz)
@@ -292,7 +317,7 @@ def test_a_description_word_in_protein_names_falls_back_to_the_ids(diann_lib, tm
             ("PEPTIDEK", 2): "P02768",
             ("PEPTIDEK", 3): "CON_sp|P02444|KRA33_SHEEP;CON_sp|P02445|KRA34_SHEEP",
             ("SC(UniMod:4)ENICK", 2): "CON_sp|P35908|K22E_HUMAN",
-            ("M(UniMod:35)ELLOWK", 2): "REAL_sp|P0A6P9|ENO_ECOLI",
+            ("M(UniMod:35)ELLAWK", 2): "REAL_sp|P0A6P9|ENO_ECOLI",
             ("K(UniMod:44)ITTENR", 2): "ENTRAP_sp|P0CG40|SP9_HUMAN",
             ("(UniMod:4)NTERMCK", 2): "CON_sp|P12081|HARS1_HUMAN;P49590",
         },
@@ -300,7 +325,7 @@ def test_a_description_word_in_protein_names_falls_back_to_the_ids(diann_lib, tm
             ("PEPTIDEK", 2): "ALBU_HUMAN",
             ("PEPTIDEK", 3): "Keratin,",
             ("SC(UniMod:4)ENICK", 2): "Keratin,",
-            ("M(UniMod:35)ELLOWK", 2): "Enolase",
+            ("M(UniMod:35)ELLAWK", 2): "Enolase",
             ("K(UniMod:44)ITTENR", 2): "",
             ("(UniMod:4)NTERMCK", 2): "Histidine--tRNA;SYHM_HUMAN",
         },
@@ -316,7 +341,7 @@ def test_a_description_word_in_protein_names_falls_back_to_the_ids(diann_lib, tm
     assert by_key[("SC[Carbamidomethyl]ENICK", 2)] == "CON_sp|P35908|K22E_HUMAN", (
         "two different keratins must not share the group `Keratin,`"
     )
-    assert by_key[("M[Oxidation]ELLOWK", 2)] == "REAL_sp|P0A6P9|ENO_ECOLI"
+    assert by_key[("M[Oxidation]ELLAWK", 2)] == "REAL_sp|P0A6P9|ENO_ECOLI"
     assert by_key[("K[Farnesyl]ITTENR", 2)] == "ENTRAP_sp|P0CG40|SP9_HUMAN", (
         "an empty name with a mapped id is not UNASSIGNED"
     )
@@ -405,7 +430,7 @@ def test_imported_library_feeds_the_documented_decoy_builder_step(imported, tmp_
     prec = tmp_path / "lib_precursors.parquet"
     frag = tmp_path / "lib_fragments.parquet"
     run_worker_ok(
-        "make_shift_decoys.py", imported["prec"], imported["frag"], prec, frag
+        "make_reverse_decoys.py", imported["prec"], imported["frag"], prec, frag
     )
     p, f = assert_library_load_invariants(prec, frag, require_both_labels=True)
     assert p.num_rows == 2 * len(KEPT_KEYS)
@@ -414,6 +439,15 @@ def test_imported_library_feeds_the_documented_decoy_builder_step(imported, tmp_
         "the importer's cardinality column did not survive the decoy builder"
     )
     assert set(read_columns(prec)["label"]) == {"target", "decoy"}
+
+
+def test_an_unknown_or_misspelled_flag_stops_the_import(diann_lib, tmp_path):
+    """A flag the importer does not know used to be ignored: `--keep-unimods 4,35,21` imported
+    the default modifications and dropped every phospho precursor without a word."""
+    for flag in (["--keep-unimods", "4,35,21"], ["--charge-by-basic-residue"]):
+        rc, _, err = run_worker("import_diann_lib.py", diann_lib, tmp_path / "p.parquet",
+                                tmp_path / "f.parquet", *flag)
+        assert rc != 0 and "unrecognized arguments" in err, flag
 
 
 def test_keep_unimod_names_the_kept_accessions(diann_lib, tmp_path):
@@ -514,7 +548,7 @@ def test_library_ion_mobility_is_written_as_predicted_im(diann_lib, tmp_path, na
     assert got[("PEPTIDEK", 3)] == pytest.approx(1.1)
     assert got[("K[Farnesyl]ITTENR", 2)] == pytest.approx(1.05)
     assert got[("SC[Carbamidomethyl]ENICK", 2)] is None, "non-finite is null"
-    assert got[("M[Oxidation]ELLOWK", 2)] is None, "non-positive is null"
+    assert got[("M[Oxidation]ELLAWK", 2)] is None, "non-positive is null"
     assert f"4 of 6 precursors carry a library 1/K0 (from {name}); 2 are null" in stdout
 
 
@@ -558,7 +592,7 @@ ANNOTATED = {
     # no gene
     ("SC(UniMod:4)ENICK", 2): ("P06733", "ENO1_YEAST", ""),
     # contaminants: a description word in Protein.Names and Genes, the ids carry the fields
-    ("M(UniMod:35)ELLOWK", 2): ("CON_sp|P02444|KRA33_SHEEP;CON_sp|P02445|KRA34_SHEEP",
+    ("M(UniMod:35)ELLAWK", 2): ("CON_sp|P02444|KRA33_SHEEP;CON_sp|P02445|KRA34_SHEEP",
                                 "Keratin,", "Keratin,"),
     # two precursors under one entry name with different isoform ids
     ("K(UniMod:44)ITTENR", 2): ("Q15363;Q15363-2", "TMED2_HUMAN", "TMED2"),
@@ -707,11 +741,11 @@ def test_a_fasta_fills_what_the_library_leaves_empty(diann_lib, tmp_path):
 def test_the_decoy_builder_carries_the_annotations_to_its_output(annotated, tmp_path):
     """A documented recipe writes the decoy library elsewhere than the import; the builder
     keeps the columns on every target and copies them onto its decoy, so the library it
-    writes carries them (the reverse builder: `test_decoy_builders.py`)."""
+    writes carries them."""
     out = tmp_path / "out"
     out.mkdir()
     prec, frag = out / "lib_precursors.parquet", out / "lib_fragments.parquet"
-    run_worker_ok("make_shift_decoys.py", annotated["prec"], annotated["frag"], prec, frag)
+    run_worker_ok("make_reverse_decoys.py", annotated["prec"], annotated["frag"], prec, frag)
     assert not (out / "protein_annotations.parquet").exists()
     t = read_columns(prec)
     target = _annotation_rows(annotated["prec"])

@@ -431,10 +431,9 @@ def rewrite_fragments(in_frag, out_frag, lut):
     """Stream the fragment table, keeping the rows of kept candidates with renumbered ids.
     Returns the number of rows written."""
     pf = pq.ParquetFile(in_frag)
-    tmp = str(out_frag) + ".remap.tmp"
     schema = narrow_table(pf.schema_arrow.empty_table()).schema
     written = 0
-    writer = pq.ParquetWriter(tmp, schema, compression="snappy")
+    writer = pq.ParquetWriter(str(out_frag), schema, compression="snappy")
     try:
         for rg in range(pf.num_row_groups):
             t = pf.read_row_group(rg)
@@ -452,7 +451,6 @@ def rewrite_fragments(in_frag, out_frag, lut):
     finally:
         writer.close()
         pf.close()
-    os.replace(tmp, str(out_frag))
     return written
 
 
@@ -477,17 +475,21 @@ def remap_files(in_prec, in_frag, out_prec, out_frag, fasta, unmapped="drop",
     out["candidate_id"] = lut[out["candidate_id"].astype(np.int64).to_numpy()].astype(
         prec["candidate_id"].dtype)
     out = out.reset_index(drop=True)
-    n_frag = rewrite_fragments(in_frag, out_frag, lut)
-    tmp = str(out_prec) + ".remap.tmp"
-    write_engine_parquet(out, tmp)
-    os.replace(tmp, str(out_prec))
-    retire_side_table(in_prec, out_prec)
+    # Both tables are written and checked before either replaces its output: the output may be
+    # the input, and a failure between the two must not leave renumbered fragments beside the
+    # old precursor table.
+    frag_tmp, prec_tmp = str(out_frag) + ".remap.tmp", str(out_prec) + ".remap.tmp"
+    n_frag = rewrite_fragments(in_frag, frag_tmp, lut)
+    write_engine_parquet(out, prec_tmp)
     summary["fragments_out"] = int(n_frag)
     if "n_fragments" in out.columns and int(out["n_fragments"].sum()) != n_frag:
         # Only a disagreement the input did not already have is a remap error.
         if int(prec["n_fragments"].sum()) == n_frag_in:
             raise RuntimeError(f"fragment rows: n_fragments sums to "
                                f"{int(out['n_fragments'].sum())}, {n_frag} written")
+    os.replace(frag_tmp, str(out_frag))
+    os.replace(prec_tmp, str(out_prec))
+    retire_side_table(in_prec, out_prec)
     log(f"remap: {n_frag} fragment rows -> {out_frag}")
     if summary_path:
         with open(summary_path, "w", encoding="utf-8") as fh:

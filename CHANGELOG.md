@@ -214,6 +214,18 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Removed
+
+- **`scripts/make_shift_decoys.py` and `scripts/augment_library.py` (docs/13, "DIA-NN
+  recipe").** Both wrote decoys whose fragment intensities are copies of their targets', which
+  the decoy rule of 2026-10-09 forbids: on the ProteoBench Astral entrapment module such decoys
+  gave a paired entrapment FDP of 1.68% at a reported precursor q of 1%, predicted ones 0.85%.
+  A shift decoy keeps its target's sequence, so it cannot be predicted at all.
+  `augment_library.py`, which added the Met-excised peptides an imported library lacked,
+  rebuilt every decoy of the library that way, predicted ones included; a library predicted
+  with `--met-excision`, which the desktop's build passes, closes that gap at the source.
+  Decoys are built with `make_reverse_decoys.py` followed by `predict_decoys.py build`.
+
 ### Fixed
 
 - **Desktop: implausible m/z limits are refused before anything starts (desktop/README.md, "Precursor
@@ -255,6 +267,29 @@ than a number. Both are recorded in every run's `manifest.json`.
   desktop declares its build's modifications in the re-export too, and an import of a chosen
   `.speclib` declares the whole catalogue. `--mod` only declares a mass: on DIA-NN 2.7 the
   re-exported targets are identical with and without it.
+- **`make_reverse_decoys.py` says that its output is not a library to search.** Its decoys
+  copy their targets' intensities and the engine cannot tell, so its docstring and a closing
+  note on stderr say to run `predict_decoys.py build` on the output first. The importer's
+  docstring named the retired shift builder as the next step, and the reverse builder's
+  warning about an unmapped modification said to edit a table that is generated from
+  `modifications.json`; both give the current step now.
+- **`import_diann_lib.py` stops at an unknown or misspelled flag.** It dropped every
+  unrecognised `--` argument and every positional after the third, so `--keep-unimods
+  4,35,21` imported the default modifications and dropped every phospho precursor without an
+  error. It parses its arguments with `argparse` now, exact flag names only; the flags and the
+  command lines the desktop and `predict_decoys.py` pass are unchanged.
+- **`remap_library.py` writes both tables before it replaces either.** A remap in place, as
+  `import_diann_lib.py --remap-fasta` runs one, replaced the fragment table before it wrote
+  the precursor table, so a failed write (a full disk) left renumbered fragments beside the
+  old precursors and the input library was lost. The fragment-count check runs before the
+  replacement as well.
+- **`prune_outputs.py` treats `chromatograms_q1.parquet` as the engine's `output.retain` does,
+  and records a prune that fails halfway.** The script did not know the ZT Scan cycle-trace
+  table, so a directory it pruned kept a table the engine's own tiers remove; a test now
+  compares its file lists with `retain.rs`. A removal that failed (a file held open on
+  Windows) ended the prune before `pruned.json` was written, so the files already removed had
+  no record; they are recorded before the error is raised.
+
 ### Security
 
 - **RUSTSEC-2026-0545, -0547 and -0548 (zip 6.0.0) are audited and ignored, with their reason

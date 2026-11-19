@@ -335,7 +335,7 @@ then feeds 3.2.
 **3.2 An in-silico decoy can win a base-peptide group and delete the real target
 from the analysis.** `grouped_q` (`rescore.rs:689-745`) groups on
 `base_peptide_id`, which a target and its decoy **share** (verified on both library
-paths: `make_shift_decoys.py:34` and `make_reverse_decoys.py:148` both
+paths: `make_reverse_decoys.py:148` sets
 `dprec = tprec.copy()`; `peptidoforms.rs:216-220` on the native path). Under
 `qmode == Entrapment`, `incoming_null` is `is_entrapment`, which is `false` for
 both the target and its decoy, so the group winner is simply the higher score. If

@@ -205,8 +205,7 @@ for byte. IM2Deep (>= 2.0.0, `scripts/im2deep_worker.py`) predicts one single-co
 (peptidoform, charge), converted to 1/K0 at the precursor m/z with IM2Deep's Mason-Schamp
 constants (`mumdia_core::constants::im_to_ccs` inverts it). A candidate without a prediction is
 dropped with its pair under the 2% ceiling. A decoy's 1/K0 follows its iRT: script-built decoys
-copy the target's value, native FASTA decoys get their own prediction. `augment_library.py` adds
-entries with null 1/K0. Re-predicting an imported library's 1/K0 is deferred (IM D3 H1: +2.3%,
+copy the target's value, native FASTA decoys get their own prediction. Re-predicting an imported library's 1/K0 is deferred (IM D3 H1: +2.3%,
 three seeds, one acquisition, no entrapment).
 
 `im_predictor = auto` resolves per run on the predicate of section 1: it is `im2deep` only when

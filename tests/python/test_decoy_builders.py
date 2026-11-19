@@ -1,10 +1,10 @@
-"""Contract tests for `scripts/make_shift_decoys.py` and
-`scripts/make_reverse_decoys.py` (offline DIA-NN recipe).
+"""Contract tests for `scripts/make_reverse_decoys.py` (offline DIA-NN recipe).
 
-Need only pandas and pyarrow, so they always run. These two scripts create the
-null population the whole FDR rests on, and they are the step that makes an
-imported library index-valid: both re-sort by `precursor_mz` and reassign
-contiguous `candidate_id`, which is what satisfies `index.rs load()`.
+Need only pandas and pyarrow, so they always run. The script creates the decoy
+population the whole FDR rests on (whose spectra `predict_decoys.py` then replaces),
+and it is the step that makes an imported library index-valid: it re-sorts by
+`precursor_mz` and reassigns contiguous `candidate_id`, which is what satisfies
+`index.rs load()`.
 
 Three properties matter beyond the index preconditions
 (`CLAUDE.md`, "Coding conventions"):
@@ -42,8 +42,6 @@ from conftest import (
     library_im,
     SCRIPTS,
 )
-
-DELTA_CH2 = 14.015650
 
 # (peptidoform, charge). PEPTIDEK appears twice so the builders see two charge
 # rows of one base sequence, which may legitimately share a decoy sequence.
@@ -135,16 +133,10 @@ def _build(script, target_library, out_dir):
     out_dir.mkdir(parents=True, exist_ok=True)
     prec = out_dir / "lib_precursors.parquet"
     frag = out_dir / "lib_fragments.parquet"
-    stdout, _ = run_worker_ok(
+    stdout, stderr = run_worker_ok(
         script, target_library["prec"], target_library["frag"], prec, frag
     )
-    return {"prec": prec, "frag": frag, "stdout": stdout}
-
-
-@pytest.fixture(scope="module")
-def shift_library(target_library, tmp_path_factory):
-    return _build("make_shift_decoys.py", target_library,
-                  tmp_path_factory.mktemp("shift_out"))
+    return {"prec": prec, "frag": frag, "stdout": stdout, "stderr": stderr}
 
 
 @pytest.fixture(scope="module")
@@ -166,22 +158,25 @@ def _split_by_label(prec_path, frag_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("builder", ["shift", "reverse"])
-def test_output_library_is_index_valid(builder, shift_library, reverse_library):
+def test_output_library_is_index_valid(reverse_library):
     """Contiguous ids, ascending `precursor_mz`, both labels present.
 
-    A decoy builder is the last step before a search, so a violation here is the
-    one that actually reaches `index.rs load()` and aborts. Both builders
-    concatenate target and decoy, re-sort by m/z and reassign ids precisely to
+    The decoy build is the last step before a search, so a violation here is the
+    one that actually reaches `index.rs load()` and aborts. The builder
+    concatenates target and decoy, re-sorts by m/z and reassigns ids precisely to
     satisfy this; a reordering added afterwards would break it silently.
     """
-    lib = shift_library if builder == "shift" else reverse_library
+    lib = reverse_library
     assert_library_load_invariants(lib["prec"], lib["frag"], require_both_labels=True)
 
 
-@pytest.mark.parametrize("builder", ["shift", "reverse"])
-def test_every_target_has_exactly_one_decoy(builder, target_library, shift_library,
-                                            reverse_library):
+def test_the_builder_says_its_decoys_must_be_predicted(reverse_library):
+    """Its decoys copy their targets' intensities, which makes the reported FDR optimistic;
+    the build says so, since the output passes every check a search makes."""
+    assert "run predict_decoys.py build" in reverse_library["stderr"]
+
+
+def test_every_target_has_exactly_one_decoy(target_library, reverse_library):
     """Target and decoy populations must be paired one to one.
 
     `q = (decoys + 1) / max(1, targets)` assumes the two populations are
@@ -189,7 +184,7 @@ def test_every_target_has_exactly_one_decoy(builder, target_library, shift_libra
     two decoys for one target, biases every q-value in the run, and nothing
     downstream can detect it.
     """
-    lib = shift_library if builder == "shift" else reverse_library
+    lib = reverse_library
     prec, _, idx_t, idx_d = _split_by_label(lib["prec"], lib["frag"])
     assert len(idx_t) == len(TARGETS)
     assert len(idx_d) == len(idx_t)
@@ -201,9 +196,7 @@ def test_every_target_has_exactly_one_decoy(builder, target_library, shift_libra
     assert len(set(pid_d)) == len(pid_d), "a target got more than one decoy"
 
 
-@pytest.mark.parametrize("builder", ["shift", "reverse"])
-def test_decoy_keeps_the_target_precursor_mz_and_irt(builder, shift_library,
-                                                     reverse_library):
+def test_decoy_keeps_the_target_precursor_mz_and_irt(reverse_library):
     """The decoy must co-isolate and co-elute with its target.
 
     Precursor m/z and iRT are what put the decoy in the same isolation window at
@@ -213,7 +206,7 @@ def test_decoy_keeps_the_target_precursor_mz_and_irt(builder, shift_library,
     takes its target's value, null included, so it shares the target's mobility
     window as well.
     """
-    lib = shift_library if builder == "shift" else reverse_library
+    lib = reverse_library
     prec, _, idx_t, idx_d = _split_by_label(lib["prec"], lib["frag"])
     by_pid = {}
     for i in idx_t:
@@ -231,8 +224,7 @@ def test_decoy_keeps_the_target_precursor_mz_and_irt(builder, shift_library,
         "the fixture must exercise both a null and a finite library 1/K0")
 
 
-@pytest.mark.parametrize("script", ["make_shift_decoys.py", "make_reverse_decoys.py"])
-def test_builder_is_deterministic(script, target_library, tmp_path):
+def test_builder_is_deterministic(target_library, tmp_path):
     """Two builds of the same library must be byte-for-byte equivalent.
 
     `make_reverse_decoys.py` resolves collisions with a Fisher-Yates seeded from
@@ -241,8 +233,8 @@ def test_builder_is_deterministic(script, target_library, tmp_path):
     library builds would carry different decoys and no result computed against
     one of them would be reproducible against the other.
     """
-    a = _build(script, target_library, tmp_path / "a")
-    b = _build(script, target_library, tmp_path / "b")
+    a = _build("make_reverse_decoys.py", target_library, tmp_path / "a")
+    b = _build("make_reverse_decoys.py", target_library, tmp_path / "b")
     for key in ("prec", "frag"):
         ca, cb = read_columns(a[key]), read_columns(b[key])
         assert list(ca) == list(cb)
@@ -255,95 +247,16 @@ def test_builder_is_deterministic(script, target_library, tmp_path):
                                    equal_nan=True)
 
 
-@pytest.mark.parametrize("builder", ["shift", "reverse"])
-def test_output_string_columns_are_utf8(builder, shift_library, reverse_library):
+def test_output_string_columns_are_utf8(reverse_library):
     """String columns must be arrow `utf8`, never `large_utf8`.
 
-    Both builders rely on the pandas default instead of casting to
+    The builder relies on the pandas default instead of casting to
     `pa.string()`, so on a pandas whose string dtype is arrow-backed the emitted
     library is rejected by the engine with "column 'peptidoform' is not utf8".
     """
-    lib = shift_library if builder == "shift" else reverse_library
+    lib = reverse_library
     for path in (lib["prec"], lib["frag"]):
         assert_string_columns_utf8(path)
-
-
-# ---------------------------------------------------------------------------
-# make_shift_decoys: the CH2 fragment shift
-# ---------------------------------------------------------------------------
-
-
-def test_shift_decoy_names_map_one_to_one_onto_the_targets(shift_library):
-    """Every decoy peptidoform and protein is `DECOY_` + the target's.
-
-    The `DECOY_` prefix is how the engine, `deeplc_finetune.py` and the report
-    stage recognise a decoy. A decoy whose name does not map back to its target
-    cannot be paired for picked target-decoy competition at the peptide level.
-    """
-    prec, _, idx_t, idx_d = _split_by_label(shift_library["prec"],
-                                            shift_library["frag"])
-    targets = {int(prec["peptidoform_id"][i]): (prec["peptidoform"][i],
-                                                prec["protein"][i]) for i in idx_t}
-    seen = set()
-    for j in idx_d:
-        pid = int(prec["peptidoform_id"][j])
-        tp, tprot = targets[pid]
-        assert prec["peptidoform"][j] == "DECOY_" + tp
-        assert prec["protein"][j] == "DECOY_" + tprot
-        seen.add(prec["peptidoform"][j])
-    assert len(seen) == len(idx_d) - 1, (
-        "expected exactly one duplicate decoy name, from the two charge rows of "
-        "PEPTIDEK; the shift builder names decoys after the peptidoform only"
-    )
-
-
-def test_shift_moves_b_down_and_y_up_by_one_ch2_per_charge(shift_library):
-    """b ions shift by `-DELTA/z` and y ions by `+DELTA/z`, net precursor zero.
-
-    The net-zero precursor shift is the whole point: the decoy stays in the same
-    isolation window while none of its fragments coincide with the target's. If
-    the sign or the charge division were wrong, decoy fragments would land on
-    real target fragment masses and the null would absorb real signal.
-    """
-    prec, frag, idx_t, idx_d = _split_by_label(shift_library["prec"],
-                                              shift_library["frag"])
-    pid_of_cid = {int(prec["candidate_id"][i]): int(prec["peptidoform_id"][i])
-                  for i in range(len(prec["candidate_id"]))}
-    label_of_cid = {int(prec["candidate_id"][i]): prec["label"][i]
-                    for i in range(len(prec["candidate_id"]))}
-
-    target_mz, decoy_mz = {}, {}
-    for k, cid in enumerate(frag["candidate_id"]):
-        cid = int(cid)
-        key = (pid_of_cid[cid], frag["name"][k])
-        (target_mz if label_of_cid[cid] == "target" else decoy_mz)[key] = (
-            float(frag["mz"][k]), frag["ion_type"][k], int(frag["frag_charge"][k])
-        )
-    assert set(target_mz) == set(decoy_mz)
-    assert len(decoy_mz) == len(TARGETS) * len(FRAGMENTS)
-    for key, (tmz, ion, z) in target_mz.items():
-        dmz = decoy_mz[key][0]
-        expect = tmz + (-1.0 if ion == "b" else 1.0) * DELTA_CH2 / z
-        assert dmz == pytest.approx(expect, abs=1e-6), (
-            "fragment {} shifted by {} instead of {}".format(key, dmz - tmz, expect - tmz)
-        )
-
-
-def test_shift_copies_intensities_and_ion_annotation(shift_library):
-    """Predicted intensities and ion annotation must be copied ion for ion.
-
-    The decoy is meant to differ from its target only in fragment m/z. A decoy
-    with different intensities is scored by a different feature distribution,
-    so the target/decoy score comparison is no longer apples to apples.
-    """
-    prec, frag, _, _ = _split_by_label(shift_library["prec"], shift_library["frag"])
-    label_of_cid = {int(prec["candidate_id"][i]): prec["label"][i]
-                    for i in range(len(prec["candidate_id"]))}
-    for k, cid in enumerate(frag["candidate_id"]):
-        if label_of_cid[int(cid)] == "decoy":
-            assert float(frag["predicted_intensity"][k]) == pytest.approx(0.5)
-            assert frag["ion_type"][k] in ("b", "y")
-            assert int(frag["frag_charge"][k]) in (1, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -429,8 +342,8 @@ def test_distinct_target_sequences_do_not_share_a_decoy_sequence(reverse_library
 def test_reverse_recomputes_real_fragment_mz_for_the_decoy_sequence(reverse_library):
     """Decoy fragment m/z must be the real b/y of the decoy sequence.
 
-    Unlike the shift builder, this one changes the sequence, so the fragments
-    must be recomputed rather than copied. A copied m/z would describe the
+    The decoy has another sequence than its target, so its fragments must be
+    recomputed rather than copied. A copied m/z would describe the
     target's fragments under the decoy's sequence label, making the decoy score
     on real target evidence. Checked against the independent residue table in
     `conftest.py`.
@@ -515,22 +428,19 @@ def _assert_decoys_carry_their_targets_annotations(prec_path):
     assert by_pair and all(v["decoy"] == v["target"] for v in by_pair.values())
 
 
-@pytest.mark.parametrize("script", ["make_shift_decoys.py", "make_reverse_decoys.py"])
-def test_the_annotation_columns_travel_with_every_target_onto_its_decoy(script, target_library,
-                                                                       tmp_path):
+def test_the_annotation_columns_travel_with_every_target_onto_its_decoy(target_library, tmp_path):
     """The protein annotations are columns of the precursor table (#299): the builder keeps
     them on every target and copies them onto its decoy, so the output library carries them
     wherever it is copied, and writes no side table."""
     src = _with_annotation_columns(target_library, tmp_path / "in")
-    out = _build(script, src, tmp_path / "out")
+    out = _build("make_reverse_decoys.py", src, tmp_path / "out")
     _assert_decoys_carry_their_targets_annotations(out["prec"])
     assert_string_columns_utf8(out["prec"])
     assert not (out["prec"].parent / "protein_annotations.parquet").exists()
     assert "carried in the library's protein_ids" in out["stdout"]
 
 
-@pytest.mark.parametrize("script", ["make_shift_decoys.py", "make_reverse_decoys.py"])
-def test_a_side_table_beside_an_older_library_becomes_its_columns(script, tmp_path):
+def test_a_side_table_beside_an_older_library_becomes_its_columns(tmp_path):
     """A target library imported before the columns existed has its annotations in the side
     table beside it; the builder writes them into its output's columns, decoys taking their
     targets' values. With no side table, a stale one at the output belongs to another
@@ -546,13 +456,13 @@ def test_a_side_table_beside_an_older_library_becomes_its_columns(script, tmp_pa
     ann = tmp_path / "in" / "protein_annotations.parquet"
     write_protein_annotations(
         {p: dict(zip(ANNOTATION_COLUMNS, _annotation(p))) for p in proteins}, ann)
-    out = _build(script, src, tmp_path / "out")
+    out = _build("make_reverse_decoys.py", src, tmp_path / "out")
     _assert_decoys_carry_their_targets_annotations(out["prec"])
     stale = out["prec"].parent / "protein_annotations.parquet"
     assert not stale.exists(), "the output carries columns, not a side table"
 
     ann.unlink()
     stale.write_bytes(ann.parent.joinpath("target_precursors.parquet").read_bytes())
-    out = _build(script, src, tmp_path / "out")
+    out = _build("make_reverse_decoys.py", src, tmp_path / "out")
     assert not stale.exists()
     assert not set(ANNOTATION_COLUMNS) & set(pq.read_schema(str(out["prec"])).names)

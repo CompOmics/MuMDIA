@@ -234,8 +234,7 @@ def sort_fragments_by_candidate(path, buckets: int = 64, tmp_dir=None) -> int:
 # side table beside it (`embed_annotations`). That side table, `protein_annotations.parquet`
 # (one row per `protein` key), is what the importer wrote beside a library before; the engine
 # still reads it beside a library without the columns, and `mumdia digest` still writes one
-# for a FASTA, which is how a FASTA-built library and the added peptides of
-# `augment_library.py` are annotated.
+# for a FASTA, which is how a FASTA-built library is annotated.
 # ---------------------------------------------------------------------------------------
 
 PROTEIN_ANNOTATIONS = "protein_annotations.parquet"

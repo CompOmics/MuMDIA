@@ -38,13 +38,13 @@ def _load():
 
 
 # PEPTIDEK occurs in ONE as PEPTLDEK (I/L) and in TWO verbatim; KITTENR in ONE after its
-# initiator Met; SCENICK in TWO; MELLOWK starts CON_P33333. NTERMCK occurs nowhere.
+# initiator Met; SCENICK in TWO; MELLAWK starts CON_P33333. NTERMCK occurs nowhere.
 FASTA = """>sp|P11111|ONE_HUMAN Protein one OS=Homo sapiens GN=ONE PE=1
 MKITTENRPEPTLDEKGG
 >sp|P22222|TWO_YEAST Protein two OS=Saccharomyces GN=TWO PE=1
 GKSCENICKPEPTIDEKAA
 >CON_P33333 a contaminant
-MELLOWKGG
+MELLAWKGG
 """
 
 
@@ -86,16 +86,16 @@ def test_the_protein_key_options():
     assert m.protein_key("sp|P11111|ONE_HUMAN", "entry_name") == "ONE_HUMAN"
     # A header without the fields keeps its first word.
     assert m.protein_key("CON_P33333", "entry_name") == "CON_P33333"
-    assert _records(FASTA)[2] == ("CON_P33333", "MELLOWKGG")
+    assert _records(FASTA)[2] == ("CON_P33333", "MELLAWKGG")
 
 
 @pytest.fixture()
 def library(diann_lib, tmp_path):  # noqa: F811
-    """The importer's fixture library with shift decoys, and the FASTA above."""
+    """The importer's fixture library with reverse decoys, and the FASTA above."""
     tp, tf = tmp_path / "t_prec.parquet", tmp_path / "t_frag.parquet"
     run_worker_ok("import_diann_lib.py", diann_lib, tp, tf)
     prec, frag = tmp_path / "lib_precursors.parquet", tmp_path / "lib_fragments.parquet"
-    run_worker_ok("make_shift_decoys.py", tp, tf, prec, frag)
+    run_worker_ok("make_reverse_decoys.py", tp, tf, prec, frag)
     fasta = tmp_path / "new.fasta"
     fasta.write_text(FASTA)
     return {"prec": prec, "frag": frag, "fasta": fasta, "dir": tmp_path}
@@ -118,11 +118,11 @@ def test_a_library_is_remapped_and_its_decoys_follow(library):
     targets = {(r["peptidoform"], r["charge"]): r for r in rows if r["label"] == "target"}
     # NTERMCK occurs in no protein: dropped, with its decoy.
     assert sorted(k[0] for k in targets) == sorted(
-        ["M[Oxidation]ELLOWK", "SC[Carbamidomethyl]ENICK", "K[Farnesyl]ITTENR",
+        ["M[Oxidation]ELLAWK", "SC[Carbamidomethyl]ENICK", "K[Farnesyl]ITTENR",
          "PEPTIDEK", "PEPTIDEK"])
     assert targets[("PEPTIDEK", 2)]["protein"] == "sp|P11111|ONE_HUMAN;sp|P22222|TWO_YEAST"
     assert targets[("K[Farnesyl]ITTENR", 2)]["protein"] == "sp|P11111|ONE_HUMAN"
-    assert targets[("M[Oxidation]ELLOWK", 2)]["protein"] == "CON_P33333"
+    assert targets[("M[Oxidation]ELLAWK", 2)]["protein"] == "CON_P33333"
     # Annotations from the new FASTA's headers.
     pep = targets[("PEPTIDEK", 2)]
     assert (pep["protein_ids"], pep["protein_names"], pep["genes"]) == (
@@ -149,7 +149,9 @@ def test_unmapped_keep_writes_unassigned(library):
     assert_library_load_invariants(out_p, out_f, require_both_labels=True)
     rows = _rows(out_p)
     assert len(rows) == 12
-    nterm = [r for r in rows if r["peptidoform"].endswith("NTERMCK")]
+    # The target and its decoy (a reversed sequence), paired on the peptidoform id.
+    pid = next(r["peptidoform_id"] for r in rows if r["peptidoform"].endswith("NTERMCK"))
+    nterm = [r for r in rows if r["peptidoform_id"] == pid]
     assert {r["protein"] for r in nterm} == {"UNASSIGNED", "DECOY_UNASSIGNED"}
     pep = next(r for r in rows if r["peptidoform"] == "PEPTIDEK")
     assert pep["protein"] == "ONE_HUMAN;TWO_YEAST"
@@ -163,6 +165,22 @@ def test_the_remap_can_write_over_its_input(library):
                   "--fasta", lib["fasta"])
     p, f = assert_library_load_invariants(lib["prec"], lib["frag"], require_both_labels=True)
     assert p.num_rows == 10 and f.num_rows < before
+
+
+def test_a_failed_in_place_remap_leaves_the_input_intact(library, monkeypatch):
+    """Both tables are written before either replaces its output, so a failure writing the
+    precursor table (a full disk) leaves the library being remapped in place as it was."""
+    m = _load()
+    before = [library[k].read_bytes() for k in ("prec", "frag")]
+
+    def full_disk(*_):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(m, "write_engine_parquet", full_disk)
+    with pytest.raises(OSError):
+        m.remap_files(library["prec"], library["frag"], library["prec"], library["frag"],
+                      str(library["fasta"]), log=lambda *_: None)
+    assert [library[k].read_bytes() for k in ("prec", "frag")] == before
 
 
 def test_a_fasta_without_any_library_peptide_is_refused(library):
@@ -186,7 +204,7 @@ def test_the_importer_remaps_its_targets(diann_lib, tmp_path):  # noqa: F811
     assert proteins["PEPTIDEK"] == "sp|P11111|ONE_HUMAN;sp|P22222|TWO_YEAST"
     assert proteins["[Carbamidomethyl]-NTERMCK"] == "UNASSIGNED"
     # The remapped targets feed the decoy builder as before.
-    run_worker_ok("make_shift_decoys.py", prec, frag, tmp_path / "d.parquet",
+    run_worker_ok("make_reverse_decoys.py", prec, frag, tmp_path / "d.parquet",
                   tmp_path / "df.parquet")
     # --fasta and --remap-fasta name the proteins two ways; refused together.
     rc, _, err = run_worker("import_diann_lib.py", diann_lib, prec, frag, "--remap-fasta", fasta,

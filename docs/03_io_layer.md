@@ -535,7 +535,7 @@ have refused it.
 ### Parquet written outside this crate
 
 Several tables the engine reads are produced by a Python helper rather than by
-`write_table`: an imported spectral library, an augmented library, a decoy
+`write_table`: an imported spectral library, a decoy
 build. The reader is deliberately narrow, so those files must match it exactly.
 Matching the column names and types is not sufficient.
 

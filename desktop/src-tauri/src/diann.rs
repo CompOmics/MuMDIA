@@ -1822,8 +1822,7 @@ fn predict_args(req: &BuildRequest, plan: &ModPlan, out_lib: &Path) -> Result<Ve
         // `--met-excision`" (CLAUDE.md), and without it the search database
         // structurally misses those peptides. A raw imported DIA-NN library built
         // without it was missing 209 of DIA-NN's own 1% peptides on the AIF benchmark,
-        // ALL of them this form -- the entire reason `augment_library.py` exists. This
-        // recipe omitted the flag, so every library the interface built lacked them,
+        // ALL of them this form. This recipe omitted the flag, so every library the interface built lacked them,
         // with nothing saying so, and the loss would have read as a MuMDIA sensitivity
         // result rather than a library-recipe defect.
         "--met-excision".into(),

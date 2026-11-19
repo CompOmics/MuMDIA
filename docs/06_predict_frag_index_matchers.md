@@ -930,8 +930,8 @@ Matcher selection (both stages default to `Fragindex`):
   does not return is dropped from the library together with its pair (it used to be
   anchored at iRT 0.0); the library report's `candidates_dropped_unpredicted` counts
   them so a large miss is visible rather than silent.
-- **A decoy's 1/K0 follows its iRT.** Script-built decoys (`make_reverse_decoys.py`,
-  `make_shift_decoys.py`, and the `predict_decoys.py` merge, which replaces only the
+- **A decoy's 1/K0 follows its iRT.** Script-built decoys (`make_reverse_decoys.py`
+  and the `predict_decoys.py` merge, which replaces only the
   fragments) copy their target's precursor row, so a decoy keeps its target's library
   `predicted_im`, null included, as it keeps the target's iRT and precursor m/z, and it
   shares the target's mobility window. Native FASTA decoys are peptidoforms of their own,
@@ -940,10 +940,6 @@ Matcher selection (both stages default to `Fragindex`):
   the Python decoy tests pin the copy (`test_decoy_keeps_the_target_precursor_mz_and_irt`,
   `test_merge_keeps_targets_and_takes_the_predicted_decoy_fragments`). Whether a copied
   1/K0 is as valid as a predicted one on diaPASEF is an open measurement.
-- **`augment_library.py` adds entries without 1/K0.** Its internal predict-frag runs
-  with `im_predictor = none` whatever the config says, so an imported library with
-  `predicted_im` gets null for the added entries rather than a second 1/K0 source, and
-  the helper prints how many rows carry a library 1/K0.
 - **An imported library can carry one iRT per stripped peptide.** The importer
   copies `predicted_irt` verbatim from the source library's RT column
   (`import_diann_lib.py:148`) and library load accepts it unchecked

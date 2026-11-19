@@ -110,6 +110,8 @@ RUN_RESULTS = {
 RUN_EVIDENCE = {
     "run_windows.parquet",
     "chromatograms.parquet",
+    # `extract.q1_traces`: the same traces on Q1 cycles (SCIEX ZT Scan DIA).
+    "chromatograms_q1.parquet",
     "features.parquet",
     "psms_competed.parquet",
     "psms_extracted.parquet",
@@ -407,10 +409,18 @@ def plan(out: Path, tier: str, *, with_mzml: bool, cwd: Path | None = None) -> d
 
 
 def apply(out: Path, p: dict) -> None:
-    for e in p["removed"]:
-        (out / e["path"]).unlink()
-    for e in p["converted_mzml"]:
-        Path(e["path"]).unlink()
+    removed, mzml = [], []
+    try:
+        for e in p["removed"]:
+            (out / e["path"]).unlink()
+            removed.append(e)
+        for e in p["converted_mzml"]:
+            Path(e["path"]).unlink()
+            mzml.append(e)
+    finally:
+        # Recorded even when a removal fails halfway (a file held open on Windows), so no file
+        # the manifest lists disappears without a record. The byte totals stay the plan's.
+        _record(out, {**p, "removed": removed, "converted_mzml": mzml})
     # Directories the prune emptied (never the output directory itself, nor a directory
     # that was empty before).
     emptied = set()
@@ -422,6 +432,10 @@ def apply(out: Path, p: dict) -> None:
     for d in sorted(emptied, key=lambda x: -len(x.parts)):
         if d.is_dir() and not any(d.iterdir()):
             d.rmdir()
+
+
+def _record(out: Path, p: dict) -> None:
+    """Append the prune `p` to `<out>/pruned.json`."""
     rec_path = out / "pruned.json"
     history = []
     if rec_path.is_file():
