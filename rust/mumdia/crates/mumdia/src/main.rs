@@ -2369,7 +2369,6 @@ fn real_main() -> Result<()> {
             config,
         } => {
             let cfg = load_config(&config)?;
-            let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             // `features.q1_consistency` reads the decisions against the run's tolerances.
             let q1_tolerances = match (&q1_cal, cfg.features.q1_consistency.on()) {
                 (Some(cal), _) => Some(stages::q1frag::read_model(cal)?.tolerances),
@@ -2386,7 +2385,6 @@ fn real_main() -> Result<()> {
                 out: &out,
                 out_pin: &out_pin,
                 cfg: &cfg.features,
-                config_hash: &ch,
                 // `retrace.apex_features` names the column a retraced psms_extracted
                 // carries; it is read only while the ion-mobility family is on.
                 imc_ref_w: cfg.retrace.apex_features,

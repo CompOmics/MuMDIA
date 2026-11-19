@@ -1513,7 +1513,6 @@ mod tests {
                 out: &feats,
                 out_pin: "",
                 cfg: &fcfg,
-                config_hash: "test",
                 imc_ref_w: false,
                 q1_tolerances: None,
             })

@@ -1342,7 +1342,6 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 out: "",
                 out_pin: "",
                 cfg: &cfg.features,
-                config_hash: ch,
                 // A grouped run is never retraced (`Config::validate`).
                 imc_ref_w: false,
                 q1_tolerances: None,
@@ -1417,7 +1416,6 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                     out: &feats,
                     out_pin: &pin,
                     cfg: &cfg.features,
-                    config_hash: ch,
                     imc_ref_w: false,
                     q1_tolerances: None,
                 },

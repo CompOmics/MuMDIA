@@ -234,6 +234,17 @@ than a number. Both are recorded in every run's `manifest.json`.
   layout of the output changes (the writer's default row groups instead of one per sort
   bucket), which the engine's range reads accept.
 
+- **The features stage writes its optional families by name.** The 37 Q1-profile,
+  per-fragment Q1, MS1-envelope and Q1-consistency columns were written through
+  hand-numbered positions that had to follow the order of their name lists, so reordering a
+  list would have put values under the wrong names without an error; they are resolved by
+  name once and written in a loop, as the other appended families already were, and the
+  extended names are read off the same plan as the values. Unused or test-only entry points
+  are removed (`features::run_with_bounds`, `active_features_with` / `_q1` / `_all` /
+  `_q1c` / `_for` and the unread `FeaturesParams::config_hash`), and a test now checks how
+  the stage feeds the default-on RT-window family. Every table, the PIN and the
+  configuration hash are unchanged.
+
 ### Removed
 
 - **`scripts/assemble_survivors.py` and `scripts/shard_parquet.py` (docs/32).**
@@ -319,6 +330,19 @@ than a number. Both are recorded in every run's `manifest.json`.
   compares its file lists with `retain.rs`. A removal that failed (a file held open on
   Windows) ended the prune before `pruned.json` was written, so the files already removed had
   no record; they are recorded before the error is raised.
+
+- **`features` refuses a chromatogram read that ends early.** With more than one thread
+  each chunk loader decodes its batches one ahead on a helper thread. A panic there (a
+  corrupt page, a decoder bug) closed the channel exactly as the end of the table does, so
+  the chunk came back short without an error: the missing candidates' PSMs got default
+  fragment features and zero extended values, and the stage published the table. A chunk
+  with fewer rows than its plan counted is now an error, as it already was for the
+  confident-bounds reader.
+- **A banded run no longer warns that `bound_from_confident` is set when it is off.** The
+  pooled elution bounds were fitted whatever the key, and with it off (the default) every
+  run with window groups, the desktop's memory bands included, logged that the key was set
+  but had fewer than 20 anchors. The fit now returns at once with the key off; the result
+  was already no global bounds.
 
 ### Security
 
