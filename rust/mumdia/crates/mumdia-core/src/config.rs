@@ -6559,8 +6559,7 @@ impl Config {
         // read there, not here.
         if self.rescore.features.is_some() && self.rescore.features_file.is_some() {
             return Err(Invalid(
-                "rescore.features and rescore.features_file are mutually exclusive; set one"
-                    .into(),
+                "rescore.features and rescore.features_file are mutually exclusive; set one".into(),
             ));
         }
         if self.rescore.features.as_ref().is_some_and(Vec::is_empty) {

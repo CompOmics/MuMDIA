@@ -762,8 +762,9 @@ fn push_projection_cache<'a>(args: &mut Vec<&'a str>, dir: Option<&'a crate::cac
 }
 
 /// Append `--shards <n>` for a sharded whole-library prediction
-/// (`rt_im_train.deeplc_predict_shards`, whose default 0 is automatic). One process passes
-/// nothing, so that argument list is the one an older `deeplc_finetune.py` accepts.
+/// (`rt_im_train.deeplc_predict_shards`). `1`, one process, passes nothing, so that argument
+/// list is the one an older `deeplc_finetune.py` accepts; the default `0` (automatic) passes
+/// `--shards 0` and the worker picks the count.
 fn push_shards<'a>(args: &mut Vec<&'a str>, shards: usize, rendered: &'a str) {
     if shards != 1 {
         args.push("--shards");

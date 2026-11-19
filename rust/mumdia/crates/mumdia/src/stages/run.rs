@@ -1314,15 +1314,24 @@ mod tests {
         no_decoys.digest.decoy.strategy = mumdia_core::config::DecoyStrategy::None;
         let e = check(&no_decoys, false).unwrap_err().to_string();
         assert!(e.contains("digest.decoy.strategy"), "{e}");
-        assert!(check(&no_decoys, true).is_ok(), "an imported library has its own decoys");
+        assert!(
+            check(&no_decoys, true).is_ok(),
+            "an imported library has its own decoys"
+        );
 
         let mut stale = base.clone();
         stale.predict_frag.deeplc_python = Some(d.join("no-such-python").to_string_lossy().into());
         let e = check(&stale, true).unwrap_err().to_string();
         assert!(e.contains("predict_frag.deeplc_python"), "{e}");
-        assert!(check(&stale, false).is_ok(), "a FASTA run does not re-predict a library");
+        assert!(
+            check(&stale, false).is_ok(),
+            "a FASTA run does not re-predict a library"
+        );
         stale.rt_im_train.library_irt = mumdia_core::config::LibraryIrt::Library;
-        assert!(check(&stale, true).is_ok(), "library_irt = library starts no DeepLC");
+        assert!(
+            check(&stale, true).is_ok(),
+            "library_irt = library starts no DeepLC"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 }
