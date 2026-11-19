@@ -3384,10 +3384,13 @@ function currentRunMode() {
 }
 
 async function pick(what) {
-  // Spectra accept several at once; everything else is a single choice.
+  // Spectra accept several at once, as files or as folders; everything else is a
+  // single choice.
   const many = what === "mzml";
+  // `mzml_dir` is the only folder picker that takes several: a Bruker `.d` or a
+  // Waters `.raw` is a directory, and an experiment is usually many of them.
   const chosen = DIR_PICKS.has(what)
-    ? await dialog.open({ directory: true, multiple: false })
+    ? await dialog.open({ directory: true, multiple: what === "mzml_dir" })
     : await dialog.open({ multiple: many, filters: FILTERS[what] });
   if (!chosen) return;
 
