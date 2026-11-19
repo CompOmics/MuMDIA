@@ -4,17 +4,13 @@
 pub mod codec;
 pub mod hash;
 pub mod json;
+pub mod publish;
 pub mod report;
 pub mod span_cache;
 pub mod table;
 
 use anyhow::Result;
 use mumdia_core::manifest::ArtifactRecord;
-
-/// Initialize tracing once, honoring `RUST_LOG` (default `info`).
-pub fn init_logging() {
-    init_logging_level(None)
-}
 
 /// Initialize tracing with an explicit level, falling back to `RUST_LOG` and then
 /// to `info`.

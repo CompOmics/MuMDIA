@@ -410,7 +410,7 @@ pub fn run(p: BuildLibraryParams) -> Result<serde_json::Value> {
 
     let n_prec = mumdia_io::table::nrows(&lib.precursors)?;
     let n_frag = mumdia_io::table::nrows(&lib.fragments)?;
-    let targets = mumdia_io::table::Table::read_cols(&lib.precursors, &["label"])?
+    let targets = mumdia_io::table::TableFile::open(&lib.precursors)?
         .str_eq("label", "target")?
         .iter()
         .filter(|t| **t)

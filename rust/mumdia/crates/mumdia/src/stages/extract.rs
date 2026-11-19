@@ -3933,7 +3933,7 @@ struct CandOut {
 /// The table used to be held whole, 21 to 32 column vectors for every accepted row, and
 /// written once at the end through `write_table`, which cut it into 65,536-row chunks.
 /// Now `PsmStream` writes a full chunk as soon as it fills, through the same writer, so
-/// the writer sees the same chunks and the file is byte-identical (`write_table_chunked`
+/// the writer sees the same chunks and the file is byte-identical (`write_table_chunked_hashed`
 /// states why the chunk sequence is what matters). Only the demix features need the
 /// whole table, because they are patched in after the loop; with
 /// `emit_demix_features` the rows are kept and written at the end as before.

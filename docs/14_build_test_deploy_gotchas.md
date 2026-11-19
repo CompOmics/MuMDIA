@@ -235,9 +235,7 @@ _`mumdia-core`:_
   by-mass agree; N-term/C-term mods; low-information fragments dropped; the basic
   residue count counts only R/H/K; per-fragment basic sites by slice;
   unknown-mod error; ambiguous-residue error.
-- `rejection.rs`: rejection `code()` strings match the spec; serde round-trip uses
-  the spec spelling; `earliest` keeps the smaller (earlier) stage; `is_rejection`
-  flags only losses; stage order is a monotone ladder.
+- `rejection.rs`: rejection `code()` strings match the spec.
 - `config.rs`: default round-trips (`min_len=5`, `FeatureSet::Minimal`,
   `top_n_peaks=300`, `rescore.strict=true`); unknown key rejected; partial override
   keeps defaults; the `quant.q_filter` enum parses and re-serializes to its snake
