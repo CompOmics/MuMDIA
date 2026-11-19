@@ -18,9 +18,18 @@ target's mobility window as it shares its retention-time window (docs/06).
 
   python predict_decoys.py build <in_prec> <in_frag> <out_prec> <out_frag> --diann <diann>
         [--threads N] [--work DIR] [--keep-unimod 4,35,...] [--diann-arg ARG ...]
+        [--diann-mod UniMod:<id>,<mass> ...]
       the whole chain: write the decoys as a DIA-NN library TSV, let DIA-NN predict them,
       re-export the prediction as Parquet when DIA-NN writes a .speclib, import it with
       import_diann_lib.py, and merge. <in_*> is make_reverse_decoys.py's output.
+
+      Both DIA-NN runs declare every modification the decoys carry (`--mod UniMod:<id>,<mass>`,
+      masses from the modification catalogue). DIA-NN knows only a few modifications by itself
+      (UniMod 4, 35 and 21 among them); for any other, methyl (UniMod:34) or trimethyl
+      (UniMod:37) for example, it refuses to predict ("cannot generate a predicted library
+      without knowing the modification masses") and its re-export then saves 0 precursors.
+      A `--diann-mod` value is declared as well, before the derived ones, and wins for its
+      accession. Without `--keep-unimod`, the importer keeps the accessions the decoys carry.
   python predict_decoys.py tsv <in_prec> <in_frag> <out.tsv>
   python predict_decoys.py merge <in_prec> <in_frag> <pred_prec> <pred_frag> <out_prec> <out_frag>
       the two halves, for a DIA-NN run made by hand (`diann --lib out.tsv --predictor
@@ -48,7 +57,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from _lib_io import (embed_annotations, narrow_table, retire_side_table,  # noqa: E402
                     sort_fragments_by_candidate, write_engine_parquet)
-from _unimod import MODIFICATIONS  # noqa: E402
+from _unimod import MASS_BY_NAME, MODIFICATIONS, NAME_BY_UNIMOD  # noqa: E402
 
 TO_UNIMOD = {name: uid for name, uid, _ in MODIFICATIONS}
 MODS = re.compile(r"\[([^\]]+)\]")
@@ -240,37 +249,145 @@ def run(cmd):
     subprocess.run(cmd, check=True)
 
 
+# What DIA-NN prints when a library carries a modification it was not given the mass of.
+NO_MASSES = "cannot generate a predicted library without knowing the modification masses"
+UNKNOWN_MODS = re.compile(r"unknown modifications found in the library[^:]*:\s*"
+                          r"(UniMod:\d+(?:,\s*UniMod:\d+)*)")
+
+
+def run_diann(cmd):
+    """Run DIA-NN with its output passed through, and return that output.
+
+    DIA-NN reports an undeclared modification as an ERROR line and still exits 0, so its
+    output is the only place the failure shows.
+    """
+    print("$ " + " ".join(cmd), flush=True)
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                         errors="replace")
+    lines = []
+    for line in p.stdout:
+        sys.stdout.write(line)
+        lines.append(line)
+    sys.stdout.flush()
+    if p.wait() != 0:
+        raise subprocess.CalledProcessError(p.returncode, cmd)
+    return "".join(lines)
+
+
+def undeclared(output):
+    """The accessions DIA-NN names as unknown in its output, in order, without repeats."""
+    seen = []
+    for m in UNKNOWN_MODS.finditer(output):
+        for uid in re.findall(r"UniMod:\d+", m.group(1)):
+            if uid not in seen:
+                seen.append(uid)
+    return seen
+
+
+def check_diann_output(output, mods):
+    """Stop with the reason when DIA-NN could not predict for want of modification masses."""
+    if NO_MASSES not in output:
+        return
+    names = undeclared(output)
+    sys.exit(
+        "DIA-NN could not predict the decoy spectra: the library carries modification(s) it "
+        f"was not given the mass of{': ' + ', '.join(names) if names else ''}. Declared: "
+        f"{', '.join(mods) or 'none'}. Declare each with --diann-mod UniMod:<id>,<mass> and "
+        "run again.")
+
+
+def mods_in(pforms):
+    """The catalogue names of every modification in these peptidoforms, sorted."""
+    names = set()
+    for pf in pforms:
+        names.update(MODS.findall(strip_decoy(pf)))
+    return sorted(names)
+
+
+def diann_mods(pforms, extra=()):
+    """`UniMod:<id>,<mass>` declarations for DIA-NN: `extra` first, then every modification
+    the peptidoforms carry, from the catalogue, once per accession.
+
+    A name the catalogue lacks is refused here rather than by DIA-NN, which would only say
+    that it cannot predict.
+    """
+    out, ids = [], set()
+    for d in extra:
+        d = d.strip()
+        uid, _, mass = d.partition(",")
+        try:
+            ok = re.fullmatch(r"UniMod:\d+", uid) is not None and float(mass.split(",")[0]) > 0
+        except ValueError:
+            ok = False
+        if not ok:
+            sys.exit(f"--diann-mod {d!r}: expected UniMod:<id>,<mass>, e.g. UniMod:34,14.015650")
+        if uid not in ids:
+            ids.add(uid)
+            out.append(d)
+    names = mods_in(pforms)
+    unknown = [n for n in names if n not in TO_UNIMOD]
+    if unknown:
+        sys.exit(f"modification(s) outside the catalogue (scripts/_unimod.py): {unknown}")
+    for uid in sorted({TO_UNIMOD[n] for n in names}):
+        key = f"UniMod:{uid}"
+        if key not in ids:
+            ids.add(key)
+            out.append(f"{key},{MASS_BY_NAME[NAME_BY_UNIMOD[uid]]:.6f}")
+    return out
+
+
+def mod_args(mods):
+    """`--mod <declaration>` per declaration: declares a modification's mass and nothing else,
+    so it neither adds nor removes a peptidoform."""
+    return [x for d in mods for x in ("--mod", d)]
+
+
 def build(a):
     work = a.work or os.path.join(os.path.dirname(os.path.abspath(a.out_prec)), "decoy_prediction")
     os.makedirs(work, exist_ok=True)
     stem = "decoys"
     lib_tsv = os.path.join(work, f"{stem}.tsv")
     tsv(a.in_prec, a.in_frag, lib_tsv)
-    run([a.diann, "--lib", lib_tsv, "--predictor", "--gen-spec-lib", "--out-lib",
-         os.path.join(work, stem), "--threads", str(a.threads), *a.diann_arg])
+    prec = pd.read_parquet(a.in_prec, columns=["peptidoform", "label"])
+    decoys = prec.peptidoform[prec.label == "decoy"].unique()
+    mods = diann_mods(decoys, a.diann_mod)
+    print(f"declared to DIA-NN: {', '.join(mods) or 'no modifications'}", flush=True)
+    out = run_diann([a.diann, "--lib", lib_tsv, "--predictor", "--gen-spec-lib", "--out-lib",
+                     os.path.join(work, stem), "--threads", str(a.threads), *mod_args(mods),
+                     *a.diann_arg])
+    check_diann_output(out, mods)
     parquet = find_parquet(work, stem)
     if parquet is None:
         speclib = sorted(glob.glob(os.path.join(work, f"{stem}*.speclib")))
         if not speclib:
             sys.exit(f"DIA-NN wrote neither a Parquet nor a .speclib library in {work}")
         parquet = os.path.join(work, f"{stem}.parquet")
-        reexport = [a.diann, "--lib", speclib[0], "--gen-spec-lib", "--out-lib", parquet]
+        reexport = [a.diann, "--lib", speclib[0], "--gen-spec-lib", "--out-lib", parquet,
+                    *mod_args(mods)]
         try:
-            run(reexport + ["--threads", str(a.threads)])
+            run_diann(reexport + ["--threads", str(a.threads)])
         except subprocess.CalledProcessError as e:
             # Seen once on a 5.4M-decoy library: DIA-NN 2.7 died with an access violation
             # right after "Initialising library", and the same command succeeded on retry.
             print(f"re-export failed ({e.returncode}); retrying once with fewer threads", flush=True)
-            run(reexport + ["--threads", str(max(1, min(8, a.threads)))])
+            run_diann(reexport + ["--threads", str(max(1, min(8, a.threads)))])
         if not os.path.isfile(parquet):
             sys.exit(f"the re-export produced no {parquet}; DIA-NN 2.x is needed")
+    if pq.ParquetFile(parquet).metadata.num_rows == 0:
+        sys.exit(f"DIA-NN predicted no decoy spectra: {parquet} has 0 rows for {len(decoys)} "
+                 f"decoy peptidoforms (declared modifications: {', '.join(mods) or 'none'}). "
+                 "DIA-NN's output above gives the reason.")
     pp, pfr = os.path.join(work, "pred_precursors.parquet"), os.path.join(work, "pred_fragments.parquet")
     # The decoys' own import writes no annotation columns: the merge keeps the input
     # library's, in which each decoy carries its target's values.
     imp = [sys.executable, os.path.join(HERE, "import_diann_lib.py"), parquet, pp, pfr,
            "--no-annotations"]
-    if a.keep_unimod:
-        imp += ["--keep-unimod", a.keep_unimod]
+    # The decoys carry only what the input library kept, so without an explicit set the
+    # import keeps exactly those accessions. The importer's default set would drop every
+    # decoy with another modification (methyl, say), and the merge its target with it.
+    keep = a.keep_unimod or ",".join(str(TO_UNIMOD[n]) for n in mods_in(decoys))
+    if keep:
+        imp += ["--keep-unimod", keep]
     run(imp)
     merge(a.in_prec, a.in_frag, pp, pfr, a.out_prec, a.out_frag)
 
@@ -294,6 +411,9 @@ def main():
     b.add_argument("--keep-unimod", help="forwarded to import_diann_lib.py")
     b.add_argument("--diann-arg", action="append", default=[],
                    help="extra argument for the DIA-NN prediction run (repeatable)")
+    b.add_argument("--diann-mod", action="append", default=[], metavar="UniMod:<id>,<mass>",
+                   help="declare a modification to both DIA-NN runs as --mod (repeatable); "
+                        "every catalogue modification the decoys carry is declared anyway")
     a = ap.parse_args()
     build(a)
 
