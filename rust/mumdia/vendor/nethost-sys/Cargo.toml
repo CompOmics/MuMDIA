@@ -1,0 +1,37 @@
+# Vendored from nethost-sys 0.7.3 (upstream commit 492d3ce2d5d03cb310e9923db097bd137ab4e688).
+# Only this manifest differs: zip is upgraded to a fixed release, and publishing is disabled.
+# Remove this patch when the upstream Thermo dependency chain supports zip >= 9.0.5.
+[package]
+name = "nethost-sys"
+version = "0.7.3"
+description = "FFI bindings for nethost."
+readme = "README.md"
+repository = "https://github.com/OpenByteDev/nethost-sys"
+documentation = "https://docs.rs/nethost-sys"
+license = "MIT"
+authors = ["OpenByte <development.openbyte@gmail.com>"]
+edition = "2021"
+links = "nethost"
+categories = ["no-std", "external-ffi-bindings"]
+keywords = ["nethost", "dotnet", "bindings", "coreclr"]
+build = "build/mod.rs"
+publish = false
+
+[package.metadata.mumdia]
+patched = "Vendored nethost-sys 0.7.3 from crates.io (upstream commit 492d3ce2); MuMDIA changed only its Cargo.toml to use zip 9.0.5 or newer. Rust sources are unmodified."
+resolves = ["RUSTSEC-2026-0367", "RUSTSEC-2026-0368", "RUSTSEC-2026-0369", "RUSTSEC-2026-0429", "RUSTSEC-2026-0545", "RUSTSEC-2026-0547", "RUSTSEC-2026-0548"]
+
+[dependencies]
+coreclr-hosting-shared = "0.1"
+
+[build-dependencies]
+build-target = "0.8"
+cargo-emit = "0.2"
+ureq = { version = "3.1", features = ["json"], optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+semver = { version = "1.0", optional = true }
+zip = { version = "9.0.5", optional = true }
+
+[features]
+download-nuget = ["ureq", "serde", "serde_json", "semver", "zip"]

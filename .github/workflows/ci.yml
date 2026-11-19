@@ -181,18 +181,6 @@ jobs:
       # nothing to bump to and a hard failure would only train people to ignore
       # this job. Deny the class that has a fix.
       #
-      # Four advisories are ignored deliberately: RUSTSEC-2026-0367, -0368, -0369 and
-      # -0429 in zip 6.0.0 (SUID/SGID bits kept, symlinks outside the destination, Unix
-      # permissions applied through symlinks, and an abort on a symlink entry with a
-      # large declared size, all during extraction). zip is only a
-      # build dependency of nethost-sys 0.7.3, reached only under the opt-in `thermo`
-      # feature (mzdata -> thermorawfilereader -> netcorehost ^0.18 -> nethost-sys): its
-      # build script downloads Microsoft's nethost NuGet package from nuget.org over TLS
-      # and unpacks it. Nothing extracts an archive at run time, and release builds do
-      # not enable the feature. The fix is zip 9.0, and no release in the chain reaches
-      # it (nethost-sys 0.8.0 still requires zip ^8.3). Drop the ignores when
-      # thermorawfilereader moves to a netcorehost whose nethost-sys requires zip >= 9.
-      #
       # Thirteen zstd advisories are ignored deliberately, all on zstd 0.13.3 /
       # zstd-safe 7.3.0, which only timsrust 0.4.2 (the diaPASEF reader) pulls in:
       # RUSTSEC-2026-0391 (data of an abandoned stream on a reused context), -0398 and
@@ -207,8 +195,6 @@ jobs:
       - name: Audit
         run: >-
           cargo audit --deny unsound --deny yanked
-          --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369
-          --ignore RUSTSEC-2026-0429
           --ignore RUSTSEC-2026-0391 --ignore RUSTSEC-2026-0395 --ignore RUSTSEC-2026-0396
           --ignore RUSTSEC-2026-0397 --ignore RUSTSEC-2026-0398 --ignore RUSTSEC-2026-0399
           --ignore RUSTSEC-2026-0400 --ignore RUSTSEC-2026-0401 --ignore RUSTSEC-2026-0402

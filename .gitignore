@@ -17,6 +17,8 @@ out_*/
 mzml_files/
 fasta/
 sidecar_work/
+/bench/proteobench_input/
+/bench/diann_compare/
 # build + run logs
 *.log
 # ad-hoc analysis notebooks, dev notes, scratch configs (not shipped)
