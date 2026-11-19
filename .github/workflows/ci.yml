@@ -193,6 +193,14 @@ jobs:
       # it (nethost-sys 0.8.0 still requires zip ^8.3). Drop the ignores when
       # thermorawfilereader moves to a netcorehost whose nethost-sys requires zip >= 9.
       #
+      # Three more zip 6.0.0 advisories on the same path are ignored for the same reason
+      # and because the build script never reaches the affected code: RUSTSEC-2026-0545
+      # (AES entries not authenticated when truncated; the script reads no encrypted
+      # entry), -0547 (legacy Shrink/Reduce/Implode decoders; the `legacy-zip` feature is
+      # off) and -0548 (`ZipStreamReader` uses local-header names; the script reads with
+      # `ZipArchive::by_index`, which uses the central directory, and keeps only the
+      # nethost library files). Their fix is zip 9.0.5. Tracked in #329.
+      #
       # Thirteen zstd advisories are ignored deliberately, all on zstd 0.13.3 /
       # zstd-safe 7.3.0, which only timsrust 0.4.2 (the diaPASEF reader) pulls in:
       # RUSTSEC-2026-0391 (data of an abandoned stream on a reused context), -0398 and
@@ -209,6 +217,7 @@ jobs:
           cargo audit --deny unsound --deny yanked
           --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369
           --ignore RUSTSEC-2026-0429
+          --ignore RUSTSEC-2026-0545 --ignore RUSTSEC-2026-0547 --ignore RUSTSEC-2026-0548
           --ignore RUSTSEC-2026-0391 --ignore RUSTSEC-2026-0395 --ignore RUSTSEC-2026-0396
           --ignore RUSTSEC-2026-0397 --ignore RUSTSEC-2026-0398 --ignore RUSTSEC-2026-0399
           --ignore RUSTSEC-2026-0400 --ignore RUSTSEC-2026-0401 --ignore RUSTSEC-2026-0402

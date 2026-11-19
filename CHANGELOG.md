@@ -212,6 +212,20 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
+## [Unreleased]
+
+### Security
+
+- **RUSTSEC-2026-0545, -0547 and -0548 (zip 6.0.0) are audited and ignored, with their reason
+  (#329).** They reach the engine on the path of the four zip advisories the audit already
+  ignores: a build dependency of `nethost-sys` under the opt-in `thermo` feature, whose build
+  script reads the nethost package fetched over TLS with `ZipArchive::by_index`. It reads no
+  AES-encrypted entry (-0545), the `legacy-zip` decoders are not compiled (-0547), and it does
+  not use `ZipStreamReader` (-0548). Release builds do not enable the feature, and no release
+  in the chain reaches the fixed zip 9.0.5. RUSTSEC-2026-0543 (chrono unmaintained) has no
+  patched release, 0.4.45 being the latest, and stays a warning that does not fail the audit.
+  Neither lockfile changes, so no output changes.
+
 ## [0.14.0] - 2026-11-16
 
 ### Added
