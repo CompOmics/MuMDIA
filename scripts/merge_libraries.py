@@ -78,7 +78,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 
@@ -89,22 +88,13 @@ import pyarrow.parquet as pq
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from _lib_io import (ANNOTATION_COLUMNS, embed_annotations, has_annotation_columns,  # noqa: E402
-                     narrow_table, retire_side_table, sort_fragments_by_candidate,
-                     write_engine_parquet)
+from _lib_io import (ANNOTATION_COLUMNS, MZ_BIN_MAX, embed_annotations,  # noqa: E402
+                     has_annotation_columns, mz_bins, narrow_table, retire_side_table,
+                     stripped, write_engine_parquet)
 
-# A bracketed modification, with the dash of a terminal group (`[Acetyl]-PEPK`).
-_STRIP = re.compile(r"-?\[[^\]]*\]-?")
-# 0.01 Da bins for the fragment cardinality, as `import_diann_lib.py` counts it.
-_MZ_BIN_MAX = 1_000_000
 # The precursor columns every library has; others are optional and kept when present.
 _REQUIRED = ("candidate_id", "peptidoform", "charge", "precursor_mz", "predicted_irt", "label",
              "protein")
-
-
-def stripped(peptidoform: str) -> str:
-    s = peptidoform[6:] if peptidoform.startswith("DECOY_") else peptidoform
-    return _STRIP.sub("", s)
 
 
 def read_targets(prec_path, frag_path, what):
@@ -180,10 +170,9 @@ def apply_curve(kx, ky, x):
 
 def cardinality(frag_mz, frag_cid):
     """Per fragment, how many distinct precursors have a fragment in its 0.01 Da bin."""
-    b = np.clip(np.round(np.asarray(frag_mz, np.float32) * np.float32(100.0)).astype(np.int64),
-                0, _MZ_BIN_MAX - 1)
+    b = mz_bins(frag_mz)
     pairs = pd.DataFrame({"c": np.asarray(frag_cid, np.int64), "b": b}).drop_duplicates()
-    card = np.bincount(pairs["b"].to_numpy(), minlength=_MZ_BIN_MAX)
+    card = np.bincount(pairs["b"].to_numpy(), minlength=MZ_BIN_MAX)
     return card[b].astype(np.int32)
 
 
@@ -447,7 +436,6 @@ def main(argv=None):
         out = pd.read_parquet(a.out_precursors, columns=["label"])
         summary["out_targets"] = int((out["label"] == "target").sum())
         summary["out_decoys"] = int((out["label"] == "decoy").sum())
-    sort_fragments_by_candidate(a.out_fragments)
     retire_side_table(a.predicted_precursors, a.out_precursors)
     if a.summary:
         with open(a.summary, "w", encoding="utf-8") as fh:

@@ -13,7 +13,7 @@ with several `--mzml`, which pays the calibration once.
    19 min at 15 GB, 8-12-mers 1:40 h at 69 GB).
 2. **Drop what the run cannot measure.** `scripts/mz_range_survivors.py <lib_precursors>
    <isolation_windows.parquet> <survivors>` lists the precursors inside the run's isolation
-   range; `scripts/assemble_survivors.py` renumbers the library to them and remaps the
+   range; `mumdia sub-library --survivors` renumbers the library to them and remaps the
    fragments. 41% of the 9-mer library and 29% of the 8-12-mer library were charge-1
    precursors above the top window and could never yield a fragment. Do this before the
    decoys: every later stage scales with the row count. For a library MuMDIA builds from a
@@ -47,7 +47,7 @@ with several `--mzml`, which pays the calibration once.
    compete and `nn_torch` rescore. Use `mumdia run` rather than stage-by-stage chains: it
    passes the MS1 scans and the seed's mass calibration to extract (see below).
 9. **Second pass** from the union of first-pass identifications across the runs
-   (`assemble_survivors.py` on the identified candidate ids), per-run multi-head
+   (`mumdia sub-library` on the identified candidate ids), per-run multi-head
    calibration, pooled rescore.
 
 ## Two omissions in the hand-built chains
@@ -119,8 +119,8 @@ hypotheses being separated differ by that mass rather than by sequence.
 First pass: one `mumdia run` per file against the full calibrated 8-12-mer library (203M
 candidates), MS1 and mass calibration on, `windows_in_flight` 2-4, 96-128 threads, one host
 per file. Second pass: the union of the first-pass target precursors at run-level
-`q_value <= 0.01` (21,342) with their paired decoys, assembled by `assemble_survivors.py`
-into a 42,684-precursor library; one `mumdia run` per file on it with per-run multi-head
+`q_value <= 0.01` (21,342) with their paired decoys, pair-linked on `peptidoform_id` as
+`mumdia sub-library` does, into a 42,684-precursor library; one `mumdia run` per file on it with per-run multi-head
 calibration (`rt_im_train.multihead_calibration = 80`, about 80 s per file, RT windows
 62-73 s), then one pooled `rescore` over the seven competed tables. This is the analogue of
 DIA-NN's empirical-library workflow, whose second pass on these files searched a
@@ -182,6 +182,4 @@ Extract's accumulator payload was 158 GB with 8 windows in flight on 203M candid
 | script | purpose |
 |---|---|
 | `scripts/mz_range_survivors.py` | candidate ids inside the run's isolation range, as a survivors table |
-| `scripts/assemble_survivors.py` | a survivors table (prescan or the above) -> renumbered library with pair-linked target/decoy union on `peptidoform_id` |
-| `scripts/shard_parquet.py` | split a parquet into row-group-aligned shards, or concatenate shards |
 | `scripts/mh_shard_predict.py` | deduplicated, sharded multi-head calibration: `uniq`, `predict`, `merge` |

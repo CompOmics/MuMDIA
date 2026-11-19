@@ -5,8 +5,8 @@ Usage: python mz_range_survivors.py <lib_precursors> <isolation_windows> <out_su
 
 A precursor no isolation window can select never yields a fragment, so it is dead weight in
 every stage: on the 9-mer immunopeptidomics library 41% of the targets are charge 1 at m/z
-above the run's 723 upper edge. Feed the output to assemble_survivors.py, which keeps the
-target/decoy pair together (both share the precursor m/z) and renumbers candidate_id.
+above the run's 723 upper edge. Feed the output to `mumdia sub-library --survivors`, which
+keeps the target/decoy pair together (both share the precursor m/z) and renumbers candidate_id.
 """
 import sys
 
