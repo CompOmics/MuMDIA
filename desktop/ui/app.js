@@ -1251,6 +1251,17 @@ function validateSetup(settings) {
       }
     }
   }
+  // The m/z limits as a whole (each is checked to be a number above): plausible, and each
+  // pair in order. A setup file is text anyone can edit.
+  const dg = out.setup.digest || {};
+  out.errors.push(
+    ...mzProblems({
+      min_pr_mz: dg.precursor_mz_min ?? null,
+      max_pr_mz: dg.precursor_mz_max ?? null,
+      min_fr_mz: dg.fragment_mz_min ?? null,
+      max_fr_mz: dg.fragment_mz_max ?? null,
+    }).map((p) => `settings.digest: ${p}`)
+  );
   const m = out.setup.modifications || {};
   if (m.fixed && m.variable) {
     const fixed = new Set(m.fixed.map((s) => modKey(s.name, s.residue, s.position)));
@@ -1448,6 +1459,7 @@ async function applySearchSetup(s) {
     $(e.id).value = v === null ? "" : String(v);
     own(e.id);
   }
+  refreshMzNote();
   if (d.enzyme !== undefined) $("d-enzyme").value = d.enzyme;
   if (typeof d.cleavage_rule === "string") $("d-rule").value = d.cleavage_rule;
   if (d.enzyme !== undefined || d.cleavage_rule !== undefined) cleavageChanged();
@@ -3494,7 +3506,9 @@ function libraryParams(fasta, read = (id) => $(id)?.value) {
   const mz = (id) => {
     const raw = read(id);
     if (raw === undefined || raw === null || String(raw).trim() === "") return null;
-    const v = parseFloat(raw);
+    // `Number`, not `parseFloat`, which reads "1,800" as 1. The number input itself only
+    // ever reports a valid number or "", but a value can also come from a setup.
+    const v = Number(String(raw).trim());
     return Number.isFinite(v) && v > 0 ? v : null;
   };
   const enzyme = read("d-enzyme") ?? "trypsin_p";
@@ -3549,6 +3563,80 @@ function digestOverrides() {
     // of its hash and the library cache key.
     ...mzOverrides(d),
   };
+}
+
+// The plausibility check of the four m/z limits, the backend's `mzlimits.rs` rule (keep the
+// two together). A limit that is a positive number but no m/z went through: a highest
+// fragment m/z of 1 made DIA-NN generate 0 precursors, and the build failed two steps later
+// in the importer. Every set limit lies between `lowest` and `highest`, an upper limit is
+// at least `floor` (DIA-NN's default lower limit: below it the range is empty without a
+// lower limit of its own), and the lower limit of each pair is below the upper one.
+const MZ_LIMITS = [
+  {
+    what: "precursor", lowest: 100, highest: 6000, floor: 300,
+    lo: { key: "min_pr_mz", id: "d-prmin", label: "Lowest precursor m/z" },
+    hi: { key: "max_pr_mz", id: "d-prmax", label: "Highest precursor m/z" },
+  },
+  {
+    what: "fragment", lowest: 50, highest: 4000, floor: 200,
+    lo: { key: "min_fr_mz", id: "d-frmin", label: "Lowest fragment m/z" },
+    hi: { key: "max_fr_mz", id: "d-frmax", label: "Highest fragment m/z" },
+  },
+];
+const MZ_IDS = MZ_LIMITS.flatMap((g) => [g.lo.id, g.hi.id]);
+
+// Every problem with the limits of `d` (`libraryParams`' keys), one sentence each naming the
+// field and its value. With `fields`, a field whose text the number input could not read
+// (it reports an empty value then, which read as no limit) is a problem too.
+function mzProblems(d, fields = false) {
+  const out = [];
+  for (const g of MZ_LIMITS) {
+    let pairOk = true;
+    for (const [end, least] of [[g.lo, g.lowest], [g.hi, g.floor]]) {
+      if (fields && $(end.id)?.validity?.badInput) {
+        pairOk = false;
+        out.push(
+          `${end.label} is not a number the field can read. Type the m/z with a decimal ` +
+            "point and no thousands separator (1800, not 1,800 or 1 800), or leave it empty for no limit."
+        );
+        continue;
+      }
+      const v = d[end.key];
+      if (v === null || v === undefined) continue;
+      if (!(typeof v === "number" && Number.isFinite(v) && v >= least && v <= g.highest)) {
+        pairOk = false;
+        out.push(
+          `${end.label} is ${v}, which is not a plausible ${g.what} m/z: it must be between ` +
+            `${least} and ${g.highest}, or empty for no limit.`
+        );
+      }
+    }
+    const a = d[g.lo.key];
+    const b = d[g.hi.key];
+    if (pairOk && typeof a === "number" && typeof b === "number" && a >= b) {
+      out.push(`${g.lo.label} (${a}) must be below ${g.hi.label} (${b}).`);
+    }
+  }
+  return out;
+}
+
+// The m/z limits as the Search screen holds them, read without the `mz()` filter of
+// `libraryParams`, which drops a value that is not positive as if it were unset.
+function mzFieldValues(read = (id) => $(id)?.value) {
+  const d = {};
+  for (const g of MZ_LIMITS) {
+    for (const end of [g.lo, g.hi]) {
+      const raw = read(end.id);
+      d[end.key] = raw === undefined || raw === null || String(raw).trim() === "" ? null : Number(raw);
+    }
+  }
+  return d;
+}
+
+// The problems of the Search screen's m/z fields, shown under them as they are typed.
+function refreshMzNote() {
+  const el = $("d-mz-warn");
+  if (el) banner(el, mzProblems(mzFieldValues(), true).join(" "));
 }
 
 function mzOverrides(d) {
@@ -3928,6 +4016,18 @@ function initSearchOptions() {
   for (const id of ["d-missed", "d-minlen", "d-maxlen", "d-minz", "d-maxz", "d-prmin", "d-prmax", "threads"]) {
     $(id).addEventListener("change", scheduleSpace);
   }
+  for (const id of MZ_IDS) {
+    const el = $(id);
+    el.addEventListener("input", refreshMzNote);
+    el.addEventListener("change", refreshMzNote);
+    // A focused number input steps on the mouse wheel, and stepping an empty one writes
+    // its minimum (it was 1) into it unseen while the page is scrolled. Leaving the field
+    // first lets the wheel scroll the page instead.
+    el.addEventListener("wheel", () => {
+      if (document.activeElement === el) el.blur();
+    });
+  }
+  refreshMzNote();
   for (const r of document.querySelectorAll('input[name="runmode"]')) {
     r.addEventListener("change", refreshPrescreenNote);
   }
@@ -4132,6 +4232,7 @@ function searchProblems() {
   const out = [];
   if (state.mode === "fasta") {
     out.push(...modProblems());
+    out.push(...mzProblems(mzFieldValues(), true));
   }
   const pre = $("prescreen").value;
   if ((pre === "before" || pre === "tags") && experimentWithSeveral()) {
@@ -4407,7 +4508,11 @@ async function followLibraryBuild(errorEl) {
     if ($("cmd").textContent !== cmds) $("cmd").textContent = cmds;
     $("prog-sub").textContent = b.step || "working";
     if (b.status === "failed") {
-      banner(errorEl, b.error || "The library build failed.");
+      // The log stays on the Progress screen, which remains reachable from the menu.
+      banner(
+        errorEl,
+        `${b.error || "The library build failed."}\n\nThe full log is on the Progress screen.`
+      );
       leaveLibraryPhase();
       screen("input");
       return null;
@@ -4760,7 +4865,7 @@ async function startLibraryBuild() {
     );
     return;
   }
-  const problems = modProblems();
+  const problems = [...modProblems(), ...mzProblems(mzFieldValues(), true)];
   if (problems.length) {
     banner($("start-error"), problems.join("\n\n"));
     return;

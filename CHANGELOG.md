@@ -216,6 +216,29 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **Desktop: implausible m/z limits are refused before anything starts (desktop/README.md, "Precursor
+  and fragment m/z limits are digest parameters too").** A highest fragment m/z of 1 on the Search
+  screen reached DIA-NN as `--max-fr-mz 1`. DIA-NN generated 0 precursors, the re-export wrote an
+  empty library, `import_diann_lib.py` exited with "no target b/y fragment rows survived the
+  filters", and the application showed only "python.exe exited with 1". Each set limit must now be a
+  plausible m/z: precursor limits from 100 to 6,000 with the upper one at least 300, fragment limits
+  from 50 to 4,000 with the upper one at least 200 (DIA-NN's default lower limits), and the lower
+  limit below the upper. The Search screen shows the problem under the fields and Start and Build
+  library only refuse it, naming the field and its value; the backend refuses it again in the DIA-NN
+  build and in the configuration of the built-in path (`mzlimits.rs`), and a setup that carries one is
+  refused on loading and on saving. A field whose text the number input cannot read (`1,800` in a
+  locale with a decimal point) is refused rather than read as no limit. The fields' `min` is the
+  lowest plausible value instead of 1: an arrow key, the spinner or the mouse wheel on an empty field
+  wrote 1 into it. The mouse wheel now leaves a focused m/z field rather than stepping it.
+- **Desktop: an empty DIA-NN library stops the build with the reason.** When DIA-NN reports
+  "0 precursors generated", or the library it wrote has no rows (read from the Parquet footer), the
+  build or import stops before the importer with a message that names the digest settings and m/z
+  limits it used.
+- **Desktop: a failed library step quotes its last output.** A DIA-NN or Python step that exits
+  non-zero now names the script it ran and quotes its last lines of output (stderr for a Python
+  helper), for example "import_diann_lib.py (python.exe) exited with 1. Its last output: ...", in
+  place of "python.exe exited with 1". The full log stays on the Progress screen, and the message
+  says so.
 - **A DIA-NN library with a modification DIA-NN does not know by itself gets predicted decoys
   (docs/13, "predict_decoys").** A desktop build with methyl (UniMod:34) or trimethyl
   (UniMod:37) variable modifications predicted its targets, because that run declared them

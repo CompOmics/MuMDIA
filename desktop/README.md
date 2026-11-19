@@ -594,6 +594,26 @@ defaults), so a request without limits is the one it always was. The natural pre
 range is the span of the acquisition's isolation windows; a narrower one loses the
 identifications outside it. There is no automatic range from the selected spectra yet.
 
+A set limit must be a plausible m/z (`src/mzlimits.rs`, mirrored by `mzProblems` in `app.js`):
+precursor limits from 100 to 6,000 with the upper one at least 300, fragment limits from 50 to
+4,000 with the upper one at least 200, and the lower limit of a pair below the upper one. The
+two floors are DIA-NN's default lower limits, below which a range without a lower limit of its
+own is empty. A highest fragment m/z of 1 once reached DIA-NN as `--max-fr-mz 1`, which
+generated 0 precursors, and the build failed two steps later in the importer. The Search screen
+shows a problem under the fields as it is typed, Start and Build library only refuse it by field
+and value, the backend refuses it again in `diann::build` and in `derive_config` (the built-in
+path), and `setups.rs` refuses a setup that carries one on reading and on writing. A field whose
+text the number input cannot read (`1,800` in a locale with a decimal point; the input then
+reports an empty value) is refused rather than read as no limit. The inputs' `min` is the
+lowest plausible value: with `min="1"`, an arrow key, the spinner or the mouse wheel on an empty
+field wrote 1 into it. The mouse wheel leaves a focused m/z field rather than stepping it.
+
+When DIA-NN reports "0 precursors generated", or the library it wrote has no rows (the Parquet
+footer's `num_rows`, read without a Parquet library), the build stops before the importer and
+says which digest settings and m/z limits it used. A step that exits non-zero quotes its last
+lines of output (stderr for a Python helper) in the error, and names the script it ran; the full
+log stays on the Progress screen.
+
 **A predicted library is cached, content-addressed.** It depends on the FASTA's bytes
 and the digest parameters and on nothing else: not the mzML, not the thread count. So
 `library_cache_dir` keys it on a digest of the FASTA plus every parameter that changes

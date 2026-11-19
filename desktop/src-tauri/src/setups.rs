@@ -207,6 +207,10 @@ fn parse_with(text: &str, fallback_name: &str, steps: &[Step]) -> Result<Documen
             "Written in settings format {version}, and brought up to format {current}."
         ));
     }
+    // The Search screen's m/z limits, checked here as well as by the interface: a setup
+    // file is text anyone can edit, and a highest fragment m/z of 1 builds an empty
+    // library.
+    check_mz_limits(&settings)?;
     Ok(Document {
         name,
         created_by,
@@ -216,6 +220,14 @@ fn parse_with(text: &str, fallback_name: &str, steps: &[Step]) -> Result<Documen
         settings,
         notes,
     })
+}
+
+/// Refuse a setup whose m/z limits (`settings.digest.*_mz_*`) are not plausible
+/// (`mzlimits`), naming the field and its value.
+fn check_mz_limits(settings: &Value) -> Result<(), String> {
+    crate::mzlimits::MzLimits::of_setup(settings)
+        .check()
+        .map_err(|e| format!("its m/z limits are not plausible: {e}"))
 }
 
 /// A setup's name, trimmed, or why it cannot be one.
@@ -249,6 +261,7 @@ pub fn render(name: &str, settings: &Value, created: &str) -> Result<String, Str
     if !settings.is_object() {
         return Err("the settings of a setup are an object".into());
     }
+    check_mz_limits(settings)?;
     let name = checked_name(name)?;
     let text = serde_json::to_string_pretty(&Envelope {
         format: FORMAT,
@@ -683,6 +696,28 @@ mod tests {
             let e = parse(text, "f").expect_err(text);
             assert!(e.contains(why), "{text}: {e}");
         }
+    }
+
+    /// A setup file can carry an m/z limit the Search screen would refuse (a highest
+    /// fragment m/z of 1 builds an empty library): it is refused on reading and on
+    /// writing, naming the field and its value; plausible limits and no limits pass.
+    #[test]
+    fn a_setup_with_an_implausible_mz_limit_is_refused() {
+        let text = |digest: Value| {
+            render("Mz", &json!({ "digest": digest }), "2026-11-16T00:00:00Z").unwrap_or_else(|e| e)
+        };
+        let bad = r#"{"format": "mumdia-desktop-settings", "version": 1, "settings":
+            {"digest": {"fragment_mz_min": null, "fragment_mz_max": 1}}}"#;
+        let e = parse(bad, "f").unwrap_err();
+        assert!(e.contains("Highest fragment m/z is 1,"), "{e}");
+        let e = text(json!({"precursor_mz_min": 900, "precursor_mz_max": 400}));
+        assert!(
+            e.contains("Lowest precursor m/z (900) must be below"),
+            "{e}"
+        );
+        let ok = text(json!({"precursor_mz_min": 400, "precursor_mz_max": 1000.5,
+                             "fragment_mz_min": null, "fragment_mz_max": 1800}));
+        assert!(parse(&ok, "f").is_ok(), "{ok}");
     }
 
     #[test]

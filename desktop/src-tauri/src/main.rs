@@ -770,6 +770,9 @@ fn derive_config(
     base: Option<String>,
     overrides: std::collections::BTreeMap<String, serde_json::Value>,
 ) -> Result<String, String> {
+    // The Search screen's m/z limits, before a configuration is written: a highest
+    // fragment m/z of 1 is a positive number the engine would accept, and an empty library.
+    mumdia_console::mzlimits::MzLimits::of_overrides(&overrides)?.check()?;
     let path = settings::derive("search-derived", base.as_deref(), overrides)?;
     settings::validate(&path)?;
     Ok(path)
