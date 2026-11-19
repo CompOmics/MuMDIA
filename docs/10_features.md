@@ -906,10 +906,10 @@ bounds (`elution_lo`..`elution_hi`). The tolerances are the run's learned decisi
 `run`, `run-experiment` and their second passes hand over the ones extract decided with, and a
 standalone `mumdia features` reads them with `--q1-cal`; without them the stage is an error.
 A row whose lists do not have one entry per chromatogram fragment row reads 0, and the stage
-logs how many did (none on the K562 runs). `q1consist::ALL` computes eight more scores the
-classifier is not given (the cosine within the consistent fragments, their log intensity,
-whether the most intense predicted fragment is consistent, and the same similarity scores over
-the fragments that belong); in the screen below they added nothing. Nothing reads a label,
+logs how many did (none on the K562 runs). Eight more scores were screened and are not computed
+(the cosine within the consistent fragments, their log intensity, whether the most intense
+predicted fragment is consistent, and the same similarity scores over the fragments that
+belong): in the screen below they added nothing. Nothing reads a label,
 and the schema id changes only with the family on.
 
 Measured on ZT Scan REP01 with the recipe (`configs/examples/ztscan.json`), four NN seeds per
@@ -1047,12 +1047,12 @@ variant no longer exists).
 | `bound_confident_pct` | 50.0 | percentile of the confident-set half-widths taken as the global half-width (50 = median) |
 | `chrom_loaders` | 3 | chromatogram decode threads in the main pass, an upper bound that `--threads` and the chunk count also cap (see "The chunked pass" below); changes time and memory only, never a value or a byte of the features table |
 | `q1_features` | false | the `q1_profile` family of scanning-quadrupole spectra, which needs `extract.q1_profile`; appended last under `extended`. Omitted from the canonical configuration at its default |
-| `q1_fragment_features` | false | the `q1_fragments` family (eight `q1f_*` features of the per-fragment Q1 decision), which needs `extract.q1_fragments`; appended last under `extended`, after `q1_profile`. Omitted from the canonical configuration at its default |
+| `q1_fragment_features` | `"auto"` | the `q1_fragments` family (eight `q1f_*` features of the per-fragment Q1 decision), which needs `extract.q1_fragments`; appended last under `extended`, after `q1_profile`; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
 | `ms1_envelope` | false | the `ms1_envelope` family (nine `ms1e_*` features of the MS1 isotope envelope around the apex), whose evidence extract reads under the same key (psms_extracted v7); appended last under `extended`, after the Q1 families. Refused on 1/K0 spectra and grouped runs. Omitted from the canonical configuration at its default |
-| `q1_precursor` | false | the `q1_precursor` family (eight `q1p_*` features of the unfragmented precursor in the MS2 steps), whose evidence extract reads under the same key (psms_extracted v8); needs `extract.q1_fragments`; appended after `ms1_envelope`. Omitted from the canonical configuration at its default |
-| `q1_multiscale` | false | the `q1_multiscale` family (nine `q1m*` features at 3, 7 and 11 Q1 steps, twelve with `q1_precursor`), psms_extracted v8; needs `extract.q1_fragments`; appended after `q1_precursor`. Omitted from the canonical configuration at its default |
-| `q1_deconvolved` | false | the `q1_deconvolved` family (five `q1d_*` features of the per-peak Q1 centroids at the apex), psms_extracted v8; needs `extract.q1_fragments`; appended after `q1_multiscale`. Omitted from the canonical configuration at its default |
-| `q1_consistency` | false | the `q1_consistency` family (sixteen `q1c_*` features: the per-fragment Q1 decisions read against each fragment's expected Q1 centre), which needs `extract.q1_fragments` and the run's Q1 calibration tolerances (`mumdia features --q1-cal`); appended last under `extended`, after `ms1_envelope` and the other Q1 families. Omitted from the canonical configuration at its default |
+| `q1_precursor` | `"auto"` | the `q1_precursor` family (eight `q1p_*` features of the unfragmented precursor in the MS2 steps), whose evidence extract reads under the same key (psms_extracted v8); needs `extract.q1_fragments`; appended after `ms1_envelope`; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
+| `q1_multiscale` | `"auto"` | the `q1_multiscale` family (nine `q1m*` features at 3, 7 and 11 Q1 steps, twelve with `q1_precursor`), psms_extracted v8; needs `extract.q1_fragments`; appended after `q1_precursor`; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
+| `q1_deconvolved` | `"auto"` | the `q1_deconvolved` family (five `q1d_*` features of the per-peak Q1 centroids at the apex), psms_extracted v8; needs `extract.q1_fragments`; appended after `q1_multiscale`; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
+| `q1_consistency` | `"auto"` | the `q1_consistency` family (sixteen `q1c_*` features: the per-fragment Q1 decisions read against each fragment's expected Q1 centre), which needs `extract.q1_fragments` and the run's Q1 calibration tolerances (`mumdia features --q1-cal`); appended last under `extended`, after `ms1_envelope` and the other Q1 families; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
 | `im_features` | `off` | the `ion_mobility` family (`off`, `on`, `auto` = on when the spectra carry 1/K0). `run` and `run-experiment` resolve it once (`Config::resolve_im_features`) and hand every stage `on` or `off`; a standalone `mumdia features` resolves `auto` from the reader extract recorded in the chromatograms report. On a 4D run it also makes extract write the chromatograms' per-point 1/K0 (v3/v4). Omitted from the canonical configuration at its default |
 
 Note that the fragment tolerance used inside `mass_accuracy` is a hardcoded

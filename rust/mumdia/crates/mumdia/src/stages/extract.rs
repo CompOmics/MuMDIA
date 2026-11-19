@@ -4638,6 +4638,8 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
              where each candidate's RT window ends"
         );
     }
+    // The sweep's Q1 grid, built once for the gate below and the per-fragment decision.
+    let mut q1_grid: Option<q1frag::Q1Grid> = None;
     // `extract.q1_deconvolved`: every MS2 peak's Q1 centroid (`stages::q1dec`) and each
     // candidate's calibrated expected centre; a hit counts only within the learned tolerance.
     let q1_gate: Option<crate::stages::q1dec::Q1Gate> = if p.cfg.q1_deconvolved
@@ -4674,6 +4676,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             Err(_) => p.cfg.frag_tol_ppm,
         };
         let dec = crate::stages::q1dec::Q1Dec::build(scans, &grid, link_tol);
+        q1_grid = Some(grid);
         let centre: Vec<f32> = (0..ncand)
             .map(|c| {
                 let cd = lib.cand(c as u32);
@@ -4855,15 +4858,20 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                  `mumdia run` reads it, `mumdia extract` takes it as --q1-cal"
             );
         }
-        let sweep = crate::spectra::load_q1_sweep(p.ms2)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "extract: extract.q1_fragments needs the Q1 sweep spectra_ms2 v3 records \
-                 (q1_cycle, q1_step), and {} has none: convert it again with \
-                 convert.isolation_half_width",
-                p.ms2
-            )
-        })?;
-        let g = q1frag::Q1Grid::build(scans, &sweep)?;
+        let g = match q1_grid.take() {
+            Some(g) => g,
+            None => {
+                let sweep = crate::spectra::load_q1_sweep(p.ms2)?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "extract: extract.q1_fragments needs the Q1 sweep spectra_ms2 v3 records \
+                         (q1_cycle, q1_step), and {} has none: convert it again with \
+                         convert.isolation_half_width",
+                        p.ms2
+                    )
+                })?;
+                q1frag::Q1Grid::build(scans, &sweep)?
+            }
+        };
         let m = p.cfg.q1_model.as_ref().expect("checked above");
         info!(
             cycles = g.n_cycles,

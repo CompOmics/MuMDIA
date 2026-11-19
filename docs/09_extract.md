@@ -1087,8 +1087,8 @@ All three keys stay off and benchmark-gated: a second ZT Scan acquisition could 
 converted with its isolation targets for this measurement (docs/04_convert.md, "SCIEX ZT
 Scan DIA"), and CLAUDE.md asks for one before any default changes.
 
-The Q1 calibration that the per-fragment decisions of a later change are to read
-(`rt_im_train.q1_calibrate`, docs/08_rt_im_train.md, section 4h) found the window centred
+The Q1 calibration the per-fragment decisions read (section 12; `rt_im_train.q1_calibrate`,
+docs/08_rt_im_train.md, section 4h) found the window centred
 on its target and wider and softer than its nominal 3.8 m/z: whole within 0.57 m/z of
 its centre and nothing beyond 4.56 m/z. The trapezoid of `q1_profile` above is the nominal
 one (one step of edge, the half-width as read).

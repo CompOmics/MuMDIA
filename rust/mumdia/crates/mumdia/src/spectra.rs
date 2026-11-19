@@ -253,11 +253,21 @@ fn decode_ms2(t: &TableFile) -> Result<Vec<Ms2Scan>> {
 /// The m/z are widened from f32 once, which is exact, so the window bounds, the walk and the
 /// distance are computed on the doubles a widened-at-load peak carried.
 pub fn nearest_peak(peaks: &[Peak], target: f64, tol_ppm: f64) -> Option<usize> {
+    nearest_by(peaks, |pk| pk.mz, target, tol_ppm)
+}
+
+/// [`nearest_peak`] on a bare m/z list (ascending), as an artifact's list column holds it.
+pub fn nearest_mz(mz: &[f32], target: f64, tol_ppm: f64) -> Option<usize> {
+    nearest_by(mz, |&m| m, target, tol_ppm)
+}
+
+/// The rule of [`nearest_peak`] on any slice ascending in the m/z `mz` reads.
+fn nearest_by<T>(xs: &[T], mz: impl Fn(&T) -> f32, target: f64, tol_ppm: f64) -> Option<usize> {
     let (lo, hi) = mumdia_core::constants::ppm_bounds(target, tol_ppm);
-    let mut j = peaks.partition_point(|pk| (pk.mz as f64) < lo);
+    let mut j = xs.partition_point(|x| (mz(x) as f64) < lo);
     let (mut best_d, mut best) = (f64::MAX, None);
-    while j < peaks.len() && (peaks[j].mz as f64) <= hi {
-        let d = (peaks[j].mz as f64 - target).abs();
+    while j < xs.len() && (mz(&xs[j]) as f64) <= hi {
+        let d = (mz(&xs[j]) as f64 - target).abs();
         if d < best_d {
             best_d = d;
             best = Some(j);

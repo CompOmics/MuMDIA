@@ -178,34 +178,9 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
     info!(stage = %"extract", "run: stage start");
     let mut ext_cfg =
         crate::stages::ms1cal::extract_cfg(&cfg.extract, seed, &co.ms1, cfg.rt_im_train.q_train)?;
-    // The per-fragment Q1 decision (`extract.q1_fragments`) reads the calibrated window and
-    // the tolerances the Q1 calibration just wrote; the re-pick (`retrace.q1_repick`) runs
-    // inside extract.
-    if cfg.extract.q1_fragments.on() || cfg.extract.q1_deconvolved {
-        ext_cfg.q1_model = Some(crate::stages::q1frag::read_model_opts(
-            &d("cal.json"),
-            cfg.extract.q1_fragments.on(),
-        )?);
-    }
-    if cfg.extract.q1_fragments.on() {
-        ext_cfg.q1_repick = cfg.retrace.q1_repick.on();
-        ext_cfg.q1_repick_peaks = cfg.retrace.q1_repick_peaks;
-    }
-    // `extract.q1_deconvolved` / `features.q1_deconvolved`: the tolerance the Q1 calibration
-    // learned.
-    if q1_dec {
-        ext_cfg.q1_dec_tol_steps = Some(crate::stages::q1frag::read_deconvolution_tol(&d(
-            "cal.json",
-        ))?);
-    }
-    // `features.ms1_envelope`: extract reads the MS1 isotope-envelope evidence.
-    ext_cfg.ms1_envelope = cfg.features.ms1_envelope;
-    // `features.q1_precursor` / `features.q1_multiscale`: extract reads the scores on
-    // the per-fragment decision's patches.
-    ext_cfg.q1_precursor = cfg.features.q1_precursor.on();
-    ext_cfg.q1_multiscale = cfg.features.q1_multiscale.on();
-    ext_cfg.q1_dec_features = cfg.features.q1_deconvolved.on();
-    ext_cfg.q1_separable = cfg.features.q1_separable;
+    // The ZT Scan keys: the per-fragment Q1 decision and the Q1-deconvolved evidence read the
+    // calibration just written to cal.json.
+    crate::stages::q1frag::configure_extract(cfg, Some(&d("cal.json")), &mut ext_cfg)?;
     let (wpsm, wchr) = extract::run_hashed(extract::ExtractParams {
         precursor_span: None,
         fragment_offset: None,

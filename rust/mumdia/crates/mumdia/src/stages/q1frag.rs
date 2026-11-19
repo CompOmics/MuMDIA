@@ -63,6 +63,7 @@ use mumdia_core::types::Ms2Scan;
 use rayon::prelude::*;
 use serde_json::json;
 
+use super::q1dec;
 use crate::calibrate::percentile;
 
 /// Cycles read either side of the apex cycle.
@@ -207,7 +208,8 @@ pub fn model_from_calibration(
     with_tolerances: bool,
 ) -> Result<Q1FragModel> {
     let status = block["status"].as_str().unwrap_or("missing");
-    if status != "fitted" {
+    // "nominal": too few profiles to fit, the nominal window (`q1cal::nominal`).
+    if status != "fitted" && status != "nominal" {
         bail!(
             "the Q1 calibration has status \"{status}\" (anchors {}, profiles {}), so there is \
              no calibrated Q1 window to decide with; unset extract.q1_fragments for this run",
@@ -288,6 +290,40 @@ pub fn read_model(cal_json: &str) -> Result<Q1FragModel> {
     read_model_opts(cal_json, true)
 }
 
+/// The ZT Scan keys of `cfg` in extract's configuration `ext`, for `mumdia run` and `mumdia
+/// extract` alike: the calibrated model (with the decision tolerances under
+/// `extract.q1_fragments`) and the Q1-deconvolution tolerance from the run's `cal_json` when
+/// the decision or the deconvolved evidence reads them, the re-pick (`retrace.q1_repick`), and
+/// the feature families whose evidence extract computes.
+pub fn configure_extract(
+    cfg: &mumdia_core::config::Config,
+    cal_json: Option<&str>,
+    ext: &mut mumdia_core::config::ExtractConfig,
+) -> Result<()> {
+    let decision = cfg.extract.q1_fragments.on();
+    let q1_dec = cfg.extract.q1_deconvolved || cfg.features.q1_deconvolved.on();
+    if decision || q1_dec {
+        let cal = cal_json.context(
+            "extract.q1_fragments and extract.q1_deconvolved need the run's cal.json with its \
+             Q1 calibration: pass --q1-cal",
+        )?;
+        ext.q1_model = Some(read_model_opts(cal, decision)?);
+        if decision {
+            ext.q1_repick = cfg.retrace.q1_repick.on();
+            ext.q1_repick_peaks = cfg.retrace.q1_repick_peaks;
+        }
+        if q1_dec {
+            ext.q1_dec_tol_steps = Some(read_deconvolution_tol(cal)?);
+        }
+    }
+    ext.ms1_envelope = cfg.features.ms1_envelope;
+    ext.q1_precursor = cfg.features.q1_precursor.on();
+    ext.q1_multiscale = cfg.features.q1_multiscale.on();
+    ext.q1_dec_features = cfg.features.q1_deconvolved.on();
+    ext.q1_separable = cfg.features.q1_separable;
+    Ok(())
+}
+
 /// [`read_model`], with the decision tolerances only when `decision` (`extract.q1_fragments`;
 /// `extract.q1_deconvolved` alone needs the window and its offsets, not them).
 pub fn read_model_opts(cal_json: &str, decision: bool) -> Result<Q1FragModel> {
@@ -310,7 +346,7 @@ pub fn read_deconvolution_tol(cal_json: &str) -> Result<f64> {
     let cal: serde_json::Value = mumdia_io::json::read_json(cal_json)
         .with_context(|| format!("extract.q1_deconvolved: reading {cal_json}"))?;
     let block = &cal["q1_calibration"];
-    if block["status"].as_str() != Some("fitted") {
+    if !matches!(block["status"].as_str(), Some("fitted" | "nominal")) {
         bail!(
             "extract.q1_deconvolved: the Q1 calibration of {cal_json} has status {}, so there \
              is no calibrated window to place the peaks with; unset extract.q1_deconvolved for \
@@ -358,18 +394,20 @@ pub struct Q1Grid {
 }
 
 impl Q1Grid {
-    /// The grid of `scans` from the sweep spectra_ms2 v3 recorded (`q1_cycle`, `q1_step` by
-    /// `scan_index`). Refused when a scan is not in the record, when a recorded step is not
-    /// the rank of its scan's target (the sweep would not be one upward pass over the
-    /// targets) or when one cycle holds a step twice.
+    /// The grid of `scans` from the cycles spectra_ms2 v3 recorded (`q1_cycle` by
+    /// `scan_index`). A scan's step is the rank of its target among the sweep's targets, as
+    /// `q1cal` reads it, not the recorded `q1_step`: that is the position in the cycle, which
+    /// shifts after a spectrum convert dropped (a non-finite scan time), and the missing scan
+    /// is then an empty cell. Refused when a scan is not in the record or when one cycle holds
+    /// a step twice.
     pub fn build(scans: &[Ms2Scan], sweep: &crate::spectra::Q1SweepCols) -> Result<Q1Grid> {
         let mut keys: Vec<i64> = scans.iter().map(|s| step_key(s.window.target_mz)).collect();
         keys.sort_unstable();
         keys.dedup();
         let target: Vec<f64> = keys.iter().map(|&k| k as f64 / 1e4).collect();
         let n_steps = keys.len();
-        let mut rec: Vec<(u32, u32, u32)> = (0..sweep.scan_index.len())
-            .map(|i| (sweep.scan_index[i], sweep.cycle[i], sweep.step[i]))
+        let mut rec: Vec<(u32, u32)> = (0..sweep.scan_index.len())
+            .map(|i| (sweep.scan_index[i], sweep.cycle[i]))
             .collect();
         rec.sort_unstable();
         let mut scan_cycle = vec![u32::MAX; scans.len()];
@@ -377,23 +415,14 @@ impl Q1Grid {
         let mut n_cycles = 0usize;
         for (si, s) in scans.iter().enumerate() {
             let j = rec.partition_point(|r| r.0 < s.scan_index);
-            let Some(&(idx, c, st)) = rec.get(j).filter(|r| r.0 == s.scan_index) else {
+            let Some(&(idx, c)) = rec.get(j).filter(|r| r.0 == s.scan_index) else {
                 bail!(
                     "extract.q1_fragments: scan {} is not in the sweep spectra_ms2 recorded",
                     s.scan_index
                 );
             };
             debug_assert_eq!(idx, s.scan_index);
-            let rank = keys.partition_point(|&k| k < step_key(s.window.target_mz)) as u32;
-            if st != rank {
-                bail!(
-                    "extract.q1_fragments: scan {} is step {st} of its cycle in spectra_ms2, and \
-                     its target {} m/z is step {rank} of the sweep; the per-fragment decision \
-                     reads one upward sweep over the targets",
-                    s.scan_index,
-                    s.window.target_mz
-                );
-            }
+            let st = keys.partition_point(|&k| k < step_key(s.window.target_mz)) as u32;
             scan_cycle[si] = c;
             scan_step[si] = st;
             n_cycles = n_cycles.max(c as usize + 1);
@@ -495,17 +524,15 @@ impl CandQ1 {
     ) -> CandQ1 {
         let z = z.max(1);
         let sp = ISOTOPE_SPACING / z as f64;
-        let pre = averagine_isotopes(neutral(pm, z), ISOTOPES);
-        let ipre: f64 = pre.iter().enumerate().map(|(i, w)| i as f64 * w).sum();
-        let centre = pm + sp * ipre - offset_mz(m, pm, None, rt);
+        let centre = q1dec::expected_centre(Some(m), pm, z, rt);
         let frags = (0..frag_mz.len())
             .map(|i| {
-                let w = isotope_weights(pm, z, frag_mz[i], frag_z[i].max(1));
-                let ibar: f64 = w.iter().enumerate().map(|(k, x)| k as f64 * x).sum();
+                let (centre, w, ibar) =
+                    q1dec::fragment_centre_weights(m, pm, z, frag_mz[i], frag_z[i], rt);
                 FragQ1 {
                     target_mz: frag_mz[i] * factor(frag_mz[i]),
                     pred: pred[i].max(0.0),
-                    centre: pm + sp * ibar - offset_mz(m, pm, Some(frag_mz[i]), rt),
+                    centre,
                     w,
                     ibar,
                 }
@@ -532,8 +559,7 @@ impl CandQ1 {
         let z = z.max(1);
         let sp = ISOTOPE_SPACING / z as f64;
         let pre = averagine_isotopes(neutral(pm, z), ISOTOPES);
-        let ipre: f64 = pre.iter().enumerate().map(|(i, w)| i as f64 * w).sum();
-        let centre = pm + sp * ipre - offset_mz(m, pm, None, rt);
+        let centre = q1dec::expected_centre(Some(m), pm, z, rt);
         let frags = (0..n_iso.min(ISOTOPES))
             .map(|k| {
                 let mz = pm + sp * k as f64;
@@ -562,9 +588,15 @@ impl CandQ1 {
         step: f64,
         omega: f64,
     ) -> f64 {
-        let fr = &self.frags[f];
-        let u = t - fr.centre - mu * step;
+        let u = t - self.frags[f].centre - mu * step;
         let (h, e) = (omega * m.half_width_mz, omega * m.edge_width_mz);
+        self.transmitted(f, u, h, e)
+    }
+
+    /// The transmission of fragment `f`, summed over its isotope weights, at `u` m/z from its
+    /// centre through a window of half-width `h` and edge `e`.
+    fn transmitted(&self, f: usize, u: f64, h: f64, e: f64) -> f64 {
+        let fr = &self.frags[f];
         fr.w.iter()
             .enumerate()
             .map(|(i, wi)| wi * transmission(self.sp * (i as f64 - fr.ibar) - u, h, e))
@@ -932,16 +964,16 @@ pub fn decide(
     // grid positions J = 4 si + 2K - k (targets spaced `step` apart from `p.t[0]`).
     let nj = MU_Q * (ns - 1) + 2 * MU_K + 1;
     let table = |f: usize, omega: f64| -> Vec<f64> {
-        let fr = &cand.frags[f];
         let (h, e) = (omega * m.half_width_mz, omega * m.edge_width_mz);
-        let base = p.t[0] - fr.centre;
+        let base = p.t[0] - cand.frags[f].centre;
         (0..nj)
             .map(|j| {
-                let u = base + step * (j as f64 - MU_K as f64) / MU_Q as f64;
-                fr.w.iter()
-                    .enumerate()
-                    .map(|(i, wi)| wi * transmission(cand.sp * (i as f64 - fr.ibar) - u, h, e))
-                    .sum()
+                cand.transmitted(
+                    f,
+                    base + step * (j as f64 - MU_K as f64) / MU_Q as f64,
+                    h,
+                    e,
+                )
             })
             .collect()
     };
@@ -1856,9 +1888,24 @@ mod tests {
         let c = CandQ1::new(&m, 405.0, 2, 1.0, &[500.0], &[1], &[1.0], &|_| 1.0);
         let p = read_patch(&g, &scans, &c, vec![1, 2], 3, 2, 10.0);
         assert_eq!(p.get(0, 1, 1), (200 + 4) as f64);
-        // A recorded step that is not the target's rank is refused.
-        let mut bad = cols;
-        bad.step[3] = 4;
-        assert!(Q1Grid::build(&scans, &bad).is_err());
+        // A spectrum convert dropped mid-cycle (cycle 1, step 5): convert records the later
+        // steps of that cycle one lower; each scan still sits at its target's rank, and the
+        // missing one is an empty cell.
+        let (mut short, mut rec) = (scans.clone(), cols.clone());
+        short.remove(25);
+        rec.scan_index.remove(25);
+        rec.cycle.remove(25);
+        rec.step.remove(25);
+        rec.step[25..39].iter_mut().for_each(|s| *s -= 1);
+        let g = Q1Grid::build(&short, &rec).unwrap();
+        assert_eq!((g.n_cycles, g.n_steps), (4, 20));
+        assert_eq!(g.scan(1, 5), None);
+        assert_eq!(g.scan(1, 4), Some(24));
+        assert_eq!(g.scan(1, 6), Some(25));
+        assert_eq!(g.scan(2, 0), Some(39));
+        // A cycle that holds a step twice is refused.
+        let mut twice = scans;
+        twice[3].window.target_mz = twice[4].window.target_mz;
+        assert!(Q1Grid::build(&twice, &cols).is_err());
     }
 }

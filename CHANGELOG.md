@@ -233,6 +233,18 @@ than a number. Both are recorded in every run's `manifest.json`.
   already writes it in `candidate_id` order, so the rows are identical; the parquet row-group
   layout of the output changes (the writer's default row groups instead of one per sort
   bucket), which the engine's range reads accept.
+- **The ZT Scan analysis computes each shared rule once, with the same output.** The expected
+  Q1 centres of a candidate and of its fragments (four copies) and a fragment's transmission
+  through the window (two) are each one function; the Q1 calibration reads its seed anchors and
+  decoys, its library fragments and its peak matches with one reader each, and takes a
+  fragment's charge from its name as extract does (the same charge for every library the
+  engine and its helpers write); the Q1 calibration and the MS1 envelope use the nearest-peak
+  rule of `spectra::nearest_peak`; `mumdia run` and `mumdia extract` set extract's ZT Scan keys
+  through one function, so the two cannot drift; extract builds the sweep's Q1 grid once
+  instead of twice; and `features.q1_consistency` computes the sixteen scores the classifier is
+  given instead of 24. A test now runs extract with the per-fragment Q1 decision on a
+  calibrated synthetic sweep. A ZT Scan search and a search of other data write the same
+  tables as before.
 
 ### Removed
 
@@ -253,6 +265,22 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **A ZT Scan run with too few confident seed PSMs for a Q1 calibration is searched on the
+  nominal Q1 window (docs/08, section 4h).** Below 200 seed fragment profiles (about 35
+  confident PSMs: a blank, a failed injection, a wrong library) the calibration recorded
+  `too_few_profiles` and extract stopped the search, and in an experiment every run with it;
+  the analysis is automatic for ZT Scan files, so it could only be turned off for every run.
+  Such a run now gets the nominal window (centred on each step's target, the half-width as
+  read, one step of edge), the decision tolerances at their floors and the seed's
+  deconvolution tolerance, with a warning, and writes every column a calibrated run writes, so
+  a pooled rescore keeps one feature set. A run with a calibration is searched as before.
+- **Extract accepts a ZT Scan sweep from which convert dropped a spectrum.** Convert skips an
+  MS2 spectrum whose scan time is not finite, with a warning, and records each spectrum's step
+  as its position in the cycle, so every later step of that cycle was recorded one too low,
+  and the per-fragment Q1 decision refused the run after the seed, the RT fit and the Q1
+  calibration had accepted it. Extract now places each spectrum by its target's rank, as the
+  Q1 calibration already did, and the dropped spectrum is an empty cell. A sweep without a
+  dropped spectrum is read as before.
 - **Desktop: "Add folder…" selects several spectra folders at once (#335).** A Bruker or Agilent `.d`
   and a Waters `.raw` are directories, so they are added with "Add folder…", and that dialog took
   one folder at a time: the spectra folder picker shared the single-choice setting of the output

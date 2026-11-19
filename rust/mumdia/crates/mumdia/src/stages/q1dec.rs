@@ -297,7 +297,7 @@ impl Q1Dec {
 
 /// The expected Q1 centre (target units, m/z) of a precursor of m/z `pm` and charge `z`: the
 /// mean m/z of its averagine isotope envelope, less the window offset of the calibrated model
-/// `m` at `rt` (the nominal 0 without one), as [`super::q1frag::CandQ1::new`] computes it.
+/// `m` at `rt` (the nominal 0 without one). [`super::q1frag::CandQ1`] places its patch here.
 pub fn expected_centre(m: Option<&Q1FragModel>, pm: f64, z: i32, rt: f64) -> f64 {
     let z = z.max(1);
     let sp = ISOTOPE_SPACING / z as f64;
@@ -306,16 +306,29 @@ pub fn expected_centre(m: Option<&Q1FragModel>, pm: f64, z: i32, rt: f64) -> f64
     pm + sp * ipre - m.map_or(0.0, |m| offset_mz(m, pm, None, rt))
 }
 
-/// The expected Q1 centre of fragment `fmz` (charge `fz`) of that precursor, as
-/// [`super::q1frag::CandQ1::new`] computes it: the precursor isotopes that leave the fragment
-/// monoisotopic weigh more (a large fragment carries most heavy atoms), so its centre lies
-/// below the envelope's, by up to about a step for a doubly charged precursor of 2,000 Da.
+/// The expected Q1 centre of fragment `fmz` (charge `fz`) of that precursor, the centre the
+/// per-fragment decision ([`super::q1frag::CandQ1::new`]) reads it against: the precursor
+/// isotopes that leave the fragment monoisotopic weigh more (a large fragment carries most
+/// heavy atoms), so its centre lies below the envelope's, by up to about a step for a doubly
+/// charged precursor of 2,000 Da.
 pub fn fragment_centre(m: &Q1FragModel, pm: f64, z: i32, fmz: f64, fz: i32, rt: f64) -> f64 {
+    fragment_centre_weights(m, pm, z, fmz, fz, rt).0
+}
+
+/// [`fragment_centre`], with the isotope weights it is computed from and their mean index.
+pub(crate) fn fragment_centre_weights(
+    m: &Q1FragModel,
+    pm: f64,
+    z: i32,
+    fmz: f64,
+    fz: i32,
+    rt: f64,
+) -> (f64, Vec<f64>, f64) {
     let z = z.max(1);
     let sp = ISOTOPE_SPACING / z as f64;
     let w = isotope_weights(pm, z, fmz, fz.max(1));
     let ibar: f64 = w.iter().enumerate().map(|(k, x)| k as f64 * x).sum();
-    pm + sp * ibar - offset_mz(m, pm, Some(fmz), rt)
+    (pm + sp * ibar - offset_mz(m, pm, Some(fmz), rt), w, ibar)
 }
 
 /// Units of a stored fragment-centre shift per step.

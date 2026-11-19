@@ -2168,37 +2168,9 @@ fn real_main() -> Result<()> {
         } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
-            // The per-fragment Q1 decision reads the run's calibration; the re-pick runs
-            // inside extract.
+            // The ZT Scan keys, from the run's calibration (`--q1-cal`), as `mumdia run` sets them.
             let mut ext_cfg = cfg.extract.clone();
-            let q1_dec = ext_cfg.q1_deconvolved || cfg.features.q1_deconvolved.on();
-            if ext_cfg.q1_fragments.on() || q1_dec {
-                let cal = q1_cal.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "extract.q1_fragments and extract.q1_deconvolved need the run's \
-                         cal.json with its Q1 calibration: pass --q1-cal"
-                    )
-                })?;
-                ext_cfg.q1_model = Some(stages::q1frag::read_model_opts(
-                    cal,
-                    ext_cfg.q1_fragments.on(),
-                )?);
-                if ext_cfg.q1_fragments.on() {
-                    ext_cfg.q1_repick = cfg.retrace.q1_repick.on();
-                    ext_cfg.q1_repick_peaks = cfg.retrace.q1_repick_peaks;
-                }
-                if q1_dec {
-                    ext_cfg.q1_dec_tol_steps = Some(stages::q1frag::read_deconvolution_tol(cal)?);
-                }
-            }
-            // `features.ms1_envelope`: extract reads the MS1 isotope-envelope evidence.
-            ext_cfg.ms1_envelope = cfg.features.ms1_envelope;
-            // `features.q1_precursor` / `features.q1_multiscale`: extract reads the scores on
-            // the per-fragment decision's patches.
-            ext_cfg.q1_precursor = cfg.features.q1_precursor.on();
-            ext_cfg.q1_multiscale = cfg.features.q1_multiscale.on();
-            ext_cfg.q1_dec_features = cfg.features.q1_deconvolved.on();
-            ext_cfg.q1_separable = cfg.features.q1_separable;
+            stages::q1frag::configure_extract(&cfg, q1_cal.as_deref(), &mut ext_cfg)?;
             stages::extract::run(stages::extract::ExtractParams {
                 precursor_span: None,
                 fragment_offset,
