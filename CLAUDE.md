@@ -524,7 +524,7 @@ fine-tuning also is not guaranteed deterministic.
   - `peptide_q_value`: base/stripped peptide;
   - `pg_q_value`: protein-accession-set group.
 - The grouped q columns (`peptide_q_value`, `precursor_q`, `pg_q_value`) are
-  written only to each group's single winning row (`rescore.rs:721-728`); losers
+  written only to each group's single winning row (`grouped_q` in `rescore.rs`); losers
   get 1.0. Under an experiment-wide rescore the grouping is experiment-wide, so
   a per-run count on those columns is diluted by roughly 1/n_runs and is
   meaningless. The correct per-file unit there is `run_psm_q`.
@@ -578,9 +578,9 @@ fine-tuning also is not guaranteed deterministic.
   transfer (`rt_transfer`) stays opt-in because its transfers measured 2.3-2.7%
   entrapment FDP. docs/12, "Second pass".
 - `rescore --competed` accepts many tables, stamps `source` with the index of
-  the input table each PSM came from (`rescore.rs:65-70,108`), and computes a
-  per-source `run_psm_q` alongside the pooled `q_value`
-  (`rescore.rs:403-408`). Pooling therefore never costs per-run FDR, and
+  the input table each PSM came from (the input merge of `rescore::run_hashed`), and
+  computes a per-source `run_psm_q` alongside the pooled `q_value`
+  (`per_source_q`). Pooling therefore never costs per-run FDR, and
   sub-batching is free in `run_psm_q` terms. It is not free in pooled-`q_value`
   terms, because the `1/T` floor moves with the pool, so a batched run and a
   single pooled run do not produce identical `q_value` columns. Batch to fit RAM,
@@ -609,8 +609,9 @@ sections 10-16:
   matrix with no parquet encode or decode and scores byte-identically to `parquet` (checked
   at scale on the six-run Astral and five-run AIF pools); it is 4 bytes a value on disk, so
   the sidecar space check refuses a work directory that cannot hold that, where `parquet`
-  only warned. mokapot and entrapment sidecars still receive the tab-separated PIN
-  (`mokapot.read_pin` cannot read parquet), automatically and with a warning.
+  only warned. mokapot still receives the tab-separated PIN (`mokapot.read_pin` cannot
+  read parquet), automatically and with a warning; the entrapment sidecar always receives
+  its own parquet table.
 - The rescore process tree is about half as tall since 2026-09-16, at identical
   identifications. Under `rescore.strict` (the production setting) with a sidecar classifier
   the engine releases its own `FeatureMatrix` as soon as the handoff parquet is written,

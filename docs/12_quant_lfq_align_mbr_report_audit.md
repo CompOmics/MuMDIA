@@ -354,7 +354,7 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
 
    The three grouped columns (`peptide_q_value`, `precursor_q`, `pg_q_value`) are
    sparse: `grouped_q` assigns the computed q only to each group's single
-   best-scoring row and writes 1.0 to every losing sibling (`rescore.rs:721-728`).
+   best-scoring row and writes 1.0 to every losing sibling (`grouped_q`).
    After an experiment-wide rescore the grouping is experiment-wide too, so each
    group's winner lives in exactly one run and a per-run slice retains only about
    `1/n_runs` of the populated rows. `PeptideQ`/`PrecursorQ` are therefore
@@ -1839,7 +1839,7 @@ FDR/reporting).
 - `q_filter` (`PeptideQ`): which q column to filter on:
   `PeptideQ`/`PrecursorQ`/`PsmQ`/`RunPsmQ`. Use `PeptideQ`/`PrecursorQ` only
   after a single-run rescore, because the grouped columns are populated on group
-  winners only (`rescore.rs:721-728`). For experiment-wide rescoring, slice by
+  winners only (`grouped_q`). For experiment-wide rescoring, slice by
   `source` and normally use `RunPsmQ`; `q_filter` alone does not select the run.
   `run-experiment` ignores this field and forces `PsmQ` (`run_experiment.rs:498`).
 - `fragment_selection` (`PatternFit` since 2026-11-07, previously `ObservedArea`):
@@ -1921,8 +1921,8 @@ but do not affect the wired `mumdia mbr` path.
 - **MS1 traces excluded.** `ms1_*` chromatogram rows are precursor channels and never
   enter peak detection or the top-N sum (`quant.rs:303`).
 - **Grouped q columns are populated on group winners only.** `grouped_q`
-  (`rescore.rs:673`) writes the computed q to the single best-scoring row of each
-  group and 1.0 to every loser (`rescore.rs:721-728`). This keeps a losing
+  writes the computed q to the single best-scoring row of each
+  group and 1.0 to every loser. This keeps a losing
   charge/modification sibling from inheriting the winner's q, but it means
   `peptide_q_value`, `precursor_q`, and `pg_q_value` are sparse. After an
   experiment-wide rescore each group has one winner across the whole experiment,

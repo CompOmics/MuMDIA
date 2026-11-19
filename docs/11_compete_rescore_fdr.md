@@ -98,20 +98,20 @@ every later schema companion must match it exactly before tables are
 concatenated. Reads `candidate_id`, `label`, `base_peptide_id`, `peptidoform`,
 `protein`, `charge` (f64 read widening, cast to i32), `prelim_score`, `precursor_mz`,
 `apex_rt`, `elution_lo`, `elution_hi`, `peak_rank` (i32, defaulted to 0 when
-absent, rescore.rs:93), and the feature columns. A feature column may be Float32
+absent, `rescore::run_hashed`), and the feature columns. A feature column may be Float32
 (`psms_competed` v4) or Float64 (v3, and the v4 columns that stay wide): a Float64
 cell is narrowed with `as f32` and a Float32 cell, narrowed that way when it was
 written, is used as stored (`FeatureCol`), so a v3 and a v4 table of the same run
 give the classifier the same values and the same scored table.
 
-Four input conditions are hard errors before any scoring: fewer than 2
-`rescore.folds` (rescore.rs:46-48), an empty `--competed` list (rescore.rs:43-45),
-zero targets or zero decoys (rescore.rs:117-125), and any non-finite feature,
-`prelim_score`, or `precursor_mz` (rescore.rs:126-143). A non-finite classifier
-score is also rejected after scoring (rescore.rs:284-290).
+Four input conditions are hard errors before any scoring (`rescore::run_hashed`):
+fewer than 2 `rescore.folds`, an empty `--competed` list, zero targets or zero
+decoys (`require_both_labels`), and any non-finite feature, `prelim_score`, or
+`precursor_mz` (`bail_non_finite`). A non-finite classifier score is also rejected
+after scoring.
 
 Produces `psms_scored` (schema version 4, `artifact::PSMS_SCORED`, schema.rs:21)
-at `--out`. Column schema is, in order (rescore.rs:508-541): `candidate_id` (u32),
+at `--out`. Column schema is, in order (`scored_schema`): `candidate_id` (u32),
 `peptidoform` (str), `charge` (i32), `label` (str), `protein` (str),
 `base_peptide_id` (u32), the carried identification `apex_rt`/`elution_lo`/
 `elution_hi` (f64), `score` (f64, the classifier discriminant),
@@ -126,21 +126,21 @@ tables, `groups.pool_competed = false`), `run_psm_q` (f64),
 rescorer kept; `0` = the up-front apex). Plus
 `<out>.report.json` whose `params` records `classifier` (the path actually taken),
 `classifier_requested`, `strict`, `folds`, `num_iter`, `train_fdr`,
-`feature_schema_id`, `competed_inputs`, `config_hash` (rescore.rs:565-575),
+`feature_schema_id`, `competed_inputs`, `config_hash`,
 `competed_sources` when a source map was given, and, when
 `nn_torch` ran, `nn_env`: the `MUMDIA_NN_*` variables the worker inherited beyond the
 ones the engine sets (`inherited_nn_env`, `docs/13_sidecars.md`),
 `model_identity` (e.g. `native-percolator-lite-v1`, `mokapot-<estimator>`
 (default `mokapot-nn`), `nn-torch-semisup-sidecar-v1`,
 `entrapment-gbm-sidecar-v1`, `native-percolator-lite-entrapment-v1`,
-rescore.rs:149/174/201/256/266/277), and `stats` records `psms`, `classifier`,
+set in `rescore::run_hashed`), and `stats` records `psms`, `classifier`,
 `target_psms_at_1pct`, `target_peptides_at_1pct`, `target_protein_groups_at_1pct`,
 `target_precursors_at_1pct`, plus `entrapment_ratio` and
-`entrapment_peptides_at_1pct` in entrapment mode (rescore.rs:544-557).
+`entrapment_peptides_at_1pct` in entrapment mode.
 
 Sidecar working files are written under `--work-dir` (created with
-`create_dir_all`, rescore.rs:753, 928). Filenames are per-invocation, tagged with
-the output artifact's file stem plus the process id (rescore.rs:935-960), so two
+`create_dir_all` in `sidecar_paths` and `run_entrapment_gbm`). Filenames are per-invocation, tagged with
+the output artifact's file stem plus the process id (`invocation_tag`), so two
 concurrent rescores cannot clobber each other's handoff files. Two distinct file
 contracts exist:
 
@@ -148,14 +148,14 @@ contracts exist:
   `rescore_<tag>.pin` (Percolator tab format) or, with the NnTorch worker, the
   raw handoff described below (the default) or, under `rescore.handoff = parquet`,
   `rescore_<tag>.features.parquet`; output `rescore_<tag>_out.parquet`
-  (rescore.rs:955-960). The PIN header is `SpecId  Label  ScanNr  ExpMass
-  CalcMass  <features...>  Peptide  Proteins` (rescore.rs:975-977); each row is
-  `psm_{i}`, `Label` = `-1` for a decoy else `+1` (rescore.rs:985), `ScanNr` = `i`
+  (`sidecar_paths`). The PIN header is `SpecId  Label  ScanNr  ExpMass
+  CalcMass  <features...>  Peptide  Proteins` (`HandoffWriter::new`); each row is
+  `psm_{i}`, `Label` = `-1` for a decoy else `+1`, `ScanNr` = `i`
   (the flat row index), `ExpMass` = `CalcMass` = `precursor_mz` (5 decimals),
   the feature columns in schema order (6 decimals), `Peptide` = `-.<peptidoform>.-`,
-  `Proteins` = `<protein>` (rescore.rs:984-993). The Parquet form carries the same
+  `Proteins` = `<protein>` (`HandoffWriter::push_row`). The Parquet form carries the same
   logical columns under the same names, written in 250k-row batches with f32
-  features (`write_features_parquet`, rescore.rs:833-906); f32 is not a precision
+  features (`HandoffWriter`); f32 is not a precision
   loss relative to the PIN, which already wrote `{:.6}` and whose values the worker
   casts to f32 anyway. Under `rescore.handoff = raw`, the default (NnTorch only), the
   worker is given `rescore_<tag>.features.raw.json`, a description naming
@@ -172,21 +172,21 @@ contracts exist:
   scores are mapped back by row index through `align_sidecar_scores`, which
   requires every input row to be covered exactly once with a finite score and
   hard-errors on a missing, duplicate, out-of-range, or non-finite entry
-  (rescore.rs:1032-1035, 1041-1077). There is no worst-score fallback for a missing
+  (`align_sidecar_scores`). There is no worst-score fallback for a missing
   row.
 - **Entrapment GBM** (`RescorerKind::Entrapment` with `rescore.python` set): input
-  `entrapment_in.parquet`, output `entrapment_out.parquet` (rescore.rs:754-755).
+  `entrapment_in.parquet`, output `entrapment_out.parquet` (`run_entrapment_gbm`).
   The input parquet columns are `row_id` (u32, the flat row index used for
   score readback), `candidate_id` (u32), `base_peptide_id` (u32), `is_entrapment`
   (i32, 0/1), `is_decoy` (i32, 0/1), then the feature columns in schema order
-  (f64) (rescore.rs:757-778). The worker is invoked as
-  `python entrapment_worker.py <in> <out> <folds>` (rescore.rs:781-788, `folds`
+  (f32). The worker is invoked as
+  `python entrapment_worker.py <in> <out> <folds>` (`folds`
   from `cfg.folds`); it reads back `row_id` (u32) + `score` (f64) and maps by
   `row_id` through the same `align_sidecar_scores` coverage contract, so an
-  incomplete or duplicated response hard-errors (rescore.rs:793-796, 1041-1077).
+  incomplete or duplicated response hard-errors.
   Both sidecars are run with `PYTHONUTF8=1` and a non-zero exit is a hard error
-  (rescore.rs:787/789-791, 1007/1024-1026). The PIN sidecar is spawned behind a
-  `ChildGuard` (rescore.rs:803-819) that kills the worker if the parent unwinds;
+  (`run_entrapment_gbm`, `run_pin_sidecar`). The PIN sidecar is spawned behind a
+  `ChildGuard` that kills the worker if the parent unwinds;
   without it a killed `mumdia` leaves the Python process holding its feature
   memmap and every later rescore fails on a file it cannot delete.
 
@@ -415,17 +415,17 @@ the stage removes the surviving temp name).
 
 ### rescore: input concat and classifier dispatch
 
-`rescore::run` (rescore.rs:41) concatenates all `--competed` tables into flat
-vectors (rescore.rs:78-111). It records a per-PSM `source` = the index of the
-input table the PSM came from (rescore.rs:65-70, 108); for a single-run rescore
+`rescore::run` (`run_hashed`) concatenates all `--competed` tables into flat
+vectors. It records a per-PSM `source` = the index of the
+input table the PSM came from; for a single-run rescore
 this is all-zero. `source` is why the PIN and entrapment sidecars key on a unique
 flat row index rather than `candidate_id`: `candidate_id` is the library index and
 repeats across runs, so an experiment-wide table would collide on it
-(rescore.rs:65-70, 761, 872-875, 978-986).
+(`run_entrapment_gbm`, `HandoffWriter::push_row`).
 
 **Pooling costs no per-run FDR, so batch only to fit memory.** Each input table
 keeps its own `source` stamp, and `run_psm_q` re-runs the whole target-decoy
-analysis within each source (rescore.rs:411-437), so a run pooled with others
+analysis within each source (`per_source_q`), so a run pooled with others
 still receives a genuine per-run q, exactly and by construction.
 
 Pooling does not TIGHTEN the pooled `q_value`: the only pool-size term in
@@ -499,11 +499,11 @@ path. `rescore.handoff = parquet` is the cheaper lever here: it keeps the same
 values in a much smaller file, so a pool that would have streamed can stay in
 memory.
 
-Immediately after the concat loop, `crate::fdr::validate_labels` (rescore.rs:112)
+Immediately after the concat loop, `crate::fdr::validate_labels`
 rejects
 any label that is not exactly `"target"` or `"decoy"`. `is_decoy` is derived at
-rescore.rs:113; entrapment status is derived separately from the protein string by
-`classify_entrapment` (rescore.rs:114, 641). Its exact rule (rescore.rs:652-666): a
+the same read; entrapment status is derived separately from the protein string by
+`classify_entrapment`. Its exact rule: a
 decoy is neither entrapment nor real; a non-decoy is `is_entrapment` when its
 protein **contains** `entrapment_marker` **and** (no `entrapment_exclude` set, or
 the protein does not contain it) **and** the protein matches none of
@@ -512,12 +512,12 @@ the protein does not contain it) **and** the protein matches none of
 The contaminant carve-out exists so genuine contaminants living inside the spike-in
 proteome (keratins, albumin) are not mislabeled as false negatives.
 
-The classifier is dispatched on `RescoreConfig::classifier` (rescore.rs:152-283).
+The classifier is dispatched on `RescoreConfig::classifier` in `rescore::run_hashed`.
 The stage tracks `classifier_used`, `model_identity`, and `qmode` so the report
-reflects the path actually taken rather than the requested one (rescore.rs:148-150).
+reflects the path actually taken rather than the requested one.
 
 **`RescorerKind::NativeTda`** (config.rs:104, the default): calls `native_scores`
--> `percolator_lite` (rescore.rs:221, 616-632). `percolator_lite`
+-> `percolator_lite`. `percolator_lite`
 (rescoring.rs:100) is a Percolator/Mokapot-style linear model:
 
 - Fold assignment is `fold_key % folds` where `fold_key = base_peptide_id`
@@ -548,19 +548,19 @@ reflects the path actually taken rather than the requested one (rescore.rs:148-1
   in one fold. `folds` is clamped to at least 1 (rescoring.rs:105) and `num_iter`
   to at least 1 (rescoring.rs:131). The clamp on `folds` is defensive only: the
   stage rejects `rescore.folds < 2` before it ever calls `percolator_lite`
-  (rescore.rs:46-48). `fit_standardizer` divides by `idx.len().max(1)`
+  (`rescore::run_hashed`). `fit_standardizer` divides by `idx.len().max(1)`
   (rescoring.rs:16) so an empty index does not divide by zero.
 
 **`RescorerKind::Mokapot`** (config.rs:106): runs `mokapot_worker.py` through
-`run_pin_sidecar` (rescore.rs:158-186, 913). On success it uses the returned
+`run_pin_sidecar`. On success it uses the returned
 scores; on failure it either hard-errors (if `rescore.strict`) or warns and falls
-back to `native_scores` (rescore.rs:177-185). Requires `rescore.python`. Mokapot
+back to `native_scores` (`strict_or_warn`). Requires `rescore.python`. Mokapot
 reads the PIN through `mokapot.read_pin()` and cannot consume Parquet, so
 `rescore.handoff = parquet` warns and writes the tab-separated PIN instead
-(rescore.rs:946-954).
+(`sidecar_paths`).
 
 **`RescorerKind::NnTorch`** (config.rs:107-113): runs `nn_rescore_worker.py`
-through the same `run_pin_sidecar` contract (rescore.rs:187-213). A nonlinear
+through the same `run_pin_sidecar` contract. A nonlinear
 PyTorch MLP with the same CV-fold + iterative positive-reselection scheme.
 
 The fold key genuinely is the same one now, and was not before: the worker derived
@@ -584,7 +584,7 @@ zero-positive folds hard-error (`:559-565`, `:602-605`), so held-out labels do n
 influence OOF scoring. The
 worker receives the NN hyperparameters through environment variables
 `MUMDIA_NN_FOLDS`, `MUMDIA_NN_ITERS`, `MUMDIA_NN_TRAIN_FDR`, set from
-`cfg.folds/num_iter/train_fdr` (rescore.rs:1012-1014), so the report reflects the
+`cfg.folds/num_iter/train_fdr` (`run_pin_sidecar`), so the report reflects the
 values actually used. Same strict/fallback logic as Mokapot.
 
 > **NnTorch is seeded but not bit-deterministic.** The worker seeds numpy and
@@ -599,26 +599,24 @@ values actually used. Same strict/fallback logic as Mokapot.
 > from the leak-free native `percolator_lite`, which fits the scaler on the train
 > fold only. Both facts are properties of the sidecar, not the Rust dispatch.
 
-**`RescorerKind::Percolator`**: **not wired.** Normal config loading rejects this
-classifier before execution (`Config::validate`, config.rs:1389-1392); the
-defensive rescore arm still errors under strict mode or falls back only for a
-manually constructed compatibility config. `rescore.percolator_bin` is a dead
-field until an adapter exists.
+**No `percolator` classifier.** `RescorerKind` has no such variant, so a config
+naming it fails to parse; `rescore.percolator_bin` is a dead field until an adapter
+exists.
 
 **`RescorerKind::Entrapment`** (config.rs:116-122): a decoy-independent path for
 spike-in entrapment experiments. It requires `entrapment_marker` and at least one
-matching PSM, else it warns/errors and falls back to native (rescore.rs:222-239).
-With `rescore.python` set it runs `run_entrapment_gbm` (rescore.rs:241, 739): a
+matching PSM, else it warns/errors and falls back to native (`strict_or_warn`).
+With `rescore.python` set it runs `run_entrapment_gbm`: a
 gradient-boosted sidecar trained out-of-fold by base peptide, positives = real
-targets, negatives = spike-in targets (rescore.rs:739-797). Without python it
+targets, negatives = spike-in targets. Without python it
 uses the native linear rescorer but with `is_entrapment` (not `is_decoy`) as the
-negative label (rescore.rs:268, 279). Any of these sets `qmode = Entrapment`, so
+negative label. Any of these sets `qmode = Entrapment`, so
 q-values are computed by `entrapment_q` instead of `target_decoy_q`.
 
 ### rescore: the top-K per-candidate collapse
 
 Between scoring and q-value computation the stage keeps only the best-scoring row
-per `(source, candidate_id)` (rescore.rs:292-346), so when top-K peak promotion is
+per `(source, candidate_id)` (in `rescore::run_hashed`), so when top-K peak promotion is
 enabled the rescorer, not the up-front apex pick, selects which chromatographic
 peak represents a candidate, and the terminal q-null holds exactly one row per
 candidate. Without this, promoting K peaks would inflate the decoy null K-fold.
@@ -707,8 +705,8 @@ The q columns are computed without per-row staging copies: the pooled PSM q read
 built an `n * 16` byte buffer, 4.1 GB at the 258.75M-row immunopeptidomics pool);
 `run_psm_q` runs the kernel on each source's rows as one slice, because the rows of
 one input are contiguous (`per_source_q`; one source returns the pooled q, which is
-the kernel's output on the same input, and a source column in any other order keeps
-the index form); `grouped_q` reads its picked groups through `target_decoy_q_by`.
+the kernel's output on the same input, and a source column that decreases, which `run`
+never builds, panics); `grouped_q` reads its picked groups through `target_decoy_q_by`.
 The protein and precursor interners grow with the distinct keys and are not
 presized: by rows they would take 17.7 GB at that pool for a key set that is a
 small fraction of them. Every q is the kernel's output on the same input as
@@ -719,15 +717,15 @@ After scoring, the stage computes q-values at several aggregation levels, each a
 best-per-group reduction. This is deliberate: q-values at different levels are not
 derived from one another, they are separately calibrated nulls.
 
-| output column | grouping | how computed | file:line |
+| output column | grouping | how computed | code |
 |---|---|---|---|
-| `q_value` | none (pooled PSM) | `target_decoy_q` / `entrapment_q` over all PSMs | rescore.rs:349-364 |
-| `experiment_psm_q` | none (pooled PSM) | clone of `q_value` | rescore.rs:407 |
-| `global_q_value` | none (pooled PSM) | clone of `q_value`, backward-compat alias | rescore.rs:406 |
-| `run_psm_q` | by `source` | independent TDA within each run, scattered back by row index | rescore.rs:411-437 |
-| `precursor_q` | `(peptidoform, charge)` | best PSM per precursor, TDA over that set | rescore.rs:440-457 |
-| `peptide_q_value` | `base_peptide_id` | best PSM per base peptide, TDA over that set | rescore.rs:370-378 |
-| `pg_q_value` | protein-accession-set string | best PSM per protein group, TDA over that set | rescore.rs:383-400 |
+| `q_value` | none (pooled PSM) | `target_decoy_q` / `entrapment_q` over all PSMs | `rescore::run_hashed` |
+| `experiment_psm_q` | none (pooled PSM) | clone of `q_value` | `write_scored` |
+| `global_q_value` | none (pooled PSM) | clone of `q_value`, backward-compat alias | `write_scored` |
+| `run_psm_q` | by `source` | independent TDA within each run, scattered back by row index | `per_source_q` |
+| `precursor_q` | `(peptidoform, charge)` | best PSM per precursor, TDA over that set | `grouped_q` |
+| `peptide_q_value` | `base_peptide_id` | best PSM per base peptide, TDA over that set | `grouped_q` |
+| `pg_q_value` | protein-accession-set string | best PSM per protein group, TDA over that set | `grouped_q` |
 
 Two more units live outside the scored table, in the `localise` stage's
 `localisation.parquet` (docs/36_ptm_localisation.md, opt-in), so the scored schema is
@@ -751,19 +749,19 @@ sees roughly one form per peptide and `precursor_q` reports a base-peptide
 population. It is a precursor-level unit only under
 `compete.group_by = peptidoform_charge`.
 
-The per-level reduction is `grouped_q` (rescore.rs:673): for each key, keep the
+The per-level reduction is `grouped_q`: for each key, keep the
 best-scoring member `(score, is_decoy, is_entrapment, is_real, row)` with an exact
 score tie resolved in favour of the active null (decoy or entrapment) so input row
-order cannot make the accepted set anti-conservative (rescore.rs:683-706), run the
-chosen q kernel over the one-row-per-group set (rescore.rs:707-719), then assign
+order cannot make the accepted set anti-conservative, run the
+chosen q kernel over the one-row-per-group set, then assign
 the group q **only to the winning row** of each group and give every losing sibling
-q = 1.0 (rescore.rs:721-728). A lower-scoring charge/mod variant (possibly itself a
+q = 1.0. A lower-scoring charge/mod variant (possibly itself a
 false target) must not inherit the winner's low q. Group counts dedup by key on the
 winner, so counts are unchanged, but per-PSM peptide/pg/precursor q no longer
 propagate to losers.
 
-`run_psm_q` groups rows by `source` in a `BTreeMap` for deterministic iteration
-(rescore.rs:411-416) and runs a full independent TDA within each run, so a per-run
+`run_psm_q` takes the rows of each `source`, which are contiguous, as one slice
+(`per_source_q`) and runs a full independent TDA within each run, so a per-run
 report gets a genuine per-run FDR instead of the pooled value. For a single-run
 rescore (`source` all-zero) it equals `q_value`. After an experiment-wide rescore
 it is the only correct per-file PSM unit: the grouped columns are assigned to one
@@ -786,18 +784,18 @@ peptide population, so the distinction only becomes real under
 `compete.group_by = peptidoform_charge`.
 
 Interned dense u32 ids are used for the protein and precursor groupings
-(rescore.rs:383-391, 440-448) purely as a performance optimization: interning the
+(`rescore::run_hashed`) purely as a performance optimization: interning the
 accession-set string and the `(peptidoform, charge)` tuple to first-seen integers
 avoids hashing and cloning hundreds of thousands of strings inside `grouped_q`.
 The mapping is bijective, so grouping and the resulting q-values are unchanged.
 
-`is_reported` (rescore.rs:461-464) selects which rows count toward the 1%
+`is_reported` (in `rescore::run_hashed`) selects which rows count toward the 1%
 summaries: real targets in entrapment mode (spike-in excluded), all non-decoys
 otherwise. The report records `target_psms_at_1pct`, `target_peptides_at_1pct`,
 `target_protein_groups_at_1pct`, `target_precursors_at_1pct`, and in entrapment
 mode the `entrapment_ratio` and the entrapment-leak count `entrapment_peptides_at_1pct`
 (spike-in peptides passing the 1% gate, a running FDR-validity check,
-rescore.rs:498-506, 551-557).
+`count_distinct`).
 
 ### fdr: the kernels
 
@@ -866,16 +864,16 @@ counts feed a hyperscore-style term; `n` is small so the naive loop is fine.
 | `compete::features_bytes_reusable` | compete.rs | the four conditions under which the features bytes can stand in for the competed table |
 | `compete::splice_kept_rows` | compete.rs | some rows removed: splice the untouched features row groups, rewrite the others |
 | `compete::splice_pays` | compete.rs | whether the non-empty untouched row groups hold at least half the rows, so a splice beats a full rewrite |
-| `rescore::run` | rescore.rs:41 | full rescore stage: concat, dispatch, multi-context q, scored table |
-| `rescore::validate_feature_schema` | rescore.rs:596 | reject a concat whose feature companions differ in id or ordered columns |
-| `rescore::native_scores` | rescore.rs:616 | thin wrapper calling `percolator_lite` with the config knobs |
-| `rescore::classify_entrapment` | rescore.rs:641 | per-PSM `(is_entrapment, is_real_target)` from the protein string |
-| `rescore::grouped_q` | rescore.rs:673 | best-per-group reduction + level q, winner-only assignment |
-| `rescore::run_entrapment_gbm` | rescore.rs:739 | write parquet, run entrapment GBM worker, read scores by row_id |
-| `rescore::run_pin_sidecar` | rescore.rs:913 | write PIN, run Mokapot/NnTorch worker, read scores by row index |
-| `rescore::align_sidecar_scores` | rescore.rs:1041 | validate exact/unique/finite sidecar coverage, map scores by row id |
-| `QMode` | rescore.rs:23 | which null q is computed against: `Decoy` or `Entrapment` |
-| `RescoreParams` | rescore.rs:30 | `competed`, `out`, `work_dir`, `script_dir`, `cfg`, `config_hash` |
+| `rescore::run` | rescore.rs | full rescore stage: concat, dispatch, multi-context q, scored table |
+| `rescore::validate_feature_schema` | rescore.rs | reject a concat whose feature companions differ in id or ordered columns |
+| `rescore::native_scores` | rescore.rs | thin wrapper calling `percolator_lite` with the config knobs |
+| `rescore::classify_entrapment` | rescore.rs | per-PSM `(is_entrapment, is_real_target)` from the protein string |
+| `rescore::grouped_q` | rescore.rs | best-per-group reduction + level q, winner-only assignment |
+| `rescore::run_entrapment_gbm` | rescore.rs | write parquet, run entrapment GBM worker, read scores by row_id |
+| `rescore::run_pin_sidecar` | rescore.rs | write PIN, run Mokapot/NnTorch worker, read scores by row index |
+| `rescore::align_sidecar_scores` | rescore.rs | validate exact/unique/finite sidecar coverage, map scores by row id |
+| `QMode` | rescore.rs | which null q is computed against: `Decoy` or `Entrapment` |
+| `RescoreParams` | rescore.rs | `competed`, `out`, `work_dir`, `script_dir`, `cfg`, `config_hash` |
 | `percolator_lite` | rescoring.rs:100 | native semi-supervised L2 logreg rescorer with per-fold scaler |
 | `RescoreInput` | rescoring.rs:87 | features, is_decoy, fold_key, init_score, folds, num_iter, train_fdr |
 | `fit_standardizer` | rescoring.rs:14 | per-fold mean/std over training rows only (leak-free) |
@@ -892,7 +890,7 @@ counts feed a hyperscore-style term; `n` is small so the naive loop is fine.
 ## Configuration
 
 The fields below are the live ones this subsystem reads. `percolator_bin` is the
-one dead field kept in the struct (the `percolator` classifier is unwired).
+one dead field kept in the struct (there is no `percolator` classifier).
 
 ### `compete` (`CompeteConfig`, config.rs:825-851)
 
@@ -913,8 +911,8 @@ unless a knob is set.
 
 | field | default | effect |
 |---|---|---|
-| `classifier` | `native_tda` | which rescorer (`RescorerKind`, config.rs:100): `native_tda`, `mokapot`, `nn_torch`, `percolator` (unwired, rejected by `validate`), `entrapment` |
-| `folds` | `3` | CV folds: native `percolator_lite`, PIN sidecars via `MUMDIA_NN_FOLDS` env (rescore.rs:1012), entrapment GBM via positional arg (rescore.rs:786). Values below 2 are a hard error (rescore.rs:46-48) |
+| `classifier` | `native_tda` | which rescorer (`RescorerKind`, config.rs:100): `native_tda`, `mokapot`, `nn_torch`, `entrapment` |
+| `folds` | `3` | CV folds: native `percolator_lite`, PIN sidecars via `MUMDIA_NN_FOLDS` env (`run_pin_sidecar`), entrapment GBM via positional arg (`run_entrapment_gbm`). Values below 2 are a hard error (`rescore::run_hashed`) |
 | `train_fdr` | `0.01` | q threshold for the confident-positive set in the semi-supervised loop |
 | `num_iter` | `10` | semi-supervised iterations for the native rescorer |
 | `python` | `None` | interpreter for the Mokapot/NnTorch/entrapment sidecars; required for those paths |
@@ -959,43 +957,41 @@ unless a knob is set.
   (standardization fit over the full matrix, not per fold, on all three backends;
   `nn_rescore_worker.py:387-391,406-409,455-460`). Do not treat its scores as
   reproducible; do not use it where byte-identity is required.
-- **`percolator` is unwired.** Config loading rejects it (config.rs:1389-1392).
-  The defensive fallback arm matters only to manually constructed compatibility
-  configs; `percolator_bin` remains a dead field.
+- **There is no `percolator` classifier.** A config naming it fails to parse;
+  `percolator_bin` remains a dead field.
 - **Only the best peak per `(source, candidate_id)` reaches the q kernels**
-  (rescore.rs:292-346). The collapse is a no-op at `extract.promote_top_peaks = 1`;
+  (in `rescore::run_hashed`). The collapse is a no-op at `extract.promote_top_peaks = 1`;
   with promotion on it is what stops K peaks per candidate from K-inflating the
   decoy null. The surviving rank is reported as `selected_peak_rank`.
-- **Sidecars key on the flat row index, not `candidate_id`** (rescore.rs:65-70,
-  761, 872-875, 978-986). `candidate_id` is the library index and repeats across
+- **Sidecars key on the flat row index, not `candidate_id`** (`run_entrapment_gbm`,
+  `HandoffWriter::push_row`). `candidate_id` is the library index and repeats across
   runs; keying on it collides in an experiment-wide (multi-file) rescore. A missing
   row in the sidecar output is a hard error, not a worst-score fallback: coverage
-  must be exact/unique/finite (`align_sidecar_scores`, rescore.rs:1041-1077,
-  missing-row bail at rescore.rs:1073-1075).
+  must be exact/unique/finite (`align_sidecar_scores`).
 - **Pooling runs costs no per-run FDR; batch for RAM.** (`run_psm_q` is exactly
   per-source; the pooled `q_value` floor is `1/T` and does move with pool size, so
   batched and unbatched runs do not produce identical `q_value` columns.) `source`
   is stamped
   per input table and `run_psm_q` re-runs TDA within each source
-  (rescore.rs:65-70, 108, 411-437), so a pooled rescore still gives every run its
+  (`per_source_q`), so a pooled rescore still gives every run its
   own FDR, and `(D+1)/T` is scale-invariant apart from the pseudocount
   (fdr.rs:38). Cost, not statistics, sets the batch size: `n_psms * n_features * 4`
   bytes of feature matrix and a measured 0.834 ms/PSM on the streaming backend.
 - **`global_q_value` and `experiment_psm_q` are exact clones of `q_value`**
-  (rescore.rs:406-407). `global_q_value` is kept only for backward-compat.
+  (`write_scored`). `global_q_value` is kept only for backward-compat.
 - **Losing siblings get q = 1.0** at the peptide/precursor/pg levels
-  (rescore.rs:721-728); do not read a loser's level q as its FDR. After an
+  (`grouped_q`); do not read a loser's level q as its FDR. After an
   experiment-wide rescore the groups are experiment-wide, so per-run counts must
   use `run_psm_q`, not a grouped column.
 - **Multi-context q-values are independent per level**, each a separate TDA on its
   own best-per-group reduction. They are not derived from `q_value` by
   aggregation.
-- **`validate_labels` runs before any counting** (rescore.rs:112). Any label other
+- **`validate_labels` runs before any counting** (`rescore::run_hashed`). Any label other
   than target/decoy aborts the stage.
 - **Schema companion is mandatory.** compete writes `<out>.schema.json`
-  (compete.rs:188); rescore reads the first input's schema (rescore.rs:76) and
+  (compete.rs:188); rescore reads the first input's schema (`FeatureSchema::read`) and
   validates every later companion against it for identity and ordered feature
-  columns (`validate_feature_schema`, rescore.rs:79-80, 596-613). A divergent
+  columns (`validate_feature_schema`). A divergent
   feature schema hard-errors rather than silently misreading columns.
 
 ## How to extend / modify
@@ -1009,23 +1005,22 @@ unless a knob is set.
   `PeptidoformCharge` does (compete.rs:52-55). State in the doc comment which
   biological unit the key actually collapses; the `Precursor` variant name already
   misleads on that point.
-- **Wire the `percolator` path**: replace the warn/bail at rescore.rs:214-220 with a
-  PIN round-trip, and drop the `validate` rejection at config.rs:1389-1392. The PIN
-  writer already exists (`run_pin_sidecar`,
-  rescore.rs:913); percolator consumes the same PIN, so the work is invoking
+- **Add a `percolator` classifier**: a `RescorerKind` variant and a dispatch arm in
+  `rescore::run_hashed` that runs a PIN round-trip. The PIN writer already exists
+  (`run_pin_sidecar`); percolator consumes the same PIN, so the work is invoking
   `percolator_bin` (config.rs:1140) and parsing its output back into a per-row score
   vector aligned to input order. Honor `strict`.
 - **Add a rescorer sidecar** that follows the PIN contract: reuse `run_pin_sidecar`
-  (rescore.rs:913), which writes SpecId `psm_i` / ScanNr `i`, ExpMass=CalcMass=mz,
+  (through `HandoffWriter`), which writes SpecId `psm_i` / ScanNr `i`, ExpMass=CalcMass=mz,
   the feature columns in schema order, and `-.<peptidoform>.-` / `<protein>`
-  (rescore.rs:974-993). The worker must echo the SpecId tail as `candidate_id` and
+  (`HandoffWriter::push_row`). The worker must echo the SpecId tail as `candidate_id` and
   emit a `score` column; scores are mapped back by that row index through
-  `align_sidecar_scores` (rescore.rs:1032-1035). If the new worker can read
-  Parquet, gate it in `use_pq` (rescore.rs:946-947) rather than assuming the PIN.
-  NN hyperparameters are passed as `MUMDIA_NN_*` env vars (rescore.rs:1012-1014).
+  `align_sidecar_scores`. If the new worker can read
+  Parquet, gate it in `sidecar_paths` rather than assuming the PIN.
+  NN hyperparameters are passed as `MUMDIA_NN_*` env vars (`run_pin_sidecar`).
 - **Add a q-value context**: add a grouping vector and a `grouped_q` call
-  (mirror `precursor_q` at rescore.rs:440-457), then add the output column at
-  rescore.rs:508-541 and a 1% count if desired. Reuse the interning pattern for
+  (mirror `precursor_q` in `rescore::run_hashed`), then add the output column to
+  `ScoredColumns` and `scored_schema` and a 1% count if desired. Reuse the interning pattern for
   string keys to avoid hashing large columns.
 - **Change the FDR estimator**: `target_decoy_q` (fdr.rs:7) and `entrapment_q`
   (fdr.rs:64) are the only two kernels; both `search-seed` and `rescore` call them,

@@ -54,10 +54,9 @@ that `Err` aborts or is caught.
 | im2deep_worker (predict-frag) | aborts run | none | none: `run_im2deep(...)?` propagates (`predict_frag.rs`, `ImRequest::call`) |
 | deeplc_finetune (run) | aborts run | none | none: `run_deeplc_finetune(...)?` propagates (`run.rs:253-263`) |
 | mbr_worker (`mumdia mbr`) | aborts command | none | none: `run_mbr(...)?` propagates (`main.rs:697-710`) |
-| mokapot_worker (rescore) | falls back / bails | `rescore.strict` | `native_tda` when `strict=false`, else bail (`rescore.rs:172-180`) |
-| nn_rescore_worker (rescore) | falls back / bails | `rescore.strict` | `native_tda` when `strict=false`, else bail (`rescore.rs:199-207`) |
-| percolator (rescore, unwired) | falls back / bails | `rescore.strict` | `native_tda` when `strict=false`, else bail (`rescore.rs:209-215`) |
-| entrapment_worker (rescore) | falls back / bails | `rescore.strict` | native linear entrapment rescorer (still `QMode::Entrapment`) when `strict=false`, else bail (`rescore.rs:255-264`) |
+| mokapot_worker (rescore) | falls back / bails | `rescore.strict` | `native_tda` when `strict=false`, else bail (`strict_or_warn`) |
+| nn_rescore_worker (rescore) | falls back / bails | `rescore.strict` | `native_tda` when `strict=false`, else bail (`strict_or_warn`) |
+| entrapment_worker (rescore) | falls back / bails | `rescore.strict` | native linear entrapment rescorer (still `QMode::Entrapment`) when `strict=false`, else bail (`strict_or_warn`) |
 
 A crashed MS2PIP, AlphaPeptDeep, DeepLC, IM2Deep, DeepLC fine-tune, or MBR worker aborts. A crashed
 rescorer aborts only under `rescore.strict = true`; otherwise its scores are
@@ -75,8 +74,8 @@ the column it keys the readback on.
 | deeplc_worker | `<in.parquet> <out.parquet> [threads]` (`sidecar.rs`, `run_deeplc`; `threads` is the engine's thread count, capped by the worker, see **DeepLC thread cap**) | `deeplc_out.parquet` | `id` |
 | im2deep_worker | `<in.parquet> <out.parquet> [threads]` (`sidecar.rs`, `run_im2deep`; `threads` is the engine's thread count, capped by the worker under `MUMDIA_IM2DEEP_THREAD_CAP`, see **DeepLC thread cap**) | `im2deep_out.parquet` | `id` |
 | deeplc_finetune | `<lib_in> <seed> <lib_out> --epochs --patience --q-train --batch --window-holdout-frac --seed --predict-threads [--shards K]` (`sidecar.rs`, `run_deeplc_finetune`; `--shards` only when `rt_im_train.deeplc_predict_shards` is not 1, for all three modes) | `<lib_out>` (= `fragment_library_precursors_ft.parquet`) | `peptidoform` (new table with replaced `predicted_irt`; input unchanged) |
-| mokapot_worker / nn_rescore_worker | `<rescore.pin> <out.parquet>` + env `MUMDIA_NN_FOLDS/ITERS/TRAIN_FDR` (`rescore.rs:781-792`) | `rescore_sidecar_out.parquet` | `candidate_id` (echoes the flat row index) |
-| entrapment_worker | `<in.parquet> <out.parquet> <folds>` (`rescore.rs:718-724`) | `entrapment_out.parquet` | `row_id` |
+| mokapot_worker / nn_rescore_worker | `<rescore.pin> <out.parquet>` + env `MUMDIA_NN_FOLDS/ITERS/TRAIN_FDR` (`run_pin_sidecar`) | `rescore_sidecar_out.parquet` | `candidate_id` (echoes the flat row index) |
+| entrapment_worker | `<in.parquet> <out.parquet> <folds>` (`run_entrapment_gbm`) | `entrapment_out.parquet` | `row_id` |
 | mbr_worker | `<scored> <psms_csv> <out> --q-anchor --min-anchor-runs --q-transfer --seed [--out-scored] [--frag-csv --consensus-corr-min]` (`sidecar.rs:193-211`) | `<out>.parquet` | `candidate_id` |
 
 For the mapping from each conda environment to the config field that points at it
@@ -185,30 +184,30 @@ code.
   internals did not let the worker measure, is `null`; under a fine-tune the model
   load is part of `fit`.
 
-**mokapot_worker** / **nn_rescore_worker** (`rescore.rs:740` `run_pin_sidecar`)
+**mokapot_worker** / **nn_rescore_worker** (`run_pin_sidecar`)
 - IN `rescore.pin`: Percolator tab-separated. Fixed columns
   `SpecId Label ScanNr ExpMass CalcMass <features...> Peptide Proteins`
-  (`rescore.rs:760-777`). `SpecId = psm_<i>`, `ScanNr = <i>` where `i` is the
+  (`HandoffWriter`). `SpecId = psm_<i>`, `ScanNr = <i>` where `i` is the
   unique flat row index (NOT `candidate_id`, which repeats across runs);
   `ExpMass=CalcMass=precursor_mz` (`{:.5}`); features are `{:.6}`; `Label` +1
   target / -1 decoy; `Peptide = -.<peptidoform>.-` (Percolator flanking dots);
-  `Proteins = <protein>` (single column, `rescore.rs:776`). `nn_rescore_worker.py`
+  `Proteins = <protein>` (single column). `nn_rescore_worker.py`
   builds its fold key from the `Peptide` column, stripping the mod brackets and
   the `X.`/`.X` flanks (`strip_pep`, `nn_rescore_worker.py:70-74`) before the
   `md5 % FOLDS` hash. The feature column order is taken from the first competed
-  input's `FeatureSchema` companion (`rescore.rs:74`), so all competed inputs must
+  input's `FeatureSchema` companion (`FeatureSchema::read`), so all competed inputs must
   share one schema.
 - OUT `rescore_sidecar_out.parquet`: `candidate_id` u32 (echoes the SpecId tail =
   row index), `score` f64, `q_value` f64 (written as zeros; Rust computes q). Rust
   maps `score` back by row index and validates exact/unique/finite coverage
-  (`align_sidecar_scores`, `rescore.rs:802-805`).
+  (`align_sidecar_scores`).
 
-**entrapment_worker** (`rescore.rs:675` `run_entrapment_gbm`)
+**entrapment_worker** (`run_entrapment_gbm`)
 - IN `entrapment_in.parquet`: `row_id` u32 (unique flat index), `candidate_id`
   u32, `base_peptide_id` u32, `is_entrapment` i32 (0/1), `is_decoy` i32 (0/1),
-  then one f64 column per feature (`rescore.rs:693-714`).
+  then one f32 column per feature (`run_entrapment_gbm`; the worker widens them to f64).
 - OUT `entrapment_out.parquet`: `row_id` u32, `candidate_id` u32, `score` f64.
-  Rust maps back by `row_id` (`rescore.rs:729-732`).
+  Rust maps back by `row_id` (`align_sidecar_scores`).
 
 **mbr_worker** (`sidecar.rs:162` `run_mbr`)
 - IN `<scored_combined>`: experiment-wide scored table, columns read =
@@ -719,9 +718,9 @@ in `docs/08_rt_im_train.md` section 4d.
 ### Rescorers (Stage F)
 
 **mokapot** and **nn_torch** share the exact PIN contract via `run_pin_sidecar`
-(`rescore.rs:740-806`). Rust concatenates the competed feature tables, writes the
+and `HandoffWriter`. Rust concatenates the competed feature tables, writes the
 PIN, spawns the worker, and passes `MUMDIA_NN_FOLDS/ITERS/TRAIN_FDR` from
-`rescore.{folds,num_iter,train_fdr}` as env vars (`rescore.rs:790-792`) so the
+`rescore.{folds,num_iter,train_fdr}` as env vars so the
 report's recorded params match what ran; mokapot ignores those three. On success
 the classifier label and `model_identity` are recorded; on failure the path falls
 back to `native_scores` only when `rescore.strict = false`; strict is the
@@ -762,7 +761,7 @@ none). `MUMDIA_NN_SEED`, `MUMDIA_NN_THREADS` (set from `--threads`) and
   `MUMDIA_NN_STREAM_GB` (auto: twice the free physical memory, never below 4 GB;
   #88). For a tab-separated PIN the compared
   quantity is the on-disk file size; for a Parquet feature table
-  (`rescore.handoff = parquet`, accepted by this worker only, `rescore.rs:943-959`)
+  (`rescore.handoff = parquet`, accepted by this worker only, `sidecar_paths`)
   it is `num_rows * (num_columns - 3) * 4`, the decoded float32 feature matrix,
   because the column store on disk is several times smaller than the memory a
   full read needs (`nn_rescore_worker.py:292-298`). The streaming backend is what
@@ -802,11 +801,11 @@ none). `MUMDIA_NN_SEED`, `MUMDIA_NN_THREADS` (set from `--threads`) and
   min from the tail. Seeds are ensembled by averaging rank-normalised OOF scores
   (`:281-288`).
 
-**entrapment** (`rescore.rs:675-733`, worker `entrapment_worker.py`). Selected by
+**entrapment** (`run_entrapment_gbm`, worker `entrapment_worker.py`). Selected by
 `rescore.classifier = "entrapment"` with `rescore.entrapment_marker` set and
 `rescore.python` present; otherwise it falls back to a native linear entrapment
-rescorer or `native_tda` (`rescore.rs:217-276`). `classify_entrapment`
-(`rescore.rs:577-604`) marks a target as entrapment when its protein contains the
+rescorer or `native_tda` (`strict_or_warn`). `classify_entrapment`
+marks a target as entrapment when its protein contains the
 marker, does not contain `entrapment_exclude`, and matches none of
 `entrapment_contaminant_markers`. The worker trains real-target (positive) vs
 spike-in (negative), decoys excluded from training (`entrapment_worker.py:80-83`),
@@ -821,12 +820,12 @@ flexible model helps (AUC ~0.97 vs ~0.62 on in-silico decoys), unlike the
 decoy-trained regime, where a native linear model is all in-silico decoys can
 support. Selecting entrapment (whether the GBM
 sidecar or the native linear fallback) flips the internal `QMode` from `Decoy` to
-`Entrapment` (`rescore.rs:145, 252/262/273`), so every q level (PSM, per-run,
+`Entrapment` (`qmode` in `rescore::run_hashed`), so every q level (PSM, per-run,
 peptide, protein-group, precursor) is computed by `entrapment_q` against the
 real-target-vs-spike-in null scaled by `rescore.entrapment_ratio`, and the
-reported IDs are the real targets only (spike-in excluded, `rescore.rs:400-403`).
+reported IDs are the real targets only (spike-in excluded, `is_reported`).
 The report also records `entrapment_peptides_at_1pct`, a leak check on spike-in
-peptides passing the 1% gate (`rescore.rs:437-445, 492`).
+peptides passing the 1% gate (`count_distinct`).
 
 ### MBR (Stage D3)
 
@@ -919,9 +918,9 @@ search.
 | `model_identity` | `sidecar.rs` | `<module>-<version>-<suffix>` for a sidecar model; `deeplc_identity` is its DeepLC case |
 | `run_deeplc_finetune` | `sidecar.rs:111` | Run `deeplc_finetune.py <lib_in> <seed> <lib_out> --epochs --patience --q-train --batch --window-holdout-frac --seed --predict-threads` (`utf8=true`) |
 | `run_mbr` | `sidecar.rs:162` | Run `mbr_worker.py <scored> <psms_csv> <out> [--out-scored] [--frag-csv --consensus-corr-min] --q-anchor --min-anchor-runs --q-transfer --seed` |
-| `run_pin_sidecar` | `rescore.rs:740` | Write PIN keyed by row index, run mokapot/nn worker, map `score` back by row index |
-| `run_entrapment_gbm` | `rescore.rs:675` | Write features+meta Parquet, run entrapment worker, map `score` back by `row_id` |
-| `align_sidecar_scores` | `rescore.rs:811` | Validate + align a sidecar's `(row_id, score)`: exact, unique, finite coverage or bail |
+| `run_pin_sidecar` | `rescore.rs` | Write PIN keyed by row index, run mokapot/nn worker, map `score` back by row index |
+| `run_entrapment_gbm` | `rescore.rs` | Write features+meta Parquet, run entrapment worker, map `score` back by `row_id` |
+| `align_sidecar_scores` | `rescore.rs` | Validate + align a sidecar's `(row_id, score)`: exact, unique, finite coverage or bail |
 | `make_model` | `mokapot_worker.py:35` | Build the mokapot model from `MUMDIA_RESCORE_MODEL` (nn/logreg/xgb/percolator) |
 | `tda_q` | `nn_rescore_worker.py:77` | Target-decoy q: `(decoys+1)/max(1,targets)`, running min from the tail |
 | `one_pass` | `nn_rescore_worker.py:225` | One CV pass -> OOF scores; per fold iterate positive re-selection + MLP retrain |
@@ -1019,7 +1018,7 @@ configured.
 | `rt_im_train.finetune_batch` | `0` | `--batch`; 0 = auto-scale to seed size in the worker |
 | `rt_im_train.q_train` | `0.01` | `--q-train` max seed `spectrum_q` for the fine-tune reference |
 | `rt_im_train.window_holdout_frac` | `0.0` | `--window-holdout-frac`; excludes `base_peptide_id %% 1000 < round(frac*1000)` anchors from the fine-tune reference so rt-im-train can size `w_rt` on them held-out (rule duplicated in `rt_im_train.rs::is_holdout`; see `docs/08` section 4b) |
-| `rescore.classifier` | `native_tda` | `mokapot`/`nn_torch` -> PIN sidecar; `entrapment` -> Parquet sidecar; `percolator` -> unwired |
+| `rescore.classifier` | `native_tda` | `mokapot`/`nn_torch` -> PIN sidecar; `entrapment` -> Parquet sidecar |
 | `rescore.python` | `None` | interpreter for the rescore/entrapment sidecar |
 | `rescore.folds` | `3` | passed as `MUMDIA_NN_FOLDS` + entrapment `folds` argv |
 | `rescore.num_iter` | `10` | passed as `MUMDIA_NN_ITERS` (native semi-supervised iterations) |
@@ -1088,8 +1087,8 @@ MLP. Set it explicitly for the logreg path.
   as the caller expects, or the readback map silently assigns the worst score.
 - **Row index vs candidate_id.** In multi-run rescoring `candidate_id` is the
   library index and repeats across runs, so the PIN keys on a unique flat row
-  index (`SpecId=psm_<i>`, `ScanNr=<i>`, `rescore.rs:763-771`) and the entrapment
-  Parquet carries a separate `row_id` (`rescore.rs:697`). Keying on
+  index (`SpecId=psm_<i>`, `ScanNr=<i>`, `HandoffWriter::push_row`) and the entrapment
+  Parquet carries a separate `row_id` (`run_entrapment_gbm`). Keying on
   `candidate_id` would collide and collapse runs.
 - **resolve_script Windows-path gotcha.** The build target dir is redirected off
   the OneDrive tree (`C:/Users/robbi/mumdia_build/...`), while `scripts/` lives
@@ -1422,7 +1421,7 @@ MLP. Set it explicitly for the logreg path.
 - **Entrapment worker needs both classes.** `entrapment_worker.py` raises
   `SystemExit` if the training set (all non-decoy rows) is single-class, i.e. no
   real-target or no entrapment PSMs (`entrapment_worker.py:86-87`); the Rust side
-  already guards this (`n_ent == 0` falls back to `native_tda`, `rescore.rs:218-234`).
+  already guards this (`n_ent == 0` falls back to `native_tda`, `rescore::run_hashed`).
   Its fold count is `k = max(2, min(folds, n_groups))` over the `base_peptide_id`
   groups (`:89-90`); folds whose training side is single-class are left NaN and
   filled by the final full-data model, which also scores every decoy
