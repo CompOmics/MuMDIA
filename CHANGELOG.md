@@ -216,8 +216,7 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Removed
 
-- **`scripts/make_shift_decoys.py` and `scripts/augment_library.py` (docs/13, "DIA-NN
-  recipe").** Both wrote decoys whose fragment intensities are copies of their targets', which
+- **`scripts/make_shift_decoys.py` and `scripts/augment_library.py` (docs/13).** Both wrote decoys whose fragment intensities are copies of their targets', which
   the decoy rule of 2026-10-09 forbids: on the ProteoBench Astral entrapment module such decoys
   gave a paired entrapment FDP of 1.68% at a reported precursor q of 1%, predicted ones 0.85%.
   A shift decoy keeps its target's sequence, so it cannot be predicted at all.
