@@ -93,7 +93,9 @@ impl TofFrame {
         match (self.lut.get(k), self.lut.get(k + 1)) {
             (Some(&a), Some(&b)) => {
                 let (a, b) = (a as usize, b as usize);
-                a + self.ev[a..b].partition_point(|&e| e < (t as u64) << TOF_SHIFT)
+                let key = (t as u64) << TOF_SHIFT;
+                let s = &self.ev[a..b];
+                a + s.iter().position(|&e| e >= key).unwrap_or(s.len())
             }
             // The closing entry, `ev.len()`: `t` lies past every event.
             (Some(&a), None) => a as usize,

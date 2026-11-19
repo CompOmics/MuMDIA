@@ -120,8 +120,10 @@ native reader.
 - **`--max-spectra` counts frames**, not spectra, on this path: N frames yield N spectra for MS1
   frames and one spectrum per slot for MS2 frames.
 
-The reader settings are provisional. `tdf_im_gap_scans` 30 and `tdf_min_points` 2 rest on a peak
-census of one run and the seed plateau. The valley fractions stay at 0 until they are measured
+The reader settings are provisional. `tdf_im_gap_scans` 30 rests on a peak census of one run
+and the seed plateau. `tdf_min_points` is 1 since 2026-11-19 (it was 2): every centroid is
+kept, including those of a single ion event, which at low load is most of the real fragment
+signal (section 11, "Low input"). The valley fractions stay at 0 until they are measured
 as one package with the seed's count-once matching on the six-run HYE set with three `nn_torch`
 seeds: on its own, the mobility split cut the seed anchors from 5,200 to 3,331. The smoothing
 half-width of 8 replaced 4, the value measured to over-split on both axes; it is inert while
@@ -868,6 +870,50 @@ IM branch: MAD k = 4, single pass), `apex_count_window` 5 (the IM branch: 3), no
 IM branch's L1c, +14.6%). Arms T3, T4, T5 and T1 of section 14 and the recipe arm measure
 them one at a time; a shortfall is bisected with them before any IM mechanism is restored.
 
+### Low input (2026-11)
+
+Five low-input diaPASEF sets, each searched with a DIA-NN 2.7 library of the same species and
+against DIA-NN 2.7 on the same library and runs: 200 pg HeLa and 200 pg yeast on a timsTOF Pro
+(six runs each, the other species of the HYE mix as a foreign-species check), 1 ng HeLa with E.
+coli entrapment on a timsTOF Pro 2 (six runs), 250 pg HYE human on an Ultra (three runs) and 13
+HeLa single cells on a Pro; with 50 ng 5-min HYE on an Ultra 2 (three runs), the E. coli
+entrapment run and three blank injections as controls. Precursors per run at `run_psm_q` 1%,
+mean of three NN seeds where a range is given, one seed otherwise.
+
+The loss breakdown on main put most of the gap in extract's presence rule: faint precursors
+whose fragments are single ion events never assembled a peak group, because the reader
+dropped every centroid of fewer than `convert.tdf_min_points` (2) points. Three changes made
+the default together: `tdf_min_points` 1, the support gate off (`gate_support_min` unset), and
+in `configs/examples/diapasef.json` `extract.presence_min_coelution` 1 (default 2), keeping
+`gate_min_score` 0.6.
+
+| set | main | new (seed range) | new vs main | % of DIA-NN, main -> new | wall, main -> new |
+|---|---:|---:|---:|---|---|
+| 200 pg HeLa | 1,884 | 7,689 (7,656-7,711) | +308% | 22% -> 88% | 8:09 -> 12:14 |
+| 200 pg yeast | 1,704 | 5,004 | +194% | 28% -> 83% | 8:07 -> 11:30 |
+| 1 ng | 7,394 | 19,270 (19,079-19,424) | +161% | 31% -> 81% | 8:07 -> 13:30 |
+| 250 pg Ultra | 4,496 | 9,544 (9,410-9,792) | +112% | 51% -> 109% | 8:59 -> 15:05 |
+| 13 single cells | 3,383 | 8,616 | +155% | 33% -> 83% | 72:31 -> 110:25 |
+| 50 ng Ultra 2 | 33,303 | 35,346 (35,252-35,458) | +6.1% | 84% -> 90% | 19:30 -> 25:35 |
+| E. coli entrapment | 15,972 | 16,451 (16,445-16,463) | +3.0% | 85% -> 88% | 4:37 -> 7:22 |
+| blanks | 0 | 0 | | | 0:18 -> 2:43 |
+
+Empirical nulls, main -> new: entrapment FDP about 1.1% -> 0.97% (0.83-1.12%); E. coli share
+at 1 ng 0.2% -> 0.15%; foreign-species share at 200 pg HeLa about 1.0% -> 0.75%, 200 pg yeast
+2.05% -> 1.83%, 50 ng 0.66% -> 0.65%, and at 250 pg Ultra 1.08% -> 1.40% (1.34-1.44%, every
+seed above the 1.17% of the intermediate arm). The 250 pg rise is the open caveat: about 2% of
+the precursors the change adds there are foreign, on that acquisition only.
+
+The intermediate arm (support gate off, presence 1, `gate_min_score` 0.3, `tdf_min_points` 2)
+gave 3,422 / 12,542 / 6,912 / 35,710 / 16,573 on the five three-seed sets, so the reader is
+most of the low-input gain and the gate change a little of the bulk one (-1.0% and -0.7% on 50
+ng and entrapment against that arm). `tdf_min_points` 1 with the gate at 0.3 found the same
+counts within seed noise but at 2.3x the wall: the candidate pool grew up to 14x, a blank took
+50 min, and the pooled single-cell rescore handoff reached 103 GB. At 0.6 the pool is 4-22x
+smaller and the blanks take under 3 minutes. Co-elution 2 or a gate of 0.45 kept less of the
+gain at more of the cost. The prefilter still stands aside on noise-heavy pools when no fold
+has 10 targets even at q 0.1.
+
 ## 12. Closed levers
 
 Measured and not kept. Commits are on the IM branch; seeds are `nn_torch` seeds on the E. coli
@@ -888,7 +934,7 @@ run unless marked.
 | `rt_im_train.rt_window_multiplier` 1.5 or 2.0 with retrace on | -1.8% (13,429), -2.9% (13,282), decoy fraction 0.99%; at 1.5 about 100 precursors came back inside the window and 373 more lost to a wrong peak inside it | `1c5b9a1` |
 | 1/K0 window narrowed to `apex_im` +/- delta | delta 0.008 -8.0%, 0.012 -1.4%, 0.020 +1.4% (seed 0); not recommended | `31cba11` |
 | `convert.tdf_mz_ppm 5` | +3.6%, but the seed fell to 615 anchors; superseded by the valley split | `31cba11` |
-| `tdf_min_points 1` | -17% (P1); for MS1 only +0.25% / -0.2% | `76d57b6`, `31cba11` |
+| `tdf_min_points 1` | -17% (P1); for MS1 only +0.25% / -0.2%. Reopened and made the default on 2026-11-19: with the recipe's presence rule and no support gate it is +54% to +125% at low load (section 11, "Low input") | `76d57b6`, `31cba11` |
 | valley fraction and smoothing | m/z 0.3 -6.1%; smoothing 12 ppm -4.4%; m/z 0.7 +1.6%, nothing once the mobility split and count-once are on | `31cba11` |
 | refit widths as fitted, and fragment mass recalibration on identifications | -4.0%; 7.99 ppm -2.7%, 10.11 ppm -0.3% | `31cba11` |
 | `peak_claim = coelution_shadow`, contested-evidence features | -8.7%, -0.4% (seed 0) | `31cba11` |
@@ -1186,8 +1232,8 @@ spectra of a diaPASEF frame are summed over the candidate's 1/K0 band, so nearly
 candidate matches its fragments and the agreement scores sit high for most. A higher
 threshold buys time with identifications.
 
-`extract.gate_support_min` (default 0.845 on spectra that carry 1/K0 since 2026-10-18, off
-otherwise; 0 turns it off) is a second threshold on the window-mean score plus the
+`extract.gate_support_min` (off by default since 2026-11-19; it was 0.845 on spectra that carry
+1/K0 from 2026-10-18, see the end of this subsection) is a second threshold on the window-mean score plus the
 apex intensity and the MS1 monoisotopic intensity and, on spectra that carry 1/K0, three 1/K0
 terms: the apex 1/K0 error against the calibrated prediction, the 1/K0 spread of the matched
 fragments at the apex and the MS1-to-fragment 1/K0 difference. The weights come from a
@@ -1226,7 +1272,10 @@ took 29 min for 38,406 peptides, and on the E. coli run (three seeds) it gave 14
 14,008 peptides at an entrapment FDP of 0.37, 0.37 and 0.32%, a smaller loss (-0.8%) for less
 of the speed.
 
-The gate is the default on spectra that carry 1/K0 since 2026-10-18, at 0.845: it trades about
+The gate was the default on spectra that carry 1/K0 from 2026-10-18 to 2026-11-19, at 0.845. It is
+off because the low-input sets of section 11 ("Low input") lost far more than these bulk sets:
++26% precursors per run at 200 pg and +19% at 1 ng with it off, +6.1% at 50 ng on Ultra 2, one
+NN seed, other-species shares unchanged. On the bulk sets above it traded about
 1.6% of the peptides for a third to a half of the wall time, at an unchanged entrapment FDP and
 an unchanged or slightly better quantification. Set `extract.gate_support_min` to 0 for the
 previous behaviour, or to 0.82 for a smaller loss at less of the speed. It applies only under
