@@ -638,8 +638,9 @@ before.
 
 ### rescore: shadow demotion and its Q1 term
 
-`rescore.shadow_min_shared` (default 3, `stages::shadow`): after a first-pass precursor q
-selects the accepted targets (the possible lenders), a row of either label among the top
+`rescore.shadow_min_shared` (default 3, `stages::shadow`): after a first-pass precursor q,
+grouped per run (a precursor accepted in several runs lends in each of them), selects the
+accepted targets (the possible lenders), a row of either label among the top
 `shadow_region x accepted` of its run by first-pass score is demoted below every other
 score when at least `shadow_min_shared` of its library fragments lie within `shadow_ppm`
 of a fragment of a higher-scoring accepted target of the same run and isolation window

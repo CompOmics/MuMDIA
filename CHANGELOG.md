@@ -253,6 +253,15 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **Shadow demotion is per run in a pooled rescore (docs/11, "rescore: shadow demotion and its
+  Q1 term").** Its first pass grouped the precursor q on peptidoform and charge over the whole
+  pool, and a grouped q goes to the group's best row only, so a precursor accepted in several
+  runs was accepted, and lent its fragments, in its best run alone: every other run lost that
+  lender and the share of its examined region (`shadow_region x accepted`) that it sized. The
+  first pass now groups on run, peptidoform and charge, as the demotion is described. One run
+  has the same groups and writes the same tables; a pooled rescore (`run` with several
+  `--mzml`, `run-experiment`) demotes more shadows in every run, so its scores and counts
+  change. The stage interns peptidoform and charge once instead of twice.
 - **Desktop: "Add folder…" selects several spectra folders at once (#335).** A Bruker or Agilent `.d`
   and a Waters `.raw` are directories, so they are added with "Add folder…", and that dialog took
   one folder at a time: the spectra folder picker shared the single-choice setting of the output

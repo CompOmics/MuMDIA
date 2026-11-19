@@ -1068,11 +1068,22 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
     }
     timings.collapse_ms = t_collapse.elapsed().as_millis();
 
-    // Shadow demotion (`rescore.shadow_min_shared`): a first-pass precursor q selects the
-    // lenders, then every shadow of either label drops below all other scores before the
-    // q-values below are computed (`stages::shadow`).
-    // Default-on since 2026-10-08, so a standalone rescore without the library fragments
-    // skips it with a warning rather than failing.
+    // Precursor ids: peptidoform + charge interned to dense u32 in first-seen order, like
+    // the protein path. The shadow demotion's first pass and `precursor_q` both group on
+    // them, and nothing but the scores changes in between.
+    let precursor_id: Vec<u32> = {
+        let mut interner: HashMap<(&str, i32), u32> = HashMap::new();
+        let mut ids = Vec::with_capacity(pform.len());
+        for (pf, &z) in pform.iter().zip(charge.iter()) {
+            let next = interner.len() as u32;
+            ids.push(*interner.entry((pf, z)).or_insert(next));
+        }
+        ids
+    };
+
+    // Shadow demotion (`rescore.shadow_min_shared`, `shadow_demote`), before the q-values
+    // below are computed. Default-on since 2026-10-08, so a standalone rescore without the
+    // library fragments skips it with a warning rather than failing.
     if p.cfg.shadow_min_shared > 0 && p.shadow.is_none() {
         tracing::warn!(
             "rescore: shadow demotion skipped: this rescore has no library fragments or \
@@ -1081,72 +1092,22 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
         );
     }
     if let (true, Some(inputs)) = (p.cfg.shadow_min_shared > 0, p.shadow.as_ref()) {
-        let t_sh = Instant::now();
-        let pid: Vec<u32> = {
-            let mut interner: HashMap<(&str, i32), u32> = HashMap::new();
-            let mut ids = Vec::with_capacity(pform.len());
-            for (pf, &z) in pform.iter().zip(charge.iter()) {
-                let next = interner.len() as u32;
-                ids.push(*interner.entry((pf, z)).or_insert(next));
-            }
-            ids
-        };
-        let pq1 = grouped_q(
-            &pid,
-            &scores,
+        shadow_demote(
+            &mut scores,
+            &source,
+            &precursor_id,
+            &cid,
+            &base,
+            &apex_rt,
+            &mz,
+            &peak_rank,
             &is_decoy,
             &is_entrapment,
             &is_real_target,
             qmode,
-            p.cfg.entrapment_ratio,
-        );
-        let accepted: Vec<bool> = (0..n).map(|i| !is_decoy[i] && pq1[i] <= 0.01).collect();
-        let demote = super::shadow::flag(
-            &super::shadow::ShadowRows {
-                source: &source,
-                cid: &cid,
-                base: &base,
-                apex_rt: &apex_rt,
-                precursor_mz: &mz,
-                score: &scores,
-                is_decoy: &is_decoy,
-                accepted: &accepted,
-                peak_rank: &peak_rank,
-            },
+            p.cfg,
             inputs,
-            super::shadow::ShadowParams {
-                min_shared: p.cfg.shadow_min_shared,
-                ppm: p.cfg.shadow_ppm,
-                rt_s: p.cfg.shadow_rt_s,
-                region: p.cfg.shadow_region,
-                im_tol: p.cfg.shadow_im_tolerance,
-                q1: p.cfg.shadow_q1.on(),
-            },
         )?;
-        let floor = scores
-            .iter()
-            .copied()
-            .filter(|s| s.is_finite())
-            .fold(f64::INFINITY, f64::min)
-            - 1.0;
-        let (mut dt, mut dd) = (0usize, 0usize);
-        for i in 0..n {
-            if demote[i] {
-                scores[i] = floor;
-                if is_decoy[i] {
-                    dd += 1;
-                } else {
-                    dt += 1;
-                }
-            }
-        }
-        info!(
-            demoted_targets = dt,
-            demoted_decoys = dd,
-            first_pass_accepted = accepted.iter().filter(|&&a| a).count(),
-            ms = t_sh.elapsed().as_millis() as u64,
-            "rescore: shadow demotion"
-        );
     }
     let t_q = Instant::now();
 
@@ -1222,17 +1183,8 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
         p.cfg.entrapment_ratio,
         &psm_q,
     );
-    // Precursor-level q: group on peptidoform+charge (interned to dense u32 like the
-    // protein path) and run TDA over the best PSM per precursor.
-    let precursor_id: Vec<u32> = {
-        let mut interner: HashMap<(&str, i32), u32> = HashMap::new();
-        let mut ids = Vec::with_capacity(pform.len());
-        for (pf, &z) in pform.iter().zip(charge.iter()) {
-            let next = interner.len() as u32;
-            ids.push(*interner.entry((pf, z)).or_insert(next));
-        }
-        ids
-    };
+    // Precursor-level q: group on peptidoform+charge (`precursor_id`) and run TDA over the
+    // best PSM per precursor.
     let precursor_q = grouped_q(
         &precursor_id,
         &scores,
@@ -1400,6 +1352,103 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
         "rescore: done"
     );
     Ok(report.written())
+}
+
+/// Shadow demotion (`rescore.shadow_min_shared`, `stages::shadow`): a first-pass precursor q
+/// selects each run's accepted targets (the possible lenders), then every shadow of either
+/// label drops below all other scores.
+///
+/// The first pass groups on `(source, precursor_id)` because the demotion is per run: a
+/// precursor accepted in several runs lends, and sizes the examined region, in each of
+/// them. Grouped on the precursor alone, `grouped_q` gives the q to the precursor's best
+/// row only, so a pooled rescore accepted it in one run. One run keeps the same groups.
+#[allow(clippy::too_many_arguments)]
+fn shadow_demote(
+    scores: &mut [f64],
+    source: &[u32],
+    precursor_id: &[u32],
+    cid: &[u32],
+    base: &[u32],
+    apex_rt: &[f64],
+    mz: &[f64],
+    peak_rank: &[i32],
+    is_decoy: &[bool],
+    is_entrapment: &[bool],
+    is_real_target: &[bool],
+    qmode: QMode,
+    cfg: &RescoreConfig,
+    inputs: &super::shadow::ShadowInputs,
+) -> Result<()> {
+    let t_sh = Instant::now();
+    let n = scores.len();
+    let run_precursor: Vec<u32> = {
+        let mut interner: HashMap<(u32, u32), u32> = HashMap::new();
+        source
+            .iter()
+            .zip(precursor_id)
+            .map(|(&s, &k)| {
+                let next = interner.len() as u32;
+                *interner.entry((s, k)).or_insert(next)
+            })
+            .collect()
+    };
+    let pq1 = grouped_q(
+        &run_precursor,
+        scores,
+        is_decoy,
+        is_entrapment,
+        is_real_target,
+        qmode,
+        cfg.entrapment_ratio,
+    );
+    let accepted: Vec<bool> = (0..n).map(|i| !is_decoy[i] && pq1[i] <= 0.01).collect();
+    let demote = super::shadow::flag(
+        &super::shadow::ShadowRows {
+            source,
+            cid,
+            base,
+            apex_rt,
+            precursor_mz: mz,
+            score: scores,
+            is_decoy,
+            accepted: &accepted,
+            peak_rank,
+        },
+        inputs,
+        super::shadow::ShadowParams {
+            min_shared: cfg.shadow_min_shared,
+            ppm: cfg.shadow_ppm,
+            rt_s: cfg.shadow_rt_s,
+            region: cfg.shadow_region,
+            im_tol: cfg.shadow_im_tolerance,
+            q1: cfg.shadow_q1.on(),
+        },
+    )?;
+    let floor = scores
+        .iter()
+        .copied()
+        .filter(|s| s.is_finite())
+        .fold(f64::INFINITY, f64::min)
+        - 1.0;
+    let (mut dt, mut dd) = (0usize, 0usize);
+    for i in 0..n {
+        if demote[i] {
+            scores[i] = floor;
+            if is_decoy[i] {
+                dd += 1;
+            } else {
+                dt += 1;
+            }
+        }
+    }
+    info!(
+        demoted_targets = dt,
+        demoted_decoys = dd,
+        first_pass_accepted = accepted.iter().filter(|&&a| a).count(),
+        ms = t_sh.elapsed().as_millis() as u64,
+        "rescore: shadow demotion"
+    );
+    Ok(())
 }
 
 /// The `psms_scored` columns, in schema order.
@@ -7085,6 +7134,87 @@ b
         assert!(align_sidecar_scores(&[0, 0], &[1.0, 2.0], 2, "test").is_err());
         assert!(align_sidecar_scores(&[0, 2], &[1.0, 2.0], 2, "test").is_err());
         assert!(align_sidecar_scores(&[0, 1], &[1.0, f64::NAN], 2, "test").is_err());
+    }
+
+    /// Shadow demotion is per run. Precursor P (cid 1) is accepted in both runs and scores
+    /// higher in run 1, so a first pass grouped on the precursor alone accepted it in run 1
+    /// only. Its run-0 borrower S must still be demoted, and D, which co-elutes only with
+    /// P's run-1 apex, must not be: a lender in one run never demotes a row of another.
+    #[test]
+    fn a_precursor_accepted_in_two_runs_lends_in_each_run_and_only_there() {
+        let win = scratch("shadow_runs_iw.parquet");
+        write_table(
+            &win,
+            vec![
+                Col::U32("window_id".into(), vec![0]),
+                Col::F64("target".into(), vec![410.0]),
+                Col::F64("lower".into(), vec![400.0]),
+                Col::F64("upper".into(), vec![420.0]),
+            ],
+        )
+        .unwrap();
+        // S (cid 2) and D (cid 3) share 3 of P's 4 fragments.
+        let frag = scratch("shadow_runs_frag.parquet");
+        let (lender, borrower) = (
+            [200.0, 300.0, 400.0, 500.0],
+            [200.001, 300.001, 400.001, 650.0],
+        );
+        write_table(
+            &frag,
+            vec![
+                Col::U32(
+                    "candidate_id".into(),
+                    vec![1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3],
+                ),
+                Col::F64("mz".into(), [lender, borrower, borrower].concat()),
+            ],
+        )
+        .unwrap();
+        // (source, precursor, cid, apex_rt, precursor_mz, score): P, S and D in run 0, P in
+        // run 1, then 100 fillers per run outside the window, so with no decoy every target
+        // passes the first pass at q = 1 / 204.
+        let mut rows: Vec<(u32, u32, u32, f64, f64, f64)> = vec![
+            (0, 0, 1, 100.0, 410.0, 4.0),
+            (0, 1, 2, 101.0, 405.0, 3.0),
+            (0, 2, 3, 200.0, 405.0, 3.0),
+        ];
+        rows.extend((0..100).map(|k| (0, 10 + k, 100 + k, 300.0, 900.0, 1.0)));
+        rows.push((1, 0, 1, 200.0, 410.0, 5.0));
+        rows.extend((0..100).map(|k| (1, 200 + k, 300 + k, 300.0, 900.0, 1.0)));
+        let n = rows.len();
+        let source: Vec<u32> = rows.iter().map(|r| r.0).collect();
+        let precursor_id: Vec<u32> = rows.iter().map(|r| r.1).collect();
+        let cid: Vec<u32> = rows.iter().map(|r| r.2).collect();
+        let base: Vec<u32> = cid.iter().map(|c| c * 10).collect();
+        let apex_rt: Vec<f64> = rows.iter().map(|r| r.3).collect();
+        let mz: Vec<f64> = rows.iter().map(|r| r.4).collect();
+        let mut scores: Vec<f64> = rows.iter().map(|r| r.5).collect();
+        let windows = vec![win.clone(), win];
+        let no = vec![false; n];
+        let before = scores.clone();
+        shadow_demote(
+            &mut scores,
+            &source,
+            &precursor_id,
+            &cid,
+            &base,
+            &apex_rt,
+            &mz,
+            &vec![0; n],
+            &no,
+            &no,
+            &vec![true; n],
+            QMode::Decoy,
+            &RescoreConfig::default(),
+            &crate::stages::shadow::ShadowInputs::new(&frag, &windows),
+        )
+        .unwrap();
+        // Only S moves, to the floor: the lowest score minus 1.
+        let moved: Vec<(usize, f64)> = (0..n)
+            .filter(|&i| scores[i] != before[i])
+            .map(|i| (i, scores[i]))
+            .collect();
+        assert_eq!(moved, vec![(1, 0.0)]);
     }
 
     #[test]
