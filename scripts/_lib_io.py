@@ -133,7 +133,7 @@ def sort_fragments_by_candidate(path, buckets: int = 64, tmp_dir=None) -> int:
     """Rewrite the fragment table at `path` ordered by `candidate_id`, in place, streaming.
 
     The engine reads one candidate-id range of a fragment table through its parquet
-    row-group statistics (`Library::load_range_with`), which needs the rows sorted by
+    row-group statistics (`Library::load_for_stage`), which needs the rows sorted by
     `candidate_id` at row-group granularity. The writers cannot produce that order directly:
     the importer streams fragments in the input's order, and a decoy builder appends decoy
     fragments after the targets while the precursor order interleaves the two. So every

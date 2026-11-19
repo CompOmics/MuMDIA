@@ -581,12 +581,12 @@ from the row group's first row. To rebuild a v1 row, take the row's own `rt_axis
 else the last `rt_axis` its candidate carried in the row group, and `trace_len` zeros
 with the stored `intensity_trimmed` copied in at `trace_offset`.
 `mumdia::chromatograms::Decoder` does exactly this, and
-`mumdia::chromatograms::rewrite` converts a table between the two layouts; convert a
-v2 table to v1 before handing it to a tool outside the engine. A pooled table has the
+`mumdia::chromatograms::rewrite` converts a table between the two layouts (a Rust
+function, no CLI command); for a tool outside the engine, run with
+`extract.chromatogram_schema = 1`. A pooled table has the
 bands' layout, and the pool refuses bands of different layouts.
 
-Measured on three real runs by the ignored test `v2_on_a_real_artifact`
-(`chromatograms.rs`), each artifact rewritten in both layouts by today's writer
+Measured on three real runs, each artifact rewritten in both layouts by the writer
 (65,536-row groups, snappy, `rt` PLAIN):
 
 | run | rows | v1 | v2 | `rt` -> `rt_axis` values | `intensity` -> `intensity_trimmed` values |

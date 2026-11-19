@@ -121,7 +121,7 @@ pub struct ExtractParams<'a> {
     /// whole-library extract.
     pub fragment_offset: Option<u32>,
     /// `library_precursors` is the WHOLE library and this stage searches its rows
-    /// `[first, first + n)`, loaded directly by row span (`Library::load_row_span_with`):
+    /// `[first, first + n)`, loaded directly by row span (`Library::load_for_stage`):
     /// local ids `0..n`, fragments at library-wide ids `first..first + n`, outputs in local
     /// ids exactly as for a band file. A grouped run loads a band this way wherever nothing
     /// rewrites the band's precursor table, instead of writing the band out first.

@@ -38,7 +38,7 @@ pub struct SearchSeedParams<'a> {
     /// is the ordinary whole-library search.
     pub fragment_offset: Option<u32>,
     /// `library_precursors` is the WHOLE library and this stage searches its rows
-    /// `[first, first + n)`, loaded directly by row span (`Library::load_row_span_with`):
+    /// `[first, first + n)`, loaded directly by row span (`Library::load_for_stage`):
     /// local ids `0..n`, fragments at library-wide ids `first..first + n`, outputs in local
     /// ids exactly as for a band file. A grouped run loads a band this way wherever nothing
     /// rewrites the band's precursor table, instead of writing the band out first.
@@ -129,10 +129,10 @@ impl SeedLibrary {
     /// predicted intensities nor fragment names (the hyperscore is a match count plus
     /// observed intensity, and the mass recalibration walks `frag_mz`), so neither the
     /// library nor the index holds the two payload columns, 12 bytes per fragment at the
-    /// build peak ([`Library::load_mz_only`], [`FragIndex::build_mz_only`]). They are still
-    /// decoded and checked here exactly as the full load checks them, batch by batch, and
-    /// discarded, so a library extract would refuse is refused by the seed, before any
-    /// DeepLC step. The bucketed matcher keeps the full load, because `page_search` serves
+    /// build peak ([`Library::load_mz_only_for_stage`], [`FragIndex::build_mz_only`]). They
+    /// are still decoded and checked here exactly as the full load checks them, batch by
+    /// batch, and discarded, so a library extract would refuse is refused by the seed, before
+    /// any DeepLC step. The bucketed matcher keeps the full load, because `page_search` serves
     /// `idx_int` out of arrays built from the intensities.
     ///
     /// Under `search_seed.count_fragments_once` the fragindex index also carries each

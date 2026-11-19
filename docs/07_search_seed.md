@@ -40,7 +40,7 @@ DeepLC fine-tune (`run.rs:237-280`).
 | `rust/mumdia/crates/mumdia/src/stages/search_seed.rs` | the stage: scoring loop, best-per-candidate merge, mass recalibration, output writers |
 | `rust/mumdia/crates/mumdia/src/fdr.rs` | `target_decoy_q`, `count_targets_at_q`, `ln_factorial` (shared with `rescore`) |
 | `rust/mumdia/crates/mumdia/src/matchers/fragindex.rs` | `FragIndex` (CSR inverted fragment index) + `SeedScratch` epoch accumulator |
-| `rust/mumdia/crates/mumdia/src/index.rs` | `Library::load`, `candidate_range`, `page_search` (bucketed backend), `cand_frags` |
+| `rust/mumdia/crates/mumdia/src/index.rs` | `Library::load_mz_only_for_stage` / `load_for_stage`, `candidate_range`, `page_search` (bucketed backend), `cand_frags` |
 | `rust/mumdia/crates/mumdia/src/calibrate.rs` | `percentile` used by the tolerance fit |
 | `rust/mumdia/crates/mumdia/src/spectra.rs` | `load_ms2` (reads the converted MS2 Parquet into `Ms2Scan`, with the per-peak 1/K0 of spectra v2), `nearest_peak` (the one nearest-peak rule of the calibrants and the 1/K0 points) |
 | `rust/mumdia/crates/mumdia/src/stats.rs` | `weighted_median` (the observed 1/K0) |
@@ -61,7 +61,8 @@ DeepLC fine-tune (`run.rs:237-280`).
   own f32 width; this stage widens it with `as f64` at each comparison, which is
   exact, exactly as it already did for the library's f32 fragment m/z.
 - **Library** (`--lib-precursors` + `--lib-fragments`), loaded by
-  `Library::load_with` (`index.rs`). Provides the per-candidate columns
+  `Library::load_mz_only_for_stage` (`index.rs`; the full `load_for_stage` on the bucketed
+  matcher). Provides the per-candidate columns
   (`peptidoform(cid)`, `charge`, `prec_mz`, `base_peptide_id`, `protein(cid)`,
   `is_decoy`, `predicted_irt: f32`, and the CSR `frag_offsets`; `cand(cid)` reads
   them back as one borrowed record), the flat fragment arrays (`frag_mz`,
@@ -139,7 +140,7 @@ over `run_hashed` (`search_seed.rs:181`), itself a wrapper over `run_returning_s
 
 **1. Load** the library and MS2 scans (`load_ms2`), then log candidate and scan
 counts. On the fragindex matcher the library is the m/z-only one
-(`Library::load_mz_only`) and its index the m/z-only index
+(`Library::load_mz_only_for_stage`) and its index the m/z-only index
 (`FragIndex::build_mz_only`): the seed reads neither predicted intensities nor
 fragment names (the hyperscore is a match count plus observed intensity, and the mass
 recalibration walks `frag_mz`), so neither the library nor the index holds those two
@@ -440,7 +441,7 @@ tolerance (falling back to the config value if the file is absent,
 | `seed_fragindex_windows` | `search_seed.rs:695` | parallel per-window fragindex scoring + deterministic merge |
 | `select_peaks` | `search_seed.rs:563` | top-N-by-intensity peak selection, re-sorted to index order |
 | `hyperscore` | `search_seed.rs:850` | `ln(matched!) + ln(1 + sum_obs)` |
-| `Library::load_mz_only` | `index.rs:1133` | the seed's library: precursor columns and fragment m/z; the payload is decoded and checked as the full load checks it, then discarded |
+| `Library::load_mz_only_for_stage` | `index.rs` | the seed's library: precursor columns and fragment m/z; the payload is decoded and checked as the full load checks it, then discarded |
 | `FragIndex::build` / `build_mz_only` | `fragindex.rs:78` / `:99` | build the CSR inverted index at a fixed tolerance; `build_mz_only` without the intensity and fragment-ordinal payload (`has_payload`, `:105`) |
 | `FragIndex::probe_peak` / `probe_peak_cand` | `fragindex.rs:396` / `:425` | matched postings for one peak in a candidate range; `probe_peak_cand` reports the candidate only and is what the seed probes through (it also serves an m/z-only index) |
 | `SeedScratch::with_min_count` / `accumulate` / `qualified` | `fragindex.rs:667` / `:691` / `:741` | epoch-stamped `(count, obs_sum)` accumulator, one 16-byte slot per candidate; `qualified` lists the candidates that reached `min_matched_peaks`, in first-reached order |

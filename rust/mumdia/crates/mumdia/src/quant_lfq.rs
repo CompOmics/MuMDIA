@@ -10,19 +10,6 @@
 //! real-data validation requires >=2 runs, which the MVP single-run pipeline does
 //! not yet orchestrate.
 
-fn median(v: &mut [f64]) -> f64 {
-    if v.is_empty() {
-        return 0.0;
-    }
-    v.sort_by(|a, b| a.total_cmp(b));
-    let n = v.len();
-    if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        0.5 * (v[n / 2 - 1] + v[n / 2])
-    }
-}
-
 /// Solve the reduced normal system `L x = c` for a connected component with the
 /// first variable fixed at 0 (removing the Laplacian's rank deficiency). Dense
 /// Gaussian elimination with partial pivoting; components are small.
@@ -126,7 +113,7 @@ pub fn lfq_profile<R: AsRef<[Option<f64>]>>(mat: &[R], n_samples: usize) -> Vec<
                 }
             }
             if !d.is_empty() {
-                edges.push((a, b, median(&mut d)));
+                edges.push((a, b, crate::stats::median_or(&mut d, 0.0)));
             }
         }
     }

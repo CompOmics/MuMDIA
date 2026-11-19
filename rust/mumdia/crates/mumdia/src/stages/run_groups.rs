@@ -701,7 +701,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             std::fs::create_dir_all(gd(b.index, ""))?;
             // The seed reads the band straight from the library by row span: the same
             // library, value for value, as a band file of those rows
-            // (`Library::load_row_span_with`), without writing one. Until 2026-09-25 every
+            // (`Library::load_for_stage`), without writing one. Until 2026-09-25 every
             // band was written out first, whether or not anything rewrote it, which on a
             // 203.5M-precursor library without an RT model was the whole precursor table
             // written again for every run. A band file is now written only where a DeepLC

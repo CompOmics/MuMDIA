@@ -67,9 +67,8 @@ the CLI in `main.rs:535` (`Cmd::Extract`) and from the orchestrator in
   separate, non-destructive seed-probing limit and does not change the evidence
   available here.
 - `library_precursors` + `library_fragments` (Parquet): loaded once into
-  `Library::load_with` (`extract.rs:1306`) at `cfg.bucket_size`. `load_with`
-  skips building the bucketed `page_search` index when the fragindex backend is
-  selected (`index.rs:73`).
+  `Library::load_for_stage` at `cfg.bucket_size`, which skips building the
+  bucketed `page_search` index when the fragindex backend is selected.
 - `run_windows` (Parquet): per-candidate RT windows, columns `candidate_id`,
   `rt_pred_cal`, `rt_lo`, `rt_hi`, read by `read_run_windows` and scattered into the
   dense `rt_lo`/`rt_hi`/`rt_cal` arrays indexed by `candidate_id`. The decoded
@@ -1513,7 +1512,7 @@ the bound fraction. Deterministic: every sum runs in fragment, cycle and step or
 | `sum_near` | `extract.rs:495` | Sum intensities within a ppm window (m/z-sorted) |
 | `enumerate_peaks` | `peaks.rs:52` | Pure top-K peak-group enumerator |
 | `PeakGroup` | `peaks.rs:22` | One enumerated peak (apex/start/end idx, apex intensity, area, rank) |
-| `Library::load_with` | `index.rs:73` | Load the SoA library, optionally skipping the bucketed index |
+| `Library::load_for_stage` | `index.rs` | Load the SoA library (whole, band file or row span), optionally skipping the bucketed index |
 | `Library::candidate_range` | `index.rs:341` | Candidate-id range for an isolation window |
 | `Library::cand_frags` | `index.rs:312` | Fragment m/z, predicted intensity, and interned name-id slices |
 | `Library::page_search` | `index.rs:350` | Bucketed-backend fragment probe |
