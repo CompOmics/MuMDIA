@@ -616,7 +616,7 @@ pub struct PrefilterInput<'a> {
 /// refitted `num_iter` times on its own scores, and each PSM is scored only by the model of
 /// the fold it is held out of. No PSM's score depends on its own label, which is what keeps
 /// a cut on it label-blind for the PSMs it scores. `None` when a fold found fewer than 10
-/// confident targets to fit on, so there is no model to cut by.
+/// targets to fit on even at a q of 0.1, so there is no model to cut by.
 pub fn prefilter_scores(inp: PrefilterInput) -> Option<Vec<f64>> {
     let n = inp.features.rows();
     if n == 0 {
@@ -660,22 +660,39 @@ pub fn prefilter_scores(inp: PrefilterInput) -> Option<Vec<f64>> {
             .iter()
             .map(|&i| inp.init_score[i as usize])
             .collect();
+        // A pool that is mostly noise (diaPASEF under the relaxed extract rules) can leave the
+        // initial score without 10 targets at `train_fdr`. Percolator's start then: the one
+        // column, in either direction, that passes the most targets.
+        if confident_targets(&scores, &decoy, inp.train_fdr) < 10 {
+            if let Some(s) = best_single_column(d, &xrow, &decoy, inp.train_fdr) {
+                scores = s;
+            }
+        }
         let mut w = vec![0.0; d + 1];
         for _ in 0..inp.num_iter.max(1) {
             let q = target_decoy_q_split(&scores, &decoy);
+            // A pool whose top is mostly decoys can leave no column with 10 targets at
+            // `train_fdr`; the positives are then the targets at the first looser level that has.
+            let passing = |f: f64| {
+                q.iter()
+                    .zip(&decoy)
+                    .filter(|(q, d)| !**d && **q <= f)
+                    .count()
+            };
+            let fdr = [inp.train_fdr, 0.05, 0.1]
+                .into_iter()
+                .filter(|&f| f >= inp.train_fdr)
+                .find(|&f| passing(f) >= 10)?;
             let mut rows: Vec<&[f32]> = Vec::new();
             let mut ys: Vec<f64> = Vec::new();
             for (k, &is_d) in decoy.iter().enumerate() {
                 if is_d {
                     rows.push(xrow(k));
                     ys.push(0.0);
-                } else if q[k] <= inp.train_fdr {
+                } else if q[k] <= fdr {
                     rows.push(xrow(k));
                     ys.push(1.0);
                 }
-            }
-            if ys.iter().filter(|&&v| v > 0.5).count() < 10 {
-                return None;
             }
             w = logreg_fit(&rows, &ys, 1e-3, 100, 0.5);
             scores = (0..train_idx.len())
@@ -698,6 +715,47 @@ pub fn prefilter_scores(inp: PrefilterInput) -> Option<Vec<f64>> {
         }
     }
     Some(out)
+}
+
+/// How many targets pass `fdr` under `scores`.
+fn confident_targets(scores: &[f64], decoy: &[bool], fdr: f64) -> usize {
+    let q = target_decoy_q_split(scores, decoy);
+    q.iter()
+        .zip(decoy)
+        .filter(|(q, d)| !**d && **q <= fdr)
+        .count()
+}
+
+/// The column of `d`, in either direction, under which the most targets pass `fdr`, as that
+/// column's values (negated for the descending direction); `None` when no column passes any.
+/// Ties go to the lowest column, then the ascending direction, so the choice is deterministic.
+fn best_single_column<'a>(
+    d: usize,
+    xrow: &(dyn Fn(usize) -> &'a [f32] + Sync),
+    decoy: &[bool],
+    fdr: f64,
+) -> Option<Vec<f64>> {
+    let col = |j: usize, sign: f64| -> Vec<f64> {
+        (0..decoy.len()).map(|k| sign * xrow(k)[j] as f64).collect()
+    };
+    let (n, j, sign) = (0..d)
+        .flat_map(|j| [(j, 1.0), (j, -1.0)])
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|(j, sign)| (confident_targets(&col(j, sign), decoy, fdr), j, sign))
+        .reduce(
+            || (0, usize::MAX, 1.0),
+            |a, b| {
+                if (b.0, std::cmp::Reverse(b.1), b.2 > 0.0)
+                    > (a.0, std::cmp::Reverse(a.1), a.2 > 0.0)
+                {
+                    b
+                } else {
+                    a
+                }
+            },
+        );
+    (n > 0).then(|| col(j, sign))
 }
 
 /// Row indices by descending `scores`, ties broken by row index so every cut is deterministic.
@@ -798,6 +856,111 @@ mod tests {
         assert!(
             (dec - plain).abs() < 0.03,
             "decoys {dec} against plain targets {plain}"
+        );
+    }
+
+    /// An initial score that passes no target at 1% (here: inverted, so the decoys rank on
+    /// top) no longer makes the prefilter give up: it starts from the best single column.
+    #[test]
+    fn the_prefilter_starts_from_the_best_column_when_the_initial_score_has_no_targets() {
+        let n = 20_000usize;
+        let mut m = FeatureMatrix::with_capacity(n, 2);
+        let mut is_decoy = Vec::with_capacity(n);
+        let mut real = Vec::with_capacity(n);
+        let mut x = 777u64;
+        let mut rnd = || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((x >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        for i in 0..n {
+            let d = i % 2 == 1;
+            let r = !d && i % 10 == 0;
+            m.push(rnd());
+            // The signal sits in column 1, and its LOW values are the real targets.
+            m.push(rnd() - if r { 3.0 } else { 0.0 });
+            is_decoy.push(d);
+            real.push(r);
+        }
+        let m = m.finish().unwrap();
+        let fold_key: Vec<u32> = (0..n as u32).map(|i| i / 2).collect();
+        let init: Vec<f64> = (0..n)
+            .map(|i| if is_decoy[i] { 1.0 } else { 0.0 })
+            .collect();
+        let s = prefilter_scores(PrefilterInput {
+            features: &m,
+            is_decoy: &is_decoy,
+            fold_key: &fold_key,
+            init_score: &init,
+            folds: 3,
+            max_train_rows: 5_000,
+            num_iter: 3,
+            train_fdr: 0.01,
+        })
+        .expect("the best column has confident targets");
+        let keep = prefilter_decoy_cut_mask(&s, &is_decoy, 0.3);
+        let kept_real = (0..n).filter(|&i| real[i] && keep[i]).count();
+        let n_real = real.iter().filter(|&&r| r).count();
+        assert!(
+            kept_real as f64 > 0.99 * n_real as f64,
+            "{kept_real} of {n_real}"
+        );
+    }
+
+    /// A few decoys above every real target (so no column has a target at q 0.01) still
+    /// leave a model: the positives are taken at the first looser level with 10 targets.
+    #[test]
+    fn the_prefilter_fits_when_decoys_sit_above_every_target() {
+        let n = 20_000usize;
+        let mut m = FeatureMatrix::with_capacity(n, 2);
+        let mut is_decoy = Vec::with_capacity(n);
+        let mut real = Vec::with_capacity(n);
+        let mut x = 4242u64;
+        let mut rnd = || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((x >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        for i in 0..n {
+            let d = i % 2 == 1;
+            let r = !d && i % 10 == 0;
+            let top_decoy = d && i % 200 == 1;
+            m.push(rnd());
+            m.push(
+                rnd()
+                    + if r {
+                        3.0
+                    } else if top_decoy {
+                        5.0
+                    } else {
+                        0.0
+                    },
+            );
+            is_decoy.push(d);
+            real.push(r);
+        }
+        let m = m.finish().unwrap();
+        let fold_key: Vec<u32> = (0..n as u32).map(|i| i / 2).collect();
+        let init: Vec<f64> = (0..n).map(|i| m.row(i)[1] as f64).collect();
+        let s = prefilter_scores(PrefilterInput {
+            features: &m,
+            is_decoy: &is_decoy,
+            fold_key: &fold_key,
+            init_score: &init,
+            folds: 3,
+            max_train_rows: 5_000,
+            num_iter: 3,
+            train_fdr: 0.01,
+        })
+        .expect("the targets pass at a looser level");
+        let keep = prefilter_decoy_cut_mask(&s, &is_decoy, 0.3);
+        let kept_real = (0..n).filter(|&i| real[i] && keep[i]).count();
+        let n_real = real.iter().filter(|&&r| r).count();
+        assert!(
+            kept_real as f64 > 0.99 * n_real as f64,
+            "{kept_real} of {n_real}"
         );
     }
 
