@@ -216,6 +216,20 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **Extract: one claimant test, one per-peak claim, and tables for the default gate and apex
+  rule.** The candidate test of the two-pass claims (window, Q1 decision, allowlist) was
+  pasted into five closures and is now `Guard::claims`; the `none` / `winner_predicted_intensity`
+  / `proportional` claim was pasted into the streamed and the serial path and is now
+  `apply_claim`; the two-pass path takes the window groups the stage already builds. The
+  window-mean gate (`window_summed`, `window_mean_score`) and the apex choice (`pick_apex`)
+  are plain functions with table tests, which pin the f32 tie of the evidence-rank apex: past
+  about 2e6 to 8e6 of signature intensity, scans of equal count tie and, without the RT prior,
+  the earliest wins (docs/09 said the RT prior always decides). The MS1 rescue's fragment floor
+  is gone, because `presence_min_fragments` already held where it is read; the configuration
+  reference now says that `presence_min_matched` and `presence_min_fragments`, and
+  `fixed_scan_window` and `min_coelution_run`, floor the same number and the larger of each pair
+  applies, and documents `fixed_scan_window`. Default output is unchanged (checked byte for
+  byte on a 3D, a diaPASEF and a ZT Scan run).
 - **The library helpers share their peptidoform and fragment-table rules
   (`scripts/_lib_io.py`).** The stripped sequence, the `DECOY_` marker, the I/L key, the
   ProForma N-terminal group, the fragment-table schema and the 0.01 Da cardinality bins were
@@ -253,6 +267,33 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **Extract's opt-in peak claims do what their documentation says.** No shipped
+  configuration, example or desktop setting sets any of them, so default runs are unchanged.
+  - `extract.peak_claim = winner_predicted_intensity` and `proportional` compared a peak's
+    claimants only within a candidate sub-range of the streamed path, whose width follows the
+    thread count and `windows_in_flight`: a peak went whole to several winners, its
+    proportional shares added up to more than the peak, and the hits changed with the
+    machine. Under these two claims each window is now probed as one task.
+  - `extract.emit_contested_features` takes the two-pass path, which applies only the
+    co-elution claims, so beside `winner_predicted_intensity` or `proportional` every claimant
+    kept the full peak without a word. The pair is now refused.
+  - `extract.apex_refine_intensity` moved the apex to the region's first scan when none of the
+    signature fragments was seen in the region, the lowest-RT fallback `apex_evidence_rank`
+    was made the default to remove. A scan without signature intensity no longer moves it.
+  - The destructive `peak_claim = coelution_demix` solved over every co-isolated claimant of a
+    scan, ignoring `extract.demix_max_candidates`; it keeps to the cap now, as the demix
+    features do, and a claimant past it gets no abundance.
+- **Smaller extract slips.** A standalone `mumdia extract` with both `--fragment-offset` and
+  `--restrict-candidates` read the allowlist's library-wide ids as band-local ones, so it
+  extracted nothing or another band's candidates; the ids are rebased onto the band. A
+  `chromatograms_q1.parquet` left in a reused output directory by an earlier ZT Scan run was
+  recorded in the new run's manifest; it is recorded only when this run's extract writes one.
+  The chromatogram tables were published before `psms_extracted` was finished, so a failure
+  of that last write left new chromatograms beside the previous PSM table; they are published
+  after it. The footprint refusal advised lowering `windows_in_flight` on the paths that hold
+  the whole run, where it changes nothing, and named the setting responsible only for an
+  all-ion layout; it names it now, and calls a window all-ion when it holds every spectrum of
+  the run rather than whenever a band has one window.
 - **Desktop: "Add folder…" selects several spectra folders at once (#335).** A Bruker or Agilent `.d`
   and a Waters `.raw` are directories, so they are added with "Add folder…", and that dialog took
   one folder at a time: the spectra folder picker shared the single-choice setting of the output

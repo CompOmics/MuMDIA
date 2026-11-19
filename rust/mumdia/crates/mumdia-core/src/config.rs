@@ -2482,12 +2482,19 @@ pub struct ExtractConfig {
     /// Never read from a configuration file.
     #[serde(skip)]
     pub q1_separable: bool,
+    /// Fewest consecutive scan groups over which `presence_min_coelution` fragments must be
+    /// present (the co-elution run) for a candidate to be accepted; values below 1 read as 1.
+    /// `min_coelution_run` floors the same run, so the larger of the two applies.
     pub fixed_scan_window: usize,
     pub frag_tol_ppm: f64,
     pub prec_tol_ppm: f64,
-    /// tier-(b) minimum matched fragment count.
+    /// Fewest distinct matched fragments a candidate needs before its peak is looked at
+    /// (tier b), and a promoted alternative peak (`promote_top_peaks > 1`) within its own
+    /// bounds. For the selected peak it floors the same count as `presence_min_fragments`, so
+    /// the larger of the two applies there.
     pub presence_min_matched: usize,
-    /// minimum distinct fragments for acceptance.
+    /// Fewest distinct matched fragments for acceptance (tier c). It floors the same count as
+    /// `presence_min_matched`, and the larger of the two applies.
     pub presence_min_fragments: usize,
     /// minimum simultaneously-present fragments over the consecutive-scan run.
     pub presence_min_coelution: usize,
@@ -7386,6 +7393,21 @@ impl Config {
                 "extract.promote_top_peaks ({}) must be <= extract.retain_top_peaks ({})",
                 self.extract.promote_top_peaks, self.extract.retain_top_peaks
             )));
+        }
+        // The contested features take the two-pass path, which applies only the co-elution
+        // claims: it would return every claimant's full peak without a word.
+        if self.extract.emit_contested_features
+            && matches!(
+                self.extract.peak_claim,
+                PeakClaim::WinnerPredictedIntensity | PeakClaim::Proportional
+            )
+        {
+            return Err(Invalid(
+                "extract.emit_contested_features applies only none or a coelution_* \
+                 extract.peak_claim; with winner_predicted_intensity or proportional every \
+                 claimant would keep the full peak"
+                    .into(),
+            ));
         }
         if !self.extract.bucket_size.is_power_of_two() {
             return Err(Invalid(format!(
