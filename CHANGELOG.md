@@ -227,7 +227,7 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
-- **Desktop: "Add folder…" selects several spectra folders at once.** A Bruker or Agilent `.d`
+- **Desktop: "Add folder…" selects several spectra folders at once (#335).** A Bruker or Agilent `.d`
   and a Waters `.raw` are directories, so they are added with "Add folder…", and that dialog took
   one folder at a time: the spectra folder picker shared the single-choice setting of the output
   and library folder pickers. It now allows a multiple selection, as "Add files…" already did;
