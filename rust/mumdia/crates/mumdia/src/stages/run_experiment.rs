@@ -29,6 +29,7 @@ use rayon::prelude::*;
 use serde_json::json;
 use tracing::{info, warn};
 
+use crate::quant_lfq;
 use crate::stages::quant::ChromTable;
 use crate::stages::*;
 
@@ -2977,7 +2978,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         _ => mumdia_core::config::NormalizeMethod::MedianRatio,
     };
     let (n_lfq, size_factors) = match (&normalised, lfq_reads_normalised) {
-        (Some((tables, _, _)), true) => quant::run_lfq_combine_grouped(
+        (Some((tables, _, _)), true) => quant_lfq::run_lfq_combine_grouped(
             tables,
             false,
             lfq_method,
@@ -2985,7 +2986,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             "quantity_normalised",
             &lfq,
         )?,
-        _ => quant::run_lfq_combine_grouped(
+        _ => quant_lfq::run_lfq_combine_grouped(
             &peptide_quants,
             false,
             lfq_method,
@@ -2996,8 +2997,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     };
     // The factors, at the experiment root under every scope, so a viewer reads them rather
     // than deriving them back from the tables.
-    let size_factors_tsv = d(quant::LFQ_SIZE_FACTORS_TSV);
-    quant::write_size_factors_tsv(&size_factors_tsv, &names, &conditions, &size_factors)?;
+    let size_factors_tsv = d(quant_lfq::LFQ_SIZE_FACTORS_TSV);
+    quant_lfq::write_size_factors_tsv(&size_factors_tsv, &names, &conditions, &size_factors)?;
     info!(
         scope = scope.as_str(),
         factors = ?size_factors.iter().map(|f| f.factor).collect::<Vec<_>>(),
@@ -3024,7 +3025,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         out_sites: &sites_tsv,
     });
     // The cross-run precursor matrix `quant-lfq` writes next to the protein matrix.
-    let prec_lfq = quant::precursor_lfq_sibling(&lfq);
+    let prec_lfq = quant_lfq::precursor_lfq_sibling(&lfq);
     // The protein annotations, at the experiment root for `mumdia report --experiment-dir`,
     // with the producer the manifest records them under. Without any the TSVs' three
     // annotation columns are empty, which is said again here and recorded in the manifest

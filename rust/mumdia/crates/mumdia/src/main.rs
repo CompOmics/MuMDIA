@@ -2909,7 +2909,7 @@ fn real_main() -> Result<()> {
                     })
                     .collect()
             });
-            let (_, factors) = stages::quant::run_lfq_combine_grouped(
+            let (_, factors) = mumdia::quant_lfq::run_lfq_combine_grouped(
                 &inputs,
                 by_fragment,
                 norm,
@@ -2919,7 +2919,7 @@ fn real_main() -> Result<()> {
             )?;
             if let Some(path) = &size_factors_out {
                 let runs: Vec<String> = (0..inputs.len()).map(|i| i.to_string()).collect();
-                stages::quant::write_size_factors_tsv(path, &runs, &conditions, &factors)?;
+                mumdia::quant_lfq::write_size_factors_tsv(path, &runs, &conditions, &factors)?;
             }
         }
         Cmd::QuantNormalise {
@@ -3132,7 +3132,7 @@ fn real_main() -> Result<()> {
                 // from before it has none, and precursors.tsv then has no normalised_<run>.
                 let prec_lfq = lfq
                     .as_deref()
-                    .and_then(stages::quant::precursor_lfq_sibling);
+                    .and_then(mumdia::quant_lfq::precursor_lfq_sibling);
                 let counts = stages::report::run_experiment_localised(
                     stages::report::ExperimentReportParams {
                         scored: &scored,
