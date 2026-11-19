@@ -191,8 +191,6 @@ pub enum RescorerKind {
     /// the extraction gate is opened. Same positional-CLI PIN contract as Mokapot;
     /// requires `rescore.python` to point at an interpreter with torch.
     NnTorch,
-    /// External percolator.exe over the PIN file.
-    Percolator,
     /// Spike-in (entrapment) negative rescorer: treat foreign-proteome PSMs
     /// (identified by `entrapment_marker`) as real negatives, train a nonlinear
     /// GBM sidecar (out-of-fold by base peptide) or a native linear fallback,
@@ -4467,8 +4465,8 @@ pub struct RescoreConfig {
     /// kept, so the share of rows kept follows the pool: 36% on a six-run diaPASEF pool, 49%
     /// on a six-run Astral pool at 0.35. The classifier, its q values and the scored table
     /// see only the kept rows; a dropped PSM is not identified. When the model cannot be
-    /// fitted (too few confident targets, a missing or non-finite column) or the pool has
-    /// fewer decoys than `min_train_decoys` (100 at least) every PSM goes to the classifier
+    /// fitted (too few confident targets, a missing or non-finite column) or the cut would
+    /// keep fewer decoys than `min_train_decoys` (100 at least) every PSM goes to the classifier
     /// with a warning, and a pool smaller than `prefilter_min_psms` is not cut. Must be in
     /// [0, 1). The default since 2026-10-17: at
     /// 0.35 within 0.11% of the peptides on diaPASEF, Astral and Orbitrap pools, an
@@ -4514,15 +4512,16 @@ pub struct RescoreConfig {
     /// unbiased when the spike-in library differs in size from the real one.
     pub entrapment_ratio: f64,
     /// When true, any sidecar/classifier failure or misconfiguration (Mokapot or
-    /// entrapment sidecar error, unwired percolator, entrapment mode with no
+    /// entrapment sidecar error, entrapment mode with no
     /// entrapment PSMs) is a hard error instead of a silent fall back to the
     /// native rescorer. Default true so a named scientific workflow cannot
     /// silently execute a different model; set false only for explicit legacy
     /// compatibility.
     pub strict: bool,
     /// How the feature matrix reaches a sidecar rescorer. See [`Handoff`]. Defaults to
-    /// `raw`, which applies to nn_torch only; mokapot and entrapment sidecars always
-    /// receive the tab-separated PIN.
+    /// `raw`, which applies to nn_torch only: mokapot always receives the tab-separated PIN
+    /// (with a warning when another handoff is set), and the entrapment sidecar its own
+    /// parquet table.
     #[serde(default)]
     pub handoff: Handoff,
     /// Restrict the classifier's input to these feature columns, by name. Absent (the
@@ -4767,7 +4766,7 @@ pub enum RtLibraryScope {
 #[serde(rename_all = "snake_case")]
 pub enum Handoff {
     /// Tab-separated PIN. Percolator's format, and what `mokapot.read_pin` requires, so it
-    /// is what a mokapot or entrapment sidecar receives whatever this is set to.
+    /// is what a mokapot sidecar receives whatever this is set to.
     Tsv,
     /// Parquet feature table with f32 features: the default from 2026-09-05 until `Raw`
     /// replaced it on 2026-09-28, with identical scores.
@@ -6580,13 +6579,6 @@ impl Config {
                 "rescore.classifier={:?} requires rescore.python",
                 self.rescore.classifier
             )));
-        }
-        if self.rescore.classifier == RescorerKind::Percolator {
-            return Err(Invalid(
-                "rescore.classifier=percolator is not wired; use native_tda, \
-                 mokapot, nn_torch, or entrapment."
-                    .into(),
-            ));
         }
         if self.rescore.classifier == RescorerKind::Entrapment
             && self.rescore.entrapment_marker.is_none()
