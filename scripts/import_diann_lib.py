@@ -2,7 +2,8 @@
 --gen-spec-lib --predictor) into the MuMDIA target-library schema, preserving the
 real species-flagged protein identifiers (e.g. ALBU_HUMAN, ..._YEAST, ..._ECOLI)
 needed for the ProteoBench species-ratio metric. Emits lib_precursors +
-lib_fragments; run make_shift_decoys.py afterwards to add the decoy population.
+lib_fragments; run make_reverse_decoys.py, then predict_decoys.py build, afterwards to add
+the decoy population.
 
 Proteins: `Protein.Names` is used for a precursor when every `;`-separated token is a
 UniProt entry name (one word with an underscore, `ALBU_HUMAN`), else `Protein.Ids`. DIA-NN
@@ -78,8 +79,8 @@ peptide can physically carry: a precursor is kept only at charge
 and fragments outside that range are dropped. Off by default (imports DIA-NN's
 charges verbatim).
 """
+import argparse
 import os
-import sys
 
 import numpy as np
 import pandas as pd
@@ -353,49 +354,42 @@ def _mz_bins(mz):
 
 def main():
     global _KEPT_UNIMOD_IDS
-    args = sys.argv[1:]
-    charge_by_basic = "--charge-by-basic-residues" in args
-    no_annotations = "--no-annotations" in args
-    values = {}
-    for flag in ("--annotations", "--fasta", "--remap-fasta", "--remap-unmapped",
-                 "--remap-enzyme", "--remap-cleavage-rule"):
-        if flag in args:
-            i = args.index(flag)
-            if i + 1 >= len(args):
-                raise SystemExit(f"{flag} needs a value")
-            values[flag] = args[i + 1]
-            del args[i:i + 2]
-    out_annotations = values.get("--annotations")
-    fasta = values.get("--fasta")
-    remap_fasta = values.get("--remap-fasta")
-    remap_unmapped = values.get("--remap-unmapped", "drop")
+    # Exact flag names only (no abbreviations): an unknown or misspelled flag stops the import
+    # instead of being ignored, which silently built another search space.
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], allow_abbrev=False)
+    for name in ("inp", "outp", "outf"):
+        ap.add_argument(name)
+    ap.add_argument("--charge-by-basic-residues", action="store_true")
+    ap.add_argument("--no-annotations", action="store_true")
+    for flag in ("--keep-unimod", "--annotations", "--fasta", "--remap-fasta", "--remap-enzyme",
+                 "--remap-cleavage-rule"):
+        ap.add_argument(flag)
+    ap.add_argument("--remap-unmapped", choices=("drop", "keep"))
+    a = ap.parse_args()
+    inp, outp, outf = a.inp, a.outp, a.outf
+    charge_by_basic, no_annotations = a.charge_by_basic_residues, a.no_annotations
+    out_annotations, fasta, remap_fasta = a.annotations, a.fasta, a.remap_fasta
+    remap_unmapped = a.remap_unmapped or "drop"
     if no_annotations and (out_annotations or fasta or remap_fasta):
         raise SystemExit("--no-annotations writes no annotations; it cannot be combined with "
                          "--annotations, --fasta or --remap-fasta")
     if remap_fasta is not None and fasta is not None:
         raise SystemExit("--remap-fasta names the proteins and their annotations from its FASTA; "
                          "it cannot be combined with --fasta")
-    if remap_unmapped not in ("drop", "keep"):
-        raise SystemExit(f"--remap-unmapped must be drop or keep, not {remap_unmapped!r}")
-    for flag in ("--remap-unmapped", "--remap-enzyme", "--remap-cleavage-rule"):
-        if flag in values and remap_fasta is None:
+    for flag, value in (("--remap-unmapped", a.remap_unmapped), ("--remap-enzyme", a.remap_enzyme),
+                        ("--remap-cleavage-rule", a.remap_cleavage_rule)):
+        if value is not None and remap_fasta is None:
             raise SystemExit(f"{flag} needs --remap-fasta")
     remap_rule = None
     if remap_fasta is not None:
         # Refused here rather than after an import of hours.
         from remap_library import cleavage_rule
-        remap_rule = cleavage_rule(values.get("--remap-enzyme", "trypsin_p"),
-                                   values.get("--remap-cleavage-rule"))
+        remap_rule = cleavage_rule("trypsin_p" if a.remap_enzyme is None else a.remap_enzyme,
+                                   a.remap_cleavage_rule)
     if remap_fasta is not None and not os.path.isfile(remap_fasta):
         raise SystemExit(f"--remap-fasta {remap_fasta}: no such file")
-    if "--keep-unimod" in args:
-        i = args.index("--keep-unimod")
-        if i + 1 >= len(args):
-            raise SystemExit("--keep-unimod needs a value, e.g. --keep-unimod 4,35,21")
-        _KEPT_UNIMOD_IDS = parse_kept_ids(args[i + 1])
-        del args[i:i + 2]
-    args = [a for a in args if not a.startswith("--")]
-    inp, outp, outf = args[0:3]
+    if a.keep_unimod is not None:
+        _KEPT_UNIMOD_IDS = parse_kept_ids(a.keep_unimod)
     if fasta is not None and not os.path.isfile(fasta):
         raise SystemExit(f"--fasta {fasta}: no such file")
 

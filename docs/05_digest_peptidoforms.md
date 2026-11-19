@@ -463,9 +463,8 @@ How it is applied, in the charge loop of `run_hashed`:
 - the report records `params.precursor_mz_min` / `precursor_mz_max` and
   `stats.out_of_mz_range_rows`, and the log the dropped share, only when a limit is set.
 
-The limits apply wherever this stage runs: `mumdia peptidoforms`, `build-library`,
-the FASTA branch of `run` and `run-experiment`, and `scripts/augment_library.py`, which
-runs the engine's own `peptidoforms` stage with the configuration it is given. With
+The limits apply wherever this stage runs: `mumdia peptidoforms`, `build-library` and
+the FASTA branch of `run` and `run-experiment`. With
 spectra (`run`, `run-experiment` in FASTA mode) the engine warns after conversion when
 the run's isolation windows extend past the configured range, because the precursors
 in the uncovered part are not in the library. In library-input mode the keys have no
@@ -539,7 +538,7 @@ difference that the group does not change. The Python helpers read the group as 
 terminal group rather than as residues: `make_reverse_decoys.py` keeps it at the
 decoy's N-terminus and adds it to every decoy b ion, `deeplc_finetune.py` and
 `mh_shard_predict.py` predict the acetylated rows on the base model's scale,
-`augment_library.py`, `predict_decoys.py` and `nn_rescore_worker.py` strip it with its
+`predict_decoys.py` and `nn_rescore_worker.py` strip it with its
 dash, and `import_diann_lib.py` keeps a leading `(UniMod:N)` as `[Name]-` when accession
 N is kept (`--keep-unimod 1,4,35` for protein N-terminal acetylation) and reports how
 many N-terminal precursors it kept and dropped.

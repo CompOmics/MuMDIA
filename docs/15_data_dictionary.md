@@ -160,7 +160,7 @@ ion-mobility source (`artifact::fragment_library_precursors(has_im)`). Version 2
 | `protein` | Utf8 | no | - | protein accessions |
 | `n_fragments` | Int32 | no | - | number of fragments kept for this candidate after top-N |
 | `predicted_im` | Float64 | yes | V s cm^-2 (1/K0) | version 2 only. Library reduced ion mobility: IM2Deep's single-conformer CCS converted at `precursor_mz` (predict-frag under `predict_frag.im_predictor`; never null there, a miss is dropped with its pair), or the imported library's `IM` / `IonMobility` (null where the source value is missing, non-finite or not positive). A script-built decoy carries its target's value, null included |
-| `protein_ids`, `protein_names`, `genes` | Utf8 | no | - | optional, all three or none: the protein annotation of the row's `protein` (accessions, UniProt entry names, gene names, each `;`-separated, empty when unknown; "protein_annotations" below). Written by `scripts/import_diann_lib.py` and kept by the decoy builders and `augment_library.py`, a decoy carrying its target's values; never written by `predict-frag`, so a FASTA-built library has none and its schema version is unchanged. No search stage reads them: `report` takes them from the target rows (#299) |
+| `protein_ids`, `protein_names`, `genes` | Utf8 | no | - | optional, all three or none: the protein annotation of the row's `protein` (accessions, UniProt entry names, gene names, each `;`-separated, empty when unknown; "protein_annotations" below). Written by `scripts/import_diann_lib.py` and kept by the decoy builders, a decoy carrying its target's values; never written by `predict-frag`, so a FASTA-built library has none and its schema version is unchanged. No search stage reads them: `report` takes them from the target rows (#299) |
 
 ### fragment_library fragments (`predict_frag.rs:212-223`)
 
@@ -217,13 +217,11 @@ library first gives them. `UNASSIGNED` has empty cells. With `--fasta`, what the
 leaves empty is filled from the FASTA headers (each protein's members and accessions matched
 as a header's first word, accession or entry name; a value the library gives is kept), and
 `--annotations <path>` also writes the side table. A library with neither `Protein.Ids` nor
-`Protein.Names` gets no columns. `make_reverse_decoys.py`, `make_shift_decoys.py` and
+`Protein.Names` gets no columns. `make_reverse_decoys.py` and
 `predict_decoys.py` keep the columns on every target and copy them onto its decoy (a decoy row
 is a copy of its target's row, so the two populations stay alike in every column the builder
 does not rewrite); an input library from before the columns existed gets them from the side
-table beside it (`_lib_io.embed_annotations`). `augment_library.py` names the peptides it adds
-from the side table `digest` writes for its FASTA, and the imported proteins from the FASTA
-when the imported library has no annotations. `digest` writes the side table, one row per
+table beside it (`_lib_io.embed_annotations`). `digest` writes the side table, one row per
 FASTA header, keyed by the header's first word (what it writes as `protein`):
 `sp|P02768|ALBU_HUMAN Serum albumin OS=... GN=ALB` gives `P02768`, `ALBU_HUMAN`, `ALB` and
 `Serum albumin`, a prefixed UniProt header (`CON_sp|P02769|ALBU_BOVIN`) its two fields, any

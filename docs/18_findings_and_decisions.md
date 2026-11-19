@@ -298,7 +298,9 @@ On this benchmark every missed peptide absent from the search database (209 of
 them) was a Met-excision peptide. Augmenting the imported DIA-NN library with the
 missing FASTA peptides through the new `scripts/augment_library.py` helper, which
 reuses `mumdia digest` (Met-excision on) and `mumdia predict-frag` so peptidoform
-strings are byte-identical, drove the not-in-database count from 209 to 0.
+strings are byte-identical, drove the not-in-database count from 209 to 0. (The helper
+was retired on 2026-11-19 because its decoys copied their targets' intensities; a library
+predicted with Met excision closes the gap at the source.)
 Met-excision is standard-proteomics-correct, but because it changes native-digest
 output it remains entrapment-plus-second-dataset gated before it is trusted as a
 default.
@@ -509,8 +511,8 @@ Library-input mode is the recipe that wins:
 
 1. Import a DIA-NN predicted library (fragment intensities plus iRT) and generate
    paired decoys (license-clean: MuMDIA ships no DIA-NN; the user runs DIA-NN
-   under their own license, then `import_diann_lib.py` and `make_reverse_decoys.py`
-   or `make_shift_decoys.py`).
+   under their own license, then `import_diann_lib.py`, `make_reverse_decoys.py`
+   and `predict_decoys.py`).
 2. Make sure the library iRT is DeepLC fine-tuned. The reference recipe does this
    per run (`rt_im_train.finetune_deeplc = true`). Rationale: finding A4, raw iRT
    is too noisy. On a multi-file experiment against a fixed library, fine-tuning

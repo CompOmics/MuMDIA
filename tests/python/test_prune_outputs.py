@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -183,6 +184,39 @@ def test_apply_writes_record_and_keeps_kept(tmp_path):
     assert p2["removed"] == []
     prune.apply(out, p2)
     assert len(json.loads((out / "pruned.json").read_text())["prunes"]) == 2
+
+
+def test_a_failed_removal_still_records_what_was_removed(tmp_path, monkeypatch):
+    """A file that cannot be removed (held open on Windows) stops the prune; the files removed
+    before it are recorded, so none disappears without provenance."""
+    out = make_experiment(tmp_path, second_pass=True)
+    p = prune.plan(out, "results", with_mzml=False)
+    stuck = out / p["removed"][1]["path"]
+    real_unlink = Path.unlink
+
+    def unlink(self, *args, **kwargs):
+        if self == stuck:
+            raise PermissionError(f"{self} is open in another program")
+        real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    with pytest.raises(PermissionError):
+        prune.apply(out, p)
+    rec = json.loads((out / "pruned.json").read_text())["prunes"][0]
+    assert [e["path"] for e in rec["removed"]] == [p["removed"][0]["path"]]
+    assert stuck.exists() and not (out / p["removed"][0]["path"]).exists()
+
+
+def test_the_file_lists_are_the_engines():
+    """The engine's `output.retain` (`retain.rs`) and this script must classify a file alike:
+    every list here is the engine's const of the same name."""
+    src = (ROOT / "rust" / "mumdia" / "crates" / "mumdia" / "src" / "retain.rs").read_text(
+        encoding="utf-8")
+    lists = {name: set(re.findall(r'"([^"]+)"', re.sub(r"//[^\n]*", "", body)))
+             for name, body in re.findall(r"const (\w+): &\[&str\] = &\[(.*?)\];", src, re.S)}
+    assert len(lists) == 6, sorted(lists)
+    for name, files in lists.items():
+        assert getattr(prune, name) == files, name
 
 
 def test_converted_mzml_only_beside_vendor_inputs(tmp_path):

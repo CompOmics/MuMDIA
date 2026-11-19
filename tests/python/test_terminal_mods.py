@@ -10,7 +10,7 @@ silently rather than failing:
 - `deeplc_finetune.py` and `mh_shard_predict.py` stripped `[Acetyl]` and kept the dash,
   so `-PEPK` was not a standard sequence and every acetylated row kept a retention time
   from another scale;
-- `augment_library.py`, `predict_decoys.py` and `nn_rescore_worker.py` produced `-PEPK`
+- `predict_decoys.py` and `nn_rescore_worker.py` produced `-PEPK`
   as the stripped sequence, which matched no target and, for DIA-NN, was no sequence;
 - `import_diann_lib.py` dropped every `(UniMod:1)` N-terminal precursor.
 
@@ -221,7 +221,6 @@ def test_deeplc_predicts_n_terminally_modified_rows():
     ("PEPC[Carbamidomethyl]K", "PEPCK"),
 ])
 def test_stripped_sequences_drop_the_terminal_dash(pform, want):
-    assert _load("augment_library").stripped(pform) == want
     assert _load("predict_decoys").stripped(pform) == want
     strip_pep = _assigned("nn_rescore_worker.py", {"strip_pep"})["strip_pep"]
     assert strip_pep(pform.replace("DECOY_", "")) == want

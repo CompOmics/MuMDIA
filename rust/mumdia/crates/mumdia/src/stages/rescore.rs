@@ -1974,8 +1974,8 @@ pub(crate) fn grouped_q(
     for i in 0..n {
         // In entrapment mode the in-silico decoys are not the null, so they must not
         // compete for the group. A target and its paired decoy SHARE `base_peptide_id`
-        // by construction (`make_shift_decoys.py`, `make_reverse_decoys.py` and the
-        // native `peptidoforms.rs` all copy it), so a decoy that outscored its target
+        // by construction (`make_reverse_decoys.py` and the native `peptidoforms.rs`
+        // both copy it), so a decoy that outscored its target
         // won the group -- and its tuple is `is_entrapment = false, is_real = false`, so
         // it counted toward neither the entrapment nor the real population and the group
         // vanished from the analysis entirely, while the real target was assigned 1.0.

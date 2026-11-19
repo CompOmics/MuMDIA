@@ -159,12 +159,11 @@ the output feeds straight into a decoy builder.
 
 ### `test_decoy_builders.py` (no ML dependency)
 
-For both `make_shift_decoys.py` and `make_reverse_decoys.py`: index validity,
-one decoy per target with names mapping 1:1, decoys keeping the target
-precursor m/z, iRT and charge so they co-isolate and co-elute, and
-reproducibility across two builds. Shift-specific: b ions move by `-DELTA/z` and
-y ions by `+DELTA/z` for one CH2, net precursor shift zero, intensities copied.
-Reverse-specific: `decoy_stripped` disjoint from `target_stripped`, the
+For `make_reverse_decoys.py`: index validity,
+one decoy per target, decoys keeping the target
+precursor m/z, iRT and charge so they co-isolate and co-elute,
+reproducibility across two builds, the note that its output goes through
+`predict_decoys.py`, `decoy_stripped` disjoint from `target_stripped`, the
 C-terminal residue and the residue composition preserved, the three colliding
 peptides in the fixture resolved by scramble, distinct base sequences never
 sharing a decoy sequence, decoy fragment m/z recomputed as the real b/y of the
@@ -228,8 +227,6 @@ became a no-op.
 
 ## Not covered
 
-* `augment_library.py`: it shells out to the `mumdia` binary for `digest`,
-  `peptidoforms` and `predict-frag`, so a contract test needs a built engine.
 * The MBR fragment-consensus guard (`--frag-csv` / `--consensus-corr-min`) and
   the re-extraction tier (`--emit-transfer-targets`); `run_mbr` passes the
   former only when both flags are supplied and never passes the latter.

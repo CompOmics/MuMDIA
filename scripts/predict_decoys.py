@@ -35,7 +35,7 @@ target's mobility window as it shares its retention-time window (docs/06).
       the two halves, for a DIA-NN run made by hand (`diann --lib out.tsv --predictor
       --gen-spec-lib --out-lib X`, then import_diann_lib.py on X's Parquet).
 
-Only reverse-sequence decoys are accepted: a shift decoy (`make_shift_decoys.py`) carries its
+Only reverse-sequence decoys are accepted: a shift decoy carries its
 target's own sequence, so predicting it would return the target's spectrum. A decoy DIA-NN
 does not predict is dropped together with its target, so the populations stay paired. The
 merge streams both fragment tables one parquet row group at a time; resident memory is the

@@ -31,13 +31,12 @@ policy for tuning and validation.
   - `mumdia-core`: typed config, schemas, manifest, masses/constants.
   - `mumdia-io`: Arrow/Parquet table layer, hashes, JSON, artifact reports.
   - `mumdia`: CLI/library, fragment index, FDR/rescoring, and stages.
-- `scripts/`: twenty-two scripts and three shared modules. Nine workers are launched by
+- `scripts/`: twenty scripts and three shared modules. Nine workers are launched by
   the engine (`ms2pip_worker.py`, `peptdeep_worker.py`, `deeplc_worker.py`,
   `deeplc_finetune.py`, `im2deep_worker.py`, `mokapot_worker.py`, `nn_rescore_worker.py`,
-  `entrapment_worker.py`, `mbr_worker.py`); seven are imported-library helpers
+  `entrapment_worker.py`, `mbr_worker.py`); five are imported-library helpers
   (`import_diann_lib.py`, `make_reverse_decoys.py`, `predict_decoys.py`,
-  `make_shift_decoys.py`, `augment_library.py`, which adds the tryptic FASTA peptides an
-  imported library is missing, `remap_library.py`, which maps a library's peptides to the
+  `remap_library.py`, which maps a library's peptides to the
   proteins of another FASTA, and `merge_libraries.py`, which merges an empirical library with
   a predicted one); five are library-scale recipes (`sort_fragments.py`,
   `mz_range_survivors.py`, `assemble_survivors.py`, `shard_parquet.py`,
@@ -115,7 +114,7 @@ Key semantics:
   the seed without confident anchors and find a fraction of the peptides (one desktop
   search: 33.6k precursors against 129k on a DIA-NN-predicted library, same engine).
   `predict_frag.allow_native_predictors = true` is the opt-in (`configs/examples/native.json`,
-  the CI smoke, the Python-free tests, `augment_library.py`'s internal predict-frag); it is
+  the CI smoke, the Python-free tests); it is
   skipped from `canonical_json`, so hashes and artifacts do not move. The desktop blocks such a
   search and never passes the opt-in. Imported-library searches are unaffected.
 - Standalone stages can be reused manually because inputs are path-addressable.
@@ -164,8 +163,7 @@ Key semantics:
   (`digest.n_term_met_excision = true`, matching DIA-NN `--met-excision`).
   Excision keys on protein position 0 with a leading `M`, not any interior `M`.
   Without it the search database structurally misses those peptides; old configs
-  still parse because the field defaults on. `augment_library.py` reuses this
-  same digest to fill an imported library's missing tryptic peptides.
+  still parse because the field defaults on.
 - Terminal modifications are opt-in: a rule with `position = "protein_n_term"` (or
   `peptide_n_term`), residue `*`, makes the digest write `protein_n_term` (peptides v2,
   Met-retained and Met-excised starts, OR over proteins, decoys inherit) and adds the
@@ -253,13 +251,12 @@ instrument preset. Measured 2026-08-24 against DIA-NN 2.2.0 library-free with
 `--reanalyse` on the same file (11,817 stripped peptides at 1%), this workflow
 reached 90.4-91.6% depending on the DeepLC version and window sizing.
 
-Prefer the `augment_library.py`-completed precursor/fragment tables over the raw
-imported library when both exist. The raw imported DIA-NN library is missing 209
-of DIA-NN's own 1% peptides on this benchmark, all N-terminal Met-excision forms;
-the augmented tables (+18,903 tryptic base peptides) recover about 80 of them at
-an unchanged 0.98% empirical decoy fraction and identification parity elsewhere.
-The remaining ~130 enter the search space but stay below threshold, which is an
-abundance limit, not a library hole. One caveat measured on the same day: DeepLC
+`scripts/augment_library.py`, which added the Met-excised peptides an imported library
+lacked, was retired on 2026-11-19 because its decoys copied their targets' intensities; a
+library predicted with `--met-excision` (the desktop's build passes it) closes that gap at
+the source.
+
+One caveat for single-run comparisons: DeepLC
 per-run fine-tuning is not deterministic, and under held-out window sizing a poor
 fine-tune draw widens `w_rt` (held-out p95 varied 150-211 s across two draws of
 one arm) and can cost about 2% of peptides; judge any single-run comparison of

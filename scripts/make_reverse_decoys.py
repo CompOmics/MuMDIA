@@ -5,6 +5,9 @@ Each target is reversed keeping the C-terminal residue fixed. Reversal preserves
 residue composition, so the decoy keeps the target's precursor m/z + iRT
 (co-isolates/co-elutes), while fragment m/z are the REAL b/y of the reversed
 sequence (recomputed from residue masses) and intensities are copied ion-for-ion.
+The output is therefore not a library to search: copied decoy intensities make the reported
+FDR optimistic, so run `predict_decoys.py build` on it first, which replaces them with
+predicted spectra for the decoy sequences.
 
 No-overlap invariant: a reversed sequence whose stripped form collides with ANY
 real target stripped sequence (palindrome, or reverse == another target) is
@@ -253,8 +256,9 @@ def main():
         listed = ", ".join(f"{k!r} x{v}" for k, v in sorted(unmapped.items()))
         print(f"WARNING: {sum(unmapped.values())} precursors carry a modification with no "
               f"mass in this script's table and will get NO decoy: {listed}", flush=True)
-        print("         Add the monoisotopic delta to UNIMOD in this file, or use a "
-              "library whose modifications are written as numeric deltas.", flush=True)
+        print("         Add the modification to mumdia-core/src/modifications.json and "
+              "regenerate scripts/_unimod.py, or use a library whose modifications are "
+              "written as numeric deltas.", flush=True)
 
     # --- validate m/z calculator against library target fragments ---
     # Up to 500 target precursors from the first row group of the fragment table.
@@ -405,6 +409,8 @@ def main():
     # A side table beside the output belongs to another library: this one carries its own.
     retire_side_table(inp, outp)
     print(f"targets_in={len(tprec)} targets_out={len(tprec_out)} decoys={len(dprec)} total_prec={len(allp)} total_frag={n_out}", flush=True)
+    print("NOTE: decoy intensities are copied from the targets; run predict_decoys.py build "
+          "on this output before a search", file=sys.stderr, flush=True)
 
 
 if __name__ == '__main__':

@@ -224,47 +224,11 @@ deny_unknown_fields)]`). Met excision is standard-proteomics-correct, but it
 changes native-digest output, so treating it as a trusted default remains
 entrapment plus second-dataset gated per repository policy.
 
-Imported-library augmentation. MuMDIA does not digest an imported library, so
-the same gap is closed with `scripts/augment_library.py`. On the
-`LFQ_Orbitrap_AIF_Ecoli_01` benchmark, every peptide DIA-NN reported at 1% FDR
-but absent from the MuMDIA search database was an N-terminal Met-excision
-peptide (about 209 not-in-database peptides, reduced to 0 after augmentation).
-The script reuses the engine's own `digest`, `peptidoforms`, and `predict-frag`
-stages so the added peptidoform strings are byte identical to what the search
-consumes. It digests the FASTA (Met excision on), set-diffs against the imported
-library's target base sequences, predicts native spectra and iRT for the missing
-set, offsets `peptidoform_id`, `base_peptide_id`, and `candidate_id` to stay
-disjoint, per-precursor max-normalizes the predicted intensities to the
-base-peak convention, merges imported plus missing targets, hands off to
-`make_shift_decoys.py` (default) or `make_reverse_decoys.py` for paired decoys,
-then validates that `candidate_id` is contiguous, `precursor_mz` is ascending,
-and both labels are present.
-
-```text
-python scripts/augment_library.py \
-  --fasta fasta/ecoli.fasta \
-  --imported-precursors lib/lib_precursors.parquet \
-  --imported-fragments lib/lib_fragments.parquet \
-  --out-precursors lib/lib_precursors_aug.parquet \
-  --out-fragments lib/lib_fragments_aug.parquet \
-  --mumdia-bin <path to mumdia release binary> \
-  --config configs/examples/diann-library.json \
-  --work-dir <scratch>
-```
-
-The augmented `lib_precursors_aug.parquet` and `lib_fragments_aug.parquet` then
-replace `--lib-precursors` and `--lib-fragments` in the `run` command. Pass the
-augmented raw library, not a `_ft` variant, so per-run fine-tuning still runs:
-the DeepLC fine-tune re-predicts iRT for the whole library, so imported and
-augmented entries share one RT axis with no explicit reconciliation.
-`--match-level base_sequence` (default) adds peptides whose stripped sequence is
-absent; `peptidoform_charge` also adds absent modforms or charges of present
-sequences, which changes the FDR population and is benchmark-gated.
-`--decoy-strategy` must match the strategy that built the imported library's
-decoys (`shift` by default); paired, collision-checked decoys are the property
-of that downstream builder, not of the augment step itself. Using augmentation
-as a routine step, rather than a diagnostic, remains benchmark and entrapment
-gated.
+Imported libraries. MuMDIA does not digest an imported library, so the library must
+contain the Met-excised forms itself: predict it with `--met-excision`, as the desktop's
+library build does. `scripts/augment_library.py`, which added the missing FASTA peptides
+after import, was retired on 2026-11-19 because its decoys copied their targets'
+intensities.
 
 ## Where missing identifications are lost
 
@@ -489,7 +453,6 @@ IDs so selection effects remain visible.
 | MBR transfer/requantification | transfer-decoy FDR and known-ratio validation |
 | Any nonzero MS2 conversion cap | the saturation pre-flight plus an end-to-end cap sweep on that acquisition class; `0` is the default and the safe choice |
 | N-terminal Met excision as a trusted digest default | entrapment plus a second dataset, though it is standard-proteomics-correct |
-| Imported-library augmentation as a routine step | empirical-null FDR plus a second acquisition context |
 | Wholesale relaxation of extract presence/apex filters | multi-context empirical-null FDR; the single-file result was a wash |
 
 A one-file AIF count can nominate an experiment; it cannot establish a universal
