@@ -258,9 +258,9 @@ than a number. Both are recorded in every run's `manifest.json`.
 - **A test pins the default canonical configuration**
   (`crates/mumdia-core/src/default_canonical.json`), the text the manifest's `config_hash`
   hashes. A new field serialized at its default, or a default changed by mistake, moved the
-  hash of every run without failing a test. The canonical configuration of the default, of
-  every example and Docker configuration, and of the diaPASEF and ZT Scan resolutions is
-  unchanged by this release's configuration cleanup.
+  hash of every run without failing a test. None of the changes above moves a canonical
+  configuration: the default, every example and Docker configuration, and their diaPASEF and
+  ZT Scan resolutions serialize as before.
 
 ### Removed
 
