@@ -20,6 +20,8 @@ invoked from.
 
 from __future__ import annotations
 
+import re
+
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -215,6 +217,59 @@ def sort_fragments_by_candidate(path, buckets: int = 64, tmp_dir=None) -> int:
 
 
 # ---------------------------------------------------------------------------------------
+# Peptidoform text, the fragment table and its m/z bins: rules the helpers must apply alike.
+# ---------------------------------------------------------------------------------------
+
+# A bracketed modification, with the dash of a terminal group (`[Acetyl]-PEPK`).
+STRIP_MODS = re.compile(r"-?\[[^\]]*\]-?")
+# The ProForma N-terminal group, `[Name]-`, before the first residue.
+NTERM = re.compile(r"^\[([^\]]*)\]-")
+
+
+def strip_decoy(peptidoform: str) -> str:
+    """The peptidoform without its `DECOY_` marker."""
+    return peptidoform[6:] if peptidoform.startswith("DECOY_") else peptidoform
+
+
+def stripped(peptidoform: str) -> str:
+    """Residues of a peptidoform: no `DECOY_` marker, no modification, no terminal dash."""
+    return STRIP_MODS.sub("", strip_decoy(peptidoform))
+
+
+def il_key(sequence: str) -> str:
+    """The sequence as the instrument sees it: I and L are isobaric (same residue mass, same
+    fragment m/z), so two sequences that differ only by I/L are the same peptide (the
+    engine's `digest::il_key`)."""
+    return sequence.replace("I", "L")
+
+
+# The fragment table every helper writes.
+FRAGMENT_SCHEMA = pa.schema([
+    pa.field("candidate_id", pa.uint32(), False),
+    pa.field("mz", pa.float64(), False),
+    pa.field("predicted_intensity", pa.float32(), False),
+    pa.field("name", pa.string(), False),
+    pa.field("ion_type", pa.string(), False),
+    pa.field("ordinal", pa.int32(), False),
+    pa.field("frag_charge", pa.int32(), False),
+    pa.field("cardinality", pa.int32(), False),
+])
+# 0.01 Da bins for the fragment cardinality; wide enough for any fragment m/z.
+MZ_BIN_MAX = 1_000_000
+
+
+def mz_bins(mz):
+    """0.01 Da bin of each fragment m/z, computed in float32 as the DIA-NN column is stored:
+    the previous implementation multiplied the float32 pandas column by 100.0 and rounded in
+    float32, and a bin that rounds differently in float64 would change `cardinality` for the
+    same library, which is a feature downstream."""
+    import numpy as np
+
+    b = np.round(np.asarray(mz, dtype=np.float32) * np.float32(100.0)).astype(np.int64)
+    return np.clip(b, 0, MZ_BIN_MAX - 1)
+
+
+# ---------------------------------------------------------------------------------------
 # Protein annotations: in the library itself, and the side table older libraries have.
 #
 # A library's `protein` column is the grouping key every later table inherits (the scored
@@ -241,8 +296,6 @@ PROTEIN_ANNOTATIONS = "protein_annotations.parquet"
 # The side table's columns, in order; all utf8 and non-null (empty when unknown). The key is
 # unique and the rows ascend by it, so the bytes depend only on the content.
 PROTEIN_ANNOTATION_COLUMNS = ("protein", "protein_ids", "protein_names", "genes", "description")
-# The engine's name and version for it (`artifact::PROTEIN_ANNOTATIONS`).
-PROTEIN_ANNOTATIONS_SCHEMA = ("protein_annotations", 1)
 # The optional precursor-table columns: on every row, the annotation of that row's `protein`
 # (utf8, `;`-separated, empty when unknown). All three or none. A decoy row carries its
 # target's values (target and decoy rows stay alike in every column a decoy builder does not

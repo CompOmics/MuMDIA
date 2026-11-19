@@ -71,7 +71,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 
 import numpy as np
@@ -79,33 +78,18 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from _lib_io import (annotate_precursors, embed_annotations, fasta_annotations,
-                     narrow_table, retire_side_table, uniprot_fields, write_engine_parquet)
+from _lib_io import (NTERM, annotate_precursors, embed_annotations, fasta_annotations,
+                     il_key, narrow_table, retire_side_table, strip_decoy, stripped,
+                     uniprot_fields, write_engine_parquet)
 
 UNASSIGNED = "UNASSIGNED"
-# A bracketed modification, with the dash of a terminal group (`[Acetyl]-PEPK`).
-_STRIP_MODS = re.compile(r"-?\[[^\]]*\]-?")
-# The ProForma N-terminal group, `[Name]-`, before the first residue.
-_NTERM = re.compile(r"^\[([^\]]*)\]-")
-
-
-def stripped(peptidoform: str) -> str:
-    """Residues of a peptidoform: no `DECOY_` marker, no modification, no terminal dash."""
-    s = peptidoform[6:] if peptidoform.startswith("DECOY_") else peptidoform
-    return _STRIP_MODS.sub("", s)
 
 
 def n_term_group(peptidoform: str) -> str:
     """The N-terminal modification group of a peptidoform (`Acetyl` of `[Acetyl]-PEPK`),
     or ''."""
-    m = _NTERM.match(peptidoform[6:] if peptidoform.startswith("DECOY_") else peptidoform)
+    m = NTERM.match(strip_decoy(peptidoform))
     return m.group(1) if m else ""
-
-
-def il_key(sequence: str) -> str:
-    """The sequence with I read as L: two sequences that differ only by I/L have the same
-    precursor and fragment masses (the engine's `digest::il_key`)."""
-    return sequence.replace("I", "L")
 
 
 def read_fasta(path):

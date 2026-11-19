@@ -39,8 +39,8 @@ import pyarrow.parquet as pq
 # The engine rejects `large_string` parquet columns ("column 'peptidoform' is not
 # utf8"), and `to_parquet` picks the width itself: pandas 3.x chooses the large
 # variant, so this helper silently emitted libraries the engine would not load.
-from _lib_io import (embed_annotations, narrow_table, retire_side_table,
-                    sort_fragments_by_candidate, write_engine_parquet)
+from _lib_io import (FRAGMENT_SCHEMA, NTERM, embed_annotations, il_key, narrow_table,
+                    retire_side_table, sort_fragments_by_candidate, write_engine_parquet)
 from _unimod import MASS_BY_NAME
 
 RES = {
@@ -56,8 +56,6 @@ WATER=18.010564684; PROTON=1.007276466812
 TOK=re.compile(r'([A-Z])(\[[^\]]*\])?')
 # A whole residue string: residues, each optionally followed by one bracketed modification.
 RESIDUES=re.compile(r'(?:[A-Z](?:\[[^\]]*\])?)*')
-# The ProForma N-terminal group, `[Name]-`, before the first residue.
-NTERM=re.compile(r'^\[([^\]]*)\]-')
 MAX_TRIES=30
 
 def split_nterm(pform):
@@ -158,10 +156,6 @@ def unknown_mods(toks, nt=''):
 def stripped(toks): return ''.join(r for r,_ in toks)
 
 
-def il_key(sequence):
-    """The sequence as the instrument sees it: I and L are isobaric (same residue mass,
-    same fragment m/z), so two sequences that differ only by I/L are the same peptide."""
-    return sequence.replace('I', 'L')
 def to_pform(toks, nt=''):
     return (f'[{nt}]-' if nt else '') + ''.join(r + (f'[{m}]' if m else '') for r,m in toks)
 def reverse_keep_cterm(t): return t[:-1][::-1] + t[-1:] if len(t) >= 2 else t[:]
@@ -354,18 +348,8 @@ def main():
     write_engine_parquet(allp, outp)
 
     # --- fragments: one row group in, target rows plus their decoy twins out ---
-    frag_schema = pa.schema([
-        pa.field("candidate_id", pa.uint32(), False),
-        pa.field("mz", pa.float64(), False),
-        pa.field("predicted_intensity", pa.float32(), False),
-        pa.field("name", pa.string(), False),
-        pa.field("ion_type", pa.string(), False),
-        pa.field("ordinal", pa.int32(), False),
-        pa.field("frag_charge", pa.int32(), False),
-        pa.field("cardinality", pa.int32(), False),
-    ])
     n_out = 0
-    writer = pq.ParquetWriter(str(outf), frag_schema, compression="snappy")
+    writer = pq.ParquetWriter(str(outf), FRAGMENT_SCHEMA, compression="snappy")
     try:
         for rg in range(pf.num_row_groups):
             g = pf.read_row_group(rg).to_pandas()
@@ -397,7 +381,7 @@ def main():
                 "ordinal": pa.array(twice('ordinal', np.int32), pa.int32()),
                 "frag_charge": pa.array(twice('frag_charge', np.int32), pa.int32()),
                 "cardinality": pa.array(twice('cardinality', np.int32), pa.int32()),
-            }, schema=frag_schema)
+            }, schema=FRAGMENT_SCHEMA)
             writer.write_table(narrow_table(table))
             n_out += table.num_rows
     finally:

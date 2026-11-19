@@ -19,22 +19,23 @@ only the rescore sidecars fall back to a native rescorer, and only when
 strict gate, so a crashed MS2PIP, AlphaPeptDeep, DeepLC, IM2Deep, or DeepLC fine-tune aborts the
 whole run. The matrix in **Failure behavior** below is authoritative.
 
-The 20 scripts split into six groups. Nine are launched by the engine:
+The 18 scripts split into six groups. Nine are launched by the engine:
 **predictors** (`ms2pip_worker`, `peptdeep_worker`, `deeplc_worker`, `deeplc_finetune`,
 `im2deep_worker`) feed the run-independent library; **rescorers** (`mokapot_worker`,
 `nn_rescore_worker`, `entrapment_worker`) score the competed PSMs in Stage F; **MBR**
-(`mbr_worker`) transfers identifications across runs (Stage D3). Eleven are run by hand:
+(`mbr_worker`) transfers identifications across runs (Stage D3). Nine are run by hand:
 the **DIA-NN recipe** (`import_diann_lib`, `make_reverse_decoys`, `predict_decoys`,
 `remap_library`, `merge_libraries`) is an offline,
 one-time toolchain that builds MuMDIA's target+decoy library schema from a user-produced
 DIA-NN library, with `remap_library` mapping any
 library's peptides to the proteins of another FASTA, and `merge_libraries` merging an
 empirical library with a predicted one; the **library-scale recipes**
-(`sort_fragments`, `mz_range_survivors`, `assemble_survivors`, `shard_parquet`,
+(`sort_fragments`, `mz_range_survivors`,
 `mh_shard_predict`) reshape very large tables (docs/32); the **post-run tool**
 (`prune_outputs`) reduces a finished output directory to a retention tier (docs/01, "Output
 retention"). The three shared modules are
-imported, never run: `_lib_io` (the parquet writer the recipe scripts share),
+imported, never run: `_lib_io` (the parquet writer and the peptidoform and fragment-table rules the recipe
+scripts share),
 `_torch_threads` (the torch CPU thread policy) and `_unimod` (the modification
 catalogue).
 
@@ -104,8 +105,6 @@ For the mapping from each conda environment to the config field that points at i
 | `scripts/merge_libraries.py` | Recipe: merge an empirical library with a predicted one (empirical spectrum and RT where both have an entry, RT calibrated onto the predicted scale), then rebuild and predict the decoys of the merged targets (#320) |
 | `scripts/sort_fragments.py` | Recipe: rewrite a fragment table in `candidate_id` order (streaming bucket sort, in place); the writers above do this themselves since the range load, this is for tables written before |
 | `scripts/mz_range_survivors.py` | Recipe: candidate ids inside the run's isolation range, as a prescan-style survivors table (docs/32) |
-| `scripts/assemble_survivors.py` | Recipe: survivors table -> renumbered library, target/decoy pair kept together on `peptidoform_id`, fragments streamed (docs/21, docs/32) |
-| `scripts/shard_parquet.py` | Recipe: row-group-aligned parquet split / concatenate |
 | `scripts/prune_outputs.py` | Post-run: reduce a finished output directory to the `results` or `viewer` retention tier (dry run by default, `--apply`, record in `pruned.json`; docs/01) |
 | `scripts/mh_shard_predict.py` | Recipe: deduplicated, sharded multi-head DeepLC calibration of a very large precursor table (`uniq` / `fit` / `predict --calibration` / `merge`; reuses `deeplc_finetune.py`). The engine shards the same prediction itself under `rt_im_train.deeplc_predict_shards`; the recipe streams the library by row group, which matters at 1e8 rows |
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | Rust clients: `resolve_script`, `run_ms2pip`, `run_peptdeep`, `run_deeplc`, `run_im2deep`, `run_deeplc_finetune`, `run_mbr`, `run_worker`; the shared `fragment_request` (the `id, peptidoform, charge` request, with an optional extra column) and `read_fragment_intensities` the intensity predictors use; and `read_id_scalars`, the one `id -> value` reader behind DeepLC and IM2Deep |

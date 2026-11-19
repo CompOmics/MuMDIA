@@ -55,19 +55,13 @@ import pyarrow.parquet as pq
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from _lib_io import (embed_annotations, narrow_table, retire_side_table,  # noqa: E402
-                    sort_fragments_by_candidate, write_engine_parquet)
+from _lib_io import (NTERM, embed_annotations, narrow_table, retire_side_table,  # noqa: E402
+                    sort_fragments_by_candidate, strip_decoy, stripped,
+                    write_engine_parquet)
 from _unimod import MASS_BY_NAME, MODIFICATIONS, NAME_BY_UNIMOD  # noqa: E402
 
 TO_UNIMOD = {name: uid for name, uid, _ in MODIFICATIONS}
 MODS = re.compile(r"\[([^\]]+)\]")
-# The ProForma N-terminal group, `[Name]-`, and every modification with a terminal dash.
-NTERM = re.compile(r"^\[([^\]]+)\]-")
-STRIP = re.compile(r"-?\[[^\]]+\]-?")
-
-
-def strip_decoy(pform):
-    return pform[6:] if pform.startswith("DECOY_") else pform
 
 
 def to_diann(pform):
@@ -83,11 +77,6 @@ def to_diann(pform):
         lead = f"[UniMod:{TO_UNIMOD[m.group(1)]}]"
         s = s[m.end():]
     return "_" + lead + MODS.sub(lambda m: f"[UniMod:{TO_UNIMOD[m.group(1)]}]", s) + "_"
-
-
-def stripped(pform):
-    """The residues of a peptidoform: no DECOY_ marker, no modification, no terminal dash."""
-    return STRIP.sub("", strip_decoy(pform))
 
 
 def load_precursors(path):

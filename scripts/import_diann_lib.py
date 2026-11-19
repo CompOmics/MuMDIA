@@ -89,9 +89,9 @@ import pyarrow.parquet as pq
 # The engine rejects `large_string` parquet columns ("column 'peptidoform' is not
 # utf8"), and `to_parquet` picks the width itself: pandas 3.x chooses the large
 # variant, so this helper silently emitted libraries the engine would not load.
-from _lib_io import (annotate_precursors, annotation_table_from_precursors,
-                    annotations_path, complete_from_fasta,
-                    fasta_annotations, fasta_index, join_unique, narrow_table,
+from _lib_io import (FRAGMENT_SCHEMA, MZ_BIN_MAX, annotate_precursors,
+                    annotation_table_from_precursors, annotations_path, complete_from_fasta,
+                    fasta_annotations, fasta_index, join_unique, mz_bins, narrow_table,
                     sort_fragments_by_candidate, uniprot_fields, write_engine_parquet,
                     write_protein_annotations)
 from _unimod import NAME_BY_UNIMOD
@@ -173,8 +173,6 @@ _OPTIONAL_COLS = ["Decoy", "Fragment.Loss.Type", "Protein.Names", "Protein.Ids",
                   "IonMobility"]
 # Read in the first pass only, for the protein annotation table.
 _ANNOTATION_COLS = ["Genes"]
-# 0.01 Da bins for the fragment cardinality; wide enough for any fragment m/z.
-_MZ_BIN_MAX = 1_000_000
 
 
 def _n_term_precursors(df):
@@ -339,17 +337,11 @@ class _Annotations:
 
 
 def _keys(df):
-    """The precursor key the whole import is joined on: ProForma peptidoform / charge."""
-    return df["Modified.Sequence"].map(to_proforma) + "/" + df["Precursor.Charge"].astype(str)
-
-
-def _mz_bins(mz):
-    """0.01 Da bin of each fragment m/z, computed in float32 as the DIA-NN column is stored:
-    the previous implementation multiplied the float32 pandas column by 100.0 and rounded in
-    float32, and a bin that rounds differently in float64 would change `cardinality` for the
-    same library, which is a feature downstream."""
-    b = np.round(np.asarray(mz, dtype=np.float32) * np.float32(100.0)).astype(np.int64)
-    return np.clip(b, 0, _MZ_BIN_MAX - 1)
+    """The precursor key the whole import is joined on: ProForma peptidoform / charge. Each
+    distinct modified sequence is converted once: a precursor's fragment rows repeat it."""
+    codes, uniq = pd.factorize(df["Modified.Sequence"].astype(str))
+    pf = pd.Series(pd.Index([to_proforma(u) for u in uniq]).take(codes), index=df.index)
+    return pf + "/" + df["Precursor.Charge"].astype(str)
 
 
 def main():
@@ -414,7 +406,7 @@ def main():
     # keeping the first occurrence, which is exactly what a whole-table
     # `drop_duplicates` would have kept.
     prec_parts, count_parts = [], []
-    card = np.zeros(_MZ_BIN_MAX, dtype=np.int64)
+    card = np.zeros(MZ_BIN_MAX, dtype=np.int64)
     dropped_prec = dropped_frag = 0
     n_term = {"seen": set(), "kept": set()}
     n_frag_total = 0
@@ -455,7 +447,7 @@ def main():
         # downstream selection reads a deterministic column. One count per (precursor,
         # bin) pair: deduplicated inside the batch, which is exact except for a precursor
         # split across two row groups with a fragment in the same bin on both sides.
-        pairs = pd.DataFrame({"k": key.to_numpy(), "b": _mz_bins(df["Product.Mz"])}).drop_duplicates()
+        pairs = pd.DataFrame({"k": key.to_numpy(), "b": mz_bins(df["Product.Mz"])}).drop_duplicates()
         if carry_key is not None:
             seen_before = (pairs["k"] == carry_key) & pairs["b"].isin(carry_bins)
             pairs = pairs[~seen_before]
@@ -572,18 +564,8 @@ def main():
     del prec_parts, count_parts, nfrag
 
     # ---- pass 2: the fragment table, one row group in, one row group out ----
-    frag_schema = pa.schema([
-        pa.field("candidate_id", pa.uint32(), False),
-        pa.field("mz", pa.float64(), False),
-        pa.field("predicted_intensity", pa.float32(), False),
-        pa.field("name", pa.string(), False),
-        pa.field("ion_type", pa.string(), False),
-        pa.field("ordinal", pa.int32(), False),
-        pa.field("frag_charge", pa.int32(), False),
-        pa.field("cardinality", pa.int32(), False),
-    ])
     n_written = 0
-    writer = pq.ParquetWriter(str(outf), frag_schema, compression="snappy")
+    writer = pq.ParquetWriter(str(outf), FRAGMENT_SCHEMA, compression="snappy")
     try:
         for rg in range(pf.num_row_groups):
             df = pf.read_row_group(rg, columns=read_cols).to_pandas()
@@ -598,7 +580,7 @@ def main():
             fc = df["Fragment.Charge"].astype(np.int32)
             name = df["Fragment.Type"].astype(str) + ordinal.astype(str)
             name = np.where(fc > 1, name + "^" + fc.astype(str), name)
-            bins = _mz_bins(df["Product.Mz"])
+            bins = mz_bins(df["Product.Mz"])
             table = pa.table({
                 "candidate_id": pa.array(cand.astype(np.uint32), pa.uint32()),
                 "mz": pa.array(df["Product.Mz"].astype(np.float64).to_numpy(), pa.float64()),
@@ -609,7 +591,7 @@ def main():
                 "ordinal": pa.array(ordinal.to_numpy(), pa.int32()),
                 "frag_charge": pa.array(fc.to_numpy(), pa.int32()),
                 "cardinality": pa.array(card[bins].astype(np.int32), pa.int32()),
-            }, schema=frag_schema)
+            }, schema=FRAGMENT_SCHEMA)
             writer.write_table(narrow_table(table))
             n_written += table.num_rows
     finally:
