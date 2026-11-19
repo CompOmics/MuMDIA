@@ -2183,22 +2183,11 @@ fn real_main() -> Result<()> {
                     cal,
                     ext_cfg.q1_fragments.on(),
                 )?);
-                if ext_cfg.q1_fragments.on() {
-                    ext_cfg.q1_repick = cfg.retrace.q1_repick.on();
-                    ext_cfg.q1_repick_peaks = cfg.retrace.q1_repick_peaks;
-                }
                 if q1_dec {
                     ext_cfg.q1_dec_tol_steps = Some(stages::q1frag::read_deconvolution_tol(cal)?);
                 }
             }
-            // `features.ms1_envelope`: extract reads the MS1 isotope-envelope evidence.
-            ext_cfg.ms1_envelope = cfg.features.ms1_envelope;
-            // `features.q1_precursor` / `features.q1_multiscale`: extract reads the scores on
-            // the per-fragment decision's patches.
-            ext_cfg.q1_precursor = cfg.features.q1_precursor.on();
-            ext_cfg.q1_multiscale = cfg.features.q1_multiscale.on();
-            ext_cfg.q1_dec_features = cfg.features.q1_deconvolved.on();
-            ext_cfg.q1_separable = cfg.features.q1_separable;
+            ext_cfg.set_search_keys(&cfg);
             stages::extract::run(stages::extract::ExtractParams {
                 precursor_span: None,
                 fragment_offset,

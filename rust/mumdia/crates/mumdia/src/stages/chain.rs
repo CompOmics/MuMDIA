@@ -187,10 +187,6 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
             cfg.extract.q1_fragments.on(),
         )?);
     }
-    if cfg.extract.q1_fragments.on() {
-        ext_cfg.q1_repick = cfg.retrace.q1_repick.on();
-        ext_cfg.q1_repick_peaks = cfg.retrace.q1_repick_peaks;
-    }
     // `extract.q1_deconvolved` / `features.q1_deconvolved`: the tolerance the Q1 calibration
     // learned.
     if q1_dec {
@@ -198,14 +194,7 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
             "cal.json",
         ))?);
     }
-    // `features.ms1_envelope`: extract reads the MS1 isotope-envelope evidence.
-    ext_cfg.ms1_envelope = cfg.features.ms1_envelope;
-    // `features.q1_precursor` / `features.q1_multiscale`: extract reads the scores on
-    // the per-fragment decision's patches.
-    ext_cfg.q1_precursor = cfg.features.q1_precursor.on();
-    ext_cfg.q1_multiscale = cfg.features.q1_multiscale.on();
-    ext_cfg.q1_dec_features = cfg.features.q1_deconvolved.on();
-    ext_cfg.q1_separable = cfg.features.q1_separable;
+    ext_cfg.set_search_keys(cfg);
     let (wpsm, wchr) = extract::run_hashed(extract::ExtractParams {
         precursor_span: None,
         fragment_offset: None,

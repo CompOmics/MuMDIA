@@ -677,33 +677,13 @@ pub struct ApplyParams<'a> {
     pub im_window_floor: Option<ImWindowFloor<'a>>,
 }
 
-fn check_cfg(cfg: &RtImTrainConfig) -> Result<()> {
-    let holdout_frac = cfg.window_holdout_frac;
-    if !(0.0..=0.9).contains(&holdout_frac) {
-        anyhow::bail!(
-            "rt_im_train.window_holdout_frac must be in [0.0, 0.9], got {holdout_frac}; \
-             0.0 disables held-out window sizing"
-        );
-    }
-    // Both size the window per calibrated RT. The local window is on by default, so an
-    // explicit `adaptive_rt_window` takes the slot instead of failing the run.
+/// The keys' refusals are `Config::validate`'s, at load. Both windows size the window per
+/// calibrated RT; the local window is on by default, so an explicit `adaptive_rt_window`
+/// takes the slot instead of failing the run.
+fn note_window_choice(cfg: &RtImTrainConfig) {
     if cfg.local_window_anchors > 0 && cfg.adaptive_rt_window {
         info!("rt-im-train: adaptive_rt_window is set, so the local RT window is not used");
     }
-    if !(cfg.local_window_multiplier.is_finite() && cfg.local_window_multiplier > 0.0) {
-        anyhow::bail!(
-            "rt_im_train.local_window_multiplier must be a positive number, got {}",
-            cfg.local_window_multiplier
-        );
-    }
-    if holdout_frac > 0.0 && cfg.adaptive_rt_window {
-        anyhow::bail!(
-            "rt_im_train.window_holdout_frac and rt_im_train.adaptive_rt_window are mutually \
-             exclusive: the adaptive per-bin percentiles are in-sample and would silently undo \
-             the held-out sizing; disable one of them"
-        );
-    }
-    Ok(())
 }
 
 pub fn run(p: RtImTrainParams) -> Result<u64> {
@@ -752,7 +732,7 @@ fn run_impl(
             ],
         )?;
     }
-    check_cfg(p.cfg)?;
+    note_window_choice(p.cfg);
 
     // Library predicted iRT, keyed by candidate_id (single source of truth, so
     // a patched/updated library iRT is used for both training and application). The same
@@ -989,7 +969,7 @@ pub fn with_anchor_cut(cfg: &RtImTrainConfig, plan: &AnchorPlan) -> RtImTrainCon
 /// iRT (`RtImTrainParams::anchor_irt_from_seed`): the fit a grouped run's bands share under
 /// `groups.calibration = global`. No library is read.
 pub fn fit_from_seed(seed_psms: &str, cfg: &RtImTrainConfig) -> Result<RtFit> {
-    check_cfg(cfg)?;
+    note_window_choice(cfg);
     fit_anchors(seed_psms, cfg, &CidJoin::Unused, &[], None, None)
 }
 

@@ -233,6 +233,34 @@ than a number. Both are recorded in every run's `manifest.json`.
   already writes it in `candidate_id` order, so the rows are identical; the parquet row-group
   layout of the output changes (the writer's default row groups instead of one per sort
   bucket), which the engine's range reads accept.
+- **Contradictory configurations are refused at load, not hours into a run.**
+  `rt_im_train.window_holdout_frac` above 0.9 (the load accepted values up to 1, which the
+  retention-time stage then refused), `window_holdout_frac` together with
+  `adaptive_rt_window`, a `local_window_multiplier` that is not positive,
+  `rescore.features` together with `rescore.features_file`, and an empty `rescore.features`
+  list were refused only by the stage that reads them: after conversion, the seed and the
+  multi-head step, or for the rescore after every run of an experiment. Each such
+  configuration failed then and fails at load now, for every subcommand. A `features_file`
+  that turns out to be empty is still refused by the rescore, which reads it.
+- **A FASTA `run` or `run-experiment` refuses `digest.decoy.strategy = none` before the
+  digest.** That strategy writes targets only, and the library was refused when the seed
+  loaded it, after the whole prediction. `digest` and `build-library` still accept it, for a
+  target-only library.
+- **`run` checks that an explicit `predict_frag.deeplc_python` exists before an
+  imported-library search under `rt_im_train.library_irt = auto`**, as `run-experiment`
+  already did. Such a search always starts the retention-time worker, and a wrong path
+  failed there, after conversion and the seed. The interpreter checks in the preflight of
+  both orchestrators that the interpreter resolution before them can no longer reach are
+  removed, and the one warning they shared is one function.
+- **`mumdia extract` and the orchestrated search set extract's copies of the `features` and
+  `retrace` keys in one place (`ExtractConfig::set_search_keys`)**, so a key added later
+  cannot reach one and not the other. The evidence written is unchanged.
+- **A test pins the default canonical configuration**
+  (`crates/mumdia-core/src/default_canonical.json`), the text the manifest's `config_hash`
+  hashes. A new field serialized at its default, or a default changed by mistake, moved the
+  hash of every run without failing a test. The canonical configuration of the default, of
+  every example and Docker configuration, and of the diaPASEF and ZT Scan resolutions is
+  unchanged by this release's configuration cleanup.
 
 ### Removed
 
@@ -319,6 +347,20 @@ than a number. Both are recorded in every run's `manifest.json`.
   compares its file lists with `retain.rs`. A removal that failed (a file held open on
   Windows) ended the prune before `pruned.json` was written, so the files already removed had
   no record; they are recorded before the error is raised.
+- **Configuration help that contradicted the code (docs/24 and the desktop's settings help
+  are generated from it).** `extract.gate_min_score` named `apex_pearson` as the default gate
+  mode (it is `window_mean`, one of seven); `extract.emit_candidate_audit` promised a
+  `<psms>.audit.parquet` that extraction never writes (the flag gates the audit stage);
+  `extract.ms1_rescue` named only the single-scan Pearson gate (it applies under every
+  `gate_mode`); `rt_im_train.multihead_calibration` said it cannot be shared across an
+  experiment (`experiment.rt_library_scope = first_run_only` shares it);
+  `rt_im_train.local_window_anchors` called itself mutually exclusive with
+  `adaptive_rt_window` (the adaptive window takes its place); `quant.q_filter = run_psm_q`
+  cited a script that does not exist; the diaPASEF support gate went off on 2026-11-19, not
+  2026-11-17. docs/02 listed `apex_pearson` and a `train_neg_ratio` of 3.0 as defaults, and
+  configs/README.md listed the support gate as on for diaPASEF input.
+- **The refusal of `search_seed.q1_deconvolved` together with `count_fragments_once` printed
+  runs of spaces in the middle of its message.**
 
 ### Security
 

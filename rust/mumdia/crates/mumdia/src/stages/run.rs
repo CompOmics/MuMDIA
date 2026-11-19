@@ -88,7 +88,6 @@ pub(crate) fn refuse_unsupported_on_4d(cfg: &Config, inputs: &[String]) -> Resul
 /// so a missing file or a misconfigured rescorer fails immediately with an
 /// actionable message.
 fn preflight(p: &RunParams, cfg: &Config) -> Result<()> {
-    use mumdia_core::config::RescorerKind;
     // Inputs depend on the mode: library-input supplies a prebuilt library and
     // skips the FASTA; otherwise the FASTA is digested into the library.
     let mut required: Vec<(&str, &str)> = vec![("--mzml", p.mzml)];
@@ -98,7 +97,10 @@ fn preflight(p: &RunParams, cfg: &Config) -> Result<()> {
             required.push(("--lib-fragments", lf));
         }
         (None, None) => match p.fasta {
-            Some(f) => required.push(("--fasta", f)),
+            Some(f) => {
+                refuse_decoy_free_digest(cfg)?;
+                required.push(("--fasta", f));
+            }
             None => anyhow::bail!(
                 "provide either --fasta (to digest a library) or both \
                  --lib-precursors and --lib-fragments (library-input mode)"
@@ -112,20 +114,35 @@ fn preflight(p: &RunParams, cfg: &Config) -> Result<()> {
         }
     }
     refuse_unsupported_on_4d(cfg, &[p.mzml.to_string()])?;
-    // The interpreter fields were filled in by `python::resolve` before this point,
-    // so a field still empty here means the role is unused or discovery failed.
-    // The messages name the field and the alternative, which is what a user acts on.
-    // An EXPLICIT head count is a hard requirement; the automatic default is not, or a
-    // native Python-free run -- a supported configuration -- would fail at startup.
-    if cfg.rt_im_train.multihead_calibration.is_some_and(|n| n > 0)
-        && cfg.predict_frag.deeplc_python.is_none()
+    // `python::resolve` ran first and refused every role this configuration requires
+    // without a usable interpreter, explicit or discovered (`Role::required_by`); what is
+    // left to check here is the roles it only wants.
+    warn_without_deeplc(cfg);
+    // An imported library under `library_irt = auto` runs DeepLC whenever an interpreter
+    // is configured (the multi-head calibration, or the base-model re-prediction), and
+    // `resolve` takes an explicit path for a wanted role as given. A wrong one would
+    // otherwise fail after convert and the seed.
+    if p.lib_precursors.is_some()
+        && cfg.rt_im_train.library_irt == mumdia_core::config::LibraryIrt::Auto
     {
-        anyhow::bail!(
-            "rt_im_train.multihead_calibration requires predict_frag.deeplc_python (a Python \
-             interpreter with DeepLC >= 4.5.0, or \"auto\" to discover one); it calibrates \
-             the DeepLC base model against this run's confident seed PSMs"
-        );
+        if let Some(exe) = cfg.predict_frag.deeplc_python.as_deref() {
+            if !std::path::Path::new(exe).exists() {
+                anyhow::bail!(
+                    "predict_frag.deeplc_python points at an interpreter that does not \
+                     exist: {exe}. An imported library is re-predicted with DeepLC under \
+                     rt_im_train.library_irt = auto; fix the path, set it to \"auto\" to \
+                     discover an interpreter, or set library_irt = library to keep the \
+                     imported iRT."
+                );
+            }
+        }
     }
+    Ok(())
+}
+
+/// The automatic multi-head calibration with no DeepLC interpreter found: a run that works,
+/// at a measured cost, which both orchestrators name before they start.
+pub(crate) fn warn_without_deeplc(cfg: &Config) {
     if cfg.rt_im_train.multihead_calibration.is_none()
         && !cfg.rt_im_train.finetune_deeplc
         && cfg.predict_frag.deeplc_python.is_none()
@@ -137,40 +154,19 @@ fn preflight(p: &RunParams, cfg: &Config) -> Result<()> {
              manifest records the retention-time model that actually ran."
         );
     }
-    if cfg.rt_im_train.finetune_deeplc && cfg.predict_frag.deeplc_python.is_none() {
+}
+
+/// `digest.decoy.strategy = none` digests targets only, and a library without decoys is
+/// refused when the seed loads it, after the whole prediction. A FASTA search is refused
+/// before the digest instead; `digest` and `build-library` still accept it, for a
+/// target-only library (docs/02_config_and_data_model.md, "Invariants").
+pub(crate) fn refuse_decoy_free_digest(cfg: &Config) -> Result<()> {
+    if cfg.digest.decoy.strategy == mumdia_core::config::DecoyStrategy::None {
         anyhow::bail!(
-            "rt_im_train.finetune_deeplc requires predict_frag.deeplc_python (a Python \
-             interpreter with DeepLC installed; see env/mumdia-deeplc.yml), or set that \
-             field to \"auto\" to discover one"
+            "digest.decoy.strategy = none builds a library without decoys, and a search \
+             needs them for its target-decoy FDR; use \"reverse\" (the default) or \
+             \"scramble\""
         );
-    }
-    if p.lib_precursors.is_some()
-        && matches!(
-            cfg.rt_im_train.library_irt,
-            mumdia_core::config::LibraryIrt::Deeplc
-        )
-        && cfg.predict_frag.deeplc_python.is_none()
-    {
-        anyhow::bail!(
-            "rt_im_train.library_irt = deeplc requires predict_frag.deeplc_python (a Python \
-             interpreter with DeepLC >= 4.5.0, or \"auto\" to discover one); set \
-             library_irt = library to keep the imported iRT"
-        );
-    }
-    match cfg.rescore.classifier {
-        RescorerKind::Mokapot | RescorerKind::NnTorch if cfg.rescore.python.is_none() => {
-            anyhow::bail!(
-                "rescore.classifier={:?} requires rescore.python (a Python interpreter \
-                 with the selected rescorer's dependencies), or \"auto\" to discover one, \
-                 or use classifier=native_tda",
-                cfg.rescore.classifier
-            )
-        }
-        RescorerKind::Entrapment if cfg.rescore.entrapment_marker.is_none() => anyhow::bail!(
-            "rescore.classifier=entrapment requires rescore.entrapment_marker (the spike-in \
-             accession substring, e.g. \"_HUMAN\")"
-        ),
-        _ => {}
     }
     Ok(())
 }
@@ -1272,6 +1268,61 @@ mod tests {
             assert!(refuse_unsupported_on_4d(&c, &mzml).is_ok());
         }
         assert!(refuse_unsupported_on_4d(&grouped, &mzml).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Two configurations that used to fail only mid-run are refused by the preflight: a
+    /// FASTA search with `digest.decoy.strategy = none`, and an imported-library search under
+    /// `library_irt = auto` whose DeepLC interpreter path does not exist. Each is refused only
+    /// where its search would fail.
+    #[test]
+    fn preflight_refuses_what_would_fail_mid_run() {
+        let d = std::env::temp_dir().join(format!("mumdia-run-preflight-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let file = |name: &str| {
+            let p = d.join(name);
+            std::fs::write(&p, b"").unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        let (mzml, fasta) = (file("run.mzML"), file("db.fasta"));
+        let (lp, lf) = (file("lib_p.parquet"), file("lib_f.parquet"));
+        let out = d.to_string_lossy().into_owned();
+        let check = |cfg: &Config, library: bool| {
+            preflight(
+                &RunParams {
+                    config: cfg,
+                    config_path: None,
+                    fasta: (!library).then_some(fasta.as_str()),
+                    mzml: &mzml,
+                    out_dir: &out,
+                    lib_precursors: library.then_some(lp.as_str()),
+                    lib_fragments: library.then_some(lf.as_str()),
+                    lib_annotations: None,
+                    max_spectra: 0,
+                    top_peaks_ms2: 0,
+                    converted_mzml: &[],
+                },
+                cfg,
+            )
+        };
+        let base = Config::default();
+        assert!(check(&base, false).is_ok());
+        assert!(check(&base, true).is_ok());
+
+        let mut no_decoys = base.clone();
+        no_decoys.digest.decoy.strategy = mumdia_core::config::DecoyStrategy::None;
+        let e = check(&no_decoys, false).unwrap_err().to_string();
+        assert!(e.contains("digest.decoy.strategy"), "{e}");
+        assert!(check(&no_decoys, true).is_ok(), "an imported library has its own decoys");
+
+        let mut stale = base.clone();
+        stale.predict_frag.deeplc_python = Some(d.join("no-such-python").to_string_lossy().into());
+        let e = check(&stale, true).unwrap_err().to_string();
+        assert!(e.contains("predict_frag.deeplc_python"), "{e}");
+        assert!(check(&stale, false).is_ok(), "a FASTA run does not re-predict a library");
+        stale.rt_im_train.library_irt = mumdia_core::config::LibraryIrt::Library;
+        assert!(check(&stale, true).is_ok(), "library_irt = library starts no DeepLC");
         let _ = std::fs::remove_dir_all(&d);
     }
 }
