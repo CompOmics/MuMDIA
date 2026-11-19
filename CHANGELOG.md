@@ -214,8 +214,34 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Changed
+
+- **The library helpers share their peptidoform and fragment-table rules
+  (`scripts/_lib_io.py`).** The stripped sequence, the `DECOY_` marker, the I/L key, the
+  ProForma N-terminal group, the fragment-table schema and the 0.01 Da cardinality bins were
+  copied across `import_diann_lib.py`, `make_reverse_decoys.py`, `predict_decoys.py`,
+  `remap_library.py` and `merge_libraries.py`, so a change to one copy would have given
+  libraries built by different helpers different cardinality values or pairings. Each
+  helper's output is byte-identical (checked on a synthetic 3,000-peptide library through the
+  import, the reverse decoys, a remap, the decoy TSV and a merge). The unused
+  `PROTEIN_ANNOTATIONS_SCHEMA` copy of the engine's artifact name is removed.
+- **`import_diann_lib.py` converts each distinct modified sequence once.** The precursor key
+  was converted from the input's `Modified.Sequence` to ProForma on every fragment row, in
+  both passes; it is now converted once per distinct sequence in each row group, about three
+  times faster for that step, with the same output.
+- **`merge_libraries.py` no longer sorts its fragment table a second time.** Every path
+  already writes it in `candidate_id` order, so the rows are identical; the parquet row-group
+  layout of the output changes (the writer's default row groups instead of one per sort
+  bucket), which the engine's range reads accept.
+
 ### Removed
 
+- **`scripts/assemble_survivors.py` and `scripts/shard_parquet.py` (docs/32).**
+  `assemble_survivors.py` was a deprecated copy of `mumdia sub-library --survivors`, which
+  applies the same pair link on `peptidoform_id` while streaming both tables (1.6 GB against
+  44 GB on the 142.7M-precursor library). `shard_parquet.py` served a retention-time sharding
+  recipe that `mh_shard_predict.py` and `rt_im_train.deeplc_predict_shards` replaced. Nothing
+  called either.
 - **`scripts/make_shift_decoys.py` and `scripts/augment_library.py` (docs/13).** Both wrote decoys whose fragment intensities are copies of their targets', which
   the decoy rule of 2026-10-09 forbids: on the ProteoBench Astral entrapment module such decoys
   gave a paired entrapment FDP of 1.68% at a reported precursor q of 1%, predicted ones 0.85%.
