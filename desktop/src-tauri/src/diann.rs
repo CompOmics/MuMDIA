@@ -1178,6 +1178,17 @@ impl ModPlan {
             .collect()
     }
 
+    /// `UniMod:<id>,<mass>` for every modification of the plan, in accession order: what each
+    /// DIA-NN run after the prediction declares with `--mod` (see `mod_declarations`).
+    pub fn declarations(&self) -> Vec<String> {
+        declarations(
+            self.fixed
+                .iter()
+                .chain(&self.variable)
+                .filter_map(|m| crate::mods::lookup(&m.name)),
+        )
+    }
+
     /// The UniMod accessions the import must keep.
     pub fn unimod_ids(&self) -> Vec<u32> {
         let mut ids: Vec<u32> = self
@@ -1190,6 +1201,32 @@ impl ModPlan {
         ids.dedup();
         ids
     }
+}
+
+/// `UniMod:<id>,<mass>` per modification, in accession order, once each, the mass written as
+/// the prediction's `--fixed-mod`/`--var-mod` writes it.
+fn declarations<'a>(mods: impl Iterator<Item = &'a crate::mods::Modification>) -> Vec<String> {
+    let by: std::collections::BTreeMap<u32, f64> = mods.map(|m| (m.unimod, m.mass)).collect();
+    by.into_iter()
+        .map(|(id, mass)| format!("UniMod:{id},{mass:.6}"))
+        .collect()
+}
+
+/// `--mod <declaration>` per declaration.
+///
+/// DIA-NN knows a few modifications by itself (UniMod 4, 35 and 21 among them) and must be
+/// told the mass of every other one, in every run that reads a library carrying it, not
+/// only in the run that predicted it. A re-export without the declaration logs "unknown
+/// modifications found in the library" and turns its fragmentation-based algorithms off; a
+/// prediction without it refuses ("cannot generate a predicted library without knowing the
+/// modification masses") and its re-export saves 0 precursors, which is how methyl
+/// (UniMod:34) and trimethyl (UniMod:37) variable modifications broke the decoy step.
+/// `--mod` only declares a mass: unlike `--var-mod` or `--fixed-mod` it adds no
+/// peptidoform, and DIA-NN 2.7 writes the same library with it as without it.
+fn mod_declaration_args(mods: &[String]) -> Vec<String> {
+    mods.iter()
+        .flat_map(|d| ["--mod".to_string(), d.clone()])
+        .collect()
 }
 
 fn d_max_var() -> u32 {
@@ -1932,6 +1969,7 @@ pub fn build(builder: Arc<Builder>, req: BuildRequest) -> Result<(), String> {
             threads: req.threads,
             keep_unimod: build_keep_unimod(&plan),
             decoy_args: req.decoy_diann_args(),
+            diann_mods: plan.declarations(),
             fasta: Some(PathBuf::from(&req.fasta)),
             remap: None,
             empty: empty_build_message(&req),
@@ -2160,6 +2198,11 @@ struct Conversion {
     /// Extra `predict_decoys.py` arguments (`--diann-arg=...`): the fragment m/z limits of
     /// the build, empty for an import or a build without them.
     decoy_args: Vec<String>,
+    /// The modifications every DIA-NN run of the conversion declares (`UniMod:<id>,<mass>`):
+    /// the re-export of a `.speclib` (`--mod`) and the decoys' prediction and re-export
+    /// (`predict_decoys.py --diann-mod`). A build's are its own modifications; an import's
+    /// the whole catalogue, since the chosen library may carry any of them.
+    diann_mods: Vec<String>,
     /// The FASTA a build predicted from, given to the importer (`--fasta`) so it can name what
     /// the DIA-NN library leaves without an accession, entry name or gene; `None` for an
     /// import, whose library names its proteins itself.
@@ -2192,9 +2235,9 @@ enum Source {
 /// The stem an imported `.speclib` is re-exported under, in the output folder.
 const IMPORT_REEXPORT_STEM: &str = "diann_library";
 
-/// DIA-NN's command line for writing a `.speclib` as Parquet.
-fn reexport_args(speclib: &Path, target: &Path, threads: u32) -> Vec<String> {
-    vec![
+/// DIA-NN's command line for writing a `.speclib` as Parquet, declaring `mods`.
+fn reexport_args(speclib: &Path, target: &Path, threads: u32, mods: &[String]) -> Vec<String> {
+    let mut args = vec![
         "--lib".to_string(),
         speclib.to_string_lossy().into_owned(),
         "--gen-spec-lib".to_string(),
@@ -2202,7 +2245,9 @@ fn reexport_args(speclib: &Path, target: &Path, threads: u32) -> Vec<String> {
         target.to_string_lossy().into_owned(),
         "--threads".to_string(),
         threads.to_string(),
-    ]
+    ];
+    args.extend(mod_declaration_args(mods));
+    args
 }
 
 /// Re-export a `.speclib` as `<stem>.parquet` in the output folder, and find what
@@ -2222,18 +2267,22 @@ fn reexport(
         speclib.display()
     ));
     let target = c.out_dir.join(format!("{stem}.parquet"));
-    let args = reexport_args(speclib, &target, c.threads);
+    let args = reexport_args(speclib, &target, c.threads, &c.diann_mods);
     builder.log(format!("== {} {}", c.exe.display(), args.join(" ")));
     if let Err(e) = run_step(builder, &c.exe, &args, Some(&c.out_dir), true) {
         return Err(format!(
             "{e}\n\nThe prediction succeeded and {} exists, but converting \
              it to Parquet failed. Convert it by hand with:\n  {} --lib {} \
-             --gen-spec-lib --out-lib {}\nthen point the search at the \
+             --gen-spec-lib --out-lib {}{}\nthen point the search at the \
              resulting tables.",
             speclib.display(),
             c.exe.display(),
             speclib.display(),
-            target.display()
+            target.display(),
+            mod_declaration_args(&c.diann_mods)
+                .chunks(2)
+                .map(|p| format!(" {} {}", p[0], p[1]))
+                .collect::<String>()
         ));
     }
     match find_lib_parquet(&c.out_dir, stem) {
@@ -2384,6 +2433,7 @@ fn conversion_steps(c: &Conversion, predicted: &Path) -> Vec<(&'static str, Vec<
             ];
             a.extend(keep);
             a.extend(c.decoy_args.iter().cloned());
+            a.extend(c.diann_mods.iter().map(|d| format!("--diann-mod={d}")));
             a
         }),
     ]
@@ -2812,6 +2862,7 @@ pub fn import(builder: Arc<Builder>, req: ImportRequest) -> Result<(), String> {
             threads: req.threads,
             keep_unimod: Some(kept.clone()),
             decoy_args: Vec::new(),
+            diann_mods: declarations(crate::mods::catalogue().iter()),
             fasta: None,
             remap: remap.clone(),
             empty: format!("the DIA-NN library {} holds no precursors", req.library),
@@ -4161,6 +4212,7 @@ PEPTIDEK
             threads: 6,
             keep_unimod,
             decoy_args: Vec::new(),
+            diann_mods: Vec::new(),
             fasta: None,
             remap: None,
             empty: String::new(),
@@ -4373,12 +4425,104 @@ PEPTIDEK
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The reported failure: a build with methyl on H and trimethyl on K, which DIA-NN does
+    /// not know by itself. The prediction declared them (`--var-mod`), the re-export and the
+    /// decoys' prediction did not, and the decoys' prediction then saved 0 precursors. Every
+    /// DIA-NN run after the prediction now declares each modification of the build.
+    #[test]
+    fn every_dia_nn_run_after_the_prediction_declares_the_builds_modifications() {
+        let dir = std::env::temp_dir().join(format!("mumdia-diann-decl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("a.fasta");
+        std::fs::write(&fa, b">sp|P1|X\nMPEPTIDEK\n").unwrap();
+        let mut r = a_request(fa.to_str().unwrap());
+        r.fixed_mods = vec![site("Carbamidomethyl", 'C')];
+        r.variable_mods = vec![
+            site("Methyl", 'H'),
+            site("Oxidation", 'M'),
+            site("Phospho", 'H'),
+            site("Phospho", 'S'),
+            site("Phospho", 'T'),
+            site("Phospho", 'Y'),
+            site("Trimethyl", 'K'),
+        ];
+        let plan = ModPlan::of(&r).unwrap();
+        let want = [
+            "UniMod:4,57.021464",
+            "UniMod:21,79.966331",
+            "UniMod:34,14.015650",
+            "UniMod:35,15.994915",
+            "UniMod:37,42.046950",
+        ];
+        assert_eq!(plan.declarations(), want);
+        // The masses are the ones the prediction itself was given.
+        let predict = predict_args(&r, &plan, Path::new("out/lib"))
+            .unwrap()
+            .join(" ");
+        assert!(
+            predict.contains("--var-mod UniMod:34,14.015650,H"),
+            "{predict}"
+        );
+        assert!(
+            predict.contains("--var-mod UniMod:37,42.046950,K"),
+            "{predict}"
+        );
+
+        let mut c = a_conversion(build_keep_unimod(&plan));
+        c.diann_mods = plan.declarations();
+        // The `.speclib` re-export.
+        let re = reexport_args(
+            Path::new("/cache/lib0/lib.predicted.speclib"),
+            Path::new("/cache/lib0/lib.parquet"),
+            6,
+            &c.diann_mods,
+        );
+        let declared: Vec<&str> = re
+            .windows(2)
+            .filter(|w| w[0] == "--mod")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(declared, want);
+        // `--mod` declares a mass; it must never become a modification of the library.
+        assert!(!re.iter().any(|a| a == "--var-mod" || a == "--fixed-mod"));
+        // The decoys' prediction and its re-export, through `predict_decoys.py`.
+        let steps = conversion_steps(&c, Path::new("/cache/lib0/lib.parquet"));
+        let decoys = &steps[2].1;
+        assert!(decoys[0].ends_with("predict_decoys.py"));
+        let passed: Vec<String> = decoys
+            .iter()
+            .filter_map(|a| a.strip_prefix("--diann-mod=").map(str::to_string))
+            .collect();
+        assert_eq!(passed, want);
+        // The importer and the decoy builder are not DIA-NN runs and take no declaration.
+        assert!(!steps[0]
+            .1
+            .iter()
+            .chain(&steps[1].1)
+            .any(|a| a.contains("diann-mod")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_import_declares_every_catalogue_modification() {
+        let all = declarations(crate::mods::catalogue().iter());
+        assert_eq!(all.len(), catalogue_unimod_ids().len());
+        for d in [
+            "UniMod:34,14.015650",
+            "UniMod:37,42.046950",
+            "UniMod:4,57.021464",
+        ] {
+            assert!(all.iter().any(|x| x == d), "{d} in {all:?}");
+        }
+    }
+
     #[test]
     fn the_re_export_is_the_command_line_the_builder_always_ran() {
         let args = reexport_args(
             Path::new("/cache/lib0/lib.predicted.speclib"),
             Path::new("/cache/lib0/lib.parquet"),
             6,
+            &[],
         );
         assert_eq!(
             args,

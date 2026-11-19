@@ -651,6 +651,27 @@ impl Ms1Seen {
     }
 }
 
+/// `rows` (raw v1 traces) in `layout`: unchanged for v1, through `enc` for v2.
+fn encode_rows(enc: &mut chromatograms::Encoder, mut rows: Rows, layout: Layout) -> Result<Rows> {
+    if layout == Layout::V1 {
+        return Ok(rows);
+    }
+    let (rt, ints, ims) = (
+        std::mem::take(&mut rows.rt),
+        std::mem::take(&mut rows.intensity),
+        std::mem::take(&mut rows.im),
+    );
+    for (k, ((rt_k, int_k), im_k)) in rt.into_iter().zip(ints).zip(ims).enumerate() {
+        let e = enc.encode_im(rows.cid[k], rt_k, int_k, Some(im_k))?;
+        rows.rt.push(e.rt);
+        rows.intensity.push(e.intensity);
+        rows.trace_offset.push(e.trace_offset);
+        rows.trace_len.push(e.trace_len);
+        rows.im.push(e.im);
+    }
+    Ok(rows)
+}
+
 /// Per-candidate lookups indexed by `candidate_id`, NaN where absent.
 fn by_candidate(ids: &[u32], vals: impl Iterator<Item = f64>, n: usize) -> Vec<f64> {
     let mut v = vec![f64::NAN; n];
@@ -1364,7 +1385,23 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
                 t_read
             }));
         }
-        let (tx_out, rx_out) = std::sync::mpsc::sync_channel::<Option<Vec<Col>>>(2);
+        // The v2 encoder is sequential and gets its own thread between this one and the
+        // writer: on this thread every worker waited for it at the end of each span.
+        let (tx_out, rx_raw) = std::sync::mpsc::sync_channel::<Option<Rows>>(2);
+        let (tx_enc, rx_out) = std::sync::mpsc::sync_channel::<Option<Vec<Col>>>(2);
+        let encoder = sc.spawn(move || -> Result<()> {
+            let mut enc = chromatograms::Encoder::new(rg_rows);
+            while let Ok(rows) = rx_raw.recv() {
+                let cols = match rows {
+                    Some(r) => Some(encode_rows(&mut enc, r, layout)?.into_cols(layout, opt)),
+                    None => None,
+                };
+                if tx_enc.send(cols).is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        });
         let writer = sc.spawn(move || -> Result<Option<(Written, u128)>> {
             let mut w = chromatograms::writer(&writer_path, rg_rows, layout)
                 .with_row_groups_in_flight(chromatograms::ROW_GROUPS_IN_FLIGHT)
@@ -1387,7 +1424,6 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
                 }
             }
         });
-        let mut enc = chromatograms::Encoder::new(rg_rows);
         let mut sent_all = true;
         let mut next_lo = 0usize;
         for i in 0..n_spans {
@@ -1686,34 +1722,14 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
                     }
                 }
             }
-            let (ints, ims) = (
-                std::mem::take(&mut rows.intensity),
-                std::mem::take(&mut rows.im),
-            );
-            for (k, ((rt_k, int_k), im_k)) in rt.into_iter().zip(ints).zip(ims).enumerate() {
-                match layout {
-                    Layout::V1 => {
-                        rows.rt.push(rt_k);
-                        rows.intensity.push(int_k);
-                        rows.im.push(im_k);
-                    }
-                    Layout::V2 => {
-                        let e = enc.encode_im(cid[k], rt_k, int_k, Some(im_k))?;
-                        rows.rt.push(e.rt);
-                        rows.intensity.push(e.intensity);
-                        rows.trace_offset.push(e.trace_offset);
-                        rows.trace_len.push(e.trace_len);
-                        rows.im.push(e.im);
-                    }
-                }
-            }
+            rows.rt = rt;
             rows.cid = cid;
             rows.name = name;
             rows.frag_mz = fmz;
             rows.frag_obs_mz = obs;
             rows.predicted_intensity = pint;
             t_sum += tp.elapsed().as_millis();
-            if tx_out.send(Some(rows.into_cols(layout, opt))).is_err() {
+            if tx_out.send(Some(rows)).is_err() {
                 sent_all = false;
                 break;
             }
@@ -1764,10 +1780,7 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
         // The chunk that fixes the schema of a table without rows (empty otherwise), then
         // the end marker.
         if sent_all {
-            sent_all = tx_out
-                .send(Some(Rows::default().into_cols(layout, opt)))
-                .is_ok()
-                && tx_out.send(None).is_ok();
+            sent_all = tx_out.send(Some(Rows::default())).is_ok() && tx_out.send(None).is_ok();
         }
         drop(tx_out);
         drop(rx_ins);
@@ -1777,6 +1790,9 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
                 .join()
                 .map_err(|_| anyhow!("retrace: a reader panicked"))?;
         }
+        encoder
+            .join()
+            .map_err(|_| anyhow!("retrace: the encoder panicked"))??;
         let written = writer
             .join()
             .map_err(|_| anyhow!("retrace: the writer panicked"))??;

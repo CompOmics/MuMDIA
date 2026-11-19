@@ -239,6 +239,33 @@ than a number. Both are recorded in every run's `manifest.json`.
   helper), for example "import_diann_lib.py (python.exe) exited with 1. Its last output: ...", in
   place of "python.exe exited with 1". The full log stays on the Progress screen, and the message
   says so.
+- **A DIA-NN library with a modification DIA-NN does not know by itself gets predicted decoys
+  (docs/13, "predict_decoys").** A desktop build with methyl (UniMod:34) or trimethyl
+  (UniMod:37) variable modifications predicted its targets, because that run declared them
+  with `--var-mod`, but the DIA-NN runs after it did not. The re-export of the `.speclib`
+  logged "unknown modifications found in the library", and the decoys' prediction printed
+  "cannot generate a predicted library without knowing the modification masses", exited 0 and
+  re-exported 0 precursors, so the build failed in `import_diann_lib.py` with "no target b/y
+  fragment rows survived the filters". `scripts/predict_decoys.py build` now declares every
+  modification the decoys carry to both of its DIA-NN runs (`--mod UniMod:<id>,<mass>`, masses
+  from the modification catalogue), takes more with `--diann-mod` (repeatable), and stops
+  with the accessions DIA-NN named when it refuses to predict, or when the predicted library
+  is empty. Without `--keep-unimod`, the decoys' import keeps the accessions the decoys carry,
+  where it kept the importer's default set and dropped every other decoy with its target. The
+  desktop declares its build's modifications in the re-export too, and an import of a chosen
+  `.speclib` declares the whole catalogue. `--mod` only declares a mass: on DIA-NN 2.7 the
+  re-exported targets are identical with and without it.
+### Security
+
+- **RUSTSEC-2026-0545, -0547 and -0548 (zip 6.0.0) are audited and ignored, with their reason
+  (#329).** They reach the engine on the path of the four zip advisories the audit already
+  ignores: a build dependency of `nethost-sys` under the opt-in `thermo` feature, whose build
+  script reads the nethost package fetched over TLS with `ZipArchive::by_index`. It reads no
+  AES-encrypted entry (-0545), the `legacy-zip` decoders are not compiled (-0547), and it does
+  not use `ZipStreamReader` (-0548). Release builds do not enable the feature, and no release
+  in the chain reaches the fixed zip 9.0.5. RUSTSEC-2026-0543 (chrono unmaintained) has no
+  patched release, 0.4.45 being the latest, and stays a warning that does not fail the audit.
+  Neither lockfile changes, so no output changes.
 
 ## [0.14.0] - 2026-11-16
 

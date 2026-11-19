@@ -289,6 +289,21 @@ the target's own sequence. The merge streams both fragment tables by row group a
 reproduced the bench prototype's output exactly (202,012,453 fragment rows). `tsv` and
 `merge` are exposed for a DIA-NN run made by hand.
 
+Both DIA-NN runs (the prediction and the re-export) declare every modification the decoys
+carry as `--mod UniMod:<id>,<mass>`, with the mass from the modification catalogue
+(`scripts/_unimod.py`). DIA-NN knows only a few modifications by itself (UniMod 4, 35 and 21
+among them); for any other, methyl (UniMod:34) or trimethyl (UniMod:37) for example, an
+undeclared prediction prints "cannot generate a predicted library without knowing the
+modification masses", still exits 0, and its re-export saves 0 precursors. `--mod` declares a
+mass and adds no peptidoform; DIA-NN 2.7 writes the same library with or without a declaration
+it does not need. `--diann-mod UniMod:<id>,<mass>` (repeatable) adds a declaration, placed
+first and winning for its accession. The script stops with the accessions DIA-NN named when
+DIA-NN refuses to predict, and stops when the predicted library has 0 rows, before the
+importer runs. Without `--keep-unimod`, the decoys' import keeps exactly the accessions the
+decoys carry. The desktop passes its build's modifications (`--diann-mod`) and declares them
+with `--mod` in the re-export of its own `.speclib` as well; an import of a chosen `.speclib`
+declares the whole catalogue.
+
 **make_reverse_decoys** / **make_shift_decoys** (offline; no Rust caller)
 - IN/OUT the same precursor+fragment schema as `import_diann_lib`, reading a
   target-only (or target-half) library and emitting a target+decoy library
