@@ -1126,7 +1126,7 @@ Written only when `out_peak_bounds` is set and `bound_peak` is on.
 | `hi_rt` | Float64 | no | s | integration window upper RT |
 | `width_s` | Float64 | no | s | `hi_rt - lo_rt` |
 
-### quant-lfq cross-run output (`quant.rs:720-728`, `run_lfq_combine` at `quant.rs:657`)
+### quant-lfq cross-run output (`run_lfq_combine_grouped` in `quant_lfq.rs`)
 
 Long-form MaxLFQ (peptide-level) or directLFQ (ion-level) matrix.
 
@@ -1147,7 +1147,7 @@ in run-index order, with a header.
 |---|---|---|
 | `run` | text | run name (`experiment.runs`); the input index for `quant-lfq` |
 | `condition` | text | the run's condition, empty when it has none |
-| `size_factor` | number | what the run's feature intensities were divided by before the MaxLFQ rollup: the median-of-ratios factor over every run (`all`), over the run's condition (`condition`), or 1 (`none`, a condition of one run, no complete feature) |
+| `size_factor` | number | what the run's feature intensities were divided by before the MaxLFQ rollup: the median-of-ratios factor over every run (`all`), over the run's condition (`condition`), or 1 (`none`, a condition of one run, a run with no quantified feature, no complete feature) |
 | `n_features` | integer | the complete-case features the factor was estimated from (the features of its condition under `condition`); 0 when no factor was estimated |
 
 ---

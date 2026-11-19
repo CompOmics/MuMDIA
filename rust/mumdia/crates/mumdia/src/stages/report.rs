@@ -909,8 +909,11 @@ pub fn run_experiment_localised(
         )?;
         if p.protein_lfq.is_some() {
             let none = vec![f64::NAN; n_runs];
-            for x in prot_lfq.get(&pg[j]).unwrap_or(&none) {
-                write!(w2, "\t{}", qcell(*x))?;
+            // 0 in the matrix is a run in which the group has no feature: a missing value,
+            // printed empty as in precursors.tsv, not an abundance of zero.
+            for &x in prot_lfq.get(&pg[j]).unwrap_or(&none) {
+                let x = if x > 0.0 { x } else { f64::NAN };
+                write!(w2, "\t{}", qcell(x))?;
             }
         }
         write!(w2, "{}", transfer_cells(j))?;
@@ -1924,19 +1927,23 @@ mod tests {
         let peptides = format!("{out}/peptides.tsv");
         let proteins = format!("{out}/proteins.tsv");
         let names = vec!["a".to_string(), "b".to_string()];
-        let (n_pep, n_prot) = run_experiment(ExperimentReportParams {
-            scored: &scored,
-            run_names: &names,
-            peptide_quants: &[qa, qb],
-            protein_lfq: Some(&lfq),
-            precursor_lfq: None,
-            out_peptides: &peptides,
-            out_proteins: &proteins,
-            out_precursors: None,
-            q_threshold: 0.01,
-            protein_annotations: None,
-        })
-        .unwrap();
+        let quants = [qa, qb];
+        let report = || {
+            run_experiment(ExperimentReportParams {
+                scored: &scored,
+                run_names: &names,
+                peptide_quants: &quants,
+                protein_lfq: Some(&lfq),
+                precursor_lfq: None,
+                out_peptides: &peptides,
+                out_proteins: &proteins,
+                out_precursors: None,
+                q_threshold: 0.01,
+                protein_annotations: None,
+            })
+            .unwrap()
+        };
+        let (n_pep, n_prot) = report();
         assert_eq!((n_pep, n_prot), (2, 1));
 
         let text = std::fs::read_to_string(&peptides).unwrap();
@@ -1978,6 +1985,22 @@ mod tests {
             (pg[0], pg[2], pg[3], pg[4]),
             ("PG1", "2", "1000.0", "1200.0")
         );
+
+        // The matrix holds 0 for a run in which the group has no feature: a missing value,
+        // printed empty as in precursors.tsv, not an abundance of zero.
+        write_table(
+            &lfq,
+            vec![
+                Col::Str("protein_group".into(), vec!["PG1".into(), "PG1".into()]),
+                Col::I32("run".into(), vec![0, 1]),
+                Col::F64("quantity".into(), vec![1000.0, 0.0]),
+            ],
+        )
+        .unwrap();
+        report();
+        let prot = std::fs::read_to_string(&proteins).unwrap();
+        let pg: Vec<&str> = prot.lines().nth(1).unwrap().split('\t').collect();
+        assert_eq!((pg[0], pg[3], pg[4]), ("PG1", "1000.0", ""));
     }
 
     /// `peptide_quant` v3 tables (`mbr.first_pass_flag`) add one `first_pass_<run>` column

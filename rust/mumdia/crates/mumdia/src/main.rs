@@ -2844,8 +2844,8 @@ fn real_main() -> Result<()> {
             stages::quant::run(stages::quant::QuantParams {
                 psms_scored: &psms_scored,
                 chromatograms: &tables,
-                out_peptide: &out_peptide,
-                out_protein: &out_protein,
+                out_peptide: Some(&out_peptide),
+                out_protein: Some(&out_protein),
                 out_fragment: out_fragment.as_deref(),
                 out_peak_bounds: out_peak_bounds.as_deref(),
                 out_quant_fragments: out_quant_fragments.as_deref(),

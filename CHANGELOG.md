@@ -233,6 +233,18 @@ than a number. Both are recorded in every run's `manifest.json`.
   already writes it in `candidate_id` order, so the rows are identical; the parquet row-group
   layout of the output changes (the writer's default row groups instead of one per sort
   bucket), which the engine's range reads accept.
+- **The `quant-lfq` combine lives beside the MaxLFQ core.** `run_lfq_combine_grouped`, the size
+  factors, `write_size_factors_tsv` and the sibling-matrix paths moved from `stages/quant.rs` to
+  `quant_lfq.rs`, and the `run_lfq_combine` wrapper, which only a test called, is gone. The
+  profiles of the protein, precursor and peptide matrices are solved in parallel, in group
+  order, so the matrices are byte-identical. The export passes of the cross-run step no longer
+  write, hash and then delete a peptide and a protein table per run
+  (`QuantParams::out_peptide` and `out_protein` are optional), and `CidSet` takes over the
+  first-apex count `CidMarks` kept. Every output is the same.
+- **`quant.peak_window_mode = consensus` warns under a fixed window.** It sets the half-widths
+  of the walked window, and under `fixed_scan_halfwidth` or `fixed_window_s` (the default is a
+  fixed window) every candidate with an apex is integrated over the fixed window instead, so
+  the setting changes no quantity. It is still accepted.
 
 ### Removed
 
@@ -319,6 +331,35 @@ than a number. Both are recorded in every run's `manifest.json`.
   compares its file lists with `retain.rs`. A removal that failed (a file held open on
   Windows) ended the prune before `pruned.json` was written, so the files already removed had
   no record; they are recorded before the error is raised.
+- **Cross-run size factors survive a run with no quantified precursor.** The median-ratio
+  factors of the cross-run LFQ were fitted on the features quantified in every run, so one
+  blank well or failed injection left none, and every run kept factor 1 with only an info
+  line to show it. Such a run now keeps factor 1 with `n_features` 0, the other runs are
+  normalised over the features they share, and `quant-lfq` warns, naming the runs, and when
+  the factors rest on fewer than 20 features. This changes `lfq_maxlfq.parquet` and its
+  precursor and peptide siblings, `lfq_size_factors.tsv`, the `lfq_<run>` columns of
+  `proteins.tsv` and the `normalised_<run>` columns of `precursors.tsv` of an experiment with
+  such a run; an experiment in which every run quantified a precursor is byte-identical.
+- **`proteins.tsv` leaves the `lfq_<run>` cell of a run without the protein group empty.** The
+  cross-run matrix holds 0 for a run in which the group has no feature, which is a missing
+  value; `precursors.tsv` already printed it empty, and `proteins.tsv` printed `0.0`. The
+  Parquet matrix is unchanged.
+- **`quant.fixed_scan_halfwidth_scale` no longer subtracts a background measured inside the
+  window.** Where a candidate's chosen window covered its whole trace in every run, no flank
+  beyond it was measured, and the fragment kept the background measured beyond the narrower
+  `fixed_scan_halfwidth` window, inside the wider window it was subtracted from. Such a
+  fragment now takes no experiment background (the per-run fallback). Only experiments that
+  set the opt-in key change.
+- **`quant` refuses `--out-peak-bounds` over one of its inputs**, as it refuses the other
+  outputs (docs/31 F6): given the `--psms-scored` path, it replaced the scored table with the
+  peak-window diagnostic. `--psms-extracted` and `--spectra-ms2`, read under the Q1 keys, are
+  guarded too.
+- **The manifest records `peptide_quant` v4 under `quant.q1_fragments`.** `run` and
+  `run-experiment` recorded v2 or v3 for the v4 table quant wrote, with its `q1_quant` column.
+- **`quant.window_centre = profile` is refused on a chromatogram table without
+  `predicted_intensity`**, as the rules that rank by prediction are: every prediction read 0,
+  and the window was placed on the first fragments in table order. Only an explicit profile
+  centre with a rule that does not rank by prediction reached it.
 
 ### Security
 

@@ -1,10 +1,10 @@
 //! Stage G `mumdia quant` (docs/12_quant_lfq_align_mbr_report_audit.md): quantify
 //! identified peptidoforms and roll up to protein groups. Integrate each fragment
-//! chromatogram over the apex region by the trapezoidal rule, sum the top-N
-//! fragments into a per-run peptidoform quantity, then roll up to protein groups.
-//! MVP is single-run, so cross-run normalization and MaxLFQ/directLFQ (which need
-//! multiple runs) reduce to a top-N sum; the method is a config strategy for
-//! later.
+//! chromatogram over the candidate's window by the trapezoidal rule, turn the fragments
+//! into a per-run peptidoform quantity under `quant.fragment_selection`, then roll up to
+//! protein groups. The file also holds the chromatogram reader this stage uses and the
+//! cross-run step of `run-experiment` ([`fit_cross_run`]); the cross-run MaxLFQ matrix and
+//! its size factors (`quant-lfq`) are in [`crate::quant_lfq`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Instant;
@@ -59,8 +59,11 @@ pub struct QuantParams<'a> {
     /// The run's chromatogram tables, in row order: one, or a grouped run's band tables
     /// (see [`ChromTable`]).
     pub chromatograms: &'a [ChromTable],
-    pub out_peptide: &'a str,
-    pub out_protein: &'a str,
+    /// The peptide and protein-group tables. `None` computes them without writing, hashing
+    /// or reporting them: the export passes of the cross-run step, which keep only
+    /// `out_fragment`.
+    pub out_peptide: Option<&'a str>,
+    pub out_protein: Option<&'a str>,
     /// Optional per-fragment area export (for ion-level directLFQ across runs).
     pub out_fragment: Option<&'a str>,
     /// Optional per-candidate peak-window diagnostic (candidate_id, lo_rt, hi_rt,
@@ -348,22 +351,43 @@ impl CidSet {
 
     /// `ids` need not be sorted or distinct: a repeated id sets the same bit twice.
     fn from_ids(ids: &[u32]) -> CidSet {
+        let mut set = CidSet::over(ids);
+        for &c in ids {
+            set.insert(c);
+        }
+        set
+    }
+
+    /// An empty set over `min(ids)..=max(ids)`; every id later inserted must lie there.
+    fn over(ids: &[u32]) -> CidSet {
         let (Some(&base), Some(&top)) = (ids.iter().min(), ids.iter().max()) else {
             return CidSet::empty();
         };
         // In u64: `top - base` reaches `u32::MAX`, and `+ 1` on a 32-bit `usize` would wrap
-        // to a zero-length allocation that the fill below then indexes out of.
+        // to a zero-length allocation that `insert` then indexes out of.
         let span = u64::from(top - base) + 1;
         if span.div_ceil(64) * 8 > CID_BITSET_MAX_BYTES as u64 {
-            return CidSet::Hashed(ids.iter().copied().collect());
+            return CidSet::Hashed(std::collections::HashSet::new());
         }
-        let span = span as usize;
-        let mut bits = vec![0u64; span.div_ceil(64)];
-        for &c in ids {
-            let k = (c - base) as usize;
-            bits[k >> 6] |= 1u64 << (k & 63);
+        CidSet::Bits {
+            base,
+            bits: vec![0u64; (span as usize).div_ceil(64)],
         }
-        CidSet::Bits { base, bits }
+    }
+
+    /// Add `c` (inside the range the set was built over), returning whether it was new.
+    #[inline]
+    fn insert(&mut self, c: u32) -> bool {
+        match self {
+            CidSet::Bits { base, bits } => {
+                let k = (c - *base) as usize;
+                let (w, b) = (k >> 6, 1u64 << (k & 63));
+                let new = bits[w] & b == 0;
+                bits[w] |= b;
+                new
+            }
+            CidSet::Hashed(h) => h.insert(c),
+        }
     }
 
     #[inline]
@@ -424,64 +448,6 @@ impl CidSet {
 fn any_in_range(sorted: &[u32], lo: f64, hi: f64) -> bool {
     let at = sorted.partition_point(|&c| f64::from(c) < lo);
     at < sorted.len() && f64::from(sorted[at]) <= hi
-}
-
-/// Distinct candidate ids marked so far, one bit per id over a range fixed up front (the
-/// hashed fallback past [`CID_BITSET_MAX_BYTES`], as for [`CidSet`]). For a count over a
-/// whole table that must not cost a map entry per candidate.
-struct CidMarks {
-    base: u32,
-    bits: Vec<u64>,
-    hashed: Option<std::collections::HashSet<u32>>,
-    count: usize,
-}
-
-impl CidMarks {
-    /// Marks for ids in `min(ids)..=max(ids)`; every id later inserted must lie there.
-    fn over(ids: &[u32]) -> CidMarks {
-        let empty = CidMarks {
-            base: 0,
-            bits: Vec::new(),
-            hashed: None,
-            count: 0,
-        };
-        let (Some(&base), Some(&top)) = (ids.iter().min(), ids.iter().max()) else {
-            return empty;
-        };
-        let span = u64::from(top - base) + 1;
-        if span.div_ceil(64) * 8 > CID_BITSET_MAX_BYTES as u64 {
-            return CidMarks {
-                hashed: Some(std::collections::HashSet::new()),
-                ..empty
-            };
-        }
-        CidMarks {
-            base,
-            bits: vec![0u64; (span as usize).div_ceil(64)],
-            ..empty
-        }
-    }
-
-    /// Mark `c`, returning whether it was unmarked before.
-    #[inline]
-    fn insert(&mut self, c: u32) -> bool {
-        let new = match &mut self.hashed {
-            Some(h) => h.insert(c),
-            None => {
-                let k = (c - self.base) as usize;
-                let (w, b) = (k >> 6, 1u64 << (k & 63));
-                let new = self.bits[w] & b == 0;
-                self.bits[w] |= b;
-                new
-            }
-        };
-        self.count += usize::from(new);
-        new
-    }
-
-    fn count(&self) -> usize {
-        self.count
-    }
 }
 
 /// The fragment chromatogram rows quant keeps, in table order, in flat buffers.
@@ -1507,6 +1473,8 @@ fn finite_option(value: f64) -> Option<f64> {
     value.is_finite().then_some(value)
 }
 
+/// Whether a scored row is quantified: a target at or below the q threshold, or an
+/// accepted match-between-runs transfer.
 ///
 /// `is_decoy` is the one bit of the `label` column this stage ever tested (`label ==
 /// "decoy"`, and anything that is neither spelling is treated as a target exactly as
@@ -2435,8 +2403,12 @@ fn page_aligned_runs(keep: &[bool], starts: &[usize]) -> Vec<(usize, bool)> {
     push(n - cursor, true, &mut runs);
     runs
 }
+
+/// [`run_hashed`], returning the rows of the peptide and protein-group tables (0 for a
+/// table it was not asked to write).
 pub fn run(p: QuantParams) -> Result<(u64, u64)> {
-    run_hashed(p).map(|w| (w.peptide.rows, w.protein.rows))
+    let rows = |w: Option<Written>| w.map_or(0, |w| w.rows);
+    run_hashed(p).map(|w| (rows(w.peptide), rows(w.protein)))
 }
 
 /// What `quant.q1_fragments` did to the chromatogram store ([`q1_apply`]).
@@ -2777,8 +2749,10 @@ fn q1_cycle_window(
 /// The quant outputs as written and reported: row count and report content hash of each.
 #[derive(Clone, Debug)]
 pub struct QuantWritten {
-    pub peptide: Written,
-    pub protein: Written,
+    /// `Some` exactly when `QuantParams::out_peptide` was set.
+    pub peptide: Option<Written>,
+    /// `Some` exactly when `QuantParams::out_protein` was set.
+    pub protein: Option<Written>,
     /// `Some` exactly when `QuantParams::out_fragment` was set.
     pub fragment: Option<Written>,
     /// `Some` exactly when `QuantParams::out_quant_fragments` was set.
@@ -2799,10 +2773,15 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             .iter()
             .map(|t| ("--chromatograms", t.path.as_str())),
     );
+    if let Some(q1) = &p.q1 {
+        inputs.extend(q1.psms_extracted.map(|x| ("--psms-extracted", x)));
+        inputs.push(("--spectra-ms2", q1.spectra_ms2));
+    }
     for out in [
-        Some(p.out_peptide),
-        Some(p.out_protein),
+        p.out_peptide,
+        p.out_protein,
         p.out_fragment,
+        p.out_peak_bounds,
         p.out_quant_fragments,
     ]
     .into_iter()
@@ -2994,23 +2973,28 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     // report's `candidates_with_scored_apex` still counts the WHOLE table's candidates with
     // a finite apex, as it always did, through one bit per candidate id.
     let mut apex_by_cid: HashMap<u32, f64> = HashMap::new();
-    let mut scored_apex = CidMarks::over(&cid);
+    let mut scored_apex = CidSet::over(&cid);
+    let mut candidates_with_scored_apex = 0usize;
     let apex_column_present = ps
         .visit_f64("apex_rt", |first, vals| {
             for (k, &a) in vals.iter().enumerate() {
                 let c = cid[first + k];
-                if a.is_finite() && scored_apex.insert(c) && (keep_all || wanted.contains(c)) {
-                    apex_by_cid.insert(c, a);
+                if a.is_finite() && scored_apex.insert(c) {
+                    candidates_with_scored_apex += 1;
+                    if keep_all || wanted.contains(c) {
+                        apex_by_cid.insert(c, a);
+                    }
                 }
             }
             Ok(())
         })
         .is_ok();
+    drop(scored_apex);
     if !apex_column_present {
         // A column that is absent or not f64 carries no hint, exactly as before; nothing a
         // failed read left behind may count.
         apex_by_cid.clear();
-        scored_apex = CidMarks::over(&[]);
+        candidates_with_scored_apex = 0;
         warn!(
             psms_scored = p.psms_scored,
             "quant: scored table has no apex_rt column (pre-v3 artifact); every \
@@ -3018,8 +3002,6 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
              the identification apex only about half the time"
         );
     }
-    let candidates_with_scored_apex = scored_apex.count();
-    drop(scored_apex);
     // Nothing below reads a column of the scored table per row any more: the outputs walk
     // the accepted rows, whose values were gathered above.
     drop((cid, is_decoy, pep_q, is_transferred, is_target));
@@ -3049,14 +3031,19 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     }
     let has_pred = has_pred.unwrap_or(false);
     // `cross_run` and the pattern rules rank by the same column wherever they fall back to
-    // `predicted`.
-    if !has_pred && p.cfg.fragment_selection.ranks_by_predicted() {
+    // `predicted`, and the profile centre places the window on the top predicted fragments.
+    if !has_pred
+        && (p.cfg.fragment_selection.ranks_by_predicted()
+            || p.cfg.window_centre == WindowCentre::Profile)
+    {
         anyhow::bail!(
-            "quant.fragment_selection = {:?} ranks fragments by the \
-             `predicted_intensity` column, which {} does not carry. Re-run `extract` to \
-             write a current chromatogram artifact, or set \
-             quant.fragment_selection = observed_area.",
+            "quant.fragment_selection = {:?} with quant.window_centre = {:?} reads the \
+             `predicted_intensity` column (to rank fragments, or to place the profile \
+             window), which {} does not carry. Re-run `extract` to write a current \
+             chromatogram artifact, or set quant.fragment_selection = observed_area and \
+             quant.window_centre = apex.",
             p.cfg.fragment_selection,
+            p.cfg.window_centre,
             p.chromatograms[0].path
         );
     }
@@ -3937,6 +3924,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     let n_first_pass_rows = q_first
         .as_ref()
         .map(|v| v.iter().filter(|&&x| x).count() as u64);
+    let n_pep = q_cid.len() as u64;
     let mut pep_cols = vec![
         Col::U32("candidate_id".into(), q_cid),
         Col::U32("base_peptide_id".into(), q_base),
@@ -3960,7 +3948,9 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     if q1a.is_some() {
         pep_cols.push(Col::Str("q1_quant".into(), q_q1));
     }
-    let n_pep = write_table(p.out_peptide, pep_cols)?;
+    if let Some(path) = p.out_peptide {
+        write_table(path, pep_cols)?;
+    }
 
     // Protein-group rollup over unique, quantifiable base peptides only.
     let (mut g_name, mut g_val, mut g_status, mut g_npep) =
@@ -3977,15 +3967,18 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         g_status.push(status.to_string());
         g_npep.push(n_bases as i32);
     }
-    let n_pg = write_table(
-        p.out_protein,
-        vec![
-            Col::Str("protein_group".into(), g_name),
-            Col::OptF64("quantity".into(), g_val),
-            Col::Str("quant_status".into(), g_status),
-            Col::I32("n_peptides".into(), g_npep),
-        ],
-    )?;
+    let n_pg = g_name.len() as u64;
+    if let Some(path) = p.out_protein {
+        write_table(
+            path,
+            vec![
+                Col::Str("protein_group".into(), g_name),
+                Col::OptF64("quantity".into(), g_val),
+                Col::Str("quant_status".into(), g_status),
+                Col::I32("n_peptides".into(), g_npep),
+            ],
+        )?;
+    }
 
     // Optional per-fragment area export for ion-level directLFQ across runs.
     let mut fragment_output: Option<(&str, u64)> = None;
@@ -4340,7 +4333,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             );
         }
     }
-    let mut written: Vec<Written> = Vec::with_capacity(2);
+    let mut written: Vec<Option<Written>> = Vec::with_capacity(2);
     // The first-pass flag's count goes into the peptide table's report alone, and only when
     // the column was written, so every other report keeps its bytes.
     let mut pep_stats = stats.clone();
@@ -4356,6 +4349,10 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         ),
         (p.out_protein, artifact::PROTEIN_GROUP_QUANT, n_pg, &stats),
     ] {
+        let Some(path) = path else {
+            written.push(None);
+            continue;
+        };
         let report = ArtifactReport {
             logical_name: schema.0.to_string(),
             schema_name: schema.0.to_string(),
@@ -4369,7 +4366,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             elapsed_ms: elapsed,
         };
         report.write_for(path)?;
-        written.push(report.written());
+        written.push(Some(report.written()));
     }
     let mut detail_written: Option<Written> = None;
     if let Some((path, rows, candidates, selected)) = detail_output {
@@ -4421,8 +4418,8 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         elapsed_ms = elapsed,
         "quant: done"
     );
-    let protein = written.pop().expect("two reports written");
-    let peptide = written.pop().expect("two reports written");
+    let protein = written.pop().expect("one entry per table");
+    let peptide = written.pop().expect("one entry per table");
     Ok(QuantWritten {
         peptide,
         protein,
@@ -4786,7 +4783,9 @@ pub fn fit_cross_run(fragment_tables: &[String], cfg: &QuantConfig) -> Result<Cr
                 )
             })
             .collect();
-        // Under the width the background is the flank beyond the chosen window.
+        // Under the width the background is the flank beyond the chosen window. Where the
+        // window covers the whole trace in every run there is none: the base flank lies
+        // inside the wider window, and subtracting it would take peak signal for background.
         if let Some(half) = &half {
             for (c, frags) in flank_h {
                 let Some(&h) = half.get(&c) else { continue };
@@ -4795,6 +4794,8 @@ pub fn fit_cross_run(fragment_tables: &[String], cfg: &QuantConfig) -> Result<Cr
                     let (sum, k) = per[h - CROSS_RUN_HALFWIDTH_MIN];
                     if k > 0 {
                         lv.insert(n, sum / k as f64);
+                    } else {
+                        lv.remove(&n);
                     }
                 }
             }
@@ -5237,8 +5238,8 @@ mod tests {
             run(QuantParams {
                 psms_scored: &scored,
                 chromatograms: &[ChromTable::whole(&chrom)],
-                out_peptide: &pep,
-                out_protein: &prot,
+                out_peptide: Some(&pep),
+                out_protein: Some(&prot),
                 out_fragment: None,
                 out_peak_bounds: None,
                 out_quant_fragments: None,
@@ -5364,8 +5365,8 @@ mod tests {
         let rows = run(QuantParams {
             psms_scored: &scored,
             chromatograms: &[ChromTable::whole(&chrom)],
-            out_peptide: &peptide,
-            out_protein: &protein,
+            out_peptide: Some(&peptide),
+            out_protein: Some(&protein),
             out_fragment: Some(&fragment),
             out_peak_bounds: Some(&bounds),
             out_quant_fragments: None,
@@ -5426,6 +5427,32 @@ mod tests {
         let fq = Table::read(&fragment).unwrap();
         assert_eq!(fq.nrows, 3, "the all-zero ion must not be exported");
         assert!(fq.f64("quantity").unwrap().iter().all(|area| *area > 0.0));
+
+        // The profile centre places the window on the top predicted fragments, so it is
+        // refused on this table too, even under a rule that ranks by observed area: every
+        // prediction would read 0, and the window would follow table order.
+        let profile = QuantConfig {
+            window_centre: WindowCentre::Profile,
+            ..QuantConfig::previous_defaults()
+        };
+        let err = run(QuantParams {
+            psms_scored: &scored,
+            chromatograms: &[ChromTable::whole(&chrom)],
+            out_peptide: Some(&peptide),
+            out_protein: Some(&protein),
+            out_fragment: None,
+            out_peak_bounds: None,
+            out_quant_fragments: None,
+            cfg: &profile,
+            config_hash: "test",
+            cross_run: None,
+            export_cross_run: false,
+            first_pass_ids: None,
+            q1: None,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("quant.window_centre = Profile"), "{err}");
     }
 
     #[test]
@@ -5634,8 +5661,8 @@ mod tests {
         let rows = run(QuantParams {
             psms_scored: &scored,
             chromatograms: &[ChromTable::whole(&chrom)],
-            out_peptide: &peptide,
-            out_protein: &protein,
+            out_peptide: Some(&peptide),
+            out_protein: Some(&protein),
             out_fragment: None,
             out_peak_bounds: None,
             out_quant_fragments: None,
@@ -5673,8 +5700,8 @@ mod tests {
             let rows = run(QuantParams {
                 psms_scored: &scored,
                 chromatograms: &[ChromTable::whole(&chrom)],
-                out_peptide: &peptide,
-                out_protein: &protein,
+                out_peptide: Some(&peptide),
+                out_protein: Some(&protein),
                 out_fragment: None,
                 out_peak_bounds: None,
                 out_quant_fragments: None,
@@ -5777,8 +5804,8 @@ mod tests {
         run(QuantParams {
             psms_scored: &input.0,
             chromatograms: &[ChromTable::whole(&input.1)],
-            out_peptide: &out[0],
-            out_protein: &out[1],
+            out_peptide: Some(&out[0]),
+            out_protein: Some(&out[1]),
             out_fragment: Some(&out[2]),
             out_peak_bounds: None,
             out_quant_fragments: None,
@@ -5900,10 +5927,11 @@ mod tests {
         assert_eq!(e.f64("peak_hwhm").unwrap(), vec![1.75; 4]);
         // directLFQ reads the export as it reads v1: the zero-area row is not a feature.
         let lfq = quant_test_path("crx_lfq.parquet");
-        crate::quant_lfq::run_lfq_combine(
+        crate::quant_lfq::run_lfq_combine_grouped(
             &[ex[2].clone()],
             true,
             mumdia_core::config::NormalizeMethod::None,
+            None,
             "quantity",
             &lfq,
         )
@@ -5911,6 +5939,30 @@ mod tests {
         assert_eq!(
             Table::read(&lfq).unwrap().i32("n_features").unwrap(),
             vec![3]
+        );
+        // The export passes of run-experiment ask for the export alone: no peptide or
+        // protein table is written or reported, and the export is the same.
+        let alone = quant_test_path("crx_alone_frag.parquet");
+        let w = run_hashed(QuantParams {
+            psms_scored: &input.0,
+            chromatograms: &[ChromTable::whole(&input.1)],
+            out_peptide: None,
+            out_protein: None,
+            out_fragment: Some(&alone),
+            out_peak_bounds: None,
+            out_quant_fragments: None,
+            cfg: &cross_run_cfg(),
+            config_hash: "test",
+            cross_run: None,
+            export_cross_run: true,
+            first_pass_ids: None,
+            q1: None,
+        })
+        .unwrap();
+        assert!(w.peptide.is_none() && w.protein.is_none());
+        assert_eq!(
+            std::fs::read(&alone).unwrap(),
+            std::fs::read(&ex[2]).unwrap()
         );
     }
 
@@ -6059,8 +6111,8 @@ mod tests {
             let w = run_hashed(QuantParams {
                 psms_scored: &input.0,
                 chromatograms: &[ChromTable::whole(&input.1)],
-                out_peptide: &out[0],
-                out_protein: &out[1],
+                out_peptide: Some(&out[0]),
+                out_protein: Some(&out[1]),
                 out_fragment: Some(&out[2]),
                 out_peak_bounds: None,
                 out_quant_fragments: with.then_some(acc.as_str()),
@@ -6393,8 +6445,8 @@ mod tests {
         let rows = run(QuantParams {
             psms_scored: &scored,
             chromatograms: &[ChromTable::whole(&chrom)],
-            out_peptide: &peptide,
-            out_protein: &protein,
+            out_peptide: Some(&peptide),
+            out_protein: Some(&protein),
             out_fragment: None,
             out_peak_bounds: None,
             out_quant_fragments: None,
@@ -6435,8 +6487,8 @@ mod tests {
         let err = run(QuantParams {
             psms_scored: &scored,
             chromatograms: &[ChromTable::whole(&chrom)],
-            out_peptide: &quant_test_path("err_peptide.parquet"),
-            out_protein: &quant_test_path("err_protein.parquet"),
+            out_peptide: Some(&quant_test_path("err_peptide.parquet")),
+            out_protein: Some(&quant_test_path("err_protein.parquet")),
             out_fragment: None,
             out_peak_bounds: None,
             out_quant_fragments: None,
@@ -6877,8 +6929,8 @@ mod tests {
         let rows = run(QuantParams {
             psms_scored: &scored,
             chromatograms: &[ChromTable::whole(&chrom)],
-            out_peptide: &peptide,
-            out_protein: &protein,
+            out_peptide: Some(&peptide),
+            out_protein: Some(&protein),
             out_fragment: Some(&fragment),
             out_peak_bounds: Some(&bounds),
             out_quant_fragments: None,
@@ -7009,8 +7061,8 @@ mod tests {
             run(QuantParams {
                 psms_scored: &scored,
                 chromatograms: &[ChromTable::whole(&chrom)],
-                out_peptide: &peptide,
-                out_protein: &protein,
+                out_peptide: Some(&peptide),
+                out_protein: Some(&protein),
                 out_fragment: None,
                 out_peak_bounds: bounds.as_deref(),
                 out_quant_fragments: None,
@@ -7894,8 +7946,8 @@ mod tests {
         run(QuantParams {
             psms_scored: scored,
             chromatograms: tables,
-            out_peptide: &pep,
-            out_protein: &prot,
+            out_peptide: Some(&pep),
+            out_protein: Some(&prot),
             out_fragment: None,
             out_peak_bounds: None,
             out_quant_fragments: None,
@@ -8101,8 +8153,8 @@ mod tests {
             run(QuantParams {
                 psms_scored: &scored,
                 chromatograms: tables,
-                out_peptide: &pep,
-                out_protein: &prot,
+                out_peptide: Some(&pep),
+                out_protein: Some(&prot),
                 out_fragment: Some(&frag),
                 out_peak_bounds: bounds.then_some(pb.as_str()),
                 out_quant_fragments: None,
@@ -8229,8 +8281,8 @@ mod tests {
             run(QuantParams {
                 psms_scored: &scored,
                 chromatograms: &[ChromTable::whole(chrom)],
-                out_peptide: &pep,
-                out_protein: &prot,
+                out_peptide: Some(&pep),
+                out_protein: Some(&prot),
                 out_fragment: Some(&frag),
                 out_peak_bounds: Some(&pb),
                 out_quant_fragments: None,
@@ -8370,8 +8422,8 @@ mod tests {
                 run(QuantParams {
                     psms_scored: &scored,
                     chromatograms: &t,
-                    out_peptide: &pep,
-                    out_protein: &prot,
+                    out_peptide: Some(&pep),
+                    out_protein: Some(&prot),
                     out_fragment: Some(&frag),
                     out_peak_bounds: None,
                     out_quant_fragments: None,
@@ -8568,8 +8620,8 @@ mod tests {
             run(QuantParams {
                 psms_scored: &scored,
                 chromatograms: &[ChromTable::whole(chrom)],
-                out_peptide: &peptide,
-                out_protein: &protein,
+                out_peptide: Some(&peptide),
+                out_protein: Some(&protein),
                 out_fragment: Some(&fragment),
                 out_peak_bounds: None,
                 out_quant_fragments: None,
@@ -9206,6 +9258,33 @@ mod source_guard_tests {
         assert_eq!(fit.background.unwrap()[&7]["a"], 100.0);
     }
 
+    /// Where the chosen window covers the whole trace in every run, no flank beyond it was
+    /// measured, and the fragment gets no experiment background: the base `flank_mean` lies
+    /// inside that window, so subtracting it would remove peak signal.
+    #[test]
+    fn the_halfwidth_scale_takes_no_background_where_no_flank_was_measured() {
+        let mut cols = vec![
+            Col::U32("candidate_id".into(), vec![7]),
+            Col::Str("fragment_name".into(), vec!["a".into()]),
+            Col::F64("quantity".into(), vec![10.0]),
+            Col::F64("apex_corr".into(), vec![0.9]),
+            Col::F64("flank_mean".into(), vec![100.0]),
+            Col::F64("peak_hwhm".into(), vec![2.0]),
+        ];
+        for h in CROSS_RUN_HALFWIDTH_MIN..=CROSS_RUN_HALFWIDTH_MAX {
+            cols.push(Col::F64(format!("flank_mean_h{h}"), vec![f64::NAN]));
+        }
+        let cfg = QuantConfig {
+            baseline_subtract: mumdia_core::config::BaselineSubtract::On,
+            baseline_source: BaselineSource::Experiment,
+            fixed_scan_halfwidth_scale: 2.5,
+            ..QuantConfig::previous_defaults()
+        };
+        let fit = fit_cross_run(&[table("crw_noflank", cols)], &cfg).unwrap();
+        assert_eq!(fit.halfwidth.unwrap()[&7], 5);
+        assert!(!fit.background.unwrap()[&7].contains_key("a"));
+    }
+
     #[test]
     fn the_pooled_guard_reads_the_u32_source_rescore_writes() {
         // The exact type rescore emits (`Col::U32("source", ...)`, rescore.rs): two runs.
@@ -9448,8 +9527,8 @@ mod pattern_tests {
         run(QuantParams {
             psms_scored: &tables.0,
             chromatograms: &[ChromTable::whole(&tables.1)],
-            out_peptide: &pep,
-            out_protein: &prot,
+            out_peptide: Some(&pep),
+            out_protein: Some(&prot),
             out_fragment: fragment,
             out_peak_bounds: None,
             out_quant_fragments: None,
@@ -9774,8 +9853,8 @@ mod pattern_tests {
         run(QuantParams {
             psms_scored: &tables.0,
             chromatograms: &[ChromTable::whole(&tables.1)],
-            out_peptide: &pep,
-            out_protein: &prot,
+            out_peptide: Some(&pep),
+            out_protein: Some(&prot),
             out_fragment: None,
             out_peak_bounds: None,
             out_quant_fragments: Some(&acc),

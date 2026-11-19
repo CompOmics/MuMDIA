@@ -6,14 +6,18 @@
 //! ion/fragment-level), so with a single run there are no cross-sample ratios and
 //! the profile reduces to the per-sample summed intensity. The shared core is
 //! [`lfq_profile`]; `maxlfq`/`directlfq` differ only in the feature granularity
-//! the caller passes. Validated on synthetic multi-sample matrices (unit tests);
-//! real-data validation requires >=2 runs, which the MVP single-run pipeline does
-//! not yet orchestrate.
+//! the caller passes.
+//!
+//! The `quant-lfq` command lives here too: [`run_lfq_combine_grouped`] reads the per-run
+//! quant tables, divides each run by its size factor and writes the protein-by-run matrix
+//! with its precursor and peptide siblings; `run-experiment` runs it on every multi-run
+//! experiment (`lfq_maxlfq.parquet`, `lfq_size_factors.tsv`).
 
 use anyhow::{Context as _, Result};
 use mumdia_core::config::NormalizeMethod;
 use mumdia_io::table::{write_table, Col, TableFile};
-use tracing::info;
+use rayon::prelude::*;
+use tracing::{info, warn};
 
 fn median(v: &mut [f64]) -> f64 {
     if v.is_empty() {
@@ -225,45 +229,32 @@ pub fn precursor_lfq_sibling(lfq: &str) -> Option<String> {
     std::path::Path::new(&p).is_file().then_some(p)
 }
 
-/// Combine several per-run quant tables into a protein-by-run abundance matrix
-/// with MaxLFQ (peptide-level: `by_fragment=false`, reads `peptide_quant`) or
-/// directLFQ (ion-level: `by_fragment=true`, reads `fragment_quant`). Each
-/// protein's feature-by-run intensity matrix is passed to the ratio-alignment
-/// core in [`crate::quant_lfq`]. Output is long form: protein_group, run,
-/// quantity, n_features. With one input this reduces to the per-run sum.
-///
-/// `normalize` applies a cross-run size factor to the feature-by-run matrix
-/// before rollup (see `size_factors`). `quantity_column` names the intensity column of
-/// the inputs: `quantity`, or `quantity_normalised` of the `peptide_quant_normalised`
-/// tables of the cross-run normalisation (`stages::quant_norm`), which are then read
-/// with `NormalizeMethod::None`.
-pub fn run_lfq_combine(
-    inputs: &[String],
-    by_fragment: bool,
-    normalize: NormalizeMethod,
-    quantity_column: &str,
-    out: &str,
-) -> Result<u64> {
-    run_lfq_combine_grouped(inputs, by_fragment, normalize, None, quantity_column, out)
-        .map(|(rows, _)| rows)
-}
-
 /// The size factor of each run of a cross-run LFQ, as [`run_lfq_combine_grouped`] applied
 /// it, and the number of features it was estimated from.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SizeFactor {
     pub factor: f64,
     /// Complete-case features of the run's group (`median_ratio`), the run's own features
-    /// (`median`), or 0 when no factor was estimated (`none`, a group of one run, or no
-    /// complete feature).
+    /// (`median`), or 0 when no factor was estimated (`none`, a group of one run, a run
+    /// with no quantified feature, or no complete feature).
     pub n_features: usize,
 }
 
-/// [`run_lfq_combine`] with the size factors estimated within groups of runs: `groups`
-/// holds one group index per input (`quant.normalisation_scope = condition`), and each
-/// group's factors are those of `normalize` over that group's runs alone, so a group of one
-/// run keeps factor 1. `None` estimates one set over every run, as `run_lfq_combine`.
-/// Returns the row count and each run's factor.
+/// Combine several per-run quant tables into a protein-by-run abundance matrix
+/// with MaxLFQ (peptide-level: `by_fragment=false`, reads `peptide_quant`) or
+/// directLFQ (ion-level: `by_fragment=true`, reads `fragment_quant`). Each
+/// protein's feature-by-run intensity matrix is passed to the ratio-alignment
+/// core [`lfq_profile`]. Output is long form: protein_group, run,
+/// quantity, n_features. With one input this reduces to the per-run sum.
+///
+/// `normalize` applies a cross-run size factor to the feature-by-run matrix
+/// before rollup (see `size_factors_counted`). `groups` holds one group index per input
+/// (`quant.normalisation_scope = condition`): each group's factors are those of `normalize`
+/// over that group's runs alone, so a group of one run keeps factor 1. `None` estimates one
+/// set over every run. `quantity_column` names the intensity column of
+/// the inputs: `quantity`, or `quantity_normalised` of the `peptide_quant_normalised`
+/// tables of the cross-run normalisation (`stages::quant_norm`), which are then read
+/// with `NormalizeMethod::None`. Returns the row count and each run's factor.
 pub fn run_lfq_combine_grouped(
     inputs: &[String],
     by_fragment: bool,
@@ -335,19 +326,20 @@ pub fn run_lfq_combine_grouped(
             }
         }
     }
-    let (mut c_pg, mut c_run, mut c_q, mut c_nf) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     // The rollup levels below read the SAME feature vectors, so each level borrows them
     // from `data` rather than cloning them: with the protein level and the two sibling
-    // levels this held three or four copies of every feature vector at once.
-    let mut mat: Vec<&Vec<Option<f64>>> = Vec::new();
+    // levels this held three or four copies of every feature vector at once. The groups'
+    // profiles are independent, so they are solved in parallel; `collect` keeps the group
+    // order, so the table is the serial loop's byte for byte.
+    let c_q: Vec<f64> = data
+        .par_iter()
+        .flat_map_iter(|(_, feats)| lfq_profile(&feats.values().collect::<Vec<_>>(), n))
+        .collect();
+    let (mut c_pg, mut c_run, mut c_nf) = (Vec::new(), Vec::new(), Vec::new());
     for (pgname, feats) in &data {
-        mat.clear();
-        mat.extend(feats.values());
-        let prof = lfq_profile(&mat, n);
-        for (r, &v) in prof.iter().enumerate() {
+        for r in 0..n {
             c_pg.push(pgname.clone());
             c_run.push(r as i32);
-            c_q.push(v);
             c_nf.push(feats.len() as i32);
         }
     }
@@ -386,15 +378,17 @@ pub fn run_lfq_combine_grouped(
     // borrows its rows from `data`.
     type LevelGroup<'a> = (String, i32, Vec<&'a Vec<Option<f64>>>);
     let write_level = |path: String, groups: Vec<LevelGroup>| -> Result<()> {
-        let (mut g_key, mut g_z, mut g_run, mut g_q, mut g_nf) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let g_q: Vec<f64> = groups
+            .par_iter()
+            .flat_map_iter(|(_, _, mat)| lfq_profile(mat, n))
+            .collect();
+        let (mut g_key, mut g_z, mut g_run, mut g_nf) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for (key, z, mat) in &groups {
-            let prof = lfq_profile(mat, n);
-            for (r, &v) in prof.iter().enumerate() {
+            for r in 0..n {
                 g_key.push(key.clone());
                 g_z.push(*z);
                 g_run.push(r as i32);
-                g_q.push(v);
                 g_nf.push(mat.len() as i32);
             }
         }
@@ -489,10 +483,11 @@ fn base_sequence(peptidoform: &str) -> String {
 /// Per-run size factors for cross-run normalization of the feature-by-run matrix.
 ///
 /// - `MedianRatio` (DESeq-style): for every complete-case feature (present and
-///   positive in all runs) take its ratio to a geometric-mean pseudo-reference;
-///   the run factor is the median of those ratios. Robust to a minority of
-///   genuinely changing features, so a spike-in design's real fold changes are
-///   preserved, not flattened.
+///   positive in every run that holds any quantified feature) take its ratio to a
+///   geometric-mean pseudo-reference; the run factor is the median of those ratios.
+///   Robust to a minority of genuinely changing features, so a spike-in design's real
+///   fold changes are preserved, not flattened. A run with no quantified feature keeps
+///   factor 1.
 /// - `Median`: align each run's median log2 intensity to the median of the
 ///   per-run medians.
 /// - `None`: all factors 1.0.
@@ -510,6 +505,10 @@ fn size_factors(
         .map(|s| s.factor)
         .collect()
 }
+
+/// Below this many complete-case features a median-ratio size factor is little more than a
+/// guess, and `quant-lfq` warns.
+const MIN_SIZE_FACTOR_FEATURES: usize = 20;
 
 /// [`size_factors`] over the runs `runs` of the matrix alone, one entry per entry of `runs`,
 /// with the number of features each factor was estimated from. Over every run (`0..n`) it
@@ -529,17 +528,49 @@ fn size_factors_counted(
             n
         ],
         NormalizeMethod::MedianRatio => {
+            // A run with no quantified feature (a blank well, a failed injection) leaves no
+            // feature complete over every run, which switched normalisation off for all of
+            // them. It keeps factor 1 now, and the others are fitted over the rest.
+            let positive = |v: &Option<f64>| v.is_some_and(|v| v > 0.0);
+            let held: Vec<usize> = (0..n)
+                .filter(|&k| {
+                    data.values()
+                        .any(|feats| feats.values().any(|vec| positive(&vec[runs[k]])))
+                })
+                .collect();
             let mut lr: Vec<Vec<f64>> = vec![Vec::new(); n];
             for feats in data.values() {
                 for vec in feats.values() {
-                    if runs.iter().all(|&r| vec[r].is_some_and(|v| v > 0.0)) {
-                        let logs: Vec<f64> = runs.iter().map(|&r| vec[r].unwrap().log2()).collect();
-                        let refm = logs.iter().sum::<f64>() / n as f64;
-                        for k in 0..n {
-                            lr[k].push(logs[k] - refm);
+                    if held.iter().all(|&k| positive(&vec[runs[k]])) {
+                        let logs: Vec<f64> =
+                            held.iter().map(|&k| vec[runs[k]].unwrap().log2()).collect();
+                        let refm = logs.iter().sum::<f64>() / held.len() as f64;
+                        for (&k, l) in held.iter().zip(&logs) {
+                            lr[k].push(l - refm);
                         }
                     }
                 }
+            }
+            if held.len() < n {
+                let empty: Vec<usize> = (0..n)
+                    .filter(|k| !held.contains(k))
+                    .map(|k| runs[k])
+                    .collect();
+                warn!(
+                    runs = ?empty,
+                    "quant-lfq: these runs (0-based, in input order) hold no quantified \
+                     feature; they keep size factor 1, and the other runs' factors are \
+                     estimated without them"
+                );
+            }
+            let complete = held.first().map_or(0, |&k| lr[k].len());
+            if held.len() > 1 && complete < MIN_SIZE_FACTOR_FEATURES {
+                warn!(
+                    features = complete,
+                    runs = ?held.iter().map(|&k| runs[k]).collect::<Vec<_>>(),
+                    "quant-lfq: the size factors of these runs rest on fewer than \
+                     {MIN_SIZE_FACTOR_FEATURES} features quantified in all of them"
+                );
             }
             (0..n)
                 .map(|k| SizeFactor {
@@ -768,6 +799,33 @@ mod tests {
             size_factors(&data, 2, NormalizeMethod::None),
             vec![1.0, 1.0]
         );
+    }
+
+    /// A run with no quantified feature (a blank well) keeps factor 1, and the 2x between
+    /// the other two runs survives it: their factors are those of the two runs alone. It
+    /// used to leave no complete feature, so every run kept factor 1.
+    #[test]
+    fn an_empty_run_keeps_factor_one_and_the_others_are_normalised() {
+        use std::collections::BTreeMap;
+        let mut feats: BTreeMap<String, Vec<Option<f64>>> = BTreeMap::new();
+        for i in 0..8 {
+            let a = 100.0 * (i as f64 + 1.0);
+            feats.insert(format!("f{i}"), vec![Some(a), Some(2.0 * a), None]);
+        }
+        let mut data: BTreeMap<String, BTreeMap<String, Vec<Option<f64>>>> = BTreeMap::new();
+        data.insert("PG".into(), feats);
+        let m = NormalizeMethod::MedianRatio;
+        let f = size_factors_counted(&data, &[0, 1, 2], m);
+        assert!((f[1].factor / f[0].factor - 2.0).abs() < 1e-12, "{f:?}");
+        assert_eq!((f[0].n_features, f[1].n_features), (8, 8));
+        assert_eq!(
+            f[2],
+            SizeFactor {
+                factor: 1.0,
+                n_features: 0
+            }
+        );
+        assert_eq!(f[..2], size_factors_counted(&data, &[0, 1], m)[..]);
     }
 
     /// A four-run design, two conditions of two replicates, where condition B has a real

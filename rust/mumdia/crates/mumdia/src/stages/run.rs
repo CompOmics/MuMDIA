@@ -913,8 +913,8 @@ pub fn run(p: RunParams) -> Result<()> {
     let wq = quant::run_hashed(quant::QuantParams {
         psms_scored: &scored,
         chromatograms: &chrom,
-        out_peptide: &pep_q,
-        out_protein: &pg_q,
+        out_peptide: Some(&pep_q),
+        out_protein: Some(&pg_q),
         out_fragment: Some(&frag_q),
         out_peak_bounds: None,
         out_quant_fragments: quant_frags.as_deref(),
@@ -933,14 +933,16 @@ pub fn run(p: RunParams) -> Result<()> {
                 spectra_ms2: &co.ms2,
             }),
     })?;
-    man.record(wq.peptide.record(
-        artifact::PEPTIDE_QUANT.0,
-        artifact::PEPTIDE_QUANT,
+    // The schema quant wrote: v4 under `quant.q1_fragments` (the `q1_quant` column).
+    let pep_schema = artifact::peptide_quant_q1(false, cfg.quant.q1_fragments);
+    man.record(wq.peptide.expect("out_peptide was set").record(
+        pep_schema.0,
+        pep_schema,
         &pep_q,
         "quant",
         &ch,
     ));
-    man.record(wq.protein.record(
+    man.record(wq.protein.expect("out_protein was set").record(
         artifact::PROTEIN_GROUP_QUANT.0,
         artifact::PROTEIN_GROUP_QUANT,
         &pg_q,

@@ -1528,8 +1528,8 @@ mod tests {
             quant::run(quant::QuantParams {
                 psms_scored: &scored,
                 chromatograms: &[quant::ChromTable::whole(chrom)],
-                out_peptide: &pep,
-                out_protein: &prot,
+                out_peptide: Some(&pep),
+                out_protein: Some(&prot),
                 out_fragment: Some(&frag),
                 out_peak_bounds: None,
                 out_quant_fragments: None,
