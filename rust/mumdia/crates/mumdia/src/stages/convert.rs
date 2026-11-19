@@ -160,10 +160,27 @@ fn top_n_by_intensity(inten: &[f32], top: usize) -> Vec<usize> {
     idx
 }
 
+/// The provenance key of the convert artifacts (`ConvertParams::config_hash`): the
+/// canonical configuration plus the conversion caps, which change the spectra but are not
+/// part of the configuration, so two conversions with different caps record different
+/// provenance (docs/18_findings_and_decisions.md). `convert`, `run` and `run-experiment`
+/// all key through this one function.
+pub fn provenance_hash(
+    canonical_json: &str,
+    max_spectra: usize,
+    top_ms2: usize,
+    top_ms1: usize,
+) -> String {
+    mumdia_io::hash::blake3_str(&format!(
+        "{canonical_json}\u{1f}max_spectra={max_spectra}\u{1f}top_peaks_ms2={top_ms2}\u{1f}top_peaks_ms1={top_ms1}"
+    ))
+}
+
 pub struct ConvertParams<'a> {
-    /// The spectra input: an mzML, or a diaPASEF `.d` that `raw::detect` classifies as
-    /// `Vendor::BrukerTdf` (read natively). Every other vendor file is converted to mzML
-    /// by `raw::ensure_mzml` before this stage.
+    /// The spectra input: an mzML, a diaPASEF `.d` that `raw::detect` classifies as
+    /// `Vendor::BrukerTdf`, or, under `convert.thermo_native` in an engine built with the
+    /// `thermo` feature, a Thermo `.raw`; the two vendor inputs are read natively. Every
+    /// other vendor file is converted to mzML by `raw::ensure_mzml` before this stage.
     pub mzml: &'a str,
     pub out_dir: &'a str,
     /// mzML: the first N spectra. Native diaPASEF: the first N frames.
@@ -272,9 +289,8 @@ impl ConvertSchemas {
 /// `LargeListF32`: a 32-bit arrow list offset saturates above 2^31-1 values, and the
 /// readers accept either width.
 ///
-/// Spectra per flushed chunk and per parquet row group. MS2 scans at ~2,000 peaks are
-/// ~8 MB per list column per chunk before compression, so the conversion's resident set is
-/// a few tens of MB regardless of run length.
+/// MS2 scans at ~2,000 peaks are ~8 MB per list column per chunk before compression, so
+/// the conversion's resident set is a few tens of MB regardless of run length.
 const SPECTRA_CHUNK: usize = 2048;
 
 /// Column accumulators for one chunk of MS1 scans. `cols()` drains them into exactly the
@@ -433,18 +449,16 @@ impl Q1Sweep {
     }
 }
 
-/// The `count` attribute of `<spectrumList>`, read from the head of an mzML.
+/// The `count` attribute of `<spectrumList>`, from the head of an mzML
+/// ([`crate::instrument::mzml_head`]).
 ///
 /// `None` when the file is compressed, the attribute is absent, or the head cannot be
 /// read: the caller then skips the completeness check rather than guessing.
-fn declared_spectrum_count(path: &str) -> Option<usize> {
-    use std::io::Read as _;
-    let mut head = vec![0u8; 1 << 20];
-    let mut f = std::fs::File::open(path).ok()?;
-    let n = f.read(&mut head).ok()?;
-    let text = String::from_utf8_lossy(&head[..n]);
-    let at = text.find("<spectrumList")?;
-    let rest = &text[at..];
+fn declared_spectrum_count(head: &str) -> Option<usize> {
+    let at = head.find("<spectrumList")?;
+    let rest = &head[at..];
+    // The start tag only: a later element's `count` is not the spectrum count.
+    let rest = &rest[..rest.find('>')?];
     let c = rest.find("count=")? + "count=".len();
     let rest = rest[c..].trim_start();
     let quote = rest.chars().next()?;
@@ -1110,7 +1124,7 @@ impl Fold {
 }
 
 /// Spectra per batch handed from the Thermo reader thread to the decode pool.
-#[cfg(feature = "thermo")]
+#[cfg(any(test, feature = "thermo"))]
 const THERMO_BATCH: usize = 512;
 
 /// The Thermo `.raw` decode (`convert.thermo_native`): one thread reads spectra from the
@@ -1118,9 +1132,9 @@ const THERMO_BATCH: usize = 512;
 /// (peak extraction and the `--top-peaks` caps), which is the larger share of the work on a
 /// dense Astral file. The batches are folded in order with the same `scan_index` and the
 /// same `read` count as [`drive_sequential`], so the output is identical to it.
-#[cfg(feature = "thermo")]
+#[cfg(any(test, feature = "thermo"))]
 fn drive_thermo(
-    reader: mzdata::io::thermo::ThermoRawReader,
+    reader: impl Iterator<Item = mzdata::spectrum::MultiLayerSpectrum> + Send,
     fold: &mut Fold,
     p: &ConvertParams,
 ) -> Result<usize> {
@@ -1130,9 +1144,13 @@ fn drive_thermo(
     } else {
         usize::MAX
     };
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<mzdata::spectrum::MultiLayerSpectrum>>(4);
     let mut read = 0usize;
     std::thread::scope(|scope| -> Result<()> {
+        // Inside the scope, so an early return drops `rx`: the reader's next send then
+        // fails and it exits. Created outside, it outlived the return, the reader blocked
+        // on the full queue and the scope waited for it for ever.
+        let (tx, rx) =
+            std::sync::mpsc::sync_channel::<Vec<mzdata::spectrum::MultiLayerSpectrum>>(4);
         scope.spawn(move || {
             let mut batch = Vec::with_capacity(THERMO_BATCH);
             for spec in reader.take(limit) {
@@ -1661,14 +1679,15 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
         //
         // Deliberately NOT `SpectrumSource::len()`: that comes from the index, and in an
         // indexedmzML the index is at the END of the file, so exactly the truncation this
-        // guard is for makes it read 0. `spectrumList count` is in the header, a few
-        // hundred KiB in at most, so it survives any truncation long enough to be worth
-        // checking.
-        let declared = declared_spectrum_count(p.mzml).unwrap_or(0);
+        // guard is for makes it read 0. `spectrumList count` is in the header, so it
+        // survives any truncation long enough to be worth checking. The header is read
+        // once, for the count and the instrument both.
+        let head = crate::instrument::mzml_head(p.mzml).unwrap_or_default();
+        let declared = declared_spectrum_count(&head).unwrap_or(0);
         // The instrument, for the settings chosen per instrument
         // (`extract.apex_count_window = "auto"`). Recorded in every spectra report; `null`
         // when the header names none.
-        let instrument = crate::instrument::from_mzml(p.mzml);
+        let instrument = crate::instrument::parse_header(&head);
         match &instrument {
             Some(i) => info!(
                 instrument = %i.describe(),
@@ -1881,9 +1900,9 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
             json!({"cycles": q1.cycles(), "max_steps": q1.max_steps}),
         );
     }
-    // The reader and its centroiding settings, for a native diaPASEF run only: an mzML
-    // report keeps exactly the fields it always had, and an absent `reader` reads as mzML
-    // (`instrument::provenance`).
+    // The reader and its centroiding settings, for a native Thermo or diaPASEF read only: an
+    // mzML report keeps exactly the fields it always had, and an absent `reader` reads as
+    // mzML (`instrument::provenance`).
     if native_thermo {
         let obj = params.as_object_mut().expect("params is an object");
         obj.insert("reader".into(), json!(crate::instrument::READER_THERMO));
@@ -2954,6 +2973,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// The same guard when `<spectrumList` starts past the first mebibyte, as it does in a
+    /// SCIEX file of a method with thousands of experiments. One 1 MiB read found no count
+    /// there, and the check was skipped without a word.
+    #[test]
+    fn a_short_file_with_a_long_header_still_refuses() {
+        let d = tmpdir("short_long_header");
+        let mzml_path = d.join("short.mzML");
+        // A comment stands in for the parameter groups; the mzML reader skips it.
+        let pad = format!("<!--{}-->", "x".repeat(3 << 19));
+        let text = mzml(5, &four_spectra(["0.10", "0.11", "0.20", "0.21"])).replacen(
+            "<run ",
+            &format!("{pad}<run "),
+            1,
+        );
+        assert!(text.find("<spectrumList").unwrap() > 1 << 20);
+        std::fs::write(&mzml_path, text).unwrap();
+        let msg = format!(
+            "{:#}",
+            convert_with(&mzml_path, &d.join("out"), None)
+                .err()
+                .expect("a file shorter than its own header must be refused")
+        );
+        assert!(msg.contains("truncated or corrupt"), "{msg}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// `--max-spectra` is a deliberate short read and stays excluded from the
     /// completeness check, including now that `read` advances earlier in the
     /// body: the `break` still precedes the assignment, so `capped` is unchanged.
@@ -3132,6 +3177,47 @@ mod tests {
             "{msg}"
         );
         assert!(msg.contains("600 distinct targets"), "{msg}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The Thermo decode returns an error of the fold instead of hanging. Its queue was
+    /// made outside the reader thread's scope, so an early return left the receiver alive,
+    /// the reader blocked on the full queue and the scope waited for it for ever. Fed an
+    /// mzML reader here, as the test build has no Thermo reader: 15,025 spectra refused at
+    /// the 10,000th target-only one leave more than the queue's four batches unread.
+    #[test]
+    fn the_thermo_decode_returns_an_error_of_the_fold_instead_of_hanging() {
+        let d = tmpdir("thermo_queue");
+        let path = d.join("zt.mzML");
+        let spectra = scanning_run(25, 600, None);
+        std::fs::write(&path, mzml(spectra.len(), &spectra)).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dir = d.clone();
+        // On its own thread, so a hang fails the test instead of blocking the suite.
+        std::thread::spawn(move || {
+            let src = dir.join("zt.mzML");
+            let src = src.to_str().unwrap();
+            let (m1, m2) = (dir.join("ms1.parquet"), dir.join("ms2.parquet"));
+            let mut fold =
+                Fold::new(m1.to_str().unwrap(), m2.to_str().unwrap(), false).with_source(src);
+            let p = ConvertParams {
+                mzml: src,
+                out_dir: dir.to_str().unwrap(),
+                max_spectra: 0,
+                top_peaks_ms2: 0,
+                top_peaks_ms1: 0,
+                config_hash: "test",
+                tdf: TdfParams::default(),
+                isolation_half_width: None,
+            };
+            let reader = mzdata::MZReader::open_path(src).unwrap();
+            let _ = tx.send(drive_thermo(reader, &mut fold, &p));
+        });
+        let res = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the Thermo decode hung after the fold failed");
+        let msg = format!("{:#}", res.expect_err("refused"));
+        assert!(msg.contains("no lower or upper offset"), "{msg}");
         let _ = std::fs::remove_dir_all(&d);
     }
 

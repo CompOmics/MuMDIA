@@ -85,8 +85,8 @@ pub(crate) fn list_col<'a>(b: &'a RecordBatch, name: &str) -> Result<ListF32<'a>
 /// ([`TableFile::row_parts`]; `convert` writes an offset index, so even its one row group
 /// splits at page granularity), each part decodes its own rows, and the parts are
 /// concatenated in order before the (stable) retention-time sort. Row order before the
-/// sort is therefore file order, as in the serial decode, and the result is the same
-/// `Vec` bit for bit (`the_parallel_ms2_decode_is_the_serial_decode`).
+/// sort is therefore file order, as in a serial decode, and the result is the same `Vec`
+/// bit for bit at any thread count (`the_parallel_decode_returns_the_written_scans`).
 pub fn load_ms2(path: &str) -> Result<Vec<Ms2Scan>> {
     let t0 = std::time::Instant::now();
     let t = TableFile::open(path).with_context(|| format!("loading ms2 {path}"))?;
@@ -107,14 +107,14 @@ pub fn load_ms2(path: &str) -> Result<Vec<Ms2Scan>> {
         .filter_map(|s| s.im.as_deref())
         .map(std::mem::size_of_val)
         .sum();
-    let mut parts = vec![
+    let mut parts_mem = vec![
         ("peaks", peak_bytes),
         ("scan_spine", std::mem::size_of_val(out.as_slice())),
     ];
     if im_bytes > 0 {
-        parts.push(("peak_im", im_bytes));
+        parts_mem.push(("peak_im", im_bytes));
     }
-    crate::memlog::report("ms2 scans", &parts);
+    crate::memlog::report("ms2 scans", &parts_mem);
     // The decode's own wall time. The stage logs bracket it together with the library load
     // and the index build, so without this line no log could say which of the three a seed
     // or an extract spent its load phase on.
@@ -409,142 +409,6 @@ fn decode_ms1(t: &TableFile) -> Result<Vec<Ms1Scan>> {
     Ok(out)
 }
 
-/// The serial decoders the parallel ones replaced, kept verbatim as the reference the tests
-/// compare against scan for scan, bit for bit.
-#[cfg(test)]
-mod serial {
-    use super::*;
-    use arrow::array::{ArrayRef, Float32Array, LargeListArray, ListArray};
-
-    enum FloatList<'a> {
-        Small(&'a ListArray),
-        Large(&'a LargeListArray),
-    }
-
-    impl<'a> FloatList<'a> {
-        fn new(col: &'a dyn Array, name: &str) -> Result<FloatList<'a>> {
-            if let Some(a) = col.as_any().downcast_ref::<ListArray>() {
-                return Ok(FloatList::Small(a));
-            }
-            if let Some(a) = col.as_any().downcast_ref::<LargeListArray>() {
-                return Ok(FloatList::Large(a));
-            }
-            Err(anyhow!("column '{name}' is not a float list"))
-        }
-        fn len(&self) -> usize {
-            match self {
-                FloatList::Small(a) => a.len(),
-                FloatList::Large(a) => a.len(),
-            }
-        }
-        fn is_null(&self, k: usize) -> bool {
-            match self {
-                FloatList::Small(a) => a.is_null(k),
-                FloatList::Large(a) => a.is_null(k),
-            }
-        }
-        fn value(&self, k: usize) -> ArrayRef {
-            match self {
-                FloatList::Small(a) => a.value(k),
-                FloatList::Large(a) => a.value(k),
-            }
-        }
-    }
-
-    fn col<'a>(b: &'a RecordBatch, name: &str) -> Result<FloatList<'a>> {
-        let i = b.schema().index_of(name)?;
-        FloatList::new(b.column(i).as_ref(), name)
-    }
-
-    fn inner_f32<'a>(v: &'a ArrayRef, name: &str) -> Result<&'a Float32Array> {
-        v.as_any()
-            .downcast_ref::<Float32Array>()
-            .ok_or_else(|| anyhow!("list '{name}' inner is not f32"))
-    }
-
-    pub fn load_ms2(path: &str) -> Result<Vec<Ms2Scan>> {
-        let t = TableFile::open(path)?;
-        let scan_index = t.u32("scan_index")?;
-        let rt = t.f64("rt_seconds")?;
-        let wlo = t.f64("window_lower")?;
-        let whi = t.f64("window_upper")?;
-        let wtarget = t.f64("window_target")?;
-        let mut out = Vec::with_capacity(t.nrows);
-        let mut i = 0usize;
-        t.for_each_batch(Some(&["mz", "intensity"]), SCAN_BATCH_ROWS, |b| {
-            let mza = col(b, "mz")?;
-            let ina = col(b, "intensity")?;
-            for k in 0..mza.len() {
-                let peaks: Vec<Peak> = if mza.is_null(k) || ina.is_null(k) {
-                    Vec::new()
-                } else {
-                    let mv = mza.value(k);
-                    let mf = inner_f32(&mv, "mz")?;
-                    let iv = ina.value(k);
-                    let iff = inner_f32(&iv, "intensity")?;
-                    let n = mf.len().min(iff.len());
-                    (0..n)
-                        .map(|j| Peak {
-                            mz: mf.value(j),
-                            intensity: iff.value(j),
-                        })
-                        .collect()
-                };
-                out.push(Ms2Scan {
-                    scan_index: scan_index[i],
-                    rt_seconds: rt[i],
-                    window: IsolationWindow {
-                        target_mz: wtarget[i],
-                        lower_mz: wlo[i],
-                        upper_mz: whi[i],
-                        im_lower: None,
-                        im_upper: None,
-                    },
-                    peaks,
-                    im: None,
-                });
-                i += 1;
-            }
-            Ok(())
-        })?;
-        out.sort_by(|a, b| a.rt_seconds.total_cmp(&b.rt_seconds));
-        Ok(out)
-    }
-
-    pub fn load_ms1(path: &str) -> Result<Vec<Ms1Scan>> {
-        let t = TableFile::open(path)?;
-        let scan_index = t.u32("scan_index")?;
-        let rt = t.f64("rt_seconds")?;
-        let mut out = Vec::with_capacity(t.nrows);
-        let mut i = 0usize;
-        t.for_each_batch(Some(&["mz", "intensity"]), SCAN_BATCH_ROWS, |b| {
-            let mza = col(b, "mz")?;
-            let ina = col(b, "intensity")?;
-            for k in 0..mza.len() {
-                let mv = (!mza.is_null(k)).then(|| mza.value(k));
-                let iv = (!ina.is_null(k)).then(|| ina.value(k));
-                let mf = mv.as_ref().map(|v| inner_f32(v, "mz")).transpose()?;
-                let iff = iv.as_ref().map(|v| inner_f32(v, "intensity")).transpose()?;
-                let n = match (&mf, &iff) {
-                    (Some(m), Some(x)) => m.len().min(x.len()),
-                    _ => 0,
-                };
-                out.push(Ms1Scan {
-                    scan_index: scan_index[i],
-                    rt_seconds: rt[i],
-                    mz: mf.map(|m| m.values()[..n].to_vec()).unwrap_or_default(),
-                    intensity: iff.map(|x| x.values()[..n].to_vec()).unwrap_or_default(),
-                    im: None,
-                });
-                i += 1;
-            }
-            Ok(())
-        })?;
-        out.sort_by(|a, b| a.rt_seconds.total_cmp(&b.rt_seconds));
-        Ok(out)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,6 +435,29 @@ mod tests {
     }
     use mumdia_io::table::{write_table, Col};
 
+    /// Scan `i` of [`write_spectra`]: its retention time (out of order, with ties), the
+    /// lower bound of its 25 m/z isolation window, and its m/z (`which` 0) and intensity
+    /// (`which` 1) lists, null for some scans and of unequal length for most.
+    fn rt_of(i: usize) -> f64 {
+        ((i * 7919) % 97) as f64 * 1.5
+    }
+
+    fn win_of(i: usize) -> f64 {
+        400.0 + (i % 8) as f64 * 25.0
+    }
+
+    fn list_of(i: usize, which: usize) -> Option<Vec<f32>> {
+        if i % 29 == 3 && which == 0 || i % 31 == 5 && which == 1 {
+            return None;
+        }
+        let len = (i * 13 + which) % 9 + usize::from(i.is_multiple_of(17) && which == 1);
+        Some(
+            (0..len)
+                .map(|k| 100.0 + i as f32 * 0.37 + k as f32 * 11.0)
+                .collect(),
+        )
+    }
+
     /// A spectra table shaped like `convert`'s (LargeList peak columns), with the awkward
     /// rows the loaders must keep: null lists, lists of unequal length, empty lists, and
     /// retention times out of order with ties, written in `row_group` rows per group and
@@ -584,18 +471,8 @@ mod tests {
         use parquet::arrow::ArrowWriter;
         use parquet::file::properties::{EnabledStatistics, WriterProperties};
         use std::sync::Arc;
-        let rt: Vec<f64> = (0..n).map(|i| ((i * 7919) % 97) as f64 * 1.5).collect();
-        let fill = |i: usize, which: usize| -> Option<Vec<f32>> {
-            if i % 29 == 3 && which == 0 || i % 31 == 5 && which == 1 {
-                return None;
-            }
-            let len = (i * 13 + which) % 9 + usize::from(i.is_multiple_of(17) && which == 1);
-            Some(
-                (0..len)
-                    .map(|k| 100.0 + i as f32 * 0.37 + k as f32 * 11.0)
-                    .collect(),
-            )
-        };
+        let rt: Vec<f64> = (0..n).map(rt_of).collect();
+        let fill = list_of;
         let list_field = Arc::new(Field::new_list_field(DataType::Float32, true));
         let lt = if list32 {
             DataType::List(list_field.clone())
@@ -639,7 +516,7 @@ mod tests {
             Field::new("mz", lt.clone(), true),
             Field::new("intensity", lt, true),
         ]));
-        let win = |i: usize| 400.0 + (i % 8) as f64 * 25.0;
+        let win = win_of;
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -712,16 +589,45 @@ mod tests {
             .collect()
     }
 
-    /// The parallel decode (row parts, the borrowed list view) returns exactly the serial
-    /// decode's scans, in the same order, on many row groups, on one row group split at
-    /// page granularity through its offset index, on one group without an index, and with
-    /// 32-bit list offsets; the peak lists keep their nulls-as-empty and shorter-list
-    /// rules and the RT sort keeps its tie order.
+    /// The parallel decode (row parts, the borrowed list view) returns the scans
+    /// `write_spectra` wrote: scan `i` at `rt_of(i)` in window `win_of(i)`, a null list
+    /// read as an empty scan, the peaks zipped and cut to the shorter list, in a stable
+    /// retention-time sort (file order on ties). On many row groups, on one row group
+    /// split at page granularity through its offset index, on one group without an index,
+    /// and with 32-bit list offsets.
     #[test]
-    fn the_parallel_ms2_decode_is_the_serial_decode() {
+    fn the_parallel_decode_returns_the_written_scans() {
         let dir = std::env::temp_dir().join(format!("mumdia_spectra_par_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let n = 3_000usize;
+        let mut want2: Vec<(f64, ScanBits)> = (0..n)
+            .map(|i| {
+                let peaks = match (list_of(i, 0), list_of(i, 1)) {
+                    (Some(mz), Some(x)) => mz
+                        .iter()
+                        .zip(&x)
+                        .map(|(m, x)| (m.to_bits(), x.to_bits()))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let w = win_of(i);
+                let window = [(w + 12.5).to_bits(), w.to_bits(), (w + 25.0).to_bits()];
+                (rt_of(i), (i as u32, rt_of(i).to_bits(), window, peaks))
+            })
+            .collect();
+        want2.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let want2: Vec<ScanBits> = want2.into_iter().map(|(_, s)| s).collect();
+        let want1: Vec<(u32, u64, Vec<u32>, Vec<u32>)> = want2
+            .iter()
+            .map(|(i, rt, _, peaks)| {
+                let (mz, intensity) = peaks.iter().copied().unzip();
+                (*i, *rt, mz, intensity)
+            })
+            .collect();
+        assert!(
+            want2.iter().any(|s| s.3.is_empty()),
+            "the fixture must hold empty scans"
+        );
         for (tag, rg, oi, l32) in [
             ("many", 211usize, true, false),
             ("one_indexed", n, true, false),
@@ -734,20 +640,14 @@ mod tests {
                 .unwrap()
                 .to_string();
             write_spectra(&p, n, rg, oi, l32);
-            let want2 = serial::load_ms2(&p).unwrap();
-            let want1 = serial::load_ms1(&p).unwrap();
-            assert!(
-                want2.iter().any(|s| s.peaks.is_empty()) && want2.len() == n,
-                "{tag}: the fixture must hold empty scans"
-            );
             for threads in [1usize, 3, 8] {
                 let pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(threads)
                     .build()
                     .unwrap();
                 let (got2, got1) = pool.install(|| (load_ms2(&p).unwrap(), load_ms1(&p).unwrap()));
-                assert_eq!(ms2_bits(&got2), ms2_bits(&want2), "{tag} ms2 @ {threads}");
-                assert_eq!(ms1_bits(&got1), ms1_bits(&want1), "{tag} ms1 @ {threads}");
+                assert_eq!(ms2_bits(&got2), want2, "{tag} ms2 @ {threads}");
+                assert_eq!(ms1_bits(&got1), want1, "{tag} ms1 @ {threads}");
             }
         }
         let _ = std::fs::remove_dir_all(&dir);

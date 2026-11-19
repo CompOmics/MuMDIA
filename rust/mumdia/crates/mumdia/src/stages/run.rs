@@ -1169,18 +1169,10 @@ fn convert_and_record(
     spectra_dir: &str,
     man: &mut Manifest,
 ) -> Result<convert::ConvertOutputs> {
-    // Fold the conversion caps into the convert artifacts' provenance key, exactly as the
-    // standalone `convert` subcommand does. They change the spectra output but are not part
-    // of the config, so passing the bare config hash here made two runs with different caps
-    // record an identical config_hash for their convert artifacts -- provenance that
-    // disagreed with the standalone entry point for the same inputs.
-    let convert_hash = mumdia_io::hash::blake3_str(&format!(
-        "{}\u{1f}max_spectra={}\u{1f}top_peaks_ms2={}\u{1f}top_peaks_ms1={}",
-        cfg.canonical_json(),
-        p.max_spectra,
-        p.top_peaks_ms2,
-        0
-    ));
+    // The caps in the provenance key, as the standalone `convert` subcommand has them: the
+    // bare config hash once made two runs with different caps record identical provenance.
+    let convert_hash =
+        convert::provenance_hash(&cfg.canonical_json(), p.max_spectra, p.top_peaks_ms2, 0);
     let co = convert::run(convert::ConvertParams {
         mzml: p.mzml,
         out_dir: spectra_dir,
