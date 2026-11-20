@@ -77,9 +77,6 @@ COPY docker/config.diann-lib.json /opt/mumdia/config.diann-lib.json
 # Notices for the statically linked crates, as in the release archive.
 COPY LICENSE THIRD_PARTY_LICENSES.md sbom.cdx.json /opt/mumdia/
 
-# mokapot logistic-regression is the recommended default rescorer.
-ENV MUMDIA_RESCORE_MODEL=logreg
-
 # The engine's caches (`mumdia::cache`): world-writable with the sticky bit, like /tmp,
 # because the container runs as the caller's uid (see --user above). The predictors'
 # model downloads (MS2PIP, AlphaPeptDeep) go there too, under /cache/models, because that

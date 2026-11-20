@@ -9,9 +9,9 @@ legacy `candidate_id` column plus mokapot score and q-value. SpecId is
 with an env that has mokapot + pyarrow (py312_mumdia).
 
 Model is env-switchable so the linear-vs-NN A/B needs no code edit:
-    MUMDIA_RESCORE_MODEL = nn  (default)  -> sklearn MLPClassifier in mokapot.Model
-                         = logreg         -> L2 logistic regression (MUMDIA_LR_C,
-                                             MUMDIA_LR_MAX_ITER); the Docker image sets it
+    MUMDIA_RESCORE_MODEL = logreg (default) -> L2 logistic regression (MUMDIA_LR_C,
+                                               MUMDIA_LR_MAX_ITER)
+                         = nn             -> sklearn MLPClassifier in mokapot.Model
                          = percolator     -> mokapot's default linear model
 NN hyperparameters (only read when MODEL=nn):
     MUMDIA_NN_HIDDEN     = "128,64,64,32"  comma-separated hidden layer sizes
@@ -35,8 +35,8 @@ import pyarrow.parquet as pq
 
 
 def make_model(mokapot):
-    """Build the mokapot model selected by MUMDIA_RESCORE_MODEL (default: nn)."""
-    kind = os.environ.get("MUMDIA_RESCORE_MODEL", "nn").lower()
+    """Build the mokapot model selected by MUMDIA_RESCORE_MODEL (default: logreg)."""
+    kind = os.environ.get("MUMDIA_RESCORE_MODEL", "logreg").lower()
     brew_iters = int(os.environ.get("MUMDIA_BREW_ITERS", "20"))
     if kind in ("percolator", "linear", "svm"):
         # mokapot's default (grid-searched linear SVM). model=None in brew.
@@ -160,7 +160,7 @@ def main():
         }
     )
     pq.write_table(out, out_path)
-    model_name = os.environ.get("MUMDIA_RESCORE_MODEL", "nn")
+    model_name = os.environ.get("MUMDIA_RESCORE_MODEL", "logreg")
     print(f"mokapot_worker[{model_name}]: {len(cids)} PSMs rescored (targets+decoys)")
 
 

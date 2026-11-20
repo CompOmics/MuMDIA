@@ -873,7 +873,7 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
                     info!("rescore: using Mokapot scores");
                     classifier_used = "mokapot";
                     let estimator =
-                        std::env::var("MUMDIA_RESCORE_MODEL").unwrap_or_else(|_| "nn".to_string());
+                        std::env::var("MUMDIA_RESCORE_MODEL").unwrap_or_else(|_| "logreg".to_string());
                     model_identity = format!("mokapot-{estimator}");
                     s
                 }

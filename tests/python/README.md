@@ -132,7 +132,7 @@ positive selection equals the full `tda_q` selection or declines.
 The same complete-coverage contract, and that the out-of-fold branch ran (there
 is deliberately no in-sample fallback). Plus model selection:
 `MUMDIA_RESCORE_MODEL=logreg` and its aliases build a `LogisticRegression`, the
-unset default is the sklearn MLP, `percolator`/`linear`/`svm` mean `model=None`,
+unset default is also logistic regression, `nn` the sklearn MLP, `percolator`/`linear`/`svm` mean `model=None`,
 and an unknown name aborts instead of falling back.
 
 ### `test_entrapment_worker.py` (needs scikit-learn)

@@ -216,6 +216,14 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **mokapot trains logistic regression on every install (docs/13).** The worker's default
+  model was the sklearn MLP; only the Docker image set `MUMDIA_RESCORE_MODEL=logreg`, so one
+  configuration with `rescore.classifier = mokapot` trained logistic regression in Docker and
+  an MLP in the conda environment, the desktop application and the release archive.
+  `logreg` is now the worker's default and the engine's model-identity fallback, and the
+  image no longer sets it. A mokapot run outside Docker therefore changes model: its scores
+  change, and `model_identity` reads `mokapot-logreg` instead of `mokapot-nn`.
+  `MUMDIA_RESCORE_MODEL=nn` keeps the MLP.
 - **The sidecar workers hold less memory and share one copy of their DeepLC helpers (docs/13).**
   `ms2pip_worker.py` writes each predicted chunk as it comes instead of keeping every chunk
   and concatenating them at the end, which held the fragment table twice.

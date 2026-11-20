@@ -2226,8 +2226,8 @@ def main():
                 fold = _folds(_tb.column("Peptide").to_pylist())
             del _tb
         else:
-            # Streamed only above twice the free memory, so the metadata is read in
-            # CHUNK-row batches as well.
+            # The streaming backend reads the metadata in CHUNK-row batches as well, so no
+            # whole column is held.
             n = int(pq.read_metadata(meta_path).num_rows)
             y = np.empty(n, np.float32)
             cids = np.empty(n, np.int64)

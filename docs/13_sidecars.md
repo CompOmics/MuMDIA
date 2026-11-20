@@ -1037,7 +1037,7 @@ configured.
 | `mbr.requant_all` | `false` | requantify already-identified precursors, not only transfers; only meaningful for `strategy = full`. **Unwired** in the current `mbr_worker.py`. |
 
 **Worker-only env knobs** (not config fields; set in the process environment).
-`mokapot_worker.py`: `MUMDIA_RESCORE_MODEL` (default `nn`; accepts the aliases
+`mokapot_worker.py`: `MUMDIA_RESCORE_MODEL` (default `logreg`; accepts `nn` and the aliases
 `logreg`/`logistic`/`lr` and `percolator`/`linear`/`svm`), `MUMDIA_BREW_ITERS` (20, the `Model.max_iter`
 semi-supervised count), `MUMDIA_NN_HIDDEN` (`128,64,64,32`), `MUMDIA_NN_SOLVER`
 (adam), `MUMDIA_NN_MAX_ITER` (200), `MUMDIA_NN_ALPHA` (1e-4); logreg reads
@@ -1069,11 +1069,11 @@ locates its model archive). Every worker inherits the temporary directory the en
 chose: with `--temp-dir` or `MUMDIA_TEMP_DIR` the engine sets `TMP`, `TEMP`, `TMPDIR` and,
 unless set, `MPLCONFIGDIR` before it starts a worker (docs/14, "Where MuMDIA writes").
 `deeplc_finetune.py`: `DEEPLC_FT_THREADS`
-(8, the training pool) plus argparse flags. Note the mokapot worker's **code default
-model is `nn`** (the sklearn MLP inside mokapot), even though the recommended portable path
-(`env/mumdia-rescore.yml`) sets `MUMDIA_RESCORE_MODEL=logreg`; the Rust caller
-does not set `MUMDIA_RESCORE_MODEL`, so unless the environment sets it you get the
-MLP. Set it explicitly for the logreg path.
+(8, the training pool) plus argparse flags. The mokapot worker's default model is
+logistic regression on every install (Docker image, conda env, desktop, release archive);
+before 2026-11-20 only the Docker image set `MUMDIA_RESCORE_MODEL=logreg` and every other
+install trained the sklearn MLP. The Rust caller does not set the variable, and records the
+model as `mokapot-<MUMDIA_RESCORE_MODEL or logreg>`.
 
 ## Invariants, determinism, gotchas
 
