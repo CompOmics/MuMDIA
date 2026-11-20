@@ -260,8 +260,10 @@ than a number. Both are recorded in every run's `manifest.json`.
   lender and the share of its examined region (`shadow_region x accepted`) that it sized. The
   first pass now groups on run, peptidoform and charge, as the demotion is described. One run
   has the same groups and writes the same tables; a pooled rescore (`run` with several
-  `--mzml`, `run-experiment`) demotes more shadows in every run, so its scores and counts
-  change. The stage interns peptidoform and charge once instead of twice, and the shadow
+  `--mzml`, `run-experiment`) demotes about three times as many shadows over three runs, so its
+  scores and counts change: on the ProteoBench Astral entrapment set (three runs pooled, three
+  NN seeds) +1.8% precursors at an experiment-wide 1% with the paired entrapment FDP
+  0.89% -> 0.86%, and +1.5% per run at 0.67% -> 0.62%. The stage interns peptidoform and charge once instead of twice, and the shadow
   test no longer holds an apex 1/K0 and an isolation window for every pooled row (24 bytes a
   row, about 6 GB at a 259M-row pool): it keeps 1/K0 values only with `shadow_im_tolerance`
   set and finds the window of the rows it reads, and its rows drop the label it never read,
