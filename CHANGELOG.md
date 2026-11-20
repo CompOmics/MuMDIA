@@ -320,7 +320,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   Windows) ended the prune before `pruned.json` was written, so the files already removed had
   no record; they are recorded before the error is raised.
 - **Prescreen: a search with a terminal modification rule runs with the tag prefilter
-  (docs/34).** The tag alphabet read every modification rule as a residue state, so a variable
+  (docs/34, #357).** The tag alphabet read every modification rule as a residue state, so a variable
   `protein_n_term` or `peptide_n_term` rule (residue `*`, as the desktop's ZT Scan library preset
   sets one) stopped the run after convert with "prescreen tag alphabet: no residue '*'". A
   terminal rule now adds no state, which loses no tag because a terminal modification already
@@ -333,7 +333,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   panicked, `n:Acetyl` meant asparagine) are refused at load. The prefilters before prediction no
   longer warn on every run that all candidates lack a retention-time window, which they lack by
   design there.
-- **Prescreen: less memory, same output.** Loading the spectra no longer holds a second copy of
+- **Prescreen: less memory, same output (#357).** Loading the spectra no longer holds a second copy of
   every MS2 peak; the per-candidate row map, repeat scores, score copy and pre-retrieval copy
   (32 bytes a candidate, about 6.5 GB on a 203M-candidate library) are allocated only when the
   evaluation sample, the repeat bonus, the scores table or tag retrieval needs them; and window
