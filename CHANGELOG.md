@@ -263,6 +263,10 @@ than a number. Both are recorded in every run's `manifest.json`.
   refused before Start, which checks every file again first. In a batch searched separately, the
   files that are not diaPASEF keep Automatic's plan. Other inputs are planned as before
   (desktop/README.md, "Prescreen, bands and modifications on the Search screen").
+- **Desktop: a prescreen on diaPASEF input is refused before Start (#PRNUM).** The engine refuses
+  all three prescreen modes on spectra that carry 1/K0, which the Search screen let through to
+  Start; it now names the files and asks to set Prescreen to Off, and the band plan no longer
+  counts a prescreen that cannot run there.
 - **Desktop: "Add folder…" selects several spectra folders at once (#335).** A Bruker or Agilent `.d`
   and a Waters `.raw` are directories, so they are added with "Add folder…", and that dialog took
   one folder at a time: the spectra folder picker shared the single-choice setting of the output

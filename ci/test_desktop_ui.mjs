@@ -1467,6 +1467,26 @@ test("a custom band count on diaPASEF input is a problem before Start", async ()
   assert.deepEqual(diapasefProblem(), []);
 });
 
+test("a prescreen on diaPASEF input is a problem before Start", async () => {
+  const p = await profile();
+  p.answers.vendor_of = vendorAnswer;
+  const problem = () =>
+    [...p.api.searchProblems()].filter((m) => /prescreen cannot be used on diaPASEF/.test(m));
+  await pick(p, "/d/run.d");
+  assert.equal(p.el("prescreen").value, "off");
+  assert.deepEqual(problem(), []);
+  // Every mode the engine refuses there, named with the file.
+  for (const mode of selectOptions(HTML, "prescreen").filter((m) => m !== "off")) {
+    p.el("prescreen").value = mode;
+    const found = problem();
+    assert.equal(found.length, 1, mode);
+    assert.match(found[0], /run\.d/);
+  }
+  // An mzML with a prescreen is not.
+  await pick(p, "/d/REP01.mzML");
+  assert.deepEqual(problem(), []);
+});
+
 test("a fresh vendor check replaces an answer from before a copy completed", async () => {
   const p = load();
   // A .d still being copied has no analysis.tdf_bin yet and reads as a plain Bruker .d.

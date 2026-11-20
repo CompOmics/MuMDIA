@@ -904,6 +904,9 @@ to the `balanced` and `stringent` presets. The two modes before prediction are
 single-file only (`run-experiment` refuses them), and the mode after calibration cannot
 be combined with bands (config validation refuses it), so the screen refuses both
 combinations before a library is built or a run starts, and says which choice to change.
+On diaPASEF input the engine refuses all three modes (they group the spectra by m/z
+window only; docs/35_diapasef.md), so the screen refuses any prescreen there too, naming
+the files, and the band plan sizes the whole library instead of what a prescreen keeps.
 
 **Bands** (`groups.window_groups`, `groups.parallel`, docs/33). Automatic, off, or a
 custom count. The automatic plan (`sizing::band_plan`) takes the machine's physical

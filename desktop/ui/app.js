@@ -4321,6 +4321,15 @@ function searchProblems() {
     );
   }
   const diapasef = diapasefInputs();
+  // The engine refuses all three prescreen modes on diaPASEF input (`refuse_unsupported_on_4d`):
+  // they group the spectra by m/z window only.
+  if (diapasef.length && pre !== "off") {
+    out.push(
+      "The prescreen cannot be used on diaPASEF spectra yet: it groups the spectra by m/z " +
+        "window only, and diaPASEF windows also differ in ion mobility. Set Prescreen to Off " +
+        `for these files: ${diapasef.map(baseName).join(", ")}.`
+    );
+  }
   if (diapasef.length && $("bands").value === "custom" && customBands().bands > 1) {
     out.push(
       "diaPASEF spectra cannot be split into bands: their windows share m/z ranges and " +

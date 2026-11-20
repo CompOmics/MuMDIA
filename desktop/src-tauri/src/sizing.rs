@@ -282,10 +282,12 @@ pub fn estimate(req: &SpaceRequest, engine: Option<&Path>) -> Space {
             },
         },
     };
-    let keep = if req.keep_fraction.is_finite() {
-        req.keep_fraction.clamp(0.0, 1.0)
-    } else {
+    // The engine refuses the prescreen on diaPASEF input (`refuse_unsupported_on_4d`), so
+    // nothing is dropped before such a search and the plan sizes the whole library.
+    let keep = if req.diapasef || !req.keep_fraction.is_finite() {
         1.0
+    } else {
+        req.keep_fraction.clamp(0.0, 1.0)
     };
     let searched = precursors.map(|p| (p as f64 * keep).round() as u64);
     let threads = req.threads.filter(|&t| t > 0).unwrap_or(m.threads);
@@ -726,6 +728,28 @@ ACDEFGHIKL
         assert_eq!(fasta_space(&f, &c).unwrap().0, 2);
         c.cleavage_rule = Some("DD D".into());
         assert!(fasta_space(&f, &c).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_prescreen_is_not_counted_on_diapasef_input() {
+        let dir = std::env::temp_dir().join(format!("mumdia-sizing-pre-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("t.fasta");
+        std::fs::write(&f, ">a\nGGGKSSSR\n").unwrap();
+        let mut r = req(&[], 1);
+        r.fasta = Some(f.to_string_lossy().into_owned());
+        r.keep_fraction = 0.5;
+        let s = estimate(&r, None);
+        let all = s.precursors.unwrap();
+        assert_eq!(
+            s.searched_precursors,
+            Some((all as f64 * 0.5).round() as u64)
+        );
+        // The engine refuses the prescreen on diaPASEF input: the whole library is searched.
+        r.diapasef = true;
+        let s = estimate(&r, None);
+        assert_eq!(s.searched_precursors, Some(all));
         std::fs::remove_dir_all(&dir).ok();
     }
 
