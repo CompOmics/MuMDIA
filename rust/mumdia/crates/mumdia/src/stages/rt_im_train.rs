@@ -17,7 +17,7 @@ use mumdia_io::table::{write_table_chunked_hashed, Col, TableFile};
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::calibrate::{linear_fit, percentile, x_domain_inliers, Loess};
+use crate::calibrate::{linear_fit, percentile, x_domain_inliers, Loess, MAD_TO_SIGMA};
 
 pub struct RtImTrainParams<'a> {
     pub seed_psms: &'a str,
@@ -278,7 +278,7 @@ fn huber_fit(x: &[[f64; 7]], y: &[f64]) -> Option<Vec<f64>> {
             .map(|i| y[i] - (0..P).map(|c| x[i][c] * sol[c]).sum::<f64>())
             .collect();
         let abs: Vec<f64> = resid.iter().map(|r| r.abs()).collect();
-        let s = 1.4826 * percentile(&abs, 0.5);
+        let s = MAD_TO_SIGMA * percentile(&abs, 0.5);
         let done = sol.iter().zip(&beta).all(|(a, b)| (a - b).abs() < 1e-6);
         beta = sol;
         if !(s.is_finite() && s > 0.0) || done {
@@ -407,7 +407,7 @@ impl LocalWindow {
 }
 
 /// A fitted retention-time calibration: everything the anchors determine, which
-/// [`apply`] then maps over a library table.
+/// [`apply_in_memory`] then maps over a library table.
 ///
 /// Under `groups.calibration = global` every band of a grouped run fits the same pooled
 /// anchors with their iRT read from the seed (`anchor_irt_from_seed`), so the fit depends on
@@ -664,7 +664,7 @@ impl RtFit {
     }
 }
 
-/// What [`apply`] writes: the windows of one library table and its `cal.json`.
+/// What [`apply_in_memory`] writes: the windows of one library table and its `cal.json`.
 pub struct ApplyParams<'a> {
     pub library_precursors: &'a str,
     /// As [`RtImTrainParams::precursor_span`].
@@ -687,18 +687,14 @@ fn note_window_choice(cfg: &RtImTrainConfig) {
 }
 
 pub fn run(p: RtImTrainParams) -> Result<u64> {
-    run_hashed(p).map(|w| w.rows)
+    run_impl(p, false, |_| Ok(())).map(|(written, _)| written.rows)
 }
 
 /// [`run`], returning the output's row count and the content hash its report records, so
-/// an orchestrator can record the artifact without reading and hashing it again.
-pub fn run_hashed(p: RtImTrainParams) -> Result<Written> {
-    run_impl(p, false, |_| Ok(())).map(|(written, _)| written)
-}
-
-/// [`run_hashed`], also returning the fitted windows in the form `extract` consumes, so an
-/// orchestrator can hand them over instead of having `extract` decode the table it just
-/// wrote. `None` only when the table holds a NaN bound (see [`RtWindows`]).
+/// an orchestrator can record the artifact without reading and hashing it again, and the
+/// fitted windows in the form `extract` consumes, so it can hand them over instead of
+/// having `extract` decode the table it just wrote. `None` only when the table holds a NaN
+/// bound (see [`RtWindows`]).
 pub fn run_in_memory(p: RtImTrainParams) -> Result<(Written, Option<RtWindows>)> {
     run_impl(p, true, |_| Ok(()))
 }
@@ -974,14 +970,9 @@ pub fn fit_from_seed(seed_psms: &str, cfg: &RtImTrainConfig) -> Result<RtFit> {
 }
 
 /// Write the windows of `p.library_precursors` and its `cal.json` from a fit made by
-/// [`fit_from_seed`]. With the fit [`run`] would have made and the same table, this writes
+/// [`fit_from_seed`], and return them in the form `extract` consumes, as [`run_in_memory`]
+/// does for [`run`]. With the fit [`run`] would have made and the same table, this writes
 /// what [`run`] writes, byte for byte (the report's `elapsed_ms` aside).
-pub fn apply(fit: &RtFit, p: &ApplyParams) -> Result<u64> {
-    apply_impl(fit, p, false).map(|(written, _)| written.rows)
-}
-
-/// [`apply`], also returning the windows in the form `extract` consumes, as
-/// [`run_in_memory`] does for [`run`].
 pub fn apply_in_memory(fit: &RtFit, p: &ApplyParams) -> Result<(Written, Option<RtWindows>)> {
     apply_impl(fit, p, true)
 }
@@ -1223,7 +1214,7 @@ fn fit_anchors(
                     .collect();
                 let p_rt_s = percentile(&resid, cfg.p_rt);
                 Some(HoldoutSizing {
-                    width: (p_rt_s * cfg.rt_window_multiplier).max(1.0),
+                    width: (p_rt_s * cfg.rt_window_multiplier).max(cfg.rt_window_min_s),
                     n_sizing_train: tr_x.len(),
                     n_holdout: ho_x.len(),
                     resid_p_rt_s: p_rt_s,
@@ -1259,7 +1250,8 @@ fn fit_anchors(
                         .zip(&train_rt)
                         .map(|(x, y)| (y - fit.predict(*x)).abs())
                         .collect();
-                    (percentile(&resid, cfg.p_rt) * cfg.rt_window_multiplier).max(1.0)
+                    (percentile(&resid, cfg.p_rt) * cfg.rt_window_multiplier)
+                        .max(cfg.rt_window_min_s)
                 }
             };
             let status = if use_loess { "loess" } else { "linear" };
@@ -1447,11 +1439,11 @@ fn write_windows(
     // Composition shift per library row, read only when the fit carries a correction.
     let shift: Option<Vec<f64>> = match (&fit.composition, &more, &charge) {
         (Some(beta), Some(lib), Some(charge)) => {
-            let pform = lib.str("peptidoform")?;
+            let (off, pform) = lib.str_flat("peptidoform")?;
             Some(
                 (0..n)
                     .map(|i| {
-                        let f = composition_features(&pform[i], charge[i]);
+                        let f = composition_features(&pform[off[i]..off[i + 1]], charge[i]);
                         let v: f64 = (0..7).map(|c| f[c] * beta[c]).sum();
                         // bounded: a shift beyond three window half-widths is a fit artefact
                         let cap = 3.0 * fit.w_rt.unwrap_or(f64::INFINITY);
@@ -1825,7 +1817,7 @@ fn im_from_seed(
         let est = if n_d == 0 {
             warn!(
                 seed_targets = n_t,
-                "rt-im-train: no seed decoy carries an observed 1/K0, so the seed was not                  written for the decoy-corrected 1/K0 window; keeping the anchors' w_im"
+                "rt-im-train: no seed decoy carries an observed 1/K0, so the seed was not written for the decoy-corrected 1/K0 window; keeping the anchors' w_im"
             );
             None
         } else {
@@ -1840,14 +1832,14 @@ fn im_from_seed(
             decoy_corrected_p_im = est,
             anchors_w_im = c.w_im,
             applied,
-            "rt-im-train: 1/K0 window from every seed PSM, decoy-corrected              (rt_im_train.im_window_sizing = seed_decoy_corrected)"
+            "rt-im-train: 1/K0 window from every seed PSM, decoy-corrected (rt_im_train.im_window_sizing = seed_decoy_corrected)"
         );
         if est.is_none() && n_d > 0 {
             warn!(
                 seed_targets = n_t,
                 seed_decoys = n_d,
                 min_true = SEED_SIZING_MIN_TRUE,
-                "rt-im-train: too few seed targets above the decoys for the decoy-corrected                  1/K0 window; keeping the anchors' w_im"
+                "rt-im-train: too few seed targets above the decoys for the decoy-corrected 1/K0 window; keeping the anchors' w_im"
             );
         }
         c.seed = Some(SeedImEstimate {
@@ -2865,11 +2857,15 @@ mod tests {
         assert!(!is_holdout(0, 0.0));
         assert!(!is_holdout(999, 0.0));
         // The documented rule, verbatim: base_peptide_id % 1000 < round(frac*1000).
-        // deeplc_finetune.py pins these same four cases; keep them in sync.
+        // deeplc_finetune.py pins these same six cases; keep them in sync.
         assert!(is_holdout(299, 0.3));
         assert!(!is_holdout(300, 0.3));
         assert!(is_holdout(1_000_299, 0.3));
         assert!(!is_holdout(1_000_300, 0.3));
+        // 0.0125 * 1000 is exactly 12.5, which rounds away from zero, where Python's
+        // round() would give 12.
+        assert!(is_holdout(12, 0.0125));
+        assert!(!is_holdout(13, 0.0125));
         // Empirical fraction over a contiguous id range is exactly frac.
         let n_held = (0u32..1_000_000).filter(|id| is_holdout(*id, 0.3)).count();
         assert_eq!(n_held, 300_000);
@@ -2922,14 +2918,26 @@ mod tests {
     }
 
     /// A seed of `n` confident target anchors (plus a decoy and an unconfident row, which
-    /// the fit must skip) and a library of `n + 5` rows, both with iRT columns.
+    /// the fit must skip) and a library of `n + 5` rows, both with iRT columns and with the
+    /// peptidoform and charge the composition correction reads: odd rows are charge 3 and
+    /// elute 30 s later, and every residue past ten adds 5 s. The library's last row is a
+    /// 1,000-residue peptidoform, whose shift only the correction's clamp bounds.
     fn anchors_and_library(dir: &std::path::Path, n: usize) -> (String, String) {
         let seed = dir.join("seed.parquet").to_str().unwrap().to_string();
         let lib = dir.join("lib.parquet").to_str().unwrap().to_string();
         let m = n + 2;
+        let charge = |i: usize| if i % 2 == 1 { 3 } else { 2 };
+        let len = |i: usize| 8 + i % 5;
+        let pform = |len: usize| format!("{}K", "A".repeat(len - 1));
         let irt: Vec<f32> = (0..m).map(|i| (i as f32) * 0.7 + 3.0).collect();
         let rt: Vec<f64> = (0..m)
-            .map(|i| 100.0 + 12.0 * (i as f64 * 0.7 + 3.0) + ((i * 37 % 11) as f64 - 5.0) * 4.0)
+            .map(|i| {
+                100.0
+                    + 12.0 * (i as f64 * 0.7 + 3.0)
+                    + ((i * 37 % 11) as f64 - 5.0) * 4.0
+                    + if charge(i) == 3 { 30.0 } else { 0.0 }
+                    + 5.0 * (len(i) as f64 - 10.0)
+            })
             .collect();
         let mut label = vec!["target".to_string(); m];
         label[n] = "decoy".to_string();
@@ -2945,6 +2953,11 @@ mod tests {
                 Col::F64("observed_rt".into(), rt),
                 Col::Str("label".into(), label),
                 Col::F32("predicted_irt".into(), irt),
+                Col::Str(
+                    "peptidoform".into(),
+                    (0..m).map(|i| pform(len(i))).collect(),
+                ),
+                Col::I32("charge".into(), (0..m).map(charge).collect()),
             ],
         )
         .unwrap();
@@ -2958,6 +2971,13 @@ mod tests {
                         .map(|i| if i == 3 { f32::NAN } else { i as f32 * 0.9 })
                         .collect(),
                 ),
+                Col::Str(
+                    "peptidoform".into(),
+                    (0..n + 5)
+                        .map(|i| pform(if i == n + 4 { 1000 } else { len(i) }))
+                        .collect(),
+                ),
+                Col::I32("charge".into(), (0..n + 5).map(charge).collect()),
             ],
         )
         .unwrap();
@@ -3151,7 +3171,7 @@ mod tests {
             })
             .unwrap();
             let fit = fit_from_seed(&seed, &cfg).unwrap();
-            apply(
+            apply_in_memory(
                 &fit,
                 &ApplyParams {
                     precursor_span: None,
@@ -3179,6 +3199,41 @@ mod tests {
                 n,
                 "{tag}: the decoy and the unconfident row are not anchors"
             );
+            // The composition correction, on by default from 50 anchors: every row's centre
+            // is the curve plus that row's own shift, clamped at three half-widths.
+            let Some(beta) = fit.composition.as_ref() else {
+                assert!(n < 50, "{tag}: no composition correction on {n} anchors");
+                continue;
+            };
+            assert!(
+                (beta[1] - 30.0).abs() < 5.0,
+                "{tag}: charge-3 term {}",
+                beta[1]
+            );
+            let t = TableFile::open(&lib).unwrap();
+            let (irt, charge) = (t.f32("predicted_irt").unwrap(), t.i32("charge").unwrap());
+            let pform = t.str("peptidoform").unwrap();
+            let shift = |i: usize| -> f64 {
+                let f = composition_features(&pform[i], charge[i]);
+                (0..7).map(|c| f[c] * beta[c]).sum()
+            };
+            let cap = 3.0 * fit.w_rt.unwrap_or(f64::INFINITY);
+            assert!(
+                shift(n + 4).abs() > cap,
+                "{tag}: the clamp is not exercised"
+            );
+            let cal = TableFile::open(&out("w_run.parquet"))
+                .unwrap()
+                .f64("rt_pred_cal")
+                .unwrap();
+            for (i, got) in cal.iter().enumerate() {
+                if irt[i].is_nan() {
+                    assert!(got.is_nan(), "{tag}: row {i} has no iRT to calibrate");
+                    continue;
+                }
+                let want = fit.predict(irt[i] as f64) + shift(i).clamp(-cap, cap);
+                assert_eq!(got.to_bits(), want.to_bits(), "{tag}: row {i}");
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

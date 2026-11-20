@@ -178,8 +178,10 @@ The stage entry point is `run(p: RtImTrainParams)` (rt_im_train.rs:72). Standalo
 it is invoked as `mumdia rt-im-train --seed-psms <p> --lib-precursors <p>
 --out-windows <p> --out-cal <p> [--config <p>]` (the `RtImTrain` subcommand,
 main.rs:94-105, dispatched at main.rs:517-534); the `run` orchestrator calls the
-same `run` function directly (run.rs:307-314). Both call sites build the config
-hash and pass it as `config_hash`, but the stage never reads it (see gotchas).
+same `run` function directly (run.rs:307-314). Both relax `q_train` through
+`anchor_q_ladder` on a seed short of anchors (`plan_anchors`, `with_anchor_cut`) before
+the call. Both call sites build the config hash and pass it as `config_hash`, but the
+stage never reads it (see gotchas).
 
 ### 1. Join iRT to candidates
 
@@ -257,7 +259,7 @@ The math:
   `k = clamp(ceil(span * n), 3, n)` (calibrate.rs:67) and it evaluates a
   local-linear regression on a uniform grid of `grid_n` points spanning
   `[min(x), max(x)]` (calibrate.rs:69-76).
-- **`local_linear`** (calibrate.rs:107-153) selects the `k` nearest anchors by
+- **`local_linear_w`** (calibrate.rs:107-153) selects the `k` nearest anchors by
   walking outward from the insertion point (calibrate.rs:110-127), assigns each a
   tricubic weight `w = (1 - d^3)^3` with `d = |x_i - x0| / dmax` (calibrate.rs:
   133-139), and solves a weighted least-squares line, returning the fitted value
@@ -1408,7 +1410,7 @@ times the global slope: the pointwise local slope it first used comes from the s
 most one-sided window in the fit, and on noisy anchors it was free to be negative (which
 inverts the iRT-to-RT map) or several times the global slope, multiplying a distance that
 is unbounded by construction (docs/31 F7). Measured on HYE B01 with the imported iRT and `native_tda`: 45,946 stripped peptides at 1% before, 45,957 after, decoy fraction unchanged; 1.9% of candidates got a different window, almost all with iRT above the anchor range, which the global line had placed past the end of the run. With the DeepLC 4.1.1 re-predicted precursors (`w_rt` 414 s): 48,533 in both arms, 0.2% of windows moved. |
-| `local_linear` | calibrate.rs:107-153 | Tricubic-weighted local least squares at one point. |
+| `local_linear_w` | calibrate.rs:107-153 | Tricubic-weighted local least squares at one point, times the robustness weights of `Loess::fit_robust` when it iterates. |
 | `percentile` | calibrate.rs:156-164 | Nearest-rank percentile: sorts a copy, `rank = round(p.clamp(0,1)*(len-1))`. Not interpolated. Empty input returns 0.0. |
 | `CalibrationMethod` | config.rs:56-61 | Enum `{ Loess, Linear, None }`; default `Loess`. `None` is rejected at load. |
 | `RtImTrainConfig` | config.rs:447-512 | All Stage B config fields (below). |
@@ -1440,7 +1442,7 @@ though the enum variant still exists.
 | `finetune_batch` | `0` | Fine-tune batch size (`--batch`). `0` auto-scales to the seed size so each epoch has ~30+ steps (config.rs:473-477); a fixed large batch underfits small seeds. |
 | `adaptive_rt_window` | `false` | Per-region window instead of one global width (rt_im_train.rs:192-229). Sensitivity-program knob, not yet default-on. |
 | `adaptive_rt_bins` | `12` | Number of equal-width calibrated-RT bins for the adaptive window (rt_im_train.rs:202). |
-| `rt_window_min_s` | `1.0` | Lower clamp (seconds) for any adaptive half-window (rt_im_train.rs:210); mirrors the 1s floor on the global window. |
+| `rt_window_min_s` | `1.0` | Lower clamp (seconds) for any RT half-window: the global `w_rt`, held-out or in-sample, and every adaptive per-bin width. |
 | `library_irt` | `auto` | Library-input mode only. `auto` re-predicts the imported `predicted_irt` with the DeepLC base model when `predict_frag.deeplc_python` is set and keeps it, with a warning, when not; `deeplc` requires the interpreter (preflight); `library` keeps the imported values. Ignored under `finetune_deeplc` and in FASTA mode. Section 4c has the measurement. |
 | `deeplc_predict_shards` | `0` | Worker processes for the whole-library DeepLC prediction (multi-head calibration, base-model re-prediction, the prediction after a fine-tune; `deeplc_finetune.py --shards`). The fit happens once, in the parent process, and is handed to every child; each child predicts a slice of the unique sequences cut at a multiple of the 100,000-sequence call, and the slices are joined in order. `K` processes share the thread budget, `budget / K` threads each; `0` is one process per 8 threads, and a GPU always gets one. Bit-identical to one process at equal threads per process, float-equivalent at the same engine thread count. Automatic by default since 2026-09-27 (one process per 8 threads, so one on a desktop budget of 8): 26:00 -> 18:02 and 29:47 -> 21:04 on two six- and five-run experiments with the peptides at 1% inside the seed spread (section "Sharded whole-library prediction"). |
 | `im_min_anchors_per_charge` | `50` | IM calibration (section 7): a charge with fewer anchors uses the global CCS fit. Omitted from the canonical configuration at the default. |

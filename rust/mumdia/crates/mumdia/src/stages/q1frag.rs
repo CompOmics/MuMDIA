@@ -91,8 +91,6 @@ pub const TOL_SIGMAS: f64 = 3.0;
 /// The correlation floor: this quantile of the 2D correlation of the anchors' fragments
 /// within the offset tolerance.
 pub const CORR_QUANTILE: f64 = 0.05;
-/// The robust standard deviation of a normal sample per unit of its MAD.
-const MAD_TO_SIGMA: f64 = 1.4826;
 /// Guards of the learned tolerances against a degenerate anchor set (too few, or too clean
 /// to have a spread): the offset and centre tolerances are at least half a step (the
 /// calibrated profiles' residual SD on ZT Scan is 0.23 steps), and the correlation floor is
@@ -1423,7 +1421,7 @@ fn collect(ds: &[Decision]) -> Pass {
 
 /// The robust standard deviation of `v` (1.4826 MAD).
 fn robust_sd(v: &[f64]) -> f64 {
-    MAD_TO_SIGMA * mad(v)
+    crate::calibrate::MAD_TO_SIGMA * mad(v)
 }
 
 /// The tolerances of one pass ([`learn`]'s rule).

@@ -43,7 +43,7 @@ use rayon::prelude::*;
 use serde_json::json;
 
 use super::q1frag::{isotope_weights, offset_mz, Q1Grid, ISOTOPES};
-use crate::calibrate::percentile;
+use crate::calibrate::{percentile, MAD_TO_SIGMA};
 
 /// Units of a stored centroid offset per step.
 pub const UNITS_PER_STEP: f64 = 8.0;
@@ -66,7 +66,6 @@ pub const LEARN_ANCHORS: usize = 3_000;
 pub const LEARN_MARGIN_STEPS: f64 = 6.0;
 
 const NONE: u32 = u32::MAX;
-const MAD_TO_SIGMA: f64 = 1.4826;
 
 /// For every peak of `a` (m/z ascending), the index of the nearest peak of `b` (m/z
 /// ascending) within `tol_ppm`, [`NONE`] without one; the lower index on a tie. Linear.

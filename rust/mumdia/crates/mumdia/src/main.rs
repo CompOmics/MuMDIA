@@ -2101,6 +2101,12 @@ fn real_main() -> Result<()> {
                 );
             }
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            // The anchor cut `run` uses: `q_train`, relaxed through `anchor_q_ladder` on a
+            // seed short of anchors.
+            let rt_cfg = stages::rt_im_train::with_anchor_cut(
+                &cfg.rt_im_train,
+                &stages::rt_im_train::plan_anchors(&seed_psms, &cfg.rt_im_train)?,
+            );
             stages::rt_im_train::run(stages::rt_im_train::RtImTrainParams {
                 precursor_span: None,
                 anchor_irt_from_seed: false,
@@ -2108,7 +2114,7 @@ fn real_main() -> Result<()> {
                 library_precursors: &lib_precursors,
                 out_windows: &out_windows,
                 out_cal: &out_cal,
-                cfg: &cfg.rt_im_train,
+                cfg: &rt_cfg,
                 config_hash: &ch,
                 im_window_floor: None,
                 im_anchor_q: Some(cfg.search_seed.fdr_seed),

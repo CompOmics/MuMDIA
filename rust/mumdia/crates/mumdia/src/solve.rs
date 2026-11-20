@@ -16,12 +16,11 @@
 //! deliberate divergence from CHIMERYS's LASSO+AICc). All reductions run in fixed index
 //! order; no BLAS/LAPACK (the Windows/OneDrive build bars C deps); no randomness.
 
-/// Reusable buffers for [`nnls_with`], plus the full normal equations for one problem.
+/// The buffers of one [`nnls`] solve, plus the full normal equations of its problem.
 ///
 /// The active-set loop is allocation-heavy by nature: every move needs a passive-column
 /// list, a solution vector, a Gram, a right-hand side and a Cholesky factor. Holding
-/// them here lets a caller that solves many small problems (the demix path solves one
-/// per candidate) allocate once instead of once per move.
+/// them here lets a solve allocate once instead of once per move.
 ///
 /// `ata` and `atb` hold `A^T A` and `A^T b` for the current problem. They are computed
 /// once per [`nnls_with`] call and indexed per move, replacing a rebuild of the passive
@@ -30,7 +29,7 @@
 /// `O(m n^2)`, i.e. at most the cost of the one move where all `n` columns are passive,
 /// and callers bound `n` by `extract.demix_max_candidates`.
 #[derive(Default)]
-pub struct NnlsScratch {
+struct NnlsScratch {
     ata: Vec<f64>,
     atb: Vec<f64>,
     passive: Vec<bool>,
@@ -47,7 +46,7 @@ pub struct NnlsScratch {
 }
 
 impl NnlsScratch {
-    pub fn new() -> NnlsScratch {
+    fn new() -> NnlsScratch {
         NnlsScratch::default()
     }
 
@@ -144,16 +143,14 @@ fn cholesky_solve_into(
 /// passive solve. `a` is row-major `m x n`, `b` has length `m`. Returns `x` (length `n`)
 /// with `x_j >= 0`. `lambda` is the ridge added to the passive Gram diagonal (> 0 keeps
 /// it PD and deterministic under collinearity). `max_iter` caps the active-set moves.
-///
-/// Allocates fresh scratch; use [`nnls_with`] to reuse buffers across many solves.
 pub fn nnls(a: &[f64], m: usize, n: usize, b: &[f64], lambda: f64, max_iter: usize) -> Vec<f64> {
     let mut s = NnlsScratch::new();
     nnls_with(&mut s, a, m, n, b, lambda, max_iter)
 }
 
-/// [`nnls`] reusing `s`'s buffers. Bit-identical to `nnls` for the same inputs; the
-/// scratch carries no state between calls beyond allocated capacity.
-pub fn nnls_with(
+/// [`nnls`] on `s`'s buffers. Bit-identical to `nnls` for the same inputs; the scratch
+/// carries no state between calls beyond allocated capacity.
+fn nnls_with(
     s: &mut NnlsScratch,
     a: &[f64],
     m: usize,

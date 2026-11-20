@@ -574,7 +574,7 @@ takes `--ms2`, `--lib-precursors`, `--lib-fragments`, `--out`, and
   the deterministic merge if the new path is parallel.
 - **Charge-2 / m/z-binned tolerance.** The current fit produces one global offset
   and tolerance. To make them charge- or m/z-dependent, partition `devs` before
-  `masscal::fit` and emit per-bin entries in `masscal.json`, then teach `extract` to
+  `masscal::fit_floored` and emit per-bin entries in `masscal.json`, then teach `extract` to
   pick the matching bin.
 - **Change the score.** `hyperscore` (`search_seed.rs:413`) is a free function; keep
   it monotone in matched-fragment count and observed intensity so the target-decoy q

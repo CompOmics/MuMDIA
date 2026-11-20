@@ -67,27 +67,6 @@ pub const MIN_LOESS_CALIBRANTS: usize = 50;
 // `served scans x report_psms x fragments per candidate` deviations whatever its precursor
 // count; [`Calibrants::bytes`] is what `search-seed` reports in its artifact stats.
 
-/// Median offset and `1.5 * p95(|dev - median|)` tolerance, floored at 5 ppm.
-///
-/// Panics on an empty slice; every caller goes through [`MassCal::fit_from`], which
-/// guards on [`MIN_CALIBRANTS`].
-pub fn fit(devs: &[f64]) -> (f64, f64) {
-    fit_floored(devs, DEFAULT_TOL_FLOOR_PPM, 0.0)
-}
-
-/// The tolerance floor `fit` applies, and the default of `search_seed.frag_tol_floor_ppm`.
-pub const DEFAULT_TOL_FLOOR_PPM: f64 = 5.0;
-
-/// The robust sigma of a normal sample per unit of its median absolute deviation.
-const MAD_TO_SIGMA: f64 = 1.4826;
-
-/// The systematic offset of the deviations: the upper median, `sorted[n / 2]`.
-fn median_offset(devs: &[f64]) -> f64 {
-    let mut sorted = devs.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
-    sorted[sorted.len() / 2]
-}
-
 /// The one fragment tolerance estimator: median offset and a tolerance floored at `floor`
 /// ppm (`search_seed.frag_tol_floor_ppm`). The tolerance is `1.5 * p95(|dev - median|)`
 /// when `mad_k` is 0, which is bit-identical to the estimator before `mad_k` existed, and
@@ -95,10 +74,11 @@ fn median_offset(devs: &[f64]) -> f64 {
 /// `|dev - median|`: the robust sigma of the deviations, which a shoulder of random matches
 /// that sets the p95 does not move.
 pub fn fit_floored(devs: &[f64], floor: f64, mad_k: f64) -> (f64, f64) {
-    let offset = median_offset(devs);
+    // The upper median, `sorted[n / 2]`.
+    let offset = crate::calibrate::percentile(devs, 0.5);
     let centered: Vec<f64> = devs.iter().map(|x| (x - offset).abs()).collect();
     let width = if mad_k > 0.0 {
-        crate::calibrate::percentile(&centered, 0.5) * MAD_TO_SIGMA * mad_k
+        crate::calibrate::percentile(&centered, 0.5) * crate::calibrate::MAD_TO_SIGMA * mad_k
     } else {
         crate::calibrate::percentile(&centered, 0.95) * 1.5
     };
@@ -152,7 +132,7 @@ impl MassCal {
                     .filter(|d| (d - o1).abs() <= t1)
                     .collect();
                 if inl.len() >= MIN_CALIBRANTS && mad_k > 0.0 {
-                    (median_offset(&inl), t1, 2)
+                    (crate::calibrate::percentile(&inl, 0.5), t1, 2)
                 } else if inl.len() >= MIN_CALIBRANTS {
                     let (o2, t2) = fit_floored(&inl, cfg.frag_tol_floor_ppm, 0.0);
                     (o2, t2, 2)
@@ -183,11 +163,21 @@ impl MassCal {
         // deviation versus fragment m/z and sample it on a fixed 25-Th grid that extract
         // interpolates per peak. Empty unless `mass_cal_loess` is set and enough
         // calibrants exist; extract then falls back to the scalar offset. Deterministic:
-        // pairs are sorted by m/z before the fit.
+        // pairs are sorted by m/z before the fit. Only the deviations inside the offset's
+        // own window enter: the grid is a local mean, which the random matches of the
+        // collection window would pull toward 0, where the median offset ignores them.
+        let mut pairs: Vec<(f64, f64)> = if cfg.mass_cal_loess {
+            dev_mz
+                .iter()
+                .cloned()
+                .zip(devs.iter().cloned())
+                .filter(|(_, d)| (d - frag_ppm_offset).abs() <= frag_tol_ppm)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let (mz_cal_grid_mz, mz_cal_grid_ppm): (Vec<f64>, Vec<f64>) =
-            if cfg.mass_cal_loess && dev_mz.len() >= MIN_LOESS_CALIBRANTS {
-                let mut pairs: Vec<(f64, f64)> =
-                    dev_mz.iter().cloned().zip(devs.iter().cloned()).collect();
+            if pairs.len() >= MIN_LOESS_CALIBRANTS {
                 pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
                 let xs: Vec<f64> = pairs.iter().map(|(m, _)| *m).collect();
                 let ys: Vec<f64> = pairs.iter().map(|(_, pp)| *pp).collect();
@@ -467,13 +457,13 @@ mod tests {
         let union: Vec<f64> = bands.iter().flatten().cloned().collect();
         let (mut w, mut wt) = (0.0f64, 0.0f64);
         for b in &bands {
-            let (_, t) = fit(b);
+            let (_, t) = fit_floored(b, 5.0, 0.0);
             assert!(t > 5.0, "not floored, or the comparison is vacuous");
             w += b.len() as f64;
             wt += b.len() as f64 * t;
         }
         let averaged = wt / w;
-        let (_, pooled_tol) = fit(&union);
+        let (_, pooled_tol) = fit_floored(&union, 5.0, 0.0);
         assert!(
             averaged > 2.0 * pooled_tol,
             "averaging per-band p95s ({averaged}) is far wider than the union's \
@@ -541,6 +531,38 @@ mod tests {
         );
     }
 
+    /// The grid is fitted on the offset's inliers. A LOESS is a local mean, so over every
+    /// deviation it sits between the instrument offset and the random matches of the
+    /// collection window, where the median offset does not move.
+    #[test]
+    fn the_loess_grid_leaves_out_the_random_matches_the_offset_leaves_out() {
+        // A -15 ppm offset, and one deviation in twenty a random match on the high side of
+        // the +-50 ppm collection window.
+        let (devs, mz): (Vec<f64>, Vec<f64>) = (0..1000)
+            .map(|i| {
+                let dev = if i % 20 == 0 {
+                    ((i / 20) * 37 % 51) as f64
+                } else {
+                    -15.0 + ((i * 37 % 11) as f64 - 5.0) * 0.1
+                };
+                (dev, 200.0 + i as f64 * 1.6)
+            })
+            .unzip();
+        let c = SearchSeedConfig {
+            mass_cal_loess: true,
+            ..Default::default()
+        };
+        let cal = MassCal::fit_from(&devs, &mz, &c);
+        assert!((cal.frag_ppm_offset + 15.0).abs() < 0.2);
+        assert!(!cal.mz_cal_grid_ppm.is_empty());
+        for p in &cal.mz_cal_grid_ppm {
+            assert!((p + 15.0).abs() < 0.2, "grid point at {p} ppm");
+        }
+        // Not vacuous: the same LOESS over every deviation is pulled off the offset.
+        let all = crate::calibrate::Loess::fit(&mz, &devs, 0.3, 200);
+        assert!((all.predict(1000.0) + 15.0).abs() > 0.5);
+    }
+
     #[test]
     fn the_mad_estimator_ignores_a_shoulder_that_sets_the_p95() {
         // A narrow core (|dev| <= 2) plus a 10% shoulder at 12-16 ppm: the shoulder is the
@@ -566,8 +588,6 @@ mod tests {
         // The floor is the configured one, not a literal 5.
         c.frag_tol_floor_ppm = 9.5;
         assert_eq!(MassCal::fit_from(&devs, &mz, &c).frag_tol_ppm, 9.5);
-        // `mad_k = 0` is the p95 estimator, bit for bit.
-        assert_eq!(fit_floored(&devs, 5.0, 0.0), fit(&devs));
     }
 
     /// Under `two_pass_mass_cal` the MAD estimator's second pass moves the offset only: the
@@ -601,7 +621,7 @@ mod tests {
             .copied()
             .filter(|d| (d - o1).abs() <= t1)
             .collect();
-        assert_eq!(two.frag_ppm_offset, median_offset(&inl));
+        assert_eq!(two.frag_ppm_offset, crate::calibrate::percentile(&inl, 0.5));
         assert!((two.frag_ppm_offset - 1.0).abs() < (o1 - 1.0).abs());
         // Re-estimating the MAD on those inliers would have narrowed the width.
         let (_, t_inl) = fit_floored(&inl, 1.0, 3.0);

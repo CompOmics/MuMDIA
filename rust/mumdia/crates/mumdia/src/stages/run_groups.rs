@@ -859,15 +859,6 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 (None, counts)
             }
         };
-    // The MS1 offset is one per run, so it is learned once from the pooled seed rather than
-    // per band (a band holds too few anchors for a stable median).
-    let ext_cfg = crate::stages::ms1cal::extract_cfg(
-        &cfg.extract,
-        &pooled_seed,
-        &g.converted.ms1,
-        cfg.rt_im_train.q_train,
-    )?;
-
     // --- RT model per band, against the pooled or the band's own anchors
     let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
     let python = cfg.predict_frag.deeplc_python.as_deref();
@@ -1127,7 +1118,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             |_| {
                 planned_frag_tol(
                     &crate::masscal::json_path(&pooled_seed),
-                    ext_cfg.frag_tol_ppm,
+                    cfg.extract.frag_tol_ppm,
                 )
             },
         )?;
@@ -1169,6 +1160,14 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             bands = bands.len(),
             "groups: spectra decoded once for the extraction phase and shared"
         );
+        // The MS1 offset is one per run, so it is learned once from the pooled seed rather
+        // than per band (a band holds too few anchors for a stable median), on these scans.
+        let ext_cfg = crate::stages::ms1cal::extract_cfg_scans(
+            &cfg.extract,
+            &pooled_seed,
+            &ms1_scans,
+            cfg.rt_im_train.q_train,
+        )?;
         // `groups.parallel` bands at a time, through the same bounded queue as the seeding
         // phase, most expensive first. Each band in flight holds its own extraction working
         // set, so that bound is what the stage's memory scales with; the artifacts are pooled
