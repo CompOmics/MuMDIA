@@ -651,6 +651,19 @@ pub enum Strictness {
     BestEffort,
 }
 
+/// Whether a configured interpreter cannot be there. A bare program name (no directory
+/// part, such as the `python3` discovery stores for an interpreter found on PATH) is looked
+/// up on PATH when it is started, so it counts as present; a path must name a file. Every
+/// check of an interpreter's existence goes through here: testing `python3` as a path looked
+/// in the working directory and refused a run whose interpreter was found on PATH.
+pub fn interpreter_missing(python: &str) -> bool {
+    let p = Path::new(python);
+    match p.parent() {
+        Some(dir) if dir.as_os_str().is_empty() => false,
+        _ => !p.is_file(),
+    }
+}
+
 /// Resolve every interpreter this run needs, mutating `cfg` so downstream stages
 /// see concrete paths. Absent or `"auto"` triggers discovery; an explicit path is
 /// taken as given. Returns one [`Resolution`] per role for logging.
@@ -674,7 +687,7 @@ pub fn resolve_with(cfg: &mut Config, strictness: Strictness) -> Result<Vec<Reso
             // clear message; whether it can import the modules is `doctor`'s
             // question, because a user may knowingly point at an environment they
             // are about to fix.
-            if required && !Path::new(&path).exists() {
+            if required && interpreter_missing(&path) {
                 let msg = format!(
                     "{} points at {}, which does not exist. Fix the path, set it to \
                      \"auto\" to discover an interpreter, or set {}.",
@@ -1160,6 +1173,20 @@ mod tests {
             .deeplc_python
             .as_deref()
             .is_none_or(|p| !p.eq_ignore_ascii_case(AUTO)));
+    }
+
+    #[test]
+    fn a_bare_program_name_is_found_on_path_not_in_the_working_directory() {
+        // What discovery stores for an interpreter found on PATH. A second, strict
+        // resolution (the orchestrators resolve again) must not test it as a path.
+        assert!(!interpreter_missing("python3"));
+        assert!(interpreter_missing("/definitely/not/here/python"));
+        assert!(interpreter_missing(""));
+        let mut cfg = Config::default();
+        cfg.rescore.classifier = RescorerKind::NnTorch;
+        cfg.rescore.python = Some("python3".into());
+        resolve(&mut cfg).expect("a required role found on PATH resolves again");
+        assert_eq!(cfg.rescore.python.as_deref(), Some("python3"));
     }
 
     #[test]

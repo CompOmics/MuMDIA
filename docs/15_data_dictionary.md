@@ -581,12 +581,12 @@ from the row group's first row. To rebuild a v1 row, take the row's own `rt_axis
 else the last `rt_axis` its candidate carried in the row group, and `trace_len` zeros
 with the stored `intensity_trimmed` copied in at `trace_offset`.
 `mumdia::chromatograms::Decoder` does exactly this, and
-`mumdia::chromatograms::rewrite` converts a table between the two layouts; convert a
-v2 table to v1 before handing it to a tool outside the engine. A pooled table has the
+`mumdia::chromatograms::rewrite` converts a table between the two layouts (a Rust
+function, no CLI command); for a tool outside the engine, run with
+`extract.chromatogram_schema = 1`. A pooled table has the
 bands' layout, and the pool refuses bands of different layouts.
 
-Measured on three real runs by the ignored test `v2_on_a_real_artifact`
-(`chromatograms.rs`), each artifact rewritten in both layouts by today's writer
+Measured on three real runs, each artifact rewritten in both layouts by the writer
 (65,536-row groups, snappy, `rt` PLAIN):
 
 | run | rows | v1 | v2 | `rt` -> `rt_axis` values | `intensity` -> `intensity_trimmed` values |
@@ -945,7 +945,7 @@ candidate removed by within-group competition.
 
 ## Stage F: `rescore` (`stages/rescore.rs`)
 
-### psms_scored (schema v3, `rescore.rs:508-541`)
+### psms_scored (schema v3, `scored_schema`)
 
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
@@ -972,9 +972,9 @@ candidate removed by within-group competition.
 
 Which null the q-values use depends on the classifier: target-decoy for
 `NativeTda`/`Mokapot`/`NnTorch`/`Percolator`, entrapment for the `Entrapment`
-rescorer. The q-value branch is at `rescore.rs:289-297`; the `qmode` selector
-defaults to target-decoy (`rescore.rs:145`) and switches to entrapment only
-inside the `Entrapment` classifier arm (`rescore.rs:252-273`).
+rescorer. The q-value branch is in `rescore::run_hashed`; the `qmode` selector
+defaults to target-decoy and switches to entrapment only
+inside the `Entrapment` classifier arm.
 
 #### q-value column units
 
@@ -984,18 +984,18 @@ select it are named.
 
 | column | q computed over | populated on | produced at |
 |---|---|---|---|
-| `q_value` | every PSM row, pooled across all `source` values | every row | `rescore.rs:522` |
-| `experiment_psm_q` | same population as `q_value` | every row | `rescore.rs:535` |
-| `global_q_value` | same population as `q_value` (backward-compat alias) | every row | `rescore.rs:526` |
-| `run_psm_q` | PSM rows within one `source`, target-decoy re-run per run | every row | `rescore.rs:411`, written at `rescore.rs:534` |
-| `precursor_q` | best PSM per `(peptidoform, charge)` | that group's winning row only; losers 1.0 | `rescore.rs:449`, written at `rescore.rs:536` |
-| `peptide_q_value` | best PSM per `base_peptide_id` (stripped sequence) | that group's winning row only; losers 1.0 | `rescore.rs:370`, written at `rescore.rs:523` |
-| `pg_q_value` | best PSM per `protein_group` | that group's winning row only; losers 1.0 | `rescore.rs:392`, written at `rescore.rs:525` |
+| `q_value` | every PSM row, pooled across all `source` values | every row | `write_scored` |
+| `experiment_psm_q` | same population as `q_value` | every row | `write_scored` |
+| `global_q_value` | same population as `q_value` (backward-compat alias) | every row | `write_scored` |
+| `run_psm_q` | PSM rows within one `source`, target-decoy re-run per run | every row | `per_source_q` |
+| `precursor_q` | best PSM per `(peptidoform, charge)` | that group's winning row only; losers 1.0 | `grouped_q` |
+| `peptide_q_value` | best PSM per `base_peptide_id` (stripped sequence) | that group's winning row only; losers 1.0 | `grouped_q` |
+| `pg_q_value` | best PSM per `protein_group` | that group's winning row only; losers 1.0 | `grouped_q` |
 
 The three grouped columns are sparse by construction. `grouped_q`
-(`rescore.rs:673`) picks the best-scoring row of each group, computes the q over
+picks the best-scoring row of each group, computes the q over
 that reduced set, and then scatters the value back to the winning row alone,
-leaving 1.0 on every losing sibling (`rescore.rs:721-728`). This is deliberate: a
+leaving 1.0 on every losing sibling. This is deliberate: a
 lower-scoring charge or modification variant, which may itself be a false target,
 must not inherit the winner's q. Deduplicated peptide, precursor, and
 protein-group counts are unaffected because they select the winner anyway.
@@ -1126,7 +1126,7 @@ Written only when `out_peak_bounds` is set and `bound_peak` is on.
 | `hi_rt` | Float64 | no | s | integration window upper RT |
 | `width_s` | Float64 | no | s | `hi_rt - lo_rt` |
 
-### quant-lfq cross-run output (`quant.rs:720-728`, `run_lfq_combine` at `quant.rs:657`)
+### quant-lfq cross-run output (`run_lfq_combine_grouped` in `quant_lfq.rs`)
 
 Long-form MaxLFQ (peptide-level) or directLFQ (ion-level) matrix.
 
@@ -1147,7 +1147,7 @@ in run-index order, with a header.
 |---|---|---|
 | `run` | text | run name (`experiment.runs`); the input index for `quant-lfq` |
 | `condition` | text | the run's condition, empty when it has none |
-| `size_factor` | number | what the run's feature intensities were divided by before the MaxLFQ rollup: the median-of-ratios factor over every run (`all`), over the run's condition (`condition`), or 1 (`none`, a condition of one run, no complete feature) |
+| `size_factor` | number | what the run's feature intensities were divided by before the MaxLFQ rollup: the median-of-ratios factor over every run (`all`), over the run's condition (`condition`), or 1 (`none`, a condition of one run, a run with no quantified feature, no complete feature) |
 | `n_features` | integer | the complete-case features the factor was estimated from (the features of its condition under `condition`); 0 when no factor was estimated |
 
 ---

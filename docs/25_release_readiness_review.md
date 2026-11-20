@@ -200,8 +200,8 @@ and at **neither external-input boundary**.
 | Boundary | Guard |
 |---|---|
 | predict-frag sidecar output | `predict_frag.rs:139-154` bails, naming the peptidoform |
-| rescore feature matrix | `rescore.rs:141-155` bails, naming the feature and row |
-| rescore sidecar scores | `rescore.rs:1086-1088` bails, naming the row |
+| rescore feature matrix | `bail_non_finite` bails, naming the feature and row |
+| rescore sidecar scores | `align_sidecar_scores` bails, naming the row |
 | feature computation | `features.rs:153` coerces non-finite to 0.0 |
 | **user-supplied library Parquet** | **none** |
 | **spectra Parquet** | **none** |
@@ -264,7 +264,7 @@ left-join, missing column or empty cell. The failure is then silent and
 directional: candidates vanish from windows, or match everything.
 
 **The fix is small and central**: one finiteness pass in `Library::load_with` in
-the style of `rescore.rs:141-149`, a value check in
+the style of `bail_non_finite`, a value check in
 `_lib_io.write_engine_parquet`, and the `!(a >= b)` inversion at `index.rs:221`.
 That one pass closes this section and most of the reachable panic census.
 
@@ -322,7 +322,7 @@ and `CLAUDE.md` gates seven changes on it. Three independent defects sit on that
 path.
 
 **3.1 In entrapment mode the native rescorer trains in-silico decoys as candidate
-positives.** `rescore.rs:282, 293` calls
+positives.** The entrapment arm of `rescore::run` calls
 `native_scores(&p, &feats, &is_entrapment, &base, &prelim)`, passing
 `is_entrapment` in the `is_decoy` slot. Inside `percolator_lite`
 (`rescoring.rs:144-153`) a row with `is_decoy == false` takes the
@@ -333,7 +333,7 @@ GBM failure with `strict = false`. Decoy scores are systematically inflated, whi
 then feeds 3.2.
 
 **3.2 An in-silico decoy can win a base-peptide group and delete the real target
-from the analysis.** `grouped_q` (`rescore.rs:689-745`) groups on
+from the analysis.** `grouped_q` groups on
 `base_peptide_id`, which a target and its decoy **share** (verified on both library
 paths: `make_reverse_decoys.py:148` sets
 `dprec = tprec.copy()`; `peptidoforms.rs:216-220` on the native path). Under
@@ -583,7 +583,7 @@ in an otherwise 50-window run is enough. The only mitigation today is `--threads
 which the user must know to reach for.
 
 **6.7 The pooled feature matrix is unbounded, and the documented workaround is
-unreachable. MAJOR.** `rescore.rs:79` is `Vec<Vec<f64>>`, not f32: `CLAUDE.md`
+unreachable. MAJOR.** The feature matrix of `rescore::run` is `Vec<Vec<f64>>`, not f32: `CLAUDE.md`
 documents `n_psms x n_features x 4` bytes, but that is the *Python* worker's
 matrix, and the code's own comment says `feats` is "~27 GB on an experiment-wide
 pool", twice the documented width plus a heap allocation and 24-byte spine entry
@@ -640,7 +640,7 @@ reads the config with a bare `?`, so a typo'd `--config` gives
 `Error: The system cannot find the file specified. (os error 2)` with **no
 filename**, in a tree with about 20 root `config.*.json` in flight.
 `table.rs:385` does not name the file, because `Table` does not retain its path,
-and dumps 390 column names into the message. `rescore.rs:806, 1043` are far thinner
+and dumps 390 column names into the message. `run_entrapment_gbm` and `run_pin_sidecar` are far thinner
 than `sidecar.rs:251-269`, which gives the interpreter, the full command, a
 reproduce instruction and a `doctor` pointer, and the rescore path is the one that
 fails after hours.

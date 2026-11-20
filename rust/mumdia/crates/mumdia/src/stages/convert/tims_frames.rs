@@ -11,12 +11,14 @@
 //! this frame lie in this TOF window, in these scans", and the stage that asks decides what
 //! to sum. Retrace sums them per trace point ([`sum_events`]); `mumdia mobilogram` bins them
 //! in 1/K0 ([`bin_events`]). Both take the scan -> 1/K0 table from [`scan_mobilities`] and
-//! the m/z -> TOF window from [`tof_window`], so the two share one calibration.
+//! the m/z -> TOF window from [`tof_window`], so the two share one calibration, and both
+//! find the `.d` ([`raw_of_spectra`]) and list its frames ([`FrameIndex`]) here.
 
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
-use timsrust::{Frame, QuadrupoleSettings};
+use anyhow::{anyhow, bail, Result};
+use rayon::prelude::*;
+use timsrust::{Frame, MSLevel, QuadrupoleSettings};
 
 use super::RawTdf;
 
@@ -183,6 +185,92 @@ pub(crate) fn bin_events(
         }
     });
     binned
+}
+
+/// The diaPASEF `.d` the spectra artifact `spectra` was read from by the native reader.
+/// Refused, with the reason, for spectra from any other reader, for a report that does not
+/// name the `.d`, and for a `.d` that is gone; each caller adds its own way out.
+pub(crate) fn raw_of_spectra(spectra: &str) -> Result<String> {
+    match crate::instrument::provenance(spectra) {
+        Some(p) if p.has_im() => {
+            let raw = p.source.ok_or_else(|| {
+                anyhow!(
+                    "{spectra} was read natively from a timsTOF .d, but its report does not \
+                     name the .d (params.mzml)"
+                )
+            })?;
+            if !std::path::Path::new(&raw).is_dir() {
+                bail!("{spectra} was converted from {raw}, which is no longer there");
+            }
+            Ok(raw)
+        }
+        _ => bail!(
+            "{spectra} was not read natively from a diaPASEF .d (an mzML input, including a \
+             timsTOF mzML written by msconvert, has no raw events)"
+        ),
+    }
+}
+
+/// The frame index of a `.d`, from the frame headers alone (RT, MS level, quad settings):
+/// the MS1 and MS2 frames in RT order, with their retention times.
+pub(crate) struct FrameIndex {
+    pub(crate) heads: Vec<Frame>,
+    pub(crate) ms1: Vec<usize>,
+    pub(crate) ms1_rt: Vec<f64>,
+    pub(crate) ms2: Vec<usize>,
+    pub(crate) ms2_rt: Vec<f64>,
+}
+
+impl FrameIndex {
+    /// Refused when the MS1 or the MS2 frames are missing or out of RT order.
+    pub(crate) fn read(raw: &RawTdf, path: &str) -> Result<FrameIndex> {
+        let heads: Vec<Frame> = (0..raw.reader.len())
+            .into_par_iter()
+            .map(|i| {
+                raw.reader
+                    .get_frame_without_coordinates(i)
+                    .map_err(|e| anyhow!("{path}: frame header {i}: {e}"))
+            })
+            .collect::<Result<_>>()?;
+        let (mut ms1, mut ms1_rt, mut ms2, mut ms2_rt) = (vec![], vec![], vec![], vec![]);
+        for (i, f) in heads.iter().enumerate() {
+            match f.ms_level {
+                MSLevel::MS1 => {
+                    ms1.push(i);
+                    ms1_rt.push(f.rt_in_seconds);
+                }
+                MSLevel::MS2 => {
+                    ms2.push(i);
+                    ms2_rt.push(f.rt_in_seconds);
+                }
+                MSLevel::Unknown => {}
+            }
+        }
+        let ascending = |v: &[f64]| v.windows(2).all(|w| w[0] <= w[1]);
+        if ms1.is_empty() || ms2.is_empty() || !ascending(&ms1_rt) || !ascending(&ms2_rt) {
+            bail!("{path}: frames are not in RT order, or MS1/MS2 frames are missing");
+        }
+        Ok(FrameIndex {
+            heads,
+            ms1,
+            ms1_rt,
+            ms2,
+            ms2_rt,
+        })
+    }
+
+    /// The 1/K0 of every scan ([`scan_mobilities`]), the scan count read from the first
+    /// MS1 frame.
+    pub(crate) fn scan_im(&self, raw: &RawTdf, path: &str) -> Result<Vec<f64>> {
+        let first = self.ms1[0];
+        let n_scans = raw
+            .frame(first)
+            .map_err(|e| anyhow!("{path}: frame {first}: {e}"))?
+            .scan_offsets
+            .len()
+            .saturating_sub(1);
+        scan_mobilities(n_scans, |s| raw.im_of_scan(s), path)
+    }
 }
 
 /// The 1/K0 of every scan `0..n_scans` through `im_of` (`RawTdf::im_of_scan`, the

@@ -23,8 +23,8 @@ use anyhow::Result;
 use mumdia_core::config::{interp_held, Ms1Cal, Ms1Surface};
 use mumdia_io::table::TableFile;
 
-use crate::calibrate::{percentile, Loess};
-use crate::spectra::load_ms1;
+use crate::calibrate::{percentile, Loess, MAD_TO_SIGMA};
+use crate::spectra::{load_ms1, Ms1Scan};
 
 /// Fewest anchors that still give a usable median.
 const MIN_ANCHORS: usize = 30;
@@ -54,23 +54,17 @@ const PREC_TOL_AUTO_MAX: f64 = 15.0;
 /// The window (ppm) each anchor's MS1 peak is searched in.
 const SEARCH_PPM: f64 = 15.0;
 
-/// The robust standard deviation of a normal sample per unit of its median absolute
-/// deviation.
-const MAD_TO_SIGMA: f64 = 1.4826;
-
 /// `(offset_ppm, anchors used)`, or `None` with fewer than `MIN_ANCHORS` anchors.
 pub fn estimate(
     seed_psms: &str,
-    ms1_path: &str,
+    ms1: &[Ms1Scan],
     q_max: f64,
     search_ppm: f64,
 ) -> Result<Option<(f64, usize)>> {
-    Ok(
-        anchor_errors(seed_psms, ms1_path, q_max, search_ppm)?.map(|e| {
-            let ppm: Vec<f64> = e.iter().map(|a| a.ppm).collect();
-            (percentile(&ppm, 0.5), ppm.len())
-        }),
-    )
+    Ok(anchor_errors(seed_psms, ms1, q_max, search_ppm)?.map(|e| {
+        let ppm: Vec<f64> = e.iter().map(|a| a.ppm).collect();
+        (percentile(&ppm, 0.5), ppm.len())
+    }))
 }
 
 /// One anchor's MS1 error: its precursor m/z, its observed retention time and the signed ppm
@@ -82,11 +76,11 @@ pub struct AnchorError {
     pub ppm: f64,
 }
 
-/// The MS1 error of every confident seed anchor with an MS1 peak within `search_ppm`, in
-/// seed order, or `None` with fewer than `MIN_ANCHORS` such anchors.
+/// The MS1 error of every confident seed anchor with an MS1 peak within `search_ppm` in the
+/// run's MS1 scans `ms1`, in seed order, or `None` with fewer than `MIN_ANCHORS` such anchors.
 pub fn anchor_errors(
     seed_psms: &str,
-    ms1_path: &str,
+    ms1: &[Ms1Scan],
     q_max: f64,
     search_ppm: f64,
 ) -> Result<Option<Vec<AnchorError>>> {
@@ -108,7 +102,6 @@ pub fn anchor_errors(
     if anchors.len() < MIN_ANCHORS {
         return Ok(None);
     }
-    let ms1 = load_ms1(ms1_path)?;
     if ms1.is_empty() {
         return Ok(None);
     }
@@ -334,11 +327,25 @@ fn calibrate(errors: &[AnchorError], surface: bool, tol_auto: bool) -> (f64, Ms1
 /// unchanged otherwise, or when too few anchors find an MS1 peak (logged). Under
 /// `ms1_calibrate = "surface"` or `prec_tol_auto` the surface, the tolerance and their
 /// diagnostics go into `ms1_cal` (and `prec_tol_ppm`); with both off this is the one-offset
-/// path, unchanged.
+/// path, unchanged. The MS1 artifact `ms1_path` is decoded only when `ms1_calibrate` is set.
 pub fn extract_cfg(
     cfg: &mumdia_core::config::ExtractConfig,
     seed_psms: &str,
     ms1_path: &str,
+    q_max: f64,
+) -> Result<mumdia_core::config::ExtractConfig> {
+    if !cfg.ms1_calibrate.is_on() {
+        return Ok(cfg.clone());
+    }
+    extract_cfg_scans(cfg, seed_psms, &load_ms1(ms1_path)?, q_max)
+}
+
+/// [`extract_cfg`] on MS1 scans the caller has decoded already: the grouped run learns the
+/// offset on the scans its extraction phase decodes anyway, instead of decoding them twice.
+pub fn extract_cfg_scans(
+    cfg: &mumdia_core::config::ExtractConfig,
+    seed_psms: &str,
+    ms1: &[Ms1Scan],
     q_max: f64,
 ) -> Result<mumdia_core::config::ExtractConfig> {
     let mut out = cfg.clone();
@@ -346,7 +353,7 @@ pub fn extract_cfg(
         return Ok(out);
     }
     if cfg.ms1_calibrate.is_surface() || cfg.prec_tol_auto {
-        let Some(errors) = anchor_errors(seed_psms, ms1_path, q_max, SEARCH_PPM)? else {
+        let Some(errors) = anchor_errors(seed_psms, ms1, q_max, SEARCH_PPM)? else {
             tracing::warn!(
                 "extract: too few seed anchors with an MS1 peak; MS1 offset left at {}, no \
                  surface, prec_tol_ppm left at {}",
@@ -385,7 +392,7 @@ pub fn extract_cfg(
         out.ms1_cal = Some(cal);
         return Ok(out);
     }
-    match estimate(seed_psms, ms1_path, q_max, SEARCH_PPM)? {
+    match estimate(seed_psms, ms1, q_max, SEARCH_PPM)? {
         Some((off, n)) => {
             tracing::info!(
                 ms1_ppm_offset = off,
@@ -462,6 +469,7 @@ mod tests {
         seed(&seed3, false);
         seed(&seed4, true);
         write_table(&ms1, ms1_cols(false)).unwrap();
+        let ms1 = load_ms1(&ms1).unwrap();
         let (off3, n3) = estimate(&seed3, &ms1, 0.01, 15.0).unwrap().unwrap();
         assert_eq!(n3, n);
         assert!(
@@ -473,6 +481,7 @@ mod tests {
         assert_eq!(off.to_bits(), off3.to_bits());
         let ms1_4d = scratch("ms1_4d.parquet");
         write_table(&ms1_4d, ms1_cols(true)).unwrap();
+        let ms1_4d = load_ms1(&ms1_4d).unwrap();
         let (off4, n4) = estimate(&seed4, &ms1_4d, 0.01, 15.0).unwrap().unwrap();
         assert_eq!(n4, n);
         assert!(
@@ -496,7 +505,7 @@ mod tests {
         };
         let errors = anchor_errors(
             &format!("{run}/seed_psms.parquet"),
-            &format!("{run}/spectra/spectra_ms1.parquet"),
+            &load_ms1(&format!("{run}/spectra/spectra_ms1.parquet")).unwrap(),
             0.01,
             SEARCH_PPM,
         )

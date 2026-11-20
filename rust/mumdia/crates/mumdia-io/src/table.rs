@@ -31,6 +31,7 @@ use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::types::{ColumnPath, SchemaDescriptor};
 
 use crate::codec::{codec_pool, ColumnEncoder};
+pub use crate::publish::{publish_byte_copy, publish_copy_of, AtomicPath, FileCopy};
 pub use crate::report::Written;
 pub use crate::span_cache::SpanReadOptions;
 
@@ -378,20 +379,6 @@ const PLAN_SAMPLE_FRACTION: usize = 4;
 /// The rows a writer capped at `row_group_rows` samples before it plans.
 fn plan_sample_rows(row_group_rows: usize) -> usize {
     row_group_rows.div_ceil(PLAN_SAMPLE_FRACTION).max(1)
-}
-
-/// Whether capped writers plan their float encodings. On unless `MUMDIA_PARQUET_PLAN` is
-/// `0`, `off`, `false` or `no`, which restores the unplanned layout of [`writer_props`] for a
-/// byte comparison against a binary from before the plan.
-fn plan_enabled() -> bool {
-    !matches!(
-        std::env::var("MUMDIA_PARQUET_PLAN")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "0" | "off" | "false" | "no"
-    )
 }
 
 /// One FLOAT or DOUBLE parquet leaf of an Arrow schema: its path as the writer spells it,
@@ -844,18 +831,16 @@ impl Encoder {
         let in_flight = opts.row_groups_in_flight;
         let row_group_rows = opts.row_group_rows;
         let state = match row_group_rows {
-            Some(cap) if plan_enabled() && !float_leaves(&schema).is_empty() => {
-                EncoderState::Sampling {
-                    sink: Box::new(sink),
-                    schema,
-                    row_group_rows: cap.max(1),
-                    pending: Vec::new(),
-                    rows: 0,
-                    plain,
-                    metadata,
-                    in_flight,
-                }
-            }
+            Some(cap) if !float_leaves(&schema).is_empty() => EncoderState::Sampling {
+                sink: Box::new(sink),
+                schema,
+                row_group_rows: cap.max(1),
+                pending: Vec::new(),
+                rows: 0,
+                plain,
+                metadata,
+                in_flight,
+            },
             _ => {
                 let props = with_metadata(
                     writer_props(&schema, row_group_rows, None, &plain),
@@ -1316,8 +1301,8 @@ fn write_table_to(mut w: TableWriter, path: &str, cols: Vec<Col>) -> Result<Tabl
     Ok(w)
 }
 
-/// [`write_table`] for a table whose columns are produced chunk by chunk rather than held
-/// whole: `chunk(start..end)` returns rows `start..end` of every column, and it is called
+/// [`write_table_hashed`] for a table whose columns are produced chunk by chunk rather than
+/// held whole: `chunk(start..end)` returns rows `start..end` of every column, and it is called
 /// for exactly the row ranges `write_table` would cut the full columns into
 /// (`WRITE_TABLE_CHUNK_ROWS` rows each, a short last one, and one empty range for an empty
 /// table). The writer and the sequence of chunks it is handed are therefore the ones
@@ -1329,18 +1314,8 @@ fn write_table_to(mut w: TableWriter, path: &str, cols: Vec<Col>) -> Result<Tabl
 /// What it saves is the whole-table columns: the caller builds one chunk at a time, and
 /// only one chunk plus the encoder's in-progress row group is resident. Each chunk must
 /// declare the same columns and hold `end - start` rows; a mismatch is an error from the
-/// writer, as it is for [`TableWriter`].
-pub fn write_table_chunked(
-    path: &str,
-    nrows: usize,
-    chunk: impl FnMut(std::ops::Range<usize>) -> Result<Vec<Col>>,
-) -> Result<u64> {
-    write_table_chunked_to(TableWriter::new(path), path, nrows, chunk)?.close()
-}
-
-/// [`write_table_chunked`], hashing the file as it is written: returns the rows and the
-/// content hash [`crate::hash::blake3_file`] would compute, without reading the file back,
-/// as [`write_table_hashed`] does for [`write_table`].
+/// writer, as it is for [`TableWriter`]. Returns the rows and the content hash
+/// [`crate::hash::blake3_file`] would compute, taken while writing.
 pub fn write_table_chunked_hashed(
     path: &str,
     nrows: usize,
@@ -1355,7 +1330,8 @@ pub fn write_table_chunked_hashed(
     .close_hashed()
 }
 
-/// Feed `w` the chunks `chunk` produces for the ranges [`write_table_chunked`] describes,
+/// Feed `w` the chunks `chunk` produces for the ranges [`write_table_chunked_hashed`]
+/// describes,
 /// leaving it open.
 fn write_table_chunked_to(
     mut w: TableWriter,
@@ -1526,164 +1502,6 @@ impl TableWriter {
     }
 }
 
-/// A sibling temp path for an artifact, and the rename that publishes it.
-///
-/// Every artifact used to be written with `File::create` directly AT its final path,
-/// which truncates on open. Three consequences, all real:
-///
-/// - a rerun destroyed the previous good artifact BEFORE producing a replacement, so
-///   an interrupted rerun left neither;
-/// - Ctrl-C or a crash part-way through a multi-gigabyte write left rubble under the
-///   canonical name. The parquet footer is written last and every reader requires it,
-///   so such a file fails to open rather than reading as a short table, but a
-///   directory of unopenable artifacts is still worse than a directory of intact ones;
-/// - nothing distinguished "this run wrote it" from "a previous run left it".
-///
-/// Writing to `<path>.tmp-<pid>-<n>` and renaming on success addresses all three: the
-/// rename is atomic on both POSIX and Windows for a same-directory target, so a reader
-/// sees either the old artifact or the new one, never a partial one. A killed run
-/// leaves at most a recognisable `.tmp-<pid>-<n>` file, which is inert.
-///
-/// Two guarantees this makes, and one it does not (docs/29 #4): the destination is never
-/// removed before the rename, so a failed publication leaves the previous artifact in
-/// place; and `n` is a process-wide counter, so two writers for one destination in one
-/// process cannot share a temporary file. It does not promise that the rename succeeds
-/// while another Windows process holds the destination open without delete sharing;
-/// then the rename fails and the old file stays, which is the first guarantee at work.
-static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-pub struct AtomicPath {
-    tmp: std::path::PathBuf,
-    final_path: std::path::PathBuf,
-    published: bool,
-}
-
-impl AtomicPath {
-    pub fn new(path: &str) -> Result<AtomicPath> {
-        let final_path = std::path::PathBuf::from(path);
-        if let Some(parent) = final_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating output directory {}", parent.display()))?;
-            }
-        }
-        let n = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = std::path::PathBuf::from(format!("{path}.tmp-{}-{n}", std::process::id()));
-        Ok(AtomicPath {
-            tmp,
-            final_path,
-            published: false,
-        })
-    }
-
-    pub fn tmp(&self) -> &std::path::Path {
-        &self.tmp
-    }
-
-    /// Move the completed temp file onto the final path.
-    pub fn publish(mut self) -> Result<()> {
-        // `std::fs::rename` replaces an existing destination FILE on POSIX and, through
-        // `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`, on Windows, so the destination is not
-        // removed first. Removing it first meant a rename that then failed had already
-        // destroyed the previous result, and gave every reader a window with no file at
-        // the final path at all (docs/29 #4). Now a failed rename is an error with the
-        // previous artifact still where it was.
-        std::fs::rename(&self.tmp, &self.final_path).with_context(|| {
-            format!(
-                "publishing {} -> {}",
-                self.tmp.display(),
-                self.final_path.display()
-            )
-        })?;
-        self.published = true;
-        Ok(())
-    }
-}
-
-impl Drop for AtomicPath {
-    fn drop(&mut self) {
-        // Abandoned write (an error return or an unwind): take the rubble with us so
-        // the output directory does not accumulate temp files.
-        if !self.published {
-            let _ = std::fs::remove_file(&self.tmp);
-        }
-    }
-}
-
-/// How [`publish_copy_of`] put the bytes at the destination.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FileCopy {
-    /// A second directory entry for the same file: no byte was read or written.
-    HardLink,
-    /// The filesystem refused the link, so the bytes were copied.
-    ByteCopy,
-}
-
-impl FileCopy {
-    /// The spelling a report records.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            FileCopy::HardLink => "hard_link",
-            FileCopy::ByteCopy => "byte_copy",
-        }
-    }
-}
-
-/// Publish the bytes of `src` at `out`, unchanged and without decoding them.
-///
-/// A hard link into the [`AtomicPath`] temp name, then the usual rename, so a reader of
-/// `out` sees its previous content or the complete new one and never a partial file. A
-/// filesystem that cannot link (another volume, FAT, some network and sync folders) falls
-/// back to a byte copy into the same temp name. An error here leaves `out` as it was.
-///
-/// The two names share one file after a link. Every writer in this crate (the parquet
-/// writers, [`write_batches`], this function and `json::write_json`) publishes by renaming
-/// a new file over its destination, which replaces the directory entry and leaves the other
-/// name's file alone, so rewriting either artifact through them never changes the other.
-/// That does not hold for a writer that opens its destination with `File::create`, which
-/// truncates the shared file and so writes through both names. The engine has two, the
-/// `features` PIN and rescore's tab-separated handoff, and neither writes a parquet
-/// artifact path. A tool that edits one of the linked files IN PLACE changes both.
-pub fn publish_copy_of(src: &str, out: &str) -> Result<FileCopy> {
-    publish_copy_of_with(src, out, true)
-}
-
-/// [`publish_copy_of`] without the hard link: `out` is always a file of its own, so a tool
-/// that edits either name in place cannot change the other. For a copy that other runs
-/// read later, such as a stored library.
-pub fn publish_byte_copy(src: &str, out: &str) -> Result<()> {
-    publish_copy_of_with(src, out, false).map(|_| ())
-}
-
-fn publish_copy_of_with(src: &str, out: &str, allow_link: bool) -> Result<FileCopy> {
-    let target = AtomicPath::new(out)?;
-    let tmp = target.tmp().to_path_buf();
-    // A temp name left by a killed process with the same pid and counter would make the
-    // link fail, and a byte copy onto it would write THROUGH it if it is itself a link to
-    // `src`, truncating the source. Start both from a fresh name.
-    let _ = std::fs::remove_file(&tmp);
-    let linked = allow_link && std::fs::hard_link(src, &tmp).is_ok();
-    let how = if linked {
-        FileCopy::HardLink
-    } else {
-        std::fs::copy(src, &tmp).with_context(|| format!("copying {src} -> {}", tmp.display()))?;
-        FileCopy::ByteCopy
-    };
-    target.publish()?;
-    // POSIX `rename` does nothing and succeeds when both names already refer to the same
-    // file, which is the case when `out` is a link to `src` from a previous run. The temp
-    // name then survives the rename; it is a third name for that same file, so removing it
-    // loses nothing.
-    if tmp.exists() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    Ok(how)
-}
-
-/// Write pre-built Arrow record batches to a Snappy Parquet file, preserving
-/// their schema exactly. Unlike [`write_table`] (which builds columns from typed
-/// vecs) this is for passing an existing schema through unchanged, e.g. filtering
-/// a scored table by run without re-declaring its column set. Returns the row count.
 /// Incremental parquet writer: feed `RecordBatch`es one at a time and the rows are encoded
 /// and flushed as they arrive, so peak memory is one batch rather than the whole table.
 ///
@@ -1772,28 +1590,13 @@ impl BatchWriter {
     }
 }
 
+/// Write pre-built Arrow record batches to a Snappy Parquet file, preserving
+/// their schema exactly. Unlike [`write_table`] (which builds columns from typed
+/// vecs) this is for passing an existing schema through unchanged, e.g. filtering
+/// a scored table by run without re-declaring its column set. Returns the row count.
 pub fn write_batches(path: &str, schema: Arc<Schema>, batches: &[RecordBatch]) -> Result<u64> {
-    Ok(write_batches_with(path, schema, batches, false)?.0)
-}
-
-/// [`write_batches`], hashing the file as it is written.
-pub fn write_batches_hashed(
-    path: &str,
-    schema: Arc<Schema>,
-    batches: &[RecordBatch],
-) -> Result<Written> {
-    let (rows, digest) = write_batches_with(path, schema, batches, true)?;
-    require_digest(rows, digest, "write_batches_hashed")
-}
-
-fn write_batches_with(
-    path: &str,
-    schema: Arc<Schema>,
-    batches: &[RecordBatch],
-    hash: bool,
-) -> Result<(u64, Option<String>)> {
     let target = AtomicPath::new(path)?;
-    let file = Sink::create(target.tmp(), hash)?;
+    let file = Sink::create(target.tmp(), false)?;
     // The same encoder [`TableWriter`] uses, minus the row-group cap: this path and the
     // chunked one must produce the same file, which
     // `write_table_matches_one_batch_byte_for_byte_on_scalars` asserts.
@@ -1803,9 +1606,9 @@ fn write_batches_with(
         writer.write(b)?;
         n += b.num_rows() as u64;
     }
-    let digest = writer.finish()?.finish()?;
+    writer.finish()?.finish()?;
     target.publish()?;
-    Ok((n, digest))
+    Ok(n)
 }
 
 /// A read-back table: all batches concatenated logically, accessed by column
@@ -1922,13 +1725,22 @@ impl Table {
             .map_err(|_| missing_column(name, &self.path, &self.column_names()))
     }
 
-    pub fn f64(&self, name: &str) -> Result<Vec<f64>> {
+    /// Column `name` of every batch, through one of the `push_*` decoders.
+    fn decode<T>(
+        &self,
+        name: &str,
+        push: impl Fn(&mut Vec<T>, &ArrayRef, &str) -> Result<()>,
+    ) -> Result<Vec<T>> {
         let i = self.idx(name)?;
         let mut out = Vec::with_capacity(self.nrows);
         for b in &self.batches {
-            push_f64(&mut out, b.column(i), name)?;
+            push(&mut out, b.column(i), name)?;
         }
         Ok(out)
+    }
+
+    pub fn f64(&self, name: &str) -> Result<Vec<f64>> {
+        self.decode(name, push_f64)
     }
 
     /// An f64 or f32 column as f64: f64 values as stored, f32 values widened exactly
@@ -1937,110 +1749,55 @@ impl Table {
     /// `features.parquet` v2 and `psms_competed.parquet` v4 (docs/15_data_dictionary.md),
     /// so one reader serves both. Any other type is the error [`Table::f64`] gives.
     pub fn f64_widening(&self, name: &str) -> Result<Vec<f64>> {
-        let i = self.idx(name)?;
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in &self.batches {
-            push_f64_widening(&mut out, b.column(i), name)?;
-        }
-        Ok(out)
+        self.decode(name, push_f64_widening)
     }
 
     pub fn f32(&self, name: &str) -> Result<Vec<f32>> {
-        let i = self.idx(name)?;
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in &self.batches {
-            push_f32(&mut out, b.column(i), name)?;
-        }
-        Ok(out)
+        self.decode(name, push_f32)
     }
 
     pub fn i64(&self, name: &str) -> Result<Vec<i64>> {
-        let i = self.idx(name)?;
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in &self.batches {
-            push_i64(&mut out, b.column(i), name)?;
-        }
-        Ok(out)
+        self.decode(name, push_i64)
     }
 
     pub fn i32(&self, name: &str) -> Result<Vec<i32>> {
-        let i = self.idx(name)?;
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in &self.batches {
-            push_i32(&mut out, b.column(i), name)?;
-        }
-        Ok(out)
+        self.decode(name, push_i32)
     }
 
     pub fn u32(&self, name: &str) -> Result<Vec<u32>> {
-        let i = self.idx(name)?;
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in &self.batches {
-            push_u32(&mut out, b.column(i), name)?;
-        }
-        Ok(out)
+        self.decode(name, push_u32)
     }
 
     pub fn bool(&self, name: &str) -> Result<Vec<bool>> {
-        let i = self.idx(name)?;
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in &self.batches {
-            push_bool(&mut out, b.column(i), name)?;
-        }
-        Ok(out)
+        self.decode(name, push_bool)
     }
 
     pub fn str(&self, name: &str) -> Result<Vec<String>> {
-        let i = self.idx(name)?;
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in &self.batches {
-            push_str(&mut out, b.column(i), name)?;
-        }
-        Ok(out)
+        self.decode(name, push_str)
     }
 
     /// A string column as `column == value`, row by row: exactly
     /// `self.str(name)?.iter().map(|s| s == value).collect()`, without building the
     /// `String`s. See [`TableFile::str_eq`] for what that costs on a two-valued column.
     pub fn str_eq(&self, name: &str, value: &str) -> Result<Vec<bool>> {
-        let i = self.idx(name)?;
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in &self.batches {
-            push_str_eq(&mut out, b.column(i), name, value)?;
-        }
-        Ok(out)
+        self.decode(name, |out, col, name| push_str_eq(out, col, name, value))
     }
 
     pub fn opt_f64(&self, name: &str) -> Result<Vec<Option<f64>>> {
-        let i = self.idx(name)?;
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in &self.batches {
-            push_opt_f64(&mut out, b.column(i), name)?;
-        }
-        Ok(out)
+        self.decode(name, push_opt_f64)
     }
 
     /// [`Table::opt_f64`] for a column stored as f64 or f32 (widened exactly), such as the
     /// window columns of `run_windows` v1 and v2.
     pub fn opt_f64_widening(&self, name: &str) -> Result<Vec<Option<f64>>> {
-        let i = self.idx(name)?;
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in &self.batches {
-            push_opt_f64_widening(&mut out, b.column(i), name)?;
-        }
-        Ok(out)
+        self.decode(name, push_opt_f64_widening)
     }
 
     /// Read an f32 list column. Accepts both `List` (32-bit offsets) and
     /// `LargeList` (64-bit offsets, written by `Col::LargeListF32`) encodings,
     /// so chromatogram artifacts written by either binary read back the same.
     pub fn list_f32(&self, name: &str) -> Result<Vec<Vec<f32>>> {
-        let i = self.idx(name)?;
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in &self.batches {
-            push_list_f32(&mut out, b.column(i), name)?;
-        }
-        Ok(out)
+        self.decode(name, push_list_f32)
     }
 }
 
@@ -3744,70 +3501,52 @@ impl TableFile {
         self.batches(Some(&[name]), batch_size)
     }
 
-    pub fn f64(&self, name: &str) -> Result<Vec<f64>> {
+    /// Column `name`, `batch_size` rows at a time, through one of the `push_*` decoders.
+    fn decode<T>(
+        &self,
+        name: &str,
+        batch_size: usize,
+        push: impl Fn(&mut Vec<T>, &ArrayRef, &str) -> Result<()>,
+    ) -> Result<Vec<T>> {
         let mut out = Vec::with_capacity(self.nrows);
-        for b in self.column(name, SCALAR_BATCH_ROWS)? {
-            push_f64(&mut out, b?.column(0), name)?;
+        for b in self.column(name, batch_size)? {
+            push(&mut out, b?.column(0), name)?;
         }
         Ok(out)
+    }
+
+    pub fn f64(&self, name: &str) -> Result<Vec<f64>> {
+        self.decode(name, SCALAR_BATCH_ROWS, push_f64)
     }
 
     /// [`Table::f64_widening`] for the streaming reader: an f64 column as stored, an f32
     /// column widened exactly, a null as NaN.
     pub fn f64_widening(&self, name: &str) -> Result<Vec<f64>> {
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in self.column(name, SCALAR_BATCH_ROWS)? {
-            push_f64_widening(&mut out, b?.column(0), name)?;
-        }
-        Ok(out)
+        self.decode(name, SCALAR_BATCH_ROWS, push_f64_widening)
     }
 
     pub fn f32(&self, name: &str) -> Result<Vec<f32>> {
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in self.column(name, SCALAR_BATCH_ROWS)? {
-            push_f32(&mut out, b?.column(0), name)?;
-        }
-        Ok(out)
+        self.decode(name, SCALAR_BATCH_ROWS, push_f32)
     }
 
     pub fn i64(&self, name: &str) -> Result<Vec<i64>> {
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in self.column(name, SCALAR_BATCH_ROWS)? {
-            push_i64(&mut out, b?.column(0), name)?;
-        }
-        Ok(out)
+        self.decode(name, SCALAR_BATCH_ROWS, push_i64)
     }
 
     pub fn i32(&self, name: &str) -> Result<Vec<i32>> {
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in self.column(name, SCALAR_BATCH_ROWS)? {
-            push_i32(&mut out, b?.column(0), name)?;
-        }
-        Ok(out)
+        self.decode(name, SCALAR_BATCH_ROWS, push_i32)
     }
 
     pub fn u32(&self, name: &str) -> Result<Vec<u32>> {
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in self.column(name, SCALAR_BATCH_ROWS)? {
-            push_u32(&mut out, b?.column(0), name)?;
-        }
-        Ok(out)
+        self.decode(name, SCALAR_BATCH_ROWS, push_u32)
     }
 
     pub fn bool(&self, name: &str) -> Result<Vec<bool>> {
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in self.column(name, SCALAR_BATCH_ROWS)? {
-            push_bool(&mut out, b?.column(0), name)?;
-        }
-        Ok(out)
+        self.decode(name, SCALAR_BATCH_ROWS, push_bool)
     }
 
     pub fn str(&self, name: &str) -> Result<Vec<String>> {
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in self.column(name, SCALAR_BATCH_ROWS)? {
-            push_str(&mut out, b?.column(0), name)?;
-        }
-        Ok(out)
+        self.decode(name, SCALAR_BATCH_ROWS, push_str)
     }
 
     /// A string column as `column == value`, row by row: exactly
@@ -3821,11 +3560,9 @@ impl TableFile {
     /// allocation. The null policy is `str`'s, so a NULL is still refused rather than
     /// quietly reading as `false`.
     pub fn str_eq(&self, name: &str, value: &str) -> Result<Vec<bool>> {
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in self.column(name, SCALAR_BATCH_ROWS)? {
-            push_str_eq(&mut out, b?.column(0), name, value)?;
-        }
-        Ok(out)
+        self.decode(name, SCALAR_BATCH_ROWS, |out, col, name| {
+            push_str_eq(out, col, name, value)
+        })
     }
 
     /// A string column as one dense id per row plus the distinct values, in
@@ -3861,62 +3598,44 @@ impl TableFile {
     }
 
     pub fn opt_f64(&self, name: &str) -> Result<Vec<Option<f64>>> {
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in self.column(name, SCALAR_BATCH_ROWS)? {
-            push_opt_f64(&mut out, b?.column(0), name)?;
-        }
-        Ok(out)
+        self.decode(name, SCALAR_BATCH_ROWS, push_opt_f64)
     }
 
     /// [`TableFile::opt_f64`] for a column stored as f64 or f32 (widened exactly).
     pub fn opt_f64_widening(&self, name: &str) -> Result<Vec<Option<f64>>> {
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in self.column(name, SCALAR_BATCH_ROWS)? {
-            push_opt_f64_widening(&mut out, b?.column(0), name)?;
-        }
-        Ok(out)
+        self.decode(name, SCALAR_BATCH_ROWS, push_opt_f64_widening)
     }
 
     /// Read a nullable utf8 column; a null cell is `None`.
     pub fn opt_str(&self, name: &str) -> Result<Vec<Option<String>>> {
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in self.column(name, SCALAR_BATCH_ROWS)? {
-            let col = b?;
-            let a: &StringArray = downcast(col.column(0), name, "utf8")?;
+        self.decode(name, SCALAR_BATCH_ROWS, |out, col, name| {
+            let a: &StringArray = downcast(col, name, "utf8")?;
             out.extend((0..a.len()).map(|k| (!a.is_null(k)).then(|| a.value(k).to_string())));
-        }
-        Ok(out)
+            Ok(())
+        })
     }
 
     /// Read a nullable i32 column; a null cell is `None`.
     pub fn opt_i32(&self, name: &str) -> Result<Vec<Option<i32>>> {
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in self.column(name, SCALAR_BATCH_ROWS)? {
-            let col = b?;
-            let a: &Int32Array = downcast(col.column(0), name, "i32")?;
+        self.decode(name, SCALAR_BATCH_ROWS, |out, col, name| {
+            let a: &Int32Array = downcast(col, name, "i32")?;
             out.extend((0..a.len()).map(|k| (!a.is_null(k)).then(|| a.value(k))));
-        }
-        Ok(out)
+            Ok(())
+        })
     }
 
     /// Read a nullable f32 column; a null cell is `None`.
     pub fn opt_f32(&self, name: &str) -> Result<Vec<Option<f32>>> {
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in self.column(name, SCALAR_BATCH_ROWS)? {
-            let col = b?;
-            let a: &Float32Array = downcast(col.column(0), name, "f32")?;
+        self.decode(name, SCALAR_BATCH_ROWS, |out, col, name| {
+            let a: &Float32Array = downcast(col, name, "f32")?;
             out.extend((0..a.len()).map(|k| (!a.is_null(k)).then(|| a.value(k))));
-        }
-        Ok(out)
+            Ok(())
+        })
     }
 
     /// Read an f32 list column (`List` or `LargeList`) as one `Vec` per row.
     pub fn list_f32(&self, name: &str) -> Result<Vec<Vec<f32>>> {
-        let mut out = Vec::with_capacity(self.nrows);
-        for b in self.column(name, LIST_BATCH_ROWS)? {
-            push_list_f32(&mut out, b?.column(0), name)?;
-        }
-        Ok(out)
+        self.decode(name, LIST_BATCH_ROWS, push_list_f32)
     }
 
     /// Read a string column into one buffer plus `nrows + 1` byte offsets (row `r` is
@@ -4725,28 +4444,19 @@ mod write_chunking_tests {
             let streamed = tmp(&format!("chunked_new_{n}.parquet"));
             assert_eq!(write_table(&whole, mixed_cols(0..n)).unwrap(), n as u64);
             let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
-            let rows = write_table_chunked(&streamed, n, |r| {
+            let w = write_table_chunked_hashed(&streamed, n, |r| {
                 ranges.push(r.clone());
                 Ok(mixed_cols(r))
             })
             .unwrap();
-            assert_eq!(rows, n as u64);
+            assert_eq!(w.rows, n as u64);
             assert_eq!(
                 std::fs::read(&streamed).unwrap(),
                 std::fs::read(&whole).unwrap(),
                 "{n} rows: the streamed file differs from write_table's"
             );
-            // Hashed while written, the file is the same file and the hash is its hash.
-            let hashed = tmp(&format!("chunked_hashed_{n}.parquet"));
-            let w = write_table_chunked_hashed(&hashed, n, |r| Ok(mixed_cols(r))).unwrap();
-            assert_eq!(w.rows, n as u64);
-            assert_eq!(
-                std::fs::read(&hashed).unwrap(),
-                std::fs::read(&whole).unwrap(),
-                "{n} rows: the hashed streamed file differs from write_table's"
-            );
-            assert_eq!(w.content_hash, crate::hash::blake3_file(&hashed).unwrap());
-            std::fs::remove_file(&hashed).ok();
+            // Hashed while written, the hash is the file's hash.
+            assert_eq!(w.content_hash, crate::hash::blake3_file(&streamed).unwrap());
             // The ranges tile 0..n in WRITE_TABLE_CHUNK_ROWS steps, one empty range when
             // the table is empty.
             assert_eq!(ranges.first().map(|r| r.start), Some(0));
@@ -4763,7 +4473,7 @@ mod write_chunking_tests {
     #[test]
     fn write_table_chunked_refuses_a_short_chunk() {
         let p = tmp("chunked_short.parquet");
-        let err = write_table_chunked(&p, 10, |r| Ok(mixed_cols(r.start..r.end - 1)))
+        let err = write_table_chunked_hashed(&p, 10, |r| Ok(mixed_cols(r.start..r.end - 1)))
             .unwrap_err()
             .to_string();
         assert!(err.contains("expected 10"), "{err}");
@@ -5148,7 +4858,7 @@ mod hash_on_write_tests {
     }
 
     #[test]
-    fn batch_writer_write_batches_and_splice_digests_are_the_file_digests() {
+    fn batch_writer_and_splice_digests_are_the_file_digests() {
         let d = dir("batch");
         let (schema, batch) = cols_to_batch("fixture", cols(5_000)).unwrap();
         let p = |x: &str| d.join(x).to_string_lossy().to_string();
@@ -5175,27 +4885,6 @@ mod hash_on_write_tests {
                 rows += b.num_rows();
             }
             check(&path, &w.close_hashed().unwrap(), rows);
-        }
-
-        // write_batches: empty, one, two batches; and the same bytes as the unhashed path.
-        for (name, batches) in [
-            ("wb_empty", vec![]),
-            ("wb_one", vec![batch.clone()]),
-            ("wb_two", vec![batch.clone(), batch.slice(100, 900)]),
-        ] {
-            let path = p(&format!("{name}.parquet"));
-            let plain = p(&format!("{name}_plain.parquet"));
-            let rows: usize = batches.iter().map(|b: &RecordBatch| b.num_rows()).sum();
-            check(
-                &path,
-                &write_batches_hashed(&path, schema.clone(), &batches).unwrap(),
-                rows,
-            );
-            write_batches(&plain, schema.clone(), &batches).unwrap();
-            assert_eq!(
-                std::fs::read(&path).unwrap(),
-                std::fs::read(&plain).unwrap()
-            );
         }
 
         // SpliceWriter over two capped sources, hashed and not.
@@ -5901,138 +5590,6 @@ mod streaming_tests {
         // A reader is moved to the thread that drains it, not shared.
         fn assert_send<T: Send>() {}
         assert_send::<BatchReader>();
-    }
-}
-
-#[cfg(test)]
-mod atomic_path_tests {
-    use super::*;
-
-    fn dir(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("mumdia_atomic_{}_{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
-    #[test]
-    fn two_writers_for_one_destination_get_different_temporary_files() {
-        let d = dir("two_writers");
-        let final_path = d.join("out.parquet").to_str().unwrap().to_string();
-        let a = AtomicPath::new(&final_path).unwrap();
-        let b = AtomicPath::new(&final_path).unwrap();
-        assert_ne!(
-            a.tmp(),
-            b.tmp(),
-            "the suffix must not be the process id alone"
-        );
-        drop(a);
-        drop(b);
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn a_failed_publication_leaves_the_previous_result_in_place() {
-        // The destination is a non-empty directory, which a file cannot be renamed onto
-        // on any platform, so publication fails. Before the fix the destination was
-        // removed first and the failure left nothing behind.
-        let d = dir("failed_publish");
-        let final_path = d.join("out.parquet");
-        std::fs::create_dir_all(&final_path).unwrap();
-        std::fs::write(final_path.join("previous"), b"previous result").unwrap();
-        let ap = AtomicPath::new(final_path.to_str().unwrap()).unwrap();
-        std::fs::write(ap.tmp(), b"new result").unwrap();
-        assert!(
-            ap.publish().is_err(),
-            "renaming a file onto a directory must fail"
-        );
-        assert!(
-            final_path.join("previous").is_file(),
-            "the previous result must survive a failed publication"
-        );
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn a_successful_publication_replaces_the_previous_file() {
-        let d = dir("replace");
-        let final_path = d.join("out.parquet");
-        let fp = final_path.to_str().unwrap().to_string();
-        let first = AtomicPath::new(&fp).unwrap();
-        std::fs::write(first.tmp(), b"v1").unwrap();
-        first.publish().unwrap();
-        let second = AtomicPath::new(&fp).unwrap();
-        std::fs::write(second.tmp(), b"v2").unwrap();
-        second.publish().unwrap();
-        assert_eq!(std::fs::read(&final_path).unwrap(), b"v2");
-        assert!(
-            std::fs::read_dir(&d).unwrap().count() == 1,
-            "no temporary file may remain after publication"
-        );
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn a_published_copy_is_the_source_bytes_by_link_and_by_copy() {
-        let d = dir("copy_of");
-        let src = d.join("features.parquet");
-        std::fs::write(&src, b"PAR1 the source bytes PAR1").unwrap();
-        let src_s = src.to_str().unwrap();
-        for (allow_link, want) in [(true, FileCopy::HardLink), (false, FileCopy::ByteCopy)] {
-            let out = d.join(format!("competed_{allow_link}.parquet"));
-            let out_s = out.to_str().unwrap();
-            // Twice: the second publication lands on a destination that already holds the
-            // same bytes, and for the link case already IS the same file.
-            for _ in 0..2 {
-                let how = publish_copy_of_with(src_s, out_s, allow_link).unwrap();
-                // A filesystem without hard links degrades to the copy; both are correct.
-                assert!(how == want || how == FileCopy::ByteCopy, "{how:?}");
-                assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&src).unwrap());
-            }
-        }
-        // The source is intact, and no temporary name survived either publication: the
-        // second link publication renamed a link onto a link to the same file, which POSIX
-        // turns into a no-op that leaves the temporary name behind.
-        assert_eq!(std::fs::read(&src).unwrap(), b"PAR1 the source bytes PAR1");
-        let names: Vec<String> = std::fs::read_dir(&d)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            names.iter().all(|n| !n.contains(".tmp-")),
-            "a temporary file survived: {names:?}"
-        );
-        assert_eq!(names.len(), 3, "{names:?}");
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn republishing_either_name_leaves_the_other_file_alone() {
-        // After a link the two names share one file. The writers publish by renaming a new
-        // file over the destination, so rewriting the source must not change the copy.
-        let d = dir("link_independence");
-        let src = d.join("features.parquet");
-        let out = d.join("competed.parquet");
-        std::fs::write(&src, b"v1").unwrap();
-        publish_copy_of(src.to_str().unwrap(), out.to_str().unwrap()).unwrap();
-        let rewrite = AtomicPath::new(src.to_str().unwrap()).unwrap();
-        std::fs::write(rewrite.tmp(), b"v2").unwrap();
-        rewrite.publish().unwrap();
-        assert_eq!(std::fs::read(&src).unwrap(), b"v2");
-        assert_eq!(std::fs::read(&out).unwrap(), b"v1");
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn a_failed_copy_leaves_the_destination_as_it_was() {
-        let d = dir("copy_fails");
-        let out = d.join("competed.parquet");
-        std::fs::write(&out, b"previous").unwrap();
-        let missing = d.join("no_such_features.parquet");
-        assert!(publish_copy_of(missing.to_str().unwrap(), out.to_str().unwrap()).is_err());
-        assert_eq!(std::fs::read(&out).unwrap(), b"previous");
-        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1);
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

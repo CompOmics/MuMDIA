@@ -44,27 +44,13 @@ fn std(v: &[f64]) -> f64 {
     (v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / (v.len() as f64 - 1.0)).sqrt()
 }
 
-fn median(v: &[f64]) -> f64 {
-    if v.is_empty() {
-        return 0.0;
-    }
-    let mut s = v.to_vec();
-    s.sort_by(|a, b| a.total_cmp(b));
-    let n = s.len();
-    if n % 2 == 1 {
-        s[n / 2]
-    } else {
-        0.5 * (s[n / 2 - 1] + s[n / 2])
-    }
-}
-
 fn median_abs_dev(v: &[f64]) -> f64 {
     if v.is_empty() {
         return 0.0;
     }
-    let m = median(v);
-    let dev: Vec<f64> = v.iter().map(|x| (x - m).abs()).collect();
-    median(&dev)
+    let m = crate::stats::median_or(&mut v.to_vec(), 0.0);
+    let mut dev: Vec<f64> = v.iter().map(|x| (x - m).abs()).collect();
+    crate::stats::median_or(&mut dev, 0.0)
 }
 
 /// Index of the maximum of a slice (first on ties); None if empty or all <= 0.

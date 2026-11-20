@@ -285,8 +285,10 @@ enum Cmd {
         #[arg(long)]
         out_fragments: String,
         /// Keep exactly the listed candidates instead of unioning the decision over
-        /// `peptidoform_id`. A target and its decoy share that id, so the default keeps
-        /// pairs together and this breaks pairing unless the list is already pair-complete.
+        /// `peptidoform_id`. In an imported library a target and its decoy share that id, so
+        /// the default keeps pairs together; a FASTA-built library gives each decoy its own
+        /// id and is refused by the default. This breaks pairing unless the list is already
+        /// pair-complete.
         #[arg(long, default_value_t = false)]
         no_pair_link: bool,
         #[arg(long)]
@@ -407,8 +409,9 @@ enum Cmd {
         /// localisation_experiment.parquet here instead, and leave the experiment untouched.
         #[arg(long, requires = "experiment_dir")]
         out_dir: Option<String>,
-        /// With --experiment-dir: only these sources (comma-separated run indices).
-        #[arg(long, requires = "experiment_dir", value_delimiter = ',')]
+        /// With --experiment-dir and --out-dir: only these sources (comma-separated run
+        /// indices). A subset is never written into the experiment.
+        #[arg(long, requires = "out_dir", value_delimiter = ',')]
         sources: Vec<u32>,
         #[arg(long)]
         config: Option<String>,
@@ -1979,15 +1982,13 @@ fn real_main() -> Result<()> {
                     cfg.convert.isolation_half_width = Some(l.half_width);
                 }
             }
-            // Fold the conversion CLI caps into the convert artifacts' provenance
-            // key: they change the spectra output but are not part of the config, so
-            // two different caps would otherwise produce an identical config_hash
-            // (docs/18_findings_and_decisions.md). The caps are also recorded in
-            // the convert report.
-            let config_hash = mumdia_io::hash::blake3_str(&format!(
-                "{}\u{1f}max_spectra={max_spectra}\u{1f}top_peaks_ms2={top_peaks_ms2}\u{1f}top_peaks_ms1={top_peaks_ms1}",
-                cfg.canonical_json()
-            ));
+            // The caps are also recorded in the convert report.
+            let config_hash = stages::convert::provenance_hash(
+                &cfg.canonical_json(),
+                max_spectra,
+                top_peaks_ms2,
+                top_peaks_ms1,
+            );
             stages::convert::run(stages::convert::ConvertParams {
                 mzml: &mzml,
                 out_dir: &out_dir,
@@ -2001,13 +2002,11 @@ fn real_main() -> Result<()> {
         }
         Cmd::Digest { fasta, out, config } => {
             let cfg = load_config(&config)?;
-            let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::digest::run(stages::digest::DigestParams {
                 fasta: &fasta,
                 out: &out,
                 cfg: &cfg.digest,
                 rng_seed: cfg.rng_seed,
-                config_hash: &ch,
                 protein_n_term: cfg.peptidoforms.has_protein_n_term_rule(),
             })?;
         }
@@ -2017,12 +2016,10 @@ fn real_main() -> Result<()> {
             config,
         } => {
             let cfg = load_config(&config)?;
-            let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::peptidoforms::run(stages::peptidoforms::PeptidoformsParams {
                 peptides: &peptides,
                 out: &out,
                 cfg: &cfg.peptidoforms,
-                config_hash: &ch,
             })?;
         }
         Cmd::PredictFrag {
@@ -2034,7 +2031,6 @@ fn real_main() -> Result<()> {
         } => {
             let cfg = load_config(&config)?;
             stages::rt_health::refuse_native_predictors(&cfg, true, "predict-frag")?;
-            let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::predict_frag::run(stages::predict_frag::PredictFragParams {
                 // The standalone stage cannot know that a multi-head calibration follows.
                 rt_placeholder: false,
@@ -2043,7 +2039,6 @@ fn real_main() -> Result<()> {
                 out_fragments: &out_fragments,
                 work_dir: &work_dir,
                 cfg: &cfg.predict_frag,
-                config_hash: &ch,
                 // No run: `im_predictor = auto` predicts nothing here (an explicit
                 // `im2deep` still does).
                 run_has_im: false,
@@ -2057,7 +2052,6 @@ fn real_main() -> Result<()> {
             config,
         } => {
             let cfg = load_config(&config)?;
-            let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::search_seed::run(stages::search_seed::SearchSeedParams {
                 observed_im_q: cfg.rt_im_train.seed_observed_im_q(),
                 precursor_span: None,
@@ -2072,7 +2066,6 @@ fn real_main() -> Result<()> {
                 out: &out,
                 cfg: &cfg.search_seed,
                 bucket_size: cfg.extract.bucket_size,
-                config_hash: &ch,
             })?;
         }
         Cmd::RtImTrain {
@@ -2109,6 +2102,12 @@ fn real_main() -> Result<()> {
                 );
             }
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            // The anchor cut `run` uses: `q_train`, relaxed through `anchor_q_ladder` on a
+            // seed short of anchors.
+            let rt_cfg = stages::rt_im_train::with_anchor_cut(
+                &cfg.rt_im_train,
+                &stages::rt_im_train::plan_anchors(&seed_psms, &cfg.rt_im_train)?,
+            );
             stages::rt_im_train::run(stages::rt_im_train::RtImTrainParams {
                 precursor_span: None,
                 anchor_irt_from_seed: false,
@@ -2116,7 +2115,7 @@ fn real_main() -> Result<()> {
                 library_precursors: &lib_precursors,
                 out_windows: &out_windows,
                 out_cal: &out_cal,
-                cfg: &cfg.rt_im_train,
+                cfg: &rt_cfg,
                 config_hash: &ch,
                 im_window_floor: None,
                 im_anchor_q: Some(cfg.search_seed.fdr_seed),
@@ -2168,37 +2167,9 @@ fn real_main() -> Result<()> {
         } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
-            // The per-fragment Q1 decision reads the run's calibration; the re-pick runs
-            // inside extract.
+            // The ZT Scan keys, from the run's calibration (`--q1-cal`), as `mumdia run` sets them.
             let mut ext_cfg = cfg.extract.clone();
-            let q1_dec = ext_cfg.q1_deconvolved || cfg.features.q1_deconvolved.on();
-            if ext_cfg.q1_fragments.on() || q1_dec {
-                let cal = q1_cal.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "extract.q1_fragments and extract.q1_deconvolved need the run's \
-                         cal.json with its Q1 calibration: pass --q1-cal"
-                    )
-                })?;
-                ext_cfg.q1_model = Some(stages::q1frag::read_model_opts(
-                    cal,
-                    ext_cfg.q1_fragments.on(),
-                )?);
-                if ext_cfg.q1_fragments.on() {
-                    ext_cfg.q1_repick = cfg.retrace.q1_repick.on();
-                    ext_cfg.q1_repick_peaks = cfg.retrace.q1_repick_peaks;
-                }
-                if q1_dec {
-                    ext_cfg.q1_dec_tol_steps = Some(stages::q1frag::read_deconvolution_tol(cal)?);
-                }
-            }
-            // `features.ms1_envelope`: extract reads the MS1 isotope-envelope evidence.
-            ext_cfg.ms1_envelope = cfg.features.ms1_envelope;
-            // `features.q1_precursor` / `features.q1_multiscale`: extract reads the scores on
-            // the per-fragment decision's patches.
-            ext_cfg.q1_precursor = cfg.features.q1_precursor.on();
-            ext_cfg.q1_multiscale = cfg.features.q1_multiscale.on();
-            ext_cfg.q1_dec_features = cfg.features.q1_deconvolved.on();
-            ext_cfg.q1_separable = cfg.features.q1_separable;
+            stages::q1frag::configure_extract(&cfg, q1_cal.as_deref(), &mut ext_cfg)?;
             stages::extract::run(stages::extract::ExtractParams {
                 precursor_span: None,
                 fragment_offset,
@@ -2369,7 +2340,6 @@ fn real_main() -> Result<()> {
             config,
         } => {
             let cfg = load_config(&config)?;
-            let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             // `features.q1_consistency` reads the decisions against the run's tolerances.
             let q1_tolerances = match (&q1_cal, cfg.features.q1_consistency.on()) {
                 (Some(cal), _) => Some(stages::q1frag::read_model(cal)?.tolerances),
@@ -2386,7 +2356,6 @@ fn real_main() -> Result<()> {
                 out: &out,
                 out_pin: &out_pin,
                 cfg: &cfg.features,
-                config_hash: &ch,
                 // `retrace.apex_features` names the column a retraced psms_extracted
                 // carries; it is read only while the ion-mobility family is on.
                 imc_ref_w: cfg.retrace.apex_features,
@@ -2466,12 +2435,10 @@ fn real_main() -> Result<()> {
             config,
         } => {
             let cfg = load_config(&config)?;
-            let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::compete::run(stages::compete::CompeteParams {
                 features: &features,
                 out: &out,
                 cfg: &cfg.compete,
-                config_hash: &ch,
                 features_hash: None,
             })?;
         }
@@ -2844,8 +2811,8 @@ fn real_main() -> Result<()> {
             stages::quant::run(stages::quant::QuantParams {
                 psms_scored: &psms_scored,
                 chromatograms: &tables,
-                out_peptide: &out_peptide,
-                out_protein: &out_protein,
+                out_peptide: Some(&out_peptide),
+                out_protein: Some(&out_protein),
                 out_fragment: out_fragment.as_deref(),
                 out_peak_bounds: out_peak_bounds.as_deref(),
                 out_quant_fragments: out_quant_fragments.as_deref(),
@@ -2909,7 +2876,7 @@ fn real_main() -> Result<()> {
                     })
                     .collect()
             });
-            let (_, factors) = stages::quant::run_lfq_combine_grouped(
+            let (_, factors) = mumdia::quant_lfq::run_lfq_combine_grouped(
                 &inputs,
                 by_fragment,
                 norm,
@@ -2919,7 +2886,7 @@ fn real_main() -> Result<()> {
             )?;
             if let Some(path) = &size_factors_out {
                 let runs: Vec<String> = (0..inputs.len()).map(|i| i.to_string()).collect();
-                stages::quant::write_size_factors_tsv(path, &runs, &conditions, &factors)?;
+                mumdia::quant_lfq::write_size_factors_tsv(path, &runs, &conditions, &factors)?;
             }
         }
         Cmd::QuantNormalise {
@@ -3132,7 +3099,7 @@ fn real_main() -> Result<()> {
                 // from before it has none, and precursors.tsv then has no normalised_<run>.
                 let prec_lfq = lfq
                     .as_deref()
-                    .and_then(stages::quant::precursor_lfq_sibling);
+                    .and_then(mumdia::quant_lfq::precursor_lfq_sibling);
                 let counts = stages::report::run_experiment_localised(
                     stages::report::ExperimentReportParams {
                         scored: &scored,

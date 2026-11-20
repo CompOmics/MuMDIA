@@ -437,6 +437,36 @@ fn terminal_rules_are_an_n_terminal_placement() {
     let _ = std::fs::remove_dir_all(&f.dir);
 }
 
+/// A site outside the configured rules (Y, with Phospho configured on S and T only, as for
+/// an imported library searched under another configuration) stays a placement of its peak:
+/// the peak is not called on the one configured residue left.
+#[test]
+fn an_identified_site_outside_the_rules_stays_a_placement() {
+    let r: Vec<FixtureRow> = vec![("AGY[Phospho]SPEK", "target", 1, 100.0, 0.9, 0.001)];
+    let planted = vec![(100.0, "AGY[Phospho]SPEK", "Phospho", vec![2])];
+    let f = fixture_of("offrule", &r, &planted);
+    let rules: Vec<ResidueMod> = "ST"
+        .chars()
+        .map(|c| rule(c, "Phospho", ModPosition::Anywhere))
+        .collect();
+    let out = f.dir.join("loc.parquet").to_str().unwrap().to_string();
+    run_with(&f, &out, &LocaliseConfig::default(), &rules, None);
+    let o = read(&out);
+    let t = TableFile::open(&out).unwrap();
+    let sites = t.opt_str("site_probabilities").unwrap();
+    let a = row_of(&o, "AGY[Phospho]SPEK");
+    let cells: Vec<&str> = sites[a]
+        .as_deref()
+        .unwrap()
+        .split(';')
+        .map(|c| c.split(':').next().unwrap())
+        .collect();
+    assert_eq!(cells, vec!["A1", "Y3", "S4"]);
+    assert_ne!(o.status[a], "unambiguous");
+    assert_eq!(o.best[a], "AGY[Phospho]SPEK", "{:?}", sites[a]);
+    let _ = std::fs::remove_dir_all(&f.dir);
+}
+
 /// Two isomers 9 s apart with overlapping elution bounds: the 5 s rule makes two peaks; the
 /// elution-bounds rule makes one when their shared fragments show one peak, and two when the
 /// shared-fragment profile dips between the apexes.
