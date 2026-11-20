@@ -708,7 +708,7 @@ first_run_only`, every run under `per_run`):
    compete and a single-run rescore, all inside `<run>/rt_bootstrap/`
    (`run_experiment::finish_run` plus `rescore::run_hashed`, the same calls as the final
    pass);
-3. the targets at `precursor_q <= q_train` of the bootstrap's scored table, one row per
+3. the targets at `precursor_q < q_train` of the bootstrap's scored table, one row per
    candidate (the best-scoring when several), with observed RT = `apex_rt`, are written to
    `<run>/rt_bootstrap/search_anchors.parquet` in the seed's column shape (`candidate_id`,
    `peptidoform`, `charge`, `base_peptide_id`, `label`, `score`, `spectrum_q` = the
@@ -1426,7 +1426,7 @@ though the enum variant still exists.
 | `loess_span` | `0.3` | LOESS local-fit fraction; passed as `span` to `Loess::fit` (rt_im_train.rs:137). Fraction of anchors in each local window. |
 | `fallback_rt_window_s` | `120.0` | Fixed half-window (seconds) when anchors are too few (`WindowPlan::Fixed`, rt_im_train.rs:168-175); also the upper clamp for adaptive bin widths (rt_im_train.rs:211). |
 | `finetune_deeplc` | `false` | Enable the DeepLC multitask fine-tune pre-step in `run` (run.rs:265). Requires `predict_frag.deeplc_python` (preflight, run.rs:62-67). On one measured run it was not needed per file once the library iRT had been fine-tuned once: the per-run LOESS reached the same residuals for much less wall clock (see the fine-tune section for the scope of that measurement). |
-| `multihead_anchors` | `auto` | Anchors of the multi-head calibration on the run that adapts the library. `search` refits it on the confident targets (`precursor_q <= q_train`, observed RT = `apex_rt`) of a bootstrap search of that run in `<run>/rt_bootstrap/`, and falls back to the seed-anchored library with a warning when that is not possible; refused with `finetune_deeplc`, `multihead_calibration = 0` and `groups.window_groups > 1`. `seed` never does. `auto` is `search` on a run whose seed found fewer than `multihead_search_below` anchors (or only at a relaxed q), else `seed` (section 4f). |
+| `multihead_anchors` | `auto` | Anchors of the multi-head calibration on the run that adapts the library. `search` refits it on the confident targets (`precursor_q < q_train`, observed RT = `apex_rt`) of a bootstrap search of that run in `<run>/rt_bootstrap/`, and falls back to the seed-anchored library with a warning when that is not possible; refused with `finetune_deeplc`, `multihead_calibration = 0` and `groups.window_groups > 1`. `seed` never does. `auto` is `search` on a run whose seed found fewer than `multihead_search_below` anchors (or only at a relaxed q), else `seed` (section 4f). |
 | `multihead_search_below` | `2500` | `auto`'s threshold on the seed anchor count (distinct target base peptides at `q_train`). |
 | `q1_calibrate` | `"auto"` | On for a ZT Scan search, off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Scanning-quadrupole spectra only: calibrate the Q1 window (centre offset, half-width, edge width) on the seed fragments and write `q1_calibration` to `cal.json`; changes no other artifact (section 4h). |
 | `finetune_epochs` | `25` | Fine-tune epoch cap (`--epochs`); early stopping usually halts sooner. Used only when `finetune_deeplc`. |
