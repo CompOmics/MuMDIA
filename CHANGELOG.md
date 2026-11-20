@@ -316,6 +316,19 @@ than a number. Both are recorded in every run's `manifest.json`.
   and missed the postings before it. Only a configuration that sets `search_seed.matcher` or
   `extract.matcher` to `"bucketed"` reaches this; the default `fragindex` matcher is
   unchanged, and so is every default output.
+- **Retrace keeps the frames of a candidate whose rows continue into the next row group.**
+  Retrace reads the chromatograms one row group at a time and holds only the MS2 frames of the
+  isolation windows that the row group's candidates need. It counted those candidates from one
+  past the previous row group's last, so a candidate whose rows straddle the boundary, which is
+  routine, was left out: when no other candidate of the new row group shared its window, the
+  frames were dropped and its remaining fragment points were rebuilt as zeros, with only a warning
+  about grid points without a decoded frame. The windows are now wanted from the row group's first
+  candidate. Only a diaPASEF search with `retrace.enabled` (the diaPASEF recipe) can change, and
+  only for such a candidate; 3D searches are byte-identical. It takes a window edge between two
+  adjacent library precursors at a row-group boundary: on a timsTOF Ultra 2 E. coli entrapment
+  run searched with the recipe, 376 of the 405 row groups opened with a straddling candidate (6,061
+  of 6,472 with `MUMDIA_CHROM_ROW_GROUP_ROWS` at 4,096) and none of them needed a window the rest
+  of its row group did not hold, so every table of that search is unchanged.
 - **Desktop: "Add folder…" selects several spectra folders at once (#335).** A Bruker or Agilent `.d`
   and a Waters `.raw` are directories, so they are added with "Add folder…", and that dialog took
   one folder at a time: the spectra folder picker shared the single-choice setting of the output

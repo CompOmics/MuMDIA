@@ -835,6 +835,35 @@ fn repick_rows(
     (picks, dumped)
 }
 
+/// The windows whose (inclusive) m/z bounds reach the precursors of candidates `lo..hi`,
+/// widened by a hair so a precursor on a window edge never misses its window.
+fn windows_reaching(win_bounds: &[(f64, f64)], pmz: &[f64], lo: usize, hi: usize) -> Vec<bool> {
+    const EDGE: f64 = 1e-6;
+    let mut want = vec![false; win_bounds.len()];
+    let (mut a, mut b) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &m in &pmz[lo.min(pmz.len())..hi.min(pmz.len())] {
+        if m.is_finite() {
+            (a, b) = (a.min(m), b.max(m));
+        }
+    }
+    if a <= b {
+        for (w, &(l, u)) in win_bounds.iter().enumerate() {
+            want[w] = l <= b + EDGE && u >= a - EDGE;
+        }
+    }
+    want
+}
+
+/// The candidates of a span whose rows carry `cid`, given `next_lo`, one past the previous
+/// span's last: `lo..hi` need their windows' frames held and `next_lo..hi` are re-picked. A
+/// candidate split across the row-group boundary starts the span at `next_lo - 1`; its
+/// remaining rows are rebuilt here, so its windows are wanted too.
+fn span_candidates(cid: &[u32], next_lo: usize) -> (usize, usize) {
+    let hi = cid.last().map_or(next_lo, |&c| c as usize + 1).max(next_lo);
+    let lo = cid.first().map_or(next_lo, |&c| (c as usize).min(next_lo));
+    (lo, hi)
+}
+
 /// The MS2 frames that isolate a window in `want` (inside the RT range), decoded into
 /// `frames`, and every other decoded MS2 frame dropped: retrace holds the frames of the
 /// windows its current candidates sit in, not the run. Returns the frames decoded.
@@ -1302,24 +1331,7 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
     let mut dumped: Vec<(u32, u32, f64, f64)> = Vec::new();
     let mut t_repick = 0u128;
     let mut t_windows = 0u128;
-    // The windows whose (inclusive) m/z bounds reach the precursors of candidates `lo..hi`,
-    // widened by a hair so a precursor on a window edge never misses its window.
-    let want_windows = |lo: usize, hi: usize| -> Vec<bool> {
-        const EDGE: f64 = 1e-6;
-        let mut want = vec![false; win_bounds.len()];
-        let (mut a, mut b) = (f64::INFINITY, f64::NEG_INFINITY);
-        for &m in &pmz[lo.min(pmz.len())..hi.min(pmz.len())] {
-            if m.is_finite() {
-                (a, b) = (a.min(m), b.max(m));
-            }
-        }
-        if a <= b {
-            for (w, &(l, u)) in win_bounds.iter().enumerate() {
-                want[w] = l <= b + EDGE && u >= a - EDGE;
-            }
-        }
-        want
-    };
+    let want_windows = |lo: usize, hi: usize| windows_reaching(&win_bounds, &pmz, lo, hi);
     // The windows' RT bounds stay only for padded traces, which are counted inside them.
     let pad_win: Option<(Vec<f64>, Vec<f64>)> =
         (trace_pad > 0.0).then(|| (win.rt_lo.clone(), win.rt_hi.clone()));
@@ -1432,15 +1444,11 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
                 .map_err(|_| anyhow!("retrace: a reader stopped early"))??;
             // Every candidate up to this span's last: the frames of their windows held, then
             // their re-pick, so `apex_rt` and `centre` are final for every row of the span.
-            let hi = span
-                .cid
-                .last()
-                .map_or(next_lo, |&c| c as usize + 1)
-                .max(next_lo);
+            let (lo, hi) = span_candidates(&span.cid, next_lo);
             let tw = Instant::now();
             decoded += hold_window_frames(
                 &mut frames_own,
-                &want_windows(next_lo, hi),
+                &want_windows(lo, hi),
                 &ms2_wins,
                 ms2_fi,
                 ms2_rt,
@@ -2381,5 +2389,22 @@ mod tests {
         assert!(median(vec![]).is_nan());
         assert_eq!(median(vec![3.0, -1.0, 2.0]), 2.0);
         assert_eq!(median(vec![4.0, 1.0, 2.0, 3.0]), 2.5);
+    }
+
+    #[test]
+    fn a_candidate_split_across_row_groups_keeps_the_frames_of_its_window() {
+        // Candidate 0 sits in [400, 425] only, candidate 1 in [425, 450] only, and the span
+        // starts with the last rows of candidate 0, re-picked in the previous span.
+        let win_bounds = [(400.0, 425.0), (425.0, 450.0)];
+        let pmz = [424.9995, 425.0005];
+        let (lo, hi) = span_candidates(&[0, 0, 1, 1], 1);
+        assert_eq!((lo, hi), (0, 2));
+        assert_eq!(windows_reaching(&win_bounds, &pmz, lo, hi), [true, true]);
+        // Wanted from `next_lo` alone, the frames of [400, 425] were dropped and those rows
+        // were rebuilt as zeros.
+        assert_eq!(windows_reaching(&win_bounds, &pmz, 1, hi), [false, true]);
+        // A span that opens on a new candidate, or holds none, starts at `next_lo`.
+        assert_eq!(span_candidates(&[3, 4], 1), (1, 5));
+        assert_eq!(span_candidates(&[], 2), (2, 2));
     }
 }
