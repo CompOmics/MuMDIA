@@ -223,7 +223,7 @@ monotone rollup of one another. The columns written by `rescore` are:
 - `peptide_q_value`: FDR grouped on stripped sequence.
 - `pg_q_value`: protein-group FDR.
 
-See `rust/mumdia/crates/mumdia/src/stages/rescore.rs:288` through `:396` for the
+See `rescore::run_hashed` in `rust/mumdia/crates/mumdia/src/stages/rescore.rs` for the
 computation (PSM, peptide, protein-group, per-run, and precursor levels) and
 `:447` through `:477` for the emitted columns. The estimator is
 `q = (n_decoys + 1) / max(1, n_targets)`, monotonized, with tied-score blocks
@@ -453,7 +453,7 @@ Concrete guarantees in code:
   (`rust/mumdia/crates/mumdia/src/fdr.rs:26` through `:52`).
 - Per-run q-values iterate sources through a `BTreeMap` (sorted keys), and the
   code notes explicitly that no floats are summed there
-  (`rust/mumdia/crates/mumdia/src/stages/rescore.rs:347` through `:376`).
+  (`per_source_q` in `rust/mumdia/crates/mumdia/src/stages/rescore.rs`).
 
 Two known exceptions are nondeterministic by design and are documented as such:
 

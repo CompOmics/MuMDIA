@@ -18,8 +18,8 @@ use tracing::{info, warn};
 
 use crate::fdr::{entrapment_q, target_decoy_q_by, target_decoy_q_split};
 use crate::rescoring::{
-    percolator_lite, prefilter_decoy_cut_mask, prefilter_scores, FeatureMatrix, PrefilterInput,
-    RescoreInput,
+    percolator_lite, prefilter_decoy_cut_mask, prefilter_decoys_kept, prefilter_scores,
+    FeatureMatrix, PrefilterInput, RescoreInput,
 };
 use crate::stages::features::FeatureSchema;
 
@@ -266,11 +266,6 @@ impl PhaseTimings {
     }
 }
 
-/// A byte count in the largest unit that keeps it readable.
-///
-/// The matrix spans six orders of magnitude between the smoke fixture and a 40-run
-/// experiment, so a fixed unit is unhelpful at one end or the other: `0.00 GiB` says
-/// nothing, and `270336.0 MiB` says it badly.
 /// Bytes of the flat f32 feature matrix for `rows` PSMs and `features` columns, or
 /// `None` when the product overflows.
 fn feature_matrix_bytes(rows: usize, features: usize) -> Option<u64> {
@@ -289,6 +284,11 @@ fn matrix_ceiling_exceeded(matrix_bytes: u64, max_gib: f64) -> Option<f64> {
     (gib > max_gib).then_some(max_gib)
 }
 
+/// A byte count in the largest unit that keeps it readable.
+///
+/// The matrix spans six orders of magnitude between the smoke fixture and a 40-run
+/// experiment, so a fixed unit is unhelpful at one end or the other: `0.00 GiB` says
+/// nothing, and `270336.0 MiB` says it badly.
 fn human_bytes(bytes: f64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
@@ -336,6 +336,25 @@ fn refuse_row_disagreement(what: &str, got: usize, expected: usize) -> Result<()
         );
     }
     Ok(())
+}
+
+/// A classifier that cannot run: under `rescore.strict` an error, otherwise a warning, after
+/// which the caller falls back to native scoring.
+fn strict_or_warn(strict: bool, failure: &str, fallback: &str) -> Result<()> {
+    if strict {
+        anyhow::bail!("rescore: {failure} and rescore.strict=true");
+    }
+    warn!("rescore: {failure}; {fallback}");
+    Ok(())
+}
+
+/// How many distinct `keys` the rows that `pass` accepts hold.
+fn count_distinct(keys: &[u32], pass: impl Fn(usize) -> bool) -> usize {
+    (0..keys.len())
+        .filter(|&i| pass(i))
+        .map(|i| keys[i])
+        .collect::<std::collections::HashSet<u32>>()
+        .len()
 }
 
 /// Refuse a rescore whose population cannot support target-decoy FDR.
@@ -470,39 +489,6 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
     let mut total_rows = 0usize;
     for path in p.competed.iter() {
         total_rows += TableFile::open(path)?.nrows;
-    }
-    // The matrix is one contiguous f32 buffer (`rescoring::FeatureMatrix`), so its size
-    // follows from the parquet footers and the selected feature count before a byte is
-    // allocated. The ceiling used to be applied after the matrix had been filled, against
-    // an estimate of the old `Vec<Vec<f64>>` layout (8 bytes per value plus a 24-byte
-    // spine per PSM), so it could neither prevent the allocation it described nor
-    // describe the one that happened (docs/29 #11). It is a limit on the matrix alone.
-    let matrix_bytes = feature_matrix_bytes(total_rows, feat_names.len()).ok_or_else(|| {
-        anyhow::anyhow!(
-            "rescore feature matrix size overflows: {total_rows} PSMs x {} features",
-            feat_names.len()
-        )
-    })?;
-    info!(
-        psms = total_rows,
-        features = feat_names.len(),
-        feature_matrix = %human_bytes(matrix_bytes as f64),
-        folds = p.cfg.folds,
-        "rescore: feature matrix size before allocation"
-    );
-    if let Some(ceiling) = matrix_ceiling_exceeded(matrix_bytes, p.cfg.max_feature_matrix_gib) {
-        anyhow::bail!(
-            "rescore feature matrix would be {} ({total_rows} PSMs x {} features x 4 bytes, \
-             f32), over the configured rescore.max_feature_matrix_gib of {ceiling:.2}. This \
-             is the matrix alone: per-PSM metadata, the one standardised training copy \
-             native_tda holds (its peak is 1 + (folds - 1) / folds times this, 1.67x at \
-             the default 3 folds and never above 2x) and the Python worker's own copy come on top. \
-             Either raise the ceiling, or rescore fewer runs \
-             per invocation -- `run_psm_q` is computed per source, so sub-batching costs no \
-             per-run FDR, though it does change which PSMs share the pooled q_value.",
-            human_bytes(matrix_bytes as f64),
-            feat_names.len(),
-        );
     }
     // Pass 1: the per-PSM metadata columns of every input. Reading them in their own pass,
     // separately from the ~390 feature columns, is what lets the feature pass below be
@@ -666,6 +652,39 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
         }));
         total_rows = keep.len();
     }
+    // The matrix is one contiguous f32 buffer (`rescoring::FeatureMatrix`), so its size
+    // follows from the rows the prefilter kept and the selected feature count before a
+    // byte is allocated; the uncut pool would refuse a matrix that is never built. The ceiling used to be applied after the matrix had been filled, against
+    // an estimate of the old `Vec<Vec<f64>>` layout (8 bytes per value plus a 24-byte
+    // spine per PSM), so it could neither prevent the allocation it described nor
+    // describe the one that happened (docs/29 #11). It is a limit on the matrix alone.
+    let matrix_bytes = feature_matrix_bytes(total_rows, feat_names.len()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "rescore feature matrix size overflows: {total_rows} PSMs x {} features",
+            feat_names.len()
+        )
+    })?;
+    info!(
+        psms = total_rows,
+        features = feat_names.len(),
+        feature_matrix = %human_bytes(matrix_bytes as f64),
+        folds = p.cfg.folds,
+        "rescore: feature matrix size before allocation"
+    );
+    if let Some(ceiling) = matrix_ceiling_exceeded(matrix_bytes, p.cfg.max_feature_matrix_gib) {
+        anyhow::bail!(
+            "rescore feature matrix would be {} ({total_rows} PSMs x {} features x 4 bytes, \
+             f32), over the configured rescore.max_feature_matrix_gib of {ceiling:.2}. This \
+             is the matrix alone: per-PSM metadata, the one standardised training copy \
+             native_tda holds (its peak is 1 + (folds - 1) / folds times this, 1.67x at \
+             the default 3 folds and never above 2x) and the Python worker's own copy come on top. \
+             Either raise the ceiling, or rescore fewer runs \
+             per invocation -- `run_psm_q` is computed per source, so sub-batching costs no \
+             per-run FDR, though it does change which PSMs share the pooled q_value.",
+            human_bytes(matrix_bytes as f64),
+            feat_names.len(),
+        );
+    }
     let (mut is_entrapment, mut is_real_target) = classify_entrapment(p.cfg, &protein, &is_decoy);
     let mut n = cid.len();
     // First row with a non-finite prelim_score/precursor_mz, if any. Found here but NOT
@@ -707,10 +726,14 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
         RescorerKind::NnTorch => Some("nn_rescore_worker.py"),
         _ => None,
     };
-    // `python.is_some()` belongs in this condition: without an interpreter the sidecar
-    // fails before it reads anything, and a streamed handoff would be work thrown away.
+    // A pool with fewer decoys than `min_train_decoys` is ranked by prelim_score below.
+    let n_train_decoys = is_decoy.iter().filter(|&&d| d).count();
+    let few_decoys = n_train_decoys < p.cfg.min_train_decoys;
+    // `python.is_some()` and `few_decoys` belong in this condition: without an interpreter
+    // the sidecar fails before it reads anything, a few-decoy pool never starts it, and a
+    // streamed handoff would be work thrown away (and left in the work directory).
     let stream_to_handoff =
-        n > 0 && p.cfg.strict && p.cfg.python.is_some() && sidecar_script.is_some();
+        n > 0 && !few_decoys && p.cfg.strict && p.cfg.python.is_some() && sidecar_script.is_some();
     let mut feats_slot: Option<FeatureMatrix> = None;
     let mut prewritten: Option<SidecarPaths> = None;
     if stream_to_handoff {
@@ -817,12 +840,11 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
     // The `MUMDIA_NN_*` knobs the NN worker inherited, when it ran (see `inherited_nn_env`).
     let mut nn_env: Option<std::collections::BTreeMap<String, String>> = None;
 
-    let n_train_decoys = is_decoy.iter().filter(|&&d| d).count();
     let mut scores = if n == 0 {
         classifier_used = "not_run_empty";
         model_identity = "none-empty-input".to_string();
         Vec::new()
-    } else if p.cfg.min_train_decoys > 0 && n_train_decoys < p.cfg.min_train_decoys {
+    } else if few_decoys {
         tracing::warn!(
             decoys = n_train_decoys,
             min_train_decoys = p.cfg.min_train_decoys,
@@ -856,12 +878,11 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
                     s
                 }
                 Err(e) => {
-                    if p.cfg.strict {
-                        anyhow::bail!(
-                            "rescore: Mokapot sidecar failed ({e}) and rescore.strict=true"
-                        );
-                    }
-                    warn!("rescore: Mokapot failed ({e}); falling back to native_tda");
+                    strict_or_warn(
+                        p.cfg.strict,
+                        &format!("Mokapot sidecar failed ({e})"),
+                        "falling back to native_tda",
+                    )?;
                     native_scores(&p, kept_matrix(&feats_slot), &is_decoy, &base, &prelim)
                 }
             },
@@ -904,42 +925,30 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
                     prelim.clone()
                 }
                 Err(e) => {
-                    if p.cfg.strict {
-                        anyhow::bail!(
-                            "rescore: NnTorch sidecar failed ({e}) and rescore.strict=true"
-                        );
-                    }
-                    warn!("rescore: NnTorch failed ({e}); falling back to native_tda");
+                    strict_or_warn(
+                        p.cfg.strict,
+                        &format!("NnTorch sidecar failed ({e})"),
+                        "falling back to native_tda",
+                    )?;
                     native_scores(&p, kept_matrix(&feats_slot), &is_decoy, &base, &prelim)
                 }
             },
-            RescorerKind::Percolator => {
-                if p.cfg.strict {
-                    anyhow::bail!("rescore: classifier=percolator but percolator.exe is not wired, and rescore.strict=true");
-                }
-                warn!("rescore: percolator.exe path not wired; using native_tda");
-                native_scores(&p, kept_matrix(&feats_slot), &is_decoy, &base, &prelim)
-            }
             RescorerKind::NativeTda => {
                 native_scores(&p, kept_matrix(&feats_slot), &is_decoy, &base, &prelim)
             }
             RescorerKind::Entrapment => {
                 let n_ent = is_entrapment.iter().filter(|&&b| b).count();
                 if p.cfg.entrapment_marker.is_none() || n_ent == 0 {
-                    if p.cfg.strict {
-                        anyhow::bail!(
-                            "rescore: classifier=entrapment but no entrapment PSMs matched \
-                             (marker={:?}, n_ent={n_ent}) and rescore.strict=true; set \
-                             rescore.entrapment_marker to the spike-in accession substring",
+                    strict_or_warn(
+                        p.cfg.strict,
+                        &format!(
+                            "classifier=entrapment but no entrapment PSMs matched \
+                             (marker={:?}, n_ent={n_ent}; set rescore.entrapment_marker to \
+                             the spike-in accession substring)",
                             p.cfg.entrapment_marker
-                        );
-                    }
-                    warn!(
-                        entrapment_psms = n_ent,
-                        "rescore: classifier=entrapment but no entrapment PSMs \
-                         (set rescore.entrapment_marker to the spike-in accession \
-                         substring); falling back to native_tda"
-                    );
+                        ),
+                        "falling back to native_tda",
+                    )?;
                     native_scores(&p, kept_matrix(&feats_slot), &is_decoy, &base, &prelim)
                 } else if p.cfg.python.is_some() {
                     match run_entrapment_gbm(
@@ -962,10 +971,11 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
                             s
                         }
                         Err(e) => {
-                            if p.cfg.strict {
-                                anyhow::bail!("rescore: entrapment GBM sidecar failed ({e}) and rescore.strict=true");
-                            }
-                            warn!("rescore: entrapment GBM sidecar failed ({e}); using native linear entrapment fallback");
+                            strict_or_warn(
+                                p.cfg.strict,
+                                &format!("entrapment GBM sidecar failed ({e})"),
+                                "using native linear entrapment fallback",
+                            )?;
                             classifier_used = "entrapment_native";
                             // `is_decoy`, not `is_entrapment`: the negative class for
                             // TRAINING is the in-silico decoy population, exactly as on
@@ -1205,44 +1215,12 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
     let n_psm_1 = (0..n)
         .filter(|&i| is_reported[i] && psm_q[i] <= 0.01)
         .count();
-    let n_pep_1 = {
-        let mut seen = std::collections::HashSet::new();
-        for i in 0..n {
-            if is_reported[i] && peptide_q[i] <= 0.01 {
-                seen.insert(base[i]);
-            }
-        }
-        seen.len()
-    };
-    let n_pg_1 = {
-        let mut seen = std::collections::HashSet::new();
-        for i in 0..n {
-            if is_reported[i] && pg_q[i] <= 0.01 {
-                seen.insert(protein_id[i]);
-            }
-        }
-        seen.len()
-    };
-    let n_prec_1 = {
-        let mut seen = std::collections::HashSet::new();
-        for i in 0..n {
-            if is_reported[i] && precursor_q[i] <= 0.01 {
-                seen.insert(precursor_id[i]);
-            }
-        }
-        seen.len()
-    };
+    let n_pep_1 = count_distinct(&base, |i| is_reported[i] && peptide_q[i] <= 0.01);
+    let n_pg_1 = count_distinct(&protein_id, |i| is_reported[i] && pg_q[i] <= 0.01);
+    let n_prec_1 = count_distinct(&precursor_id, |i| is_reported[i] && precursor_q[i] <= 0.01);
     // Entrapment leak: spike-in peptides passing the 1% gate. A running check on
     // FDR validity (should track the reported q if the null is well-modelled).
-    let n_entrap_1 = {
-        let mut seen = std::collections::HashSet::new();
-        for i in 0..n {
-            if is_entrapment[i] && peptide_q[i] <= 0.01 {
-                seen.insert(base[i]);
-            }
-        }
-        seen.len()
-    };
+    let n_entrap_1 = count_distinct(&base, |i| is_entrapment[i] && peptide_q[i] <= 0.01);
     timings.q_ms = t_q.elapsed().as_millis();
     let t_write = Instant::now();
 
@@ -1557,6 +1535,32 @@ fn write_scored(path: &str, hash: bool, c: ScoredColumns) -> Result<(u64, Option
 
     let schema = scored_schema();
     let nrows = c.cid.len();
+    // Every column is sliced at the same `lo..hi` below, so a column that a row gather of
+    // `run` left behind would be written misaligned rather than fail.
+    for (name, len) in [
+        ("peptidoform", c.pform.len()),
+        ("charge", c.charge.len()),
+        ("label", c.is_decoy.len()),
+        ("protein", c.protein.len()),
+        ("base_peptide_id", c.base.len()),
+        ("apex_rt", c.apex_rt.len()),
+        ("elution_lo", c.elution_lo.len()),
+        ("elution_hi", c.elution_hi.len()),
+        ("score", c.scores.len()),
+        ("q_value", c.psm_q.len()),
+        ("peptide_q_value", c.peptide_q.len()),
+        ("pg_q_value", c.pg_q.len()),
+        ("prelim_score", c.prelim.len()),
+        ("source", c.source.len()),
+        ("run_psm_q", c.run_psm_q.len()),
+        ("precursor_q", c.precursor_q.len()),
+        ("selected_peak_rank", c.peak_rank.len()),
+    ] {
+        anyhow::ensure!(
+            len == nrows,
+            "rescore: the scored column '{name}' has {len} rows, not {nrows}"
+        );
+    }
     let mut opts = mumdia_io::table::WriteOptions::new();
     if hash {
         opts = opts.content_hash();
@@ -1622,17 +1626,6 @@ fn write_scored(path: &str, hash: bool, c: ScoredColumns) -> Result<(u64, Option
     w.close_with_digest()
 }
 
-/// Reject a concatenation whose feature companions differ in either identity or
-/// ordered feature columns. Both checks are intentional: the ID catches a
-/// declared contract mismatch, while the explicit column comparison protects
-/// against a malformed or manually edited companion.
-/// The classifier's feature columns: every column of the schema, or the projection named
-/// by `rescore.features` / `rescore.features_file`.
-///
-/// The result keeps SCHEMA order, not the order the caller listed, so a selection can
-/// never silently reorder the matrix (the sidecar contract is positional). A name that is
-/// not in the schema is an error rather than a silent drop: a typo in a 100-name list
-/// would otherwise train a different model than the one asked for.
 /// The `compact` preset, one name per line; see `FeaturePreset::Compact`.
 const COMPACT_FEATURES: &str = include_str!("feature_presets/compact.txt");
 
@@ -1651,6 +1644,13 @@ fn preset_names(preset: FeaturePreset) -> Option<Vec<String>> {
     }
 }
 
+/// The classifier's feature columns: every column of the schema, or the projection named
+/// by `rescore.features` / `rescore.features_file`.
+///
+/// The result keeps SCHEMA order, not the order the caller listed, so a selection can
+/// never silently reorder the matrix (the sidecar contract is positional). A name that is
+/// not in the schema is an error rather than a silent drop: a typo in a 100-name list
+/// would otherwise train a different model than the one asked for.
 fn resolve_feature_subset(cfg: &RescoreConfig, available: &[String]) -> Result<Vec<String>> {
     let wanted: Vec<String> = match (&cfg.features, &cfg.features_file) {
         (Some(_), Some(_)) => anyhow::bail!(
@@ -1720,6 +1720,10 @@ fn resolve_feature_subset(cfg: &RescoreConfig, available: &[String]) -> Result<V
         .collect())
 }
 
+/// Reject a concatenation whose feature companions differ in either identity or
+/// ordered feature columns. Both checks are intentional: the ID catches a
+/// declared contract mismatch, while the explicit column comparison protects
+/// against a malformed or manually edited companion.
 fn validate_feature_schema(
     expected: &FeatureSchema,
     actual: &FeatureSchema,
@@ -1827,8 +1831,9 @@ fn classify_entrapment(
 /// source (8 bytes per row, all alive at once) and copied the scores and labels out
 /// through them; the slice holds the same rows in the same order, so the kernel sees the
 /// same input and returns the same q. With a single source the input IS the pooled one,
-/// and `pooled` (the kernel's output on it) is returned as is. A `source` that decreases
-/// somewhere takes the index form, which is exact in every case.
+/// and `pooled` (the kernel's output on it) is returned as is. `run` refuses input sources
+/// that decrease and both of its row gathers keep the row order, so a `source` that
+/// decreases here is a bug, and it panics rather than return a wrong per-run q.
 #[allow(clippy::too_many_arguments)]
 fn per_source_q(
     source: &[u32],
@@ -1853,57 +1858,17 @@ fn per_source_q(
     if source.windows(2).all(|w| w[0] == w[1]) {
         return pooled.to_vec();
     }
-    if source.windows(2).all(|w| w[0] <= w[1]) {
-        let mut rq = vec![1.0f64; n];
-        let mut lo = 0usize;
-        while lo < n {
-            let s = source[lo];
-            let hi = lo + source[lo..].iter().take_while(|&&x| x == s).count();
-            rq[lo..hi].copy_from_slice(&kernel(lo, hi));
-            lo = hi;
-        }
-        return rq;
-    }
-    per_source_q_by_index(
-        source,
-        scores,
-        is_decoy,
-        is_entrapment,
-        is_real,
-        qmode,
-        ratio,
-    )
-}
-
-/// [`per_source_q`] for a `source` column in any order: one row-index vector per source,
-/// in ascending source order (a `BTreeMap`, so the result does not depend on hashing).
-fn per_source_q_by_index(
-    source: &[u32],
-    scores: &[f64],
-    is_decoy: &[bool],
-    is_entrapment: &[bool],
-    is_real: &[bool],
-    qmode: QMode,
-    ratio: f64,
-) -> Vec<f64> {
-    let mut by_src: std::collections::BTreeMap<u32, Vec<usize>> = std::collections::BTreeMap::new();
-    for (i, &s) in source.iter().enumerate() {
-        by_src.entry(s).or_default().push(i);
-    }
-    let mut rq = vec![1.0f64; scores.len()];
-    for (_s, idxs) in by_src {
-        let q = match qmode {
-            QMode::Decoy => target_decoy_q_by(idxs.len(), |k| (scores[idxs[k]], is_decoy[idxs[k]])),
-            QMode::Entrapment => {
-                let sc: Vec<f64> = idxs.iter().map(|&i| scores[i]).collect();
-                let en: Vec<bool> = idxs.iter().map(|&i| is_entrapment[i]).collect();
-                let re: Vec<bool> = idxs.iter().map(|&i| is_real[i]).collect();
-                entrapment_q(&sc, &en, &re, ratio)
-            }
-        };
-        for (k, &i) in idxs.iter().enumerate() {
-            rq[i] = q[k];
-        }
+    assert!(
+        source.windows(2).all(|w| w[0] <= w[1]),
+        "per_source_q: the source column decreases"
+    );
+    let mut rq = vec![1.0f64; n];
+    let mut lo = 0usize;
+    while lo < n {
+        let s = source[lo];
+        let hi = lo + source[lo..].iter().take_while(|&&x| x == s).count();
+        rq[lo..hi].copy_from_slice(&kernel(lo, hi));
+        lo = hi;
     }
     rq
 }
@@ -2145,17 +2110,19 @@ fn run_entrapment_gbm(
             is_decoy.iter().map(|&b| b as i32).collect(),
         ),
     ];
+    // f32, as the matrix holds them: the worker widens every column to f64 on read, so its
+    // input is the same either way, and the f64 table was twice the size.
     for (fi, name) in feat_names.iter().enumerate() {
-        cols.push(Col::F64(
+        cols.push(Col::F32(
             name.clone(),
-            (0..cid.len()).map(|i| feats.row(i)[fi] as f64).collect(),
+            (0..cid.len()).map(|i| feats.row(i)[fi]).collect(),
         ));
     }
     check_sidecar_space(
         p.work_dir,
         cid.len(),
         feat_names.len(),
-        HandoffFormat::ParquetF64,
+        HandoffFormat::Parquet,
         false,
     )?;
     write_table(&inp, cols)?;
@@ -2203,18 +2170,6 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Write the sidecar feature table as Parquet, streaming a batch at a time.
-///
-/// Same logical contract as the tab-separated PIN - `SpecId`, `Label`, `ScanNr`, `ExpMass`,
-/// `CalcMass`, the feature columns, `Peptide`, `Proteins` - so the worker reads either format
-/// from the same column names.
-///
-/// Features are `f32`: the TSV wrote `{:.6}` and the worker casts to float32 anyway, so f32
-/// matches what is actually used, halves the file, and does not silently increase precision
-/// relative to the validated TSV reference.
-///
-/// Batched because `feats` is already resident (one flat row-major matrix, 8 bytes per
-/// value); materialising 387 full columns as well would add ~12.8 GB for nothing.
 /// The feature matrix, for the paths that read it.
 ///
 /// It is absent in exactly two situations, both of them `rescore.strict` with a PIN
@@ -2632,34 +2587,6 @@ impl<'a> HandoffWriter<'a> {
         protein: &'a FlatStr,
         mz: &'a [f64],
     ) -> Result<HandoffWriter<'a>> {
-        Self::with_block_size(
-            paths,
-            feat_names,
-            is_decoy,
-            pform,
-            protein,
-            mz,
-            HANDOFF_BATCH_ROWS,
-        )
-    }
-
-    /// [`HandoffWriter::new`] with the parquet block size named, so the staging buffer is
-    /// reserved at that size ONCE.
-    ///
-    /// Production always goes through `new` at `HANDOFF_BATCH_ROWS`. This exists for
-    /// `handoff_block_size_end_to_end`: a benchmark arm at N has to allocate what a build
-    /// with `HANDOFF_BATCH_ROWS = N` would allocate. The staging buffers are reserved when
-    /// the first block is staged, at the block size of the writer.
-    #[allow(clippy::too_many_arguments)]
-    fn with_block_size(
-        paths: &SidecarPaths,
-        feat_names: &'a [String],
-        is_decoy: &'a [bool],
-        pform: &'a FlatStr,
-        protein: &'a FlatStr,
-        mz: &'a [f64],
-        block_rows: usize,
-    ) -> Result<HandoffWriter<'a>> {
         use arrow::datatypes::{DataType, Field, Schema};
         use std::io::Write as _;
         use std::sync::Arc;
@@ -2706,7 +2633,7 @@ impl<'a> HandoffWriter<'a> {
         };
         Ok(HandoffWriter {
             sink,
-            block_rows: block_rows.max(1),
+            block_rows: HANDOFF_BATCH_ROWS,
             rows: 0,
             encode: std::time::Duration::ZERO,
             feat_names,
@@ -2721,9 +2648,8 @@ impl<'a> HandoffWriter<'a> {
     /// uses `HANDOFF_BATCH_ROWS`.
     ///
     /// Call it before the first row: the staging buffers are reserved at the block size in
-    /// force when the first block is staged. The benchmark arms still go through
-    /// [`HandoffWriter::with_block_size`], which is what a build with another
-    /// `HANDOFF_BATCH_ROWS` would construct.
+    /// force when the first block is staged, so a writer at N allocates what a build with
+    /// `HANDOFF_BATCH_ROWS = N` would, which is what the benchmark arms need.
     #[cfg(test)]
     fn with_block_rows(mut self, rows: usize) -> Self {
         self.block_rows = rows.max(1);
@@ -3214,12 +3140,12 @@ fn for_each_feature_batch_with(
     Ok(())
 }
 
-/// The prefilter's default columns (`rescore.prefilter_features`): the agreement and
-/// co-elution scores that best separated targets from decoys on a HYE diaPASEF run, and one
-/// or two of each other family, so the per-experiment fit has varied evidence to weigh.
 /// Fewest decoys a pool needs before `rescore.prefilter_keep_decoys` cuts it.
 const PREFILTER_MIN_DECOYS: usize = 100;
 
+/// The prefilter's default columns (`rescore.prefilter_features`): the agreement and
+/// co-elution scores that best separated targets from decoys on a HYE diaPASEF run, and one
+/// or two of each other family, so the per-experiment fit has varied evidence to weigh.
 const DEFAULT_PREFILTER_FEATURES: &[&str] = &[
     "pairwise_coelution_weighted",
     "wf1_cos_sqrt",
@@ -3320,10 +3246,15 @@ fn prefilter_mask(
     };
     // A cut by decoy share on a pool with few decoys removes targets the q values need: one
     // decoy in 316 PSMs put the cut at that decoy, kept 96 targets and raised the q floor
-    // 1/T above 1%, so nothing passed. The classifier's own minimum applies, and 100 at least.
+    // 1/T above 1%, so nothing passed. The classifier's own minimum applies to the decoys
+    // the cut keeps, and 100 at least: fewer would rank the pool by prelim_score.
     let n_dec = is_decoy.iter().filter(|&&d| d).count();
-    if n_dec < p.cfg.min_train_decoys.max(PREFILTER_MIN_DECOYS) {
-        return skip("fewer decoys than rescore.min_train_decoys, and 100 at least");
+    if prefilter_decoys_kept(n_dec, p.cfg.prefilter_keep_decoys)
+        < p.cfg.min_train_decoys.max(PREFILTER_MIN_DECOYS)
+    {
+        return skip(
+            "the cut would keep fewer decoys than rescore.min_train_decoys, and 100 at least",
+        );
     }
     if cols.is_empty() {
         return skip("none of its feature columns is in the competed table");
@@ -3476,8 +3407,6 @@ fn remove_sidecar_files(files: &[&str], keep: bool) -> u64 {
 enum HandoffFormat {
     Pin,
     Parquet,
-    /// The entrapment worker's input: f64 features in a parquet table.
-    ParquetF64,
     /// The raw handoff: exactly 4 bytes a value, plus the metadata parquet.
     Raw,
 }
@@ -3525,7 +3454,6 @@ fn handoff_space(rows: u64, nf: u64, format: HandoffFormat, memmap: u64) -> Spac
             cells.saturating_mul(11),
         ),
         HandoffFormat::Parquet => (0, cells.saturating_mul(4)),
-        HandoffFormat::ParquetF64 => (0, cells.saturating_mul(8)),
         // The `.npy` header is at least 64 bytes.
         HandoffFormat::Raw => (
             cells.saturating_mul(4).saturating_add(64),
@@ -4053,7 +3981,16 @@ fn run_pin_sidecar(
     let t_worker = Instant::now();
     let mut guard = ChildGuard(Some(child));
     let status = guard.wait()?;
+    let remove_files = || {
+        let files = paths.files();
+        remove_sidecar_files(
+            &files.iter().map(String::as_str).collect::<Vec<_>>(),
+            keep_handoff(),
+        )
+    };
     if status.code() == Some(NO_TRAINING_SIGNAL_EXIT) {
+        // The stage succeeds on prelim_score, so nothing reads these files again.
+        remove_files();
         return Err(anyhow::Error::new(NoTrainingSignal {
             script: script_name.to_string(),
         }));
@@ -4084,11 +4021,7 @@ fn run_pin_sidecar(
         "rescore: sidecar timings"
     );
     // The scores are in memory and validated; the files are not read again.
-    let files = paths.files();
-    remove_sidecar_files(
-        &files.iter().map(String::as_str).collect::<Vec<_>>(),
-        keep_handoff(),
-    );
+    remove_files();
     Ok(aligned)
 }
 
@@ -5791,10 +5724,9 @@ b
     /// test; it is the only thing that can re-derive that constant.
     ///
     /// Both arms pay for everything they use and nothing they do not: each builds its own
-    /// `HandoffWriter` through `with_block_size`, so the staging buffer is reserved ONCE
-    /// at that arm's size (`with_block_rows` would not do -- `new` reserves at
-    /// `HANDOFF_BATCH_ROWS` first, and every arm would pay that 387 MB reservation and
-    /// free inside the timer), then pushes every row, transposes, builds every
+    /// `HandoffWriter` with `new(..).with_block_rows(block)`, and the staging buffer is
+    /// reserved ONCE, at that arm's size, when the first block is staged; then it pushes
+    /// every row, transposes, builds every
     /// `RecordBatch` and encodes to a real file. Nothing is hoisted out of the timer,
     /// which is the point: the transpose is only part of the handoff write, so a
     /// per-transpose speedup is not a per-stage speedup, and the second section below
@@ -5847,10 +5779,9 @@ b
                     kind: HandoffKind::Parquet,
                 };
                 let t0 = std::time::Instant::now();
-                let mut w = HandoffWriter::with_block_size(
-                    &paths, &names, &is_decoy, &pform, &protein, &mz, block,
-                )
-                .unwrap();
+                let mut w = HandoffWriter::new(&paths, &names, &is_decoy, &pform, &protein, &mz)
+                    .unwrap()
+                    .with_block_rows(block);
                 for i in 0..rows {
                     w.push_row(i, &pool[i % pool.len()]).unwrap();
                 }
@@ -6218,6 +6149,71 @@ b
             rep["params"]["classifier"],
             json!("prelim_score_few_decoys")
         );
+        // A pool that is never handed to the sidecar leaves no handoff behind.
+        no_handoff_rubble(&work);
+    }
+
+    /// The two row gathers of `run`, the prefilter cut and the top-K collapse, which no
+    /// other test reaches: every scored row keeps its own value in every column. The
+    /// crafted table derives each column from the candidate id, and the second table
+    /// repeats candidates 0 and 1 in the same run (`sources`), as promoted peaks do.
+    #[test]
+    fn the_prefilter_cut_and_the_top_k_collapse_keep_every_column_on_its_row() {
+        let a = scratch("gathers_a.parquet");
+        crafted_competed_table(&a, 600);
+        let b = scratch("gathers_b.parquet");
+        crafted_competed_table(&b, 2);
+        let out = scratch("gathers_scored.parquet");
+        let cfg = RescoreConfig {
+            prefilter_min_psms: 0,
+            prefilter_features: Some(vec!["feat_a".to_string()]),
+            ..Default::default()
+        };
+        run(RescoreParams {
+            competed: &[a, b],
+            sources: Some(&[0, 0]),
+            out: &out,
+            work_dir: &scratch("gathers_work"),
+            script_dir: "scripts",
+            cfg: &cfg,
+            config_hash: "test",
+            shadow: None,
+        })
+        .unwrap();
+        let t = TableFile::open(&out).unwrap();
+        let cid = t.u32("candidate_id").unwrap();
+        let label = t.str("label").unwrap();
+        // The cut ran (ceil(301 x 0.35) = 106 of the 301 decoys), and the collapse left one
+        // row per candidate, the repeated target 0 included.
+        assert!(label.iter().filter(|l| *l == "decoy").count() <= 106);
+        let mut ids = cid.clone();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), cid.len(), "one row per candidate");
+        assert!(cid.contains(&0));
+        let pform = t.str("peptidoform").unwrap();
+        let protein = t.str("protein").unwrap();
+        let base = t.u32("base_peptide_id").unwrap();
+        let apex = t.f64("apex_rt").unwrap();
+        let lo = t.f64("elution_lo").unwrap();
+        let hi = t.f64("elution_hi").unwrap();
+        let prelim = t.f64("prelim_score").unwrap();
+        for (r, &c) in cid.iter().enumerate() {
+            let i = c as usize;
+            let want_label = ["target", "decoy"][i % 2];
+            assert_eq!(label[r], want_label, "row {r}");
+            assert_eq!(pform[r], format!("PEPTIDEK{i}"), "row {r}");
+            assert_eq!(protein[r], format!("sp|P{i:04}|X"), "row {r}");
+            assert_eq!(base[r], c / 2, "row {r}");
+            let x = i as f64;
+            assert_eq!(
+                (apex[r], lo[r], hi[r]),
+                (10.0 + x, 9.0 + x, 11.0 + x),
+                "row {r}"
+            );
+            let want_prelim = [9.0, 1.0][i % 2] + x * 0.01;
+            assert_eq!(prelim[r], want_prelim, "row {r}");
+        }
     }
 
     #[test]
@@ -6754,8 +6750,8 @@ b
 
     #[test]
     fn per_source_q_reproduces_the_index_vector_form() {
-        // Contiguous sources (the stage's own layout), one source, and a shuffled source
-        // column that has to take the index path; ties in the scores; both nulls.
+        // Contiguous sources (the stage's own layout) and one source; ties in the scores;
+        // both nulls.
         let mut state = 0x2545_f491_4f6c_dd1du64;
         let mut next = move || {
             state ^= state << 13;
@@ -6770,7 +6766,6 @@ b
         let is_real: Vec<bool> = (0..n).map(|i| !is_decoy[i] && !is_ent[i]).collect();
         let contiguous: Vec<u32> = (0..n).map(|i| (i * 4 / n) as u32).collect();
         let single = vec![0u32; n];
-        let shuffled: Vec<u32> = (0..n).map(|_| (next() % 4) as u32).collect();
         for qmode in [QMode::Decoy, QMode::Entrapment] {
             let pooled = match qmode {
                 QMode::Decoy => {
@@ -6787,7 +6782,7 @@ b
             if qmode == QMode::Decoy {
                 assert_eq!(target_decoy_q_split(&scores, &is_decoy), pooled);
             }
-            for source in [&contiguous, &single, &shuffled] {
+            for source in [&contiguous, &single] {
                 let want = per_source_q_reference(
                     source, &scores, &is_decoy, &is_ent, &is_real, qmode, 1.5,
                 );
@@ -6840,10 +6835,6 @@ b
         let pq = handoff_space(1_000, 100, HandoffFormat::Parquet, 0);
         assert_eq!(pq.floor, 0);
         assert_eq!(pq.estimate, 1_000 * 100 * 4 + 1_000 * 72);
-        assert_eq!(
-            handoff_space(1_000, 100, HandoffFormat::ParquetF64, 0).floor,
-            0
-        );
         // The PIN and the raw matrix have one, from their uncompressed bytes.
         let pin = handoff_space(1_000, 100, HandoffFormat::Pin, 0);
         assert_eq!(pin.floor, 1_000 * 100 * 9 + 1_000 * 32);

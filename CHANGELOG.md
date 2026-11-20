@@ -233,6 +233,21 @@ than a number. Both are recorded in every run's `manifest.json`.
 - **The prescreen uses the engine's 13C-12C spacing.** It defined its own `ISOTOPE_SPACING`,
   7e-11 Da from the shared constant. Only a search with `prescreen.enabled` reads it, and only
   a peak at a tolerance edge can tell the two apart.
+- **The rescore stage lost its duplicated and dead code (docs/11).** The target-decoy
+  and entrapment q kernels share one walk (`fdr.rs`, bit-identical), the strict-or-native
+  classifier fallback and the distinct counts at 1% are one helper each, `rescoring.rs`
+  reuses `fdr::count_targets_at_q`, `HandoffWriter::with_block_size` folds into `new`,
+  and five doc comments sit on their own items again. The developer guide cites
+  `stages/rescore.rs` by item instead of by line number; most of those numbers were stale.
+  Scored tables are unchanged.
+- **The entrapment sidecar receives f32 feature columns (docs/13).** They were widened
+  f32 values already, and the worker widens every column to f64 on read, so its input and
+  scores are the same (checked on a 4,000-row input written both ways), at half the
+  table's size. The configuration reference says who receives what: mokapot the
+  tab-separated PIN, the entrapment sidecar its own parquet table.
+- **`rescore.max_feature_matrix_gib` is judged on the rows the prefilter keeps**, the
+  matrix that is actually built; a pool whose uncut size was over the ceiling but whose
+  kept rows are under it now runs.
 - **The library helpers share their peptidoform and fragment-table rules
   (`scripts/_lib_io.py`).** The stripped sequence, the `DECOY_` marker, the I/L key, the
   ProForma N-terminal group, the fragment-table schema and the 0.01 Da cardinality bins were
@@ -285,6 +300,17 @@ than a number. Both are recorded in every run's `manifest.json`.
 - **`MUMDIA_PARQUET_PLAN` (docs/03).** It turned off the float-encoding plan of capped
   writers, for a byte comparison against binaries from before 0.5.0; release checks compare
   decoded tables. A set variable is now ignored.
+- **`rescore.classifier = "percolator"`.** It was never wired: configuration validation
+  already refused it ("rescore.classifier=percolator is not wired"), so no configuration
+  that loaded could select it. A configuration naming it now fails to parse with an
+  unknown-variant error instead, and the desktop application, which builds its options from
+  `configs/config-schema.json`, no longer offers it. `rescore.percolator_bin` stays a dead
+  field.
+- **The index form of the per-run q for a source column that decreases**, which `rescore`
+  never builds (it refuses such inputs, and its row gathers keep the order); such a column
+  is now a panic rather than a second code path. Also the per-row percolator reference
+  test, whose one remaining job, pinning the f32 rounding of `score_std_row`, is a direct
+  test now, and the `MUMDIA_BENCH_BASELINE=per_row` arm of the fold-cost benchmark.
 - **`scripts/assemble_survivors.py` and `scripts/shard_parquet.py` (docs/32).**
   `assemble_survivors.py` was a deprecated copy of `mumdia sub-library --survivors`, which
   applies the same pair link on `peptidoform_id` while streaming both tables (1.6 GB against
@@ -361,6 +387,20 @@ than a number. Both are recorded in every run's `manifest.json`.
   row, about 6 GB at a 259M-row pool): it keeps 1/K0 values only with `shadow_im_tolerance`
   set and finds the window of the rows it reads, and its rows drop the label it never read,
   with the same output.
+- **The rescore prefilter no longer sends a pool to the untrained ranking.** Its guard
+  counted the decoys before the cut: a pool with 100 to 285 decoys passed it, the cut at
+  0.35 kept fewer than `rescore.min_train_decoys`, and the stage then ranked the pool by
+  `prelim_score`. The guard now counts the decoys the cut keeps, so such a pool goes to the
+  classifier whole. Only reachable with `rescore.prefilter_min_psms` lowered from its
+  default; every other pool is scored as before.
+- **Two successful rescore paths no longer leave the sidecar handoff in the work
+  directory.** A pool with too few decoys to train on streamed a handoff it never used, and
+  a worker that found no training signal left its handoff behind; neither is written or
+  kept now (`MUMDIA_KEEP_HANDOFF=1` still keeps them).
+- **A scored column of the wrong length is an error.** `write_scored` sliced every column
+  at the table's rows, so a column a row gather (the prefilter cut, the top-K collapse)
+  missed would have been written misaligned; it now refuses it, and one test reaches both
+  gathers.
 - **Desktop: "Add folder…" selects several spectra folders at once (#335).** A Bruker or Agilent `.d`
   and a Waters `.raw` are directories, so they are added with "Add folder…", and that dialog took
   one folder at a time: the spectra folder picker shared the single-choice setting of the output

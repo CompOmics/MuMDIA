@@ -113,7 +113,7 @@ id into the Parquet file itself).
 selected peak; v4 added `selected_peak_rank` for top-K peak promotion. The
 `psms_extracted` and `psms_competed` bumps carry `peak_rank` through the same
 chain. The scored column layout is written by the rescore stage
-(`rescore.rs:508-540`) and is the schema a downstream reader must expect:
+(`scored_schema`) and is the schema a downstream reader must expect:
 
 | Column | Type | Meaning |
 |---|---|---|
@@ -130,11 +130,11 @@ chain. The scored column layout is written by the rescore stage
 | `peptide_q_value` | F64 | peptide-level q (global per base peptide) |
 | `protein_group` | Str | protein-group key |
 | `pg_q_value` | F64 | protein-group q |
-| `global_q_value` | F64 | byte-identical clone of `q_value` (rescore.rs:406), kept for backward compatibility |
+| `global_q_value` | F64 | byte-identical clone of `q_value` (`write_scored`), kept for backward compatibility |
 | `prelim_score` | F64 | pre-rescore feature-stage score |
-| `source` | U32 | index of the `--competed` table the PSM came from, stamped during input concat (rescore.rs:65-70, 108); 0 throughout a single-run rescore |
-| `run_psm_q` | F64 | per-run PSM FDR: an independent target-decoy analysis within each `source` (rescore.rs:411-437) |
-| `experiment_psm_q` | F64 | pooled PSM FDR (clone of `q_value`, rescore.rs:407) |
+| `source` | U32 | index of the `--competed` table the PSM came from, stamped during input concat (`rescore::run_hashed`); 0 throughout a single-run rescore |
+| `run_psm_q` | F64 | per-run PSM FDR: an independent target-decoy analysis within each `source` (`per_source_q`) |
+| `experiment_psm_q` | F64 | pooled PSM FDR (clone of `q_value`, `write_scored`) |
 | `precursor_q` | F64 | per (peptidoform+charge) FDR over the rows that survived compete |
 | `selected_peak_rank` | I32 | which enumerated chromatographic peak won: 0 = the up-front apex, >0 = a promoted alternate (`extract.promote_top_peaks`) |
 
@@ -213,8 +213,7 @@ poor setting is detectable. Defaults always pass.
    (`config.rs:1371-1378`).
 8. Mokapot or NnTorch without `rescore.python` -> `Invalid`
    (`config.rs:1379-1388`).
-9. `classifier = percolator` -> `Invalid`: the adapter is not wired
-   (`config.rs:1389-1395`).
+9. `classifier = percolator` does not parse: `RescorerKind` has no such variant.
 10. Entrapment without `rescore.entrapment_marker` -> `Invalid`
     (`config.rs:1396-1404`).
 
@@ -416,7 +415,7 @@ listed with its default and effect. Fields marked **default-off**, **inert**, or
 | `FeatureSet` | config.rs:65-75 | **`minimal`** (14), `rich` (44), `extended` (387) | superset battery in `stages/features/`; the `feature_sets_sized` test (`features.rs:1724-1738`) asserts 14, 14+30, and `14 + 30 + extended_names().len() + 6`, which currently resolves to 387 (337 deduplicated family names) |
 | `RtPredictorKind` | config.rs:79-86 | **`native`**, `deeplc` | DeepLC is a Python sidecar |
 | `FragPredictorKind` | config.rs:90-96 | **`native`**, `ms2pip` | MS2PIP is a Python sidecar |
-| `RescorerKind` | config.rs:100-123 | **`native_tda`**, `mokapot`, `nn_torch`, `percolator`, `entrapment` | see RescoreConfig |
+| `RescorerKind` | config.rs:100-123 | **`native_tda`**, `mokapot`, `nn_torch`, `entrapment` | see RescoreConfig |
 | `PeakClaim` | config.rs:132-182 | **`none`**, `winner_predicted_intensity`, `proportional`, `coelution_winner`, `coelution_proportional`, `coelution_winner_margin`, `coelution_multi_cue`, `coelution_demix`, `coelution_shadow` | shared-peak apportionment; the last three are the fragment-competition framework (see below) |
 | `ClaimCues` (struct, not an enum) | config.rs:192-248 | `mz_close`, `rt_prior`, `ms1_support`, `reassign`, `apportion_em_iters` + their sigmas | composable per-claimant weight cues for `coelution_multi_cue`; every cue defaults off (weight 1.0) |
 | `GateMode` | config.rs:735-758 | **`apex_pearson`**, `peak_spectral`, `spectral_entropy`, `coelution`, `combined` | which spectral score `gate_min_score` thresholds |
@@ -450,8 +449,8 @@ Python sidecar over the PIN. `NnTorch` (107-113): PyTorch semi-supervised MLP
 sidecar (`nn_rescore_worker.py`), a nonlinear Percolator/mokapot-style rescorer
 with CV folds + iterative positive re-selection; on the E.coli benchmark it beats
 linear mokapot on the same PIN and gains further when the extraction gate is
-opened; requires `rescore.python` to point at a torch interpreter. `Percolator`
-(114-115): external `percolator.exe` over the PIN. `Entrapment` (116-122): treats
+opened; requires `rescore.python` to point at a torch interpreter. `Entrapment`
+(116-122): treats
 foreign-proteome PSMs (marked by `entrapment_marker`) as real negatives, trains a
 nonlinear GBM sidecar (out-of-fold by base peptide) or a native linear fallback,
 and reports entrapment-calibrated q-values; the chimeric false matches that
