@@ -141,8 +141,10 @@ then publishes neither table: the chromatogram writer is dropped unclosed
 (`close_chromatograms`), so its temporary file is removed and a chromatograms table
 already at the path stays as it was, as the `psms_extracted` one does. Publishing
 the chromatograms there would put a truncated table beside an older
-`psms_extracted`. Before the rows were streamed, the psms table was written after
-the chromatograms were complete, so this case could not arise.
+`psms_extracted`. The chromatogram table (and the cycle-trace table) is published
+only after `psms_extracted` is, so a failure of that table's last write (its tail
+chunk and footer, or the whole table under `emit_demix_features`) leaves both
+previous tables in place as well.
 
 On spectra that carry 1/K0 the table is v4 (`artifact::psms_extracted(has_im)`):
 `apex_im` is filled and three nullable Float64 columns follow it, before
@@ -1734,9 +1736,10 @@ tests encode the behavioral invariants that gate tuning must preserve.
 - **A new peak-claim strategy**: add a `PeakClaim` variant (`config.rs:132`); if it
   needs elution profiles, extend the two-pass trigger (`extract.rs:1443`), the
   `reassign` predicate (`extract.rs:1557`), and the reassignment match in
-  `extract_twopass_windows` (`extract.rs:1236`); otherwise add it to the serial
-  single-pass match (`extract.rs:1500`) and the parallel accumulation
-  (`extract.rs:718`). Keep tie-breaks deterministic (lowest `candidate_id`). Prefer
+  `extract_twopass_windows` (`extract.rs:1236`); otherwise add it to `apply_claim`,
+  which the serial and the streamed single-pass paths share, and, when it compares a
+  peak's claimants, to the claims for which `accumulate_groups` probes each window as
+  one task. Keep tie-breaks deterministic (lowest `candidate_id`). Prefer
   a cue in `ClaimCues` (`config.rs:192`) over a new variant when the change is
   really a new per-claimant weight: `claim_cue_multiplier` (`extract.rs:163`)
   already composes them and defaults each to 1.0.
