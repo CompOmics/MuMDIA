@@ -110,7 +110,9 @@ pub(crate) fn wide_scan_options() -> mumdia_io::table::ScanOptions {
 /// that exists and cannot be removed is an error naming it ("deleting the `what` <file>"),
 /// so a run never reports space it did not free. The one helper for intermediates a run
 /// deletes once their only reader is done: a grouped run's band tables
-/// (`groups.delete_band_intermediates`) and retrace's centroid chromatograms.
+/// (`groups.delete_band_intermediates`) and retrace's centroid chromatograms. A grouped run
+/// also takes away, with it, the pooled tables an earlier run left that this one does not
+/// write.
 pub(crate) fn delete_intermediate(path: &str, what: &str) -> anyhow::Result<(u64, u64)> {
     use anyhow::Context as _;
     let (mut files, mut bytes) = (0u64, 0u64);

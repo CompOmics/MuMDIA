@@ -350,6 +350,30 @@ than a number. Both are recorded in every run's `manifest.json`.
   IM2Deep request uses, the seed computes the observed 1/K0 of its anchors and of the 1/K0
   window sizing with one function, and the unread `config_hash` field of the digest,
   peptidoform, predict-frag and search-seed parameters is gone.
+- **`run-experiment` searches a run whose multi-head calibration is skipped on base-model
+  retention times, as `run` does.** A run whose seed is short of anchors at every
+  `rt_im_train.anchor_q_ladder` rung skips the multi-head calibration. `run` then re-predicted
+  an imported library with the DeepLC base model, but `run-experiment` searched the imported
+  iRT, because its experiment-level re-prediction is not made when a calibration is planned.
+  The experiment now makes that re-prediction once, on the first run that skips, as
+  `fragment_library_precursors_deeplc.parquet` at the experiment root, and every run that
+  skips reads it. Under `rt_im_train.library_irt = library` both keep the imported iRT, which
+  `run` replaced before when `multihead_calibration` was set explicitly. Both orchestrators
+  now run one retention-time adaptation (`chain::adapt_rt_library`). Output changes only where
+  a calibration is skipped. On two Q Exactive E. coli runs against an E. coli library with
+  human entrapment, with the calibration skipped in both (`min_seed_for_calibration` above
+  their anchors), the base-model retention times gave 7,287 and 7,242 precursors at a
+  run-level q of 1% against 5,339 and 5,323, at a combined entrapment FDP of 1.34-1.35%
+  against 1.56-1.68%.
+- **A grouped search with `rt_im_train.finetune_deeplc` is refused when the configuration
+  loads.** A grouped run (`groups.window_groups > 1`) cannot fine-tune, and it said so only
+  when it started, after the library build and the conversion. `Config::validate` refuses the
+  combination now, beside the other grouped refusals.
+- **`extract.emit_candidate_audit` no longer makes a grouped run of `run-experiment` pool its
+  tables.** Only a single `run` runs the candidate audit, yet under `run-experiment` the
+  setting made every grouped run read and rewrite its bands' extracted rows (and, under
+  `groups.pool_competed = false`, its competed rows) for no reader. `run-experiment` warns
+  once that the setting has no effect there; scored and quantification tables are unchanged.
 
 ### Removed
 
@@ -402,6 +426,13 @@ than a number. Both are recorded in every run's `manifest.json`.
   rewritten, with the same rows, order and values; its row groups and file hash can differ, and
   the compete report no longer carries `publish = spliced`, `rewritten_row_groups` or
   `row_groups`.
+- **Unreachable and duplicated orchestration code.** The seed pool's combination of the
+  bands' scalar mass calibrations, kept for band directories without a calibrant sidecar,
+  which every band now writes (a missing one is an error naming it); the grouped run's
+  fine-tune branches; an unreachable log line of `run`; and output fields nothing read. The
+  union-mode band libraries and the prescreen survivors are hashed only when a manifest
+  records them, and a grouped run removes the pooled tables an earlier run left with the
+  shared helper, a stale pooled `psms_extracted.parquet` included. Output is unchanged.
 
 ### Fixed
 
@@ -660,6 +691,13 @@ than a number. Both are recorded in every run's `manifest.json`.
   `predicted_intensity`**, as the rules that rank by prediction are: every prediction read 0,
   and the window was placed on the first fragments in table order. Only an explicit profile
   centre with a rule that does not rank by prediction reached it.
+- **The run manifest names the retention-time model that ran.** A run whose multi-head
+  calibration was skipped for want of anchors recorded `multihead-80` as its
+  `model_identities.rt_predictor`, and a grouped FASTA run without a DeepLC step recorded
+  `imported-library`. They now record the base-model re-prediction (`deeplc-<version>-base`),
+  or the library's own model (`imported-library` for an imported library, the configured
+  `rt_predictor` for a FASTA one). No table changes. docs/33 no longer describes a per-band
+  view of the pooled seed that no code writes.
 
 ### Security
 

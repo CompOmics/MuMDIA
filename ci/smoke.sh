@@ -637,6 +637,9 @@ diff "$work/out_grouped/peptides.tsv" "$work/out_grouped2/peptides.tsv" > /dev/n
     || { echo "two grouped runs of the same input disagree"; exit 1; }
 grep -q 'because groups.allow_unbounded_rt = true' "$work/grouped.log" \
     || { echo "the grouped run extracted with unbounded windows without the warning"; exit 1; }
+# No DeepLC step ran on the bands, so the manifest names the FASTA library's own RT model.
+grep -q '"rt_predictor": "Native"' "$work/out_grouped/manifest.json" \
+    || { grep rt_predictor "$work/out_grouped/manifest.json"; echo "the grouped run's manifest names the wrong RT model"; exit 1; }
 echo "    ok: 3 bands, $n_ms2 MS2 + $n_ms1 MS1 decodes, $n_grouped peptides, reproducible"
 
 #     Without `groups.allow_unbounded_rt` a grouped run stops before a band extracts with
@@ -1526,6 +1529,9 @@ arm("auto_overlap", rt_im_train={"multihead_calibration": 2},
     experiment={"overlap_front_threads": 1})
 arm("auto_seed", rt_im_train={"multihead_calibration": 2, "multihead_search_below": 0},
     experiment={"parallel_runs": 1, "overlap_front_threads": 0})
+# The automatic multi-head calibration on a seed short of anchors at every anchor_q_ladder
+# rung: skipped, and the imported library searched on base-model retention times instead.
+arm("skip", rt_im_train={"min_seed_for_calibration": 1000000})
 # No trailing newline: on Windows it would arrive as CR LF, and $( ) strips the LF only.
 sys.stdout.write(os.path.join(root, "site"))
 PYEOF
@@ -1598,6 +1604,14 @@ grep -q "converting and seeding the other runs while the first adapts" "$stub/au
     || { echo "the auto_overlap arm did not keep the overlap"; exit 1; }
 grep -q "multihead_anchors = auto kept the seed anchors" "$stub/auto_seed.log" \
     || { tail -20 "$stub/auto_seed.log"; echo "the auto_seed arm did not keep the seed anchors"; exit 1; }
+# The skipped multi-head calibration, in `run-experiment` and in `run`.
+stub_experiment skip skip \
+    || { tail -30 "$stub/skip.log"; echo "stub arm skip failed"; exit 1; }
+stub_run skip_run "$BIN" run \
+    --lib-precursors "$work/lib_prec.parquet" --lib-fragments "$work/lib_frag.parquet" \
+    --mzml "$work/fixture.mzML" --out-dir "$stub/skip_run" --config "$stub/skip.json" \
+    --threads 2 \
+    || { tail -30 "$stub/skip_run.log"; echo "stub arm skip_run failed"; exit 1; }
 # The deferred FASTA build: refused when the calibration keeps a row's placeholder iRT,
 # accepted when it re-predicts every row.
 stub_run defer_fast "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
@@ -1793,6 +1807,27 @@ b = pq.read_table(stub / "auto_overlap/scored_combined.parquet")
 if not a.equals(b):
     fail("auto: the overlapped experiment scored differently from the sequential one")
 
+# The skipped calibration: no multi-head call, and one base-model re-prediction of the
+# imported library, beside the run under `run` and once for both runs under `run-experiment`.
+for name in ("skip_run", "skip"):
+    c = calls(name)
+    if len(c) != 1 or c[0]["mode"] != "repredict" or c[0]["bands"]:
+        fail("%s: expected one base-model re-prediction, got %r" % (name, c))
+    if not same(c[0]["pairs"][0][0], work / "lib_prec.parquet"):
+        fail("%s: re-predicted %r, not the imported library" % (name, c[0]["pairs"][0][0]))
+    if not same(c[0]["pairs"][0][1], stub / name / "fragment_library_precursors_deeplc.parquet"):
+        fail("%s: the re-prediction wrote %r" % (name, c[0]["pairs"][0][1]))
+if not (stub / "skip/scored_combined.parquet").exists():
+    fail("skip: the experiment did not finish")
+m = json.loads((stub / "skip_run/manifest.json").read_text("utf-8"))
+if not m["model_identities"]["rt_predictor"].endswith("-base"):
+    fail("skip_run: rt_predictor %r for a skipped multi-head calibration"
+         % m["model_identities"]["rt_predictor"])
+if not same(m["artifacts"]["fragment_library_precursors"]["path"],
+            stub / "skip_run/fragment_library_precursors_deeplc.parquet"):
+    fail("skip_run: the manifest records %r as the library"
+         % m["artifacts"]["fragment_library_precursors"]["path"])
+
 # The deferred build: one --bands multi-head call per run, over the two bands.
 for name in ("defer_fast", "defer_kept"):
     c = calls(name)
@@ -1800,10 +1835,10 @@ for name in ("defer_fast", "defer_kept"):
         fail("%s: expected one two-band multi-head call, got %r" % (name, c))
 print("    ok: once_per_run union, kept re-prediction, per-band slices reused, deferred "
       "library refused and accepted, overlap equal to sequential, search anchors refit and "
-      "fall back (%d stub calls)"
+      "fall back, a skipped calibration re-predicted (%d stub calls)"
       % sum(len(calls(n)) for n in ("union", "keep", "perband", "seq", "overlap",
                                      "overlap_fail", "defer_fast", "defer_kept", "boot",
-                                     "boot_run", "boot_fallback")))
+                                     "boot_run", "boot_fallback", "skip", "skip_run")))
 PYEOF
 
 # 5p. Protein annotations: the report of the run's scored table without the annotation table

@@ -2109,7 +2109,7 @@ fn pooled_mass_calibration_equals_the_unbanded_fit(overlap: bool) {
         let slice = tmp(&format!("two_band_slice_{arm}_{k}.parquet"));
         mumdia::groups::write_band_slice(&f.prec, first, rows, &slice).unwrap();
         let out = seed(&slice, Some(first as u32), true, &format!("band{k}"));
-        bands.push((out, first as u32, rows as u32));
+        bands.push((out, first as u32));
     }
     // The fixture does what it is for: band B's own q rejects hundreds of the targets the
     // pooled q will accept, more than a 2,000-target prefix could make up for.
@@ -2132,18 +2132,13 @@ fn pooled_mass_calibration_equals_the_unbanded_fit(overlap: bool) {
     let pooled = tmp(&format!("two_band_pooled_{arm}.parquet"));
     let seeds: Vec<stages::seed_pool::BandSeed> = bands
         .iter()
-        .map(|(path, offset, rows)| stages::seed_pool::BandSeed {
+        .map(|(path, offset)| stages::seed_pool::BandSeed {
             path: path.clone(),
             offset: *offset,
-            rows: *rows,
         })
         .collect();
     stages::seed_pool::run(stages::seed_pool::SeedPoolParams {
         seeds: &seeds,
-        masscals: &bands
-            .iter()
-            .map(|b| mumdia::masscal::json_path(&b.0))
-            .collect::<Vec<_>>(),
         calibrants: &bands
             .iter()
             .map(|b| mumdia::masscal::calibrants_path(&b.0))
@@ -2159,7 +2154,7 @@ fn pooled_mass_calibration_equals_the_unbanded_fit(overlap: bool) {
         // band's sidecar carries their deviations.
         assert!(f.shared_rows >= 10, "{} shared rows", f.shared_rows);
         let shared = f.spans[1].0 as u32..(f.spans[1].0 + f.shared_rows) as u32;
-        for (path, _, _) in &bands {
+        for (path, _) in &bands {
             let c =
                 mumdia::masscal::read_calibrants(&mumdia::masscal::calibrants_path(path)).unwrap();
             let n = c

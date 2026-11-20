@@ -97,8 +97,8 @@ The stages then run unchanged on that band, as if it were the library:
   `candidate_id` at row-group granularity (`scripts/sort_fragments.py`; every library writer
   ends with the sort) the read is selective; an unsorted table still loads through a filtered
   scan of the whole table, with a warning, and costs the scan per band.
-- the RT model (multi-head calibration, the optional fine-tune, or the base-model
-  re-prediction, whichever the configuration resolves to; `docs/08_rt_im_train.md`) runs
+- the RT model (multi-head calibration or the base-model re-prediction, whichever the
+  configuration resolves to; `docs/08_rt_im_train.md`) runs
   on the band table and writes the band's re-predicted table. The DeepLC sidecars rewrite a
   precursor FILE, so a band that an RT model adapts is first written out as a precursor table
   of its own, `groups/gNN/lib_precursors.parquet`, with band-local ids `0..n`
@@ -230,9 +230,7 @@ ones, keeps the higher-scoring row where two bands searched the same candidate, 
 `spectrum_q` over the union with the seed's own target-decoy kernel (`fdr::target_decoy_q`),
 and writes the run-level `seed_psms.parquet`. Beside it goes
 `seed_psms.parquet.masscal.json`, the run's fragment mass calibration, fitted once over the
-bands' calibrant deviations (next subsection). It also writes each band's view of the
-pooled seed, `groups/gNN/seed_psms_pooled.parquet`: the band's own rows, local ids,
-pooled q.
+bands' calibrant deviations (next subsection).
 
 ### 4a. The mass calibration is fitted once, not averaged
 
@@ -335,22 +333,20 @@ band's seed report records `calibrant_deviations`, `calibrant_bytes` and
 and 452 deviations (9,856 and 7,232 B, from 103 and 76 target rows), all 1,068 of them
 accepted. Not yet measured at scale: see section 10.
 
-`masscal.json` gains `masscal_source`, which reads `pooled_deviations` or `band_scalars`. A
-band directory seeded before the sidecar existed has none, and the pool then combines the
-scalars as it always did, naming the missing groups in a warning; if `mass_cal_loess` is set
-it warns separately that the grid cannot be recovered from scalars. A band with no
-calibrants wrote the configured tolerance in place of a learned one, and when the pooled fit
-has fewer than `masscal::MIN_CALIBRANTS` deviations the pool keeps that tolerance rather
-than fitting a percentile of a handful of points, with a warning.
+`masscal.json` gains `masscal_source`, which reads `pooled_deviations`. Every band is seeded
+with `emit_calibrants`, which writes the sidecar even when it is empty, so a band without one
+is an error naming it. When the pooled fit has fewer than `masscal::MIN_CALIBRANTS`
+deviations the pool keeps the configured tolerance rather than fitting a percentile of a
+handful of points, with a warning.
 
 `groups.calibration` decides which anchors each band's calibration sees:
 
 | | `global` (default) | `per_group` |
 |---|---|---|
-| RT model (multi-head / fine-tune) | the pooled seed, joined by peptidoform | the band's seed |
+| RT model (multi-head calibration) | the pooled seed, joined by peptidoform | the band's seed |
 | `rt-im-train` anchors | the pooled seed, iRT read from the seed row (`anchor_irt_from_seed`), one fit shared by every band | the band's seed, iRT joined from the band table |
 | `extract` mass calibration | the pooled `masscal.json` | the band's |
-| `features` seed corroboration and confident elution boundary | the band's view of the pooled seed | the band's seed |
+| `features` seed corroboration and confident elution boundary | the pooled seed (library-wide ids) | the pooled seed (library-wide ids) |
 
 Under `global`, after a per-band re-prediction of the library iRT, the pooled anchors carry
 the library's iRT as it was when seeded; `seed_pool::refresh_irt` then copies each anchor's
@@ -370,8 +366,8 @@ Refitting per band is sound because the multi-head ridge and the base-model re-p
 are deterministic in their anchors: the same pooled anchors give the same head selection,
 the same ridge and the same predictions, so every band carries one model. What it costs is
 one DeepLC worker per band, which section 4b below removes. The optional DeepLC fine-tune is not deterministic and
-would be trained once per band, so a grouped run refuses `rt_im_train.finetune_deeplc`;
-fine-tune the library once beforehand (`docs/08_rt_im_train.md`, once per library) and
+would be trained once per band, so `rt_im_train.finetune_deeplc` with `window_groups > 1` is
+refused when the configuration loads; fine-tune the library once beforehand (`docs/08_rt_im_train.md`, once per library) and
 search that table.
 
 `per_group` is kept for the comparison the design asked for, not as a recommendation: it is
@@ -690,7 +686,6 @@ out/
   groups/plan.json                   bands, windows, estimates, calibration mode
   groups/gNN/lib_precursors.parquet  the band (local ids), only where an RT model rewrites it
   groups/gNN/seed_psms.parquet       band seed (+ .masscal.json)
-  groups/gNN/seed_psms_pooled.parquet  the band's view of the pooled seed
   groups/gNN/lib_precursors_<model>.parquet  re-predicted band, when an RT model ran
   groups/gNN/run_windows.parquet     the band's RT windows
   groups/gNN/cal.json                the band's RT calibration
