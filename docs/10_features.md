@@ -50,7 +50,7 @@ recipe use `Extended`.
 
 `FeaturesParams` (`features.rs:537`) names the paths: `psms` (extracted PSMs),
 `chromatograms`, optional `seed` (seed PSMs), `out` (features Parquet),
-`out_pin` (PIN), `cfg`, `config_hash`.
+`out_pin` (PIN), `cfg`.
 
 ### Consumed: psms_extracted (`features.rs:550`-`588`)
 
@@ -442,7 +442,7 @@ duplicated.
 Fragment co-elution against the predicted-weighted reference profile R and
 pairwise between fragments. Three groups: per-fragment vs R (peak/full windows,
 leave-one-out), pairwise Pearson statistics and lag cross-correlation
-(`best_xcorr`, `MAXLAG=5`), and structured cross-correlations (b vs y ions,
+(`best_xcorr_normed`, `MAXLAG=5`), and structured cross-correlations (b vs y ions,
 charge-1 vs multiply-charged). Names include `frag_ref_corr_mean`,
 `frag_ref_corr_obsweighted`, `frag_ref_corr_min`, `frag_ref_corr_std`,
 `frag_ref_corr_sq_mean`, `frag_ref_corr_topk_weighted`,
@@ -998,7 +998,7 @@ vector is all-zero. `spectral_angle` (`stats.rs:44`) is
 `1 - 2 * acos(clamp(cosine, -1, 1)) / pi`, in [0,1] with 1 = identical. Families
 add local specializations that do not belong in the shared kernel (weighted
 Pearson, Spearman via `pearson` on average ranks, Kendall tau, windowed cross-
-correlation via `super::best_xcorr`, `features.rs:1484`, which returns the best
+correlation via `super::best_xcorr_normed`, which returns the best
 normalized correlation and its integer lag over `[-maxlag, maxlag]` as
 `(lag_of_max, value.max(0.0))`), but the base Pearson/cosine call the shared
 functions. `best_xcorr_normed` takes the two norms (`xcorr_norm`) so a pair
@@ -1173,7 +1173,7 @@ set `chrom_loaders: 1` there if that matters.
   of matching length and order, `mod`-declare it (`features.rs:32`), and append
   `(name, values)` to `FAMILIES` (`features.rs:52`). Appending at the end keeps
   all prior schema positions stable. Reuse `crate::stats` and the parent helpers
-  (`mean`, `normalize_sum`, `best_xcorr`, `smooth3`, `peak_bounds`) rather than
+  (`mean`, `normalize_sum`, `best_xcorr_normed`, `smooth3`, `peak_bounds`) rather than
   reimplementing kernels. A family that needs a pair correlation, a pair
   cross-correlation or a fragment-vs-reference correlation should read it from
   `e.pair_stats` when `PairStats::fits` holds, and compute it otherwise. Add an arity unit test (`values(&e).len() ==

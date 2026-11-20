@@ -313,7 +313,6 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
         out: &feats,
         out_pin: &d("run.pin"),
         cfg: &cfg.features,
-        config_hash: ch,
         // Retrace's `imc_ref_w`, when this pass retraced under `retrace.apex_features`.
         imc_ref_w: raw.is_some() && cfg.retrace.apex_features,
         // The tolerances extract decided with, for `features.q1_consistency`.

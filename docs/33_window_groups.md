@@ -997,7 +997,7 @@ now two phases. Phase 1 runs `rt-im-train` and `extract` for every band and call
 internally -- same confident set, same row-group pruning, same detector -- returning the
 per-anchor half-widths instead of a percentile of them. The run absorbs every band's
 samples, fits `features::bounds_from_samples` once, and phase 2 runs `features` and
-`compete` for every band through `features::run_with_bounds` on that one pair. A run whose
+`compete` for every band through `features::run_with_bounds_hashed` on that one pair. A run whose
 pooled set is genuinely under 20 anchors still falls back, now once rather than band by
 band.
 

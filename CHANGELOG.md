@@ -263,6 +263,17 @@ than a number. Both are recorded in every run's `manifest.json`.
   conversion caps by hand, and the copies had already disagreed once. The hashes are
   unchanged.
 
+- **The features stage writes its optional families by name.** The 37 Q1-profile,
+  per-fragment Q1, MS1-envelope and Q1-consistency columns were written through
+  hand-numbered positions that had to follow the order of their name lists, so reordering a
+  list would have put values under the wrong names without an error; they are resolved by
+  name once and written in a loop, as the other appended families already were, and the
+  extended names are read off the same plan as the values. Unused or test-only entry points
+  are removed (`features::run_with_bounds`, `active_features_with` / `_q1` / `_all` /
+  `_q1c` / `_for` and the unread `FeaturesParams::config_hash`), and a test now checks how
+  the stage feeds the default-on RT-window family. Every table, the PIN and the
+  configuration hash are unchanged.
+
 ### Removed
 
 - **`MUMDIA_PARQUET_PLAN` (docs/03).** It turned off the float-encoding plan of capped
@@ -390,6 +401,19 @@ than a number. Both are recorded in every run's `manifest.json`.
   `raw::is_thermo_raw` and the test-only copies of the serial spectra decoders are removed,
   and the vendor converter run has its first test: a stand-in converter that fills both
   output pipes, and one that exits 0 without writing a file.
+
+- **`features` refuses a chromatogram read that ends early.** With more than one thread
+  each chunk loader decodes its batches one ahead on a helper thread. A panic there (a
+  corrupt page, a decoder bug) closed the channel exactly as the end of the table does, so
+  the chunk came back short without an error: the missing candidates' PSMs got default
+  fragment features and zero extended values, and the stage published the table. A chunk
+  with fewer rows than its plan counted is now an error, as it already was for the
+  confident-bounds reader.
+- **A banded run no longer warns that `bound_from_confident` is set when it is off.** The
+  pooled elution bounds were fitted whatever the key, and with it off (the default) every
+  run with window groups, the desktop's memory bands included, logged that the key was set
+  but had fewer than 20 anchors. The fit now returns at once with the key off; the result
+  was already no global bounds.
 
 ### Security
 
