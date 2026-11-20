@@ -4326,15 +4326,15 @@ function searchProblems() {
   if (diapasef.length && pre !== "off") {
     out.push(
       "The prescreen cannot be used on diaPASEF spectra yet: it groups the spectra by m/z " +
-        "window only, and diaPASEF windows also differ in ion mobility. Set Prescreen to Off " +
-        `for these files: ${diapasef.map(baseName).join(", ")}.`
+        "window only and does not use their ion mobility. Set Prescreen to Off for these " +
+        `files: ${diapasef.map(baseName).join(", ")}.`
     );
   }
   if (diapasef.length && $("bands").value === "custom" && customBands().bands > 1) {
     out.push(
-      "diaPASEF spectra cannot be split into bands: their windows share m/z ranges and " +
-        "differ in ion mobility, so the engine searches them in one piece. Set Bands to " +
-        `Automatic or Off for these files: ${diapasef.map(baseName).join(", ")}.`
+      "diaPASEF spectra cannot be split into bands yet: when the engine combines the bands, " +
+        "it loses their ion-mobility (1/K0) calibration, so it searches them in one piece. " +
+        `Set Bands to Automatic or Off for these files: ${diapasef.map(baseName).join(", ")}.`
     );
   }
   const zt = ztscanFiles();

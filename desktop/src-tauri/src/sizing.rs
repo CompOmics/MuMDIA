@@ -541,15 +541,18 @@ pub fn band_plan(precursors: Option<u64>, memory: Option<u64>, threads: usize) -
 /// The plan for diaPASEF input: one band, whatever the memory.
 ///
 /// The engine refuses window groups on spectra that carry 1/K0
-/// (`stages::run::refuse_unsupported_on_4d`): the groups are cut in m/z, and the windows of a
-/// diaPASEF run share m/z ranges and differ in their 1/K0 slots. The diaPASEF recipe also
-/// turns on retrace, which config validation refuses with bands. Splitting is therefore no
-/// answer to a search that does not fit, and the note says so instead of proposing bands.
-/// `library` says the size is an existing library's, which the Search screen's digest
-/// fields do not change, so the advice is a smaller library instead.
+/// (`stages::run::refuse_unsupported_on_4d`): the grouped search pools its bands' seeds and
+/// calibrations on m/z only, so the bands would lose the 1/K0 calibration and windows
+/// (docs/35_diapasef.md; implementing them is issue #350). The diaPASEF recipe also turns on
+/// retrace, which config validation refuses with bands. Splitting is therefore no answer to
+/// a search that does not fit, and the note names the lever that is:
+/// `extract.windows_in_flight`, a memory setting with identical output, which bounds
+/// extraction's fragment-peak matches, the largest part of a diaPASEF search's memory
+/// (docs/35_diapasef.md section 16). `library` says the size is an existing library's, which
+/// the Search screen's digest fields do not change, so the advice is a smaller library.
 pub fn in_one_piece(plan: BandPlan, library: bool) -> BandPlan {
-    const WHY: &str = "diaPASEF spectra are searched in one piece: the engine cannot split \
-                       their windows into bands.";
+    const WHY: &str = "diaPASEF spectra are searched in one piece: the engine does not split \
+                       them into bands yet.";
     let smaller = if library {
         "a smaller library (built with fewer variable modifications, missed cleavages or \
          charges)"
@@ -559,8 +562,9 @@ pub fn in_one_piece(plan: BandPlan, library: bool) -> BandPlan {
     let note = match plan.unbanded_gb {
         Some(gb) if gb > plan.budget_gb => format!(
             "{WHY} About {gb:.0} GB estimated, more than the {:.0} GB this machine can give a \
-             search, so it may run out of memory; {smaller} or a machine with more memory \
-             avoids that.",
+             search, so it may run out of memory. Setting extract.windows_in_flight to 1 \
+             (Settings) lowers the memory extraction needs without changing the results; \
+             {smaller} or a machine with more memory also helps.",
             plan.budget_gb
         ),
         Some(gb) => format!(
@@ -830,6 +834,12 @@ ACDEFGHIKL
         );
         assert!(p.note.contains("may run out of memory"), "{}", p.note);
         assert!(p.note.contains("a smaller search space"), "{}", p.note);
+        // The lever that works on diaPASEF input, since bands do not.
+        assert!(
+            p.note.contains("extract.windows_in_flight to 1"),
+            "{}",
+            p.note
+        );
         // An existing library's size does not follow the Search screen's digest fields, so
         // the advice is a smaller library.
         let lib = in_one_piece(split.clone(), true);
@@ -843,6 +853,7 @@ ACDEFGHIKL
         assert_eq!((fits.bands, fits.parallel), (1, 1));
         assert!(fits.note.contains("within the"), "{}", fits.note);
         assert!(!fits.note.contains("run out of memory"), "{}", fits.note);
+        assert!(!fits.note.contains("windows_in_flight"), "{}", fits.note);
         // Without an estimate the reason the plan gave is kept.
         let unknown = in_one_piece(band_plan(Some(60_000_000), None, 24), false);
         assert_eq!(unknown.bands, 1);

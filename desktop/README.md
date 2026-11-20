@@ -924,14 +924,18 @@ inputs at Start, so a plan computed before the last change cannot decide the run
 "Off" and "Custom" write it.
 
 diaPASEF input is searched in one piece. The engine refuses bands on spectra that carry
-1/K0 (the bands are cut in m/z, and the windows of a diaPASEF run share m/z ranges and
-differ in their 1/K0 slots; docs/35_diapasef.md), and the diaPASEF recipe turns on
-retrace, which config validation refuses with bands. When a selected input is a timsTOF
-diaPASEF `.d` (the same `vendor_of` check that labels it in the file list), "Automatic"
-is one band and writes it over the preset's own `groups` block
-(`sizing::in_one_piece`). The note under Bands says so, and says when the estimate
-exceeds the memory budget, where a smaller search space (a smaller library, for an
-existing one) or a machine with more memory is the answer instead of bands. A "Custom"
+1/K0: the grouped search pools its bands' seeds and calibrations on m/z only, so the
+bands would lose the 1/K0 calibration and windows (docs/35_diapasef.md; implementing
+them is issue #350). The diaPASEF recipe also turns on retrace, which config validation
+refuses with bands. When a selected input is a timsTOF diaPASEF `.d` (the same
+`vendor_of` check that labels it in the file list), "Automatic" is one band and writes it
+over the preset's own `groups` block (`sizing::in_one_piece`). The note under Bands says
+so, and says when the estimate exceeds the memory budget. It then names the lever that
+works on diaPASEF input, `extract.windows_in_flight` set to 1 on the Settings screen: a
+memory setting with identical output, which bounds extraction's fragment-peak matches,
+the largest part of a diaPASEF search's memory (docs/35_diapasef.md section 16). A smaller
+search space (a smaller library, for an existing one) or a machine with more memory also
+helps. A "Custom"
 count above one on such input is refused before Start. Start checks every file again
 first, so a `.d` added while it was still being copied, which reads as a plain Bruker
 `.d` until its `analysis.tdf_bin` is there, is planned on what it is when the search

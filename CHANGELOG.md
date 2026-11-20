@@ -259,7 +259,8 @@ than a number. Both are recorded in every run's `manifest.json`.
   spectra that carry 1/K0, and the diaPASEF recipe's retrace is refused with bands (`invalid config:
   retrace.enabled is not supported with groups.window_groups > 1`). With a diaPASEF input selected,
   Automatic is now one band, written over a preset's own bands; the note under Bands says why, and
-  says when the estimate exceeds the memory budget. A custom band count above one on such input is
+  says when the estimate exceeds the memory budget, naming `extract.windows_in_flight` 1 as the
+  lever that works there (bands for diaPASEF are #350). A custom band count above one on such input is
   refused before Start, which checks every file again first. In a batch searched separately, the
   files that are not diaPASEF keep Automatic's plan. Other inputs are planned as before
   (desktop/README.md, "Prescreen, bands and modifications on the Search screen").
