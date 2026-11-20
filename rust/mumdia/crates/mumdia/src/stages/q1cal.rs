@@ -5,9 +5,11 @@
 //! steps whose window covers it. Where in the sweep a precursor shows up says where the
 //! quadrupole's window really is relative to the target the file records for each step, how
 //! wide it is and how soft its edges are. This module measures that on the confident seed
-//! PSMs, before extract, and writes it to `cal.json` (`q1_calibration`). Nothing reads it
-//! back yet: it is the calibration the per-fragment Q1 decisions of a later change are to
-//! be built on.
+//! PSMs, before extract, and writes it to `cal.json` (`q1_calibration`). Extract places each
+//! candidate's Q1 window with it for the per-fragment decision (`extract.q1_fragments`,
+//! `stages::q1frag`) and the Q1-deconvolved evidence (`stages::q1dec`), and the features stage
+//! reads the decision tolerances learned here. A run with too few profiles to fit (a blank, a
+//! failed injection) gets the nominal window below instead (`status: "nominal"`).
 //!
 //! For each anchor (a target seed PSM with `spectrum_q` under the anchor cut) and each of
 //! its strongest library fragments, the matched intensity (the nearest peak within the
@@ -251,9 +253,14 @@ struct Anchor {
     c0: u32,
 }
 
-/// The confident target seed PSMs whose seed scan is in the sweep, one per candidate, the
-/// best `MAX_ANCHORS` by score, ordered by candidate.
-fn read_anchors(seed: &str, sweep: &Sweep, q_max: f64) -> Result<Vec<Anchor>> {
+/// The seed PSMs `keep` accepts (by label and `spectrum_q`) whose seed scan is in the sweep,
+/// with a finite precursor m/z and a charge: one per candidate (its best score), ordered by
+/// candidate, with that score.
+fn read_best(
+    seed: &str,
+    sweep: &Sweep,
+    keep: impl Fn(&str, f64) -> bool,
+) -> Result<Vec<(f64, Anchor)>> {
     let t = TableFile::open(seed)?;
     let label = t.str("label")?;
     let q = t.f64("spectrum_q")?;
@@ -273,8 +280,7 @@ fn read_anchors(seed: &str, sweep: &Sweep, q_max: f64) -> Result<Vec<Anchor>> {
     };
     let mut best: BTreeMap<u32, (f64, Anchor)> = BTreeMap::new();
     for i in 0..t.nrows {
-        if label[i] != "target" || q[i].is_nan() || q[i] >= q_max || !pm[i].is_finite() || z[i] <= 0
-        {
+        if !keep(label[i].as_str(), q[i]) || !pm[i].is_finite() || z[i] <= 0 {
             continue;
         }
         let Some(row) = row_of(scan[i]) else {
@@ -294,7 +300,14 @@ fn read_anchors(seed: &str, sweep: &Sweep, q_max: f64) -> Result<Vec<Anchor>> {
             }
         }
     }
-    let mut v: Vec<(f64, Anchor)> = best.into_values().collect();
+    Ok(best.into_values().collect())
+}
+
+/// The confident target seed PSMs whose seed scan is in the sweep, one per candidate, the
+/// best `MAX_ANCHORS` by score, ordered by candidate.
+fn read_anchors(seed: &str, sweep: &Sweep, q_max: f64) -> Result<Vec<Anchor>> {
+    // A NaN q fails `q < q_max`.
+    let mut v = read_best(seed, sweep, |label, q| label == "target" && q < q_max)?;
     if v.len() > MAX_ANCHORS {
         v.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cid.cmp(&b.1.cid)));
         v.truncate(MAX_ANCHORS);
@@ -307,55 +320,13 @@ fn read_anchors(seed: &str, sweep: &Sweep, q_max: f64) -> Result<Vec<Anchor>> {
 /// most `max` (every k-th by candidate), ordered by candidate: the null the Q1-deconvolution
 /// tolerance is learned against.
 fn read_decoys(seed: &str, sweep: &Sweep, max: usize) -> Result<Vec<Anchor>> {
-    let t = TableFile::open(seed)?;
-    let label = t.str("label")?;
-    let cid = t.u32("candidate_id")?;
-    let pm = t.f64("precursor_mz")?;
-    let z = t.i32("charge")?;
-    let rt = t.f64("observed_rt")?;
-    let scan = t.u32("scan_index")?;
-    let score = t.f64("score")?;
-    let sorted = sweep.scan_index.windows(2).all(|w| w[0] < w[1]);
-    let row_of = |s: u32| -> Option<usize> {
-        if sorted {
-            sweep.scan_index.binary_search(&s).ok()
-        } else {
-            sweep.scan_index.iter().position(|&x| x == s)
-        }
-    };
-    let mut best: BTreeMap<u32, (f64, Anchor)> = BTreeMap::new();
-    for i in 0..t.nrows {
-        if label[i] != "decoy" || !pm[i].is_finite() || z[i] <= 0 {
-            continue;
-        }
-        let Some(row) = row_of(scan[i]) else {
-            continue;
-        };
-        let a = Anchor {
-            cid: cid[i],
-            pm: pm[i],
-            z: z[i],
-            rt: rt[i],
-            c0: sweep.row_cycle[row],
-        };
-        match best.get(&cid[i]) {
-            Some((s, _)) if *s >= score[i] => {}
-            _ => {
-                best.insert(cid[i], (score[i], a));
-            }
-        }
-    }
-    let v: Vec<Anchor> = best.into_values().map(|(_, a)| a).collect();
+    let v: Vec<Anchor> = read_best(seed, sweep, |label, _| label == "decoy")?
+        .into_iter()
+        .map(|(_, a)| a)
+        .collect();
     let k = v.len().div_ceil(max.max(1)).max(1);
     Ok(v.into_iter().step_by(k).collect())
 }
-
-/// A library fragment row of an anchor: the anchor's slot, m/z, predicted intensity and
-/// charge.
-type FragRow = (u32, f64, f64, i32);
-
-/// A fragment match: anchor, fragment slot, spectrum row and intensity.
-type Match = (u32, u8, u32, f64);
 
 /// One library fragment of an anchor: its m/z and charge.
 #[derive(Clone, Copy, Debug)]
@@ -365,66 +336,16 @@ struct Frag {
 }
 
 /// The `FRAGMENTS` strongest library fragments of every anchor (by predicted intensity, the
-/// earlier row on a tie), read one row group at a time.
+/// earlier row on a tie), with the charge from the name as extract reads it.
 fn read_fragments(path: &str, anchors: &[Anchor]) -> Result<Vec<Vec<Frag>>> {
-    let max_cid = anchors.iter().map(|a| a.cid).max().unwrap_or(0) as usize;
-    let mut slot = vec![u32::MAX; max_cid + 1];
-    for (i, a) in anchors.iter().enumerate() {
-        slot[a.cid as usize] = i as u32;
-    }
-    let t = TableFile::open(path).with_context(|| format!("q1-calibrate: reading {path}"))?;
-    let has_z = t.has_column("frag_charge");
-    let parts = t.row_group_parts()?;
-    let found: Vec<Result<Vec<FragRow>>> = parts
-        .par_iter()
-        .map(|p| {
-            let cid = p.u32("candidate_id")?;
-            let mz = p.f64_widening("mz")?;
-            let pi = p.f64_widening("predicted_intensity")?;
-            let fz = if has_z {
-                p.i32("frag_charge")?
-            } else {
-                vec![1; cid.len()]
-            };
-            Ok((0..cid.len())
-                .filter_map(|i| {
-                    let s = *slot.get(cid[i] as usize)?;
-                    (s != u32::MAX).then_some((s, mz[i], pi[i], fz[i].max(1)))
-                })
-                .collect())
-        })
-        .collect();
-    let mut per: Vec<Vec<(f64, Frag)>> = vec![Vec::new(); anchors.len()];
-    for f in found {
-        for (s, mz, pi, z) in f? {
-            per[s as usize].push((pi, Frag { mz, z }));
-        }
-    }
-    Ok(per
+    Ok(read_all_fragments(path, anchors)?
         .into_iter()
         .map(|mut v| {
-            v.sort_by(|a, b| b.0.total_cmp(&a.0));
+            v.sort_by(|a, b| b.1.total_cmp(&a.1));
             v.truncate(FRAGMENTS);
-            v.into_iter().map(|(_, f)| f).collect()
+            v.into_iter().map(|(mz, _, z)| Frag { mz, z }).collect()
         })
         .collect())
-}
-
-/// The peak of `mz` (ascending) nearest `target` within `tol_ppm`, the lower on a tie
-/// (`spectra::nearest_peak` on the artifact's own lists).
-fn nearest(mz: &[f32], target: f64, tol_ppm: f64) -> Option<usize> {
-    let (lo, hi) = mumdia_core::constants::ppm_bounds(target, tol_ppm);
-    let mut j = mz.partition_point(|&m| (m as f64) < lo);
-    let (mut best_d, mut best) = (f64::MAX, None);
-    while j < mz.len() && (mz[j] as f64) <= hi {
-        let d = (mz[j] as f64 - target).abs();
-        if d < best_d {
-            best_d = d;
-            best = Some(j);
-        }
-        j += 1;
-    }
-    best
 }
 
 /// One fragment's Q1 profile: the anchor, the fragment's m/z and isotope weights and the
@@ -474,54 +395,7 @@ fn read_profiles(
         .iter()
         .map(|fs| fs.iter().map(|f| f.mz * factor(f.mz)).collect())
         .collect();
-    let t = TableFile::open(ms2)?;
-    let parts = t.row_group_parts()?;
-    let mut first = Vec::with_capacity(parts.len());
-    let mut acc = 0usize;
-    for p in &parts {
-        first.push(acc);
-        acc += p.nrows;
-    }
-    // (anchor, fragment, row, intensity) of every match, per part in row order.
-    let hits: Vec<Result<Vec<Match>>> = parts
-        .par_iter()
-        .zip(first.par_iter())
-        .map(|(p, &f0)| {
-            let a = requests.partition_point(|q| (q.0 as usize) < f0);
-            let b = requests.partition_point(|q| (q.0 as usize) < f0 + p.nrows);
-            let mut out = Vec::new();
-            if a == b {
-                return Ok(out);
-            }
-            let mut k = a;
-            let mut row = f0;
-            p.for_each_batch(Some(&["mz", "intensity"]), 1024, |batch| {
-                let mza = crate::spectra::list_col(batch, "mz")?;
-                let ina = crate::spectra::list_col(batch, "intensity")?;
-                for i in 0..mza.len() {
-                    while k < b && (requests[k].0 as usize) == row {
-                        let ai = requests[k].1;
-                        let (mz, inten) = (mza.row_slice(i, "mz")?, ina.row_slice(i, "intensity")?);
-                        let n = mz.len().min(inten.len());
-                        for (fi, &tg) in targets[ai as usize].iter().enumerate() {
-                            if let Some(j) = nearest(&mz[..n], tg, tol_ppm) {
-                                out.push((ai, fi as u8, row as u32, inten[j] as f64));
-                            }
-                        }
-                        k += 1;
-                    }
-                    row += 1;
-                }
-                Ok(())
-            })?;
-            Ok(out)
-        })
-        .collect();
-    let mut all: Vec<Match> = Vec::new();
-    for h in hits {
-        all.extend(h?);
-    }
-    all.sort_by_key(|x| (x.0, x.1, x.2));
+    let all = gather(ms2, &requests, &targets, tol_ppm)?;
     let step_t: Vec<Vec<f64>> = step_keys
         .iter()
         .map(|v| v.iter().map(|&(_, t)| t).collect())
@@ -1300,10 +1174,9 @@ fn deconvolution_offsets(
                 if r == u32::MAX || (t[si] - a.pm).abs() > sweep.half_width {
                     continue;
                 }
-                let mzs: Vec<f32> = pk[si].iter().map(|x| x.mz).collect();
                 for (f, c) in fs.iter().zip(&cf) {
                     let target = f.0 * factor(f.0);
-                    if let Some(j) = nearest(&mzs, target, tol_ppm) {
+                    if let Some(j) = crate::spectra::nearest_peak(pk[si], target, tol_ppm) {
                         let cen = t[si] + off[si][j] as f64 / q1dec::UNITS_PER_STEP * step;
                         d.push((cen - c) / step);
                     }
@@ -1403,7 +1276,7 @@ fn gather(
                         let (mz, inten) = (mza.row_slice(i, "mz")?, ina.row_slice(i, "intensity")?);
                         let n = mz.len().min(inten.len());
                         for (fi, &tg) in targets[ai as usize].iter().enumerate() {
-                            if let Some(j) = nearest(&mz[..n], tg, tol_ppm) {
+                            if let Some(j) = crate::spectra::nearest_mz(&mz[..n], tg, tol_ppm) {
                                 out.push((ai, fi as u16, row as u32, inten[j] as f64));
                             }
                         }
@@ -1424,8 +1297,41 @@ fn gather(
     Ok(all)
 }
 
+/// The block of a run with too few profiles to fit (a blank, a failed injection): the
+/// nominal window of the module docs, with the decision tolerances at their guards
+/// (`q1frag::MIN_OFFSET_TOL`, `MIN_CENTRE_TOL`, no correlation floor) and the seed's
+/// deconvolution tolerance, each only when asked for, as the fitted block carries them. The
+/// run is then searched, and writes every column a calibrated run writes.
+fn nominal(sweep: &Sweep, anchors: usize, profiles: usize, p: &Q1CalParams) -> serde_json::Value {
+    let mut b = json!({
+        "version": 1,
+        "status": "nominal",
+        "anchors": anchors,
+        "profiles": profiles,
+        "sweep": {
+            "recorded": sweep.recorded,
+            "cycles": sweep.n_cycles(),
+            "step_mz": sweep.step_mz,
+            "half_width_as_read_mz": sweep.half_width,
+        },
+        "half_width_mz": sweep.half_width,
+        "edge_width_mz": sweep.step_mz,
+    });
+    if p.fragment_decision {
+        b["fragment_decision"] = json!({"tolerances": {
+            "offset_steps": q1frag::MIN_OFFSET_TOL,
+            "centre_steps": q1frag::MIN_CENTRE_TOL,
+            "corr2d_min": 0.0,
+        }});
+    }
+    if p.deconvolution {
+        b["deconvolution"] = json!({"tol_steps": q1dec::SEED_TOL_STEPS});
+    }
+    b
+}
+
 /// Run the Q1 calibration and add `q1_calibration` to `cal.json`. A run with too few
-/// profiles gets `status: "too_few_profiles"` and a warning.
+/// profiles gets the nominal window (`status: "nominal"`) and a warning.
 pub fn run(p: Q1CalParams) -> Result<()> {
     let t0 = std::time::Instant::now();
     let sweep = read_sweep(p.ms2)?;
@@ -1438,14 +1344,12 @@ pub fn run(p: Q1CalParams) -> Result<()> {
         warn!(
             anchors = anchors.len(),
             profiles = profiles.len(),
-            "q1-calibrate: too few seed fragment profiles for a Q1 calibration"
+            min_profiles = MIN_PROFILES,
+            "q1-calibrate: too few seed fragment profiles for a Q1 calibration; this run is \
+             searched on the nominal Q1 window (centred on each step's target, the half-width \
+             as read, one step of edge)"
         );
-        json!({
-            "version": 1,
-            "status": "too_few_profiles",
-            "anchors": anchors.len(),
-            "profiles": profiles.len(),
-        })
+        nominal(&sweep, anchors.len(), profiles.len(), &p)
     } else {
         fit(
             &sweep,
@@ -1615,70 +1519,101 @@ mod tests {
         assert!(profile_sse(&y2, &e) > 0.0);
     }
 
-    /// The whole calibration on synthetic ZT Scan spectra: windows whose real centre sits
-    /// 0.3 m/z above the recorded target, 1.9 m/z half-width as read. The fit finds the
-    /// offset, calls the target the centre, and the calibrated residuals are centred.
-    #[test]
-    fn a_synthetic_sweep_is_calibrated() {
-        use mumdia_io::table::{write_table, Col};
-        let dir = std::env::temp_dir().join(format!("mumdia_q1cal_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = |n: &str| dir.join(n).to_string_lossy().to_string();
-        let (step, hw, shift) = (0.7614f64, 1.9f64, 0.3f64);
-        let n_steps = 120usize;
-        let n_cycles = 12usize;
-        let target = |k: usize| 400.0 + step * k as f64;
-        // 300 precursors, charge 2, at m/z spread over the sweep, eluting at cycle 6; three
-        // fragments each.
-        let n_prec = 300usize;
-        let prec_mz: Vec<f64> = (0..n_prec)
-            .map(|i| 410.0 + (i as f64 * 0.2637) % 70.0)
-            .collect();
-        let frag_mz = |i: usize, f: usize| 200.0 + i as f64 * 1.7 + f as f64 * 0.31;
-        let (mut si, mut rt, mut wt, mut wl, mut wu, mut mzs, mut ints) =
-            (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
-        let mut row = 0u32;
-        for c in 0..n_cycles {
-            for k in 0..n_steps {
-                let t = target(k);
-                let mut peaks: Vec<(f32, f32)> = Vec::new();
-                let elution = (-((c as f64 - 6.0) / 2.0).powi(2)).exp();
-                for (i, &pm) in prec_mz.iter().enumerate() {
-                    // The true transmission: centred at t + shift, isotopes of a 2+.
-                    let a = Anchor {
-                        cid: i as u32,
-                        pm,
-                        z: 2,
-                        rt: 0.0,
-                        c0: 0,
-                    };
-                    for f in 0..3 {
-                        let fr = Frag {
-                            mz: frag_mz(i, f),
-                            z: 1,
+    const STEP: f64 = 0.7614;
+    const HW: f64 = 1.9;
+    /// How far above its recorded target a synthetic window's real centre sits (m/z).
+    const SHIFT: f64 = 0.3;
+    const N_STEPS: usize = 120;
+    const N_CYCLES: usize = 12;
+    const N_PREC: usize = 300;
+
+    /// A synthetic ZT Scan run in a temp directory of its own: windows whose real centre sits
+    /// `SHIFT` m/z above the recorded target, `HW` m/z half-width as read, `N_STEPS` steps a
+    /// cycle; `N_PREC` precursors of charge 2 at m/z spread over the sweep, eluting at cycle 6,
+    /// with three planted fragments each (`y3`, `y4`, `y5`); one seed PSM per precursor at
+    /// spectrum q `seed_q`, at the step nearest it in cycle 6. `for_extract` adds what extract
+    /// reads: candidate ids in precursor m/z order (a library's order), the sweep spectra_ms2
+    /// v3 records (`q1_cycle`, `q1_step`), a fourth library fragment second in library order
+    /// (`b2`) that is never in the spectra, the precursor table and RT windows over the run.
+    struct Fixture {
+        dir: std::path::PathBuf,
+        ms2: String,
+        seed: String,
+        prec: String,
+        frags: String,
+        windows: String,
+        cal: String,
+    }
+
+    impl Fixture {
+        fn write(tag: &str, seed_q: f64, for_extract: bool) -> Fixture {
+            use mumdia_io::table::{write_table, Col};
+            let dir =
+                std::env::temp_dir().join(format!("mumdia_q1cal_{tag}_{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = |n: &str| dir.join(n).to_string_lossy().to_string();
+            let fx = Fixture {
+                ms2: path("ms2.parquet"),
+                seed: path("seed.parquet"),
+                prec: path("prec.parquet"),
+                frags: path("frags.parquet"),
+                windows: path("windows.parquet"),
+                cal: path("cal.json"),
+                dir: dir.clone(),
+            };
+            let target = |k: usize| 400.0 + STEP * k as f64;
+            let mut prec_mz: Vec<f64> = (0..N_PREC)
+                .map(|i| 410.0 + (i as f64 * 0.2637) % 70.0)
+                .collect();
+            if for_extract {
+                prec_mz.sort_by(f64::total_cmp);
+            }
+            let frag_mz = |i: usize, f: usize| 200.0 + i as f64 * 1.7 + f as f64 * 0.31;
+            let (mut si, mut rt, mut wt, mut wl, mut wu, mut mzs, mut ints) =
+                (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
+            let (mut cycle, mut step) = (vec![], vec![]);
+            let mut row = 0u32;
+            for c in 0..N_CYCLES {
+                for k in 0..N_STEPS {
+                    let t = target(k);
+                    let mut peaks: Vec<(f32, f32)> = Vec::new();
+                    let elution = (-((c as f64 - 6.0) / 2.0).powi(2)).exp();
+                    for (i, &pm) in prec_mz.iter().enumerate() {
+                        // The true transmission: centred at t + SHIFT, isotopes of a 2+.
+                        let a = Anchor {
+                            cid: i as u32,
+                            pm,
+                            z: 2,
+                            rt: 0.0,
+                            c0: 0,
                         };
-                        let w = isotope_weights(&a, fr);
-                        let tr = expected(&[t], pm, 2, &w, shift, hw, step)[0];
-                        let v = 1000.0 * elution * tr;
-                        if v > 1.0 {
-                            peaks.push((fr.mz as f32, v as f32));
+                        for f in 0..3 {
+                            let fr = Frag {
+                                mz: frag_mz(i, f),
+                                z: 1,
+                            };
+                            let w = isotope_weights(&a, fr);
+                            let tr = expected(&[t], pm, 2, &w, SHIFT, HW, STEP)[0];
+                            let v = 1000.0 * elution * tr;
+                            if v > 1.0 {
+                                peaks.push((fr.mz as f32, v as f32));
+                            }
                         }
                     }
+                    peaks.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    si.push(row);
+                    rt.push(c as f64 + 0.001 * k as f64);
+                    wt.push(t);
+                    wl.push(t - HW);
+                    wu.push(t + HW);
+                    mzs.push(peaks.iter().map(|p| p.0).collect::<Vec<f32>>());
+                    ints.push(peaks.iter().map(|p| p.1).collect::<Vec<f32>>());
+                    cycle.push(c as u32);
+                    step.push(k as u32);
+                    row += 1;
                 }
-                peaks.sort_by(|a, b| a.0.total_cmp(&b.0));
-                si.push(row);
-                rt.push(c as f64 + 0.001 * k as f64);
-                wt.push(t);
-                wl.push(t - hw);
-                wu.push(t + hw);
-                mzs.push(peaks.iter().map(|p| p.0).collect::<Vec<f32>>());
-                ints.push(peaks.iter().map(|p| p.1).collect::<Vec<f32>>());
-                row += 1;
             }
-        }
-        write_table(
-            &path("ms2.parquet"),
-            vec![
+            let mut cols = vec![
                 Col::U32("scan_index".into(), si),
                 Col::F64("rt_seconds".into(), rt),
                 Col::F64("window_target".into(), wt),
@@ -1686,74 +1621,187 @@ mod tests {
                 Col::F64("window_upper".into(), wu),
                 Col::LargeListF32("mz".into(), mzs),
                 Col::LargeListF32("intensity".into(), ints),
-            ],
-        )
-        .unwrap();
-        // Seed: each precursor at the step nearest it in cycle 6.
-        let seed_scan: Vec<u32> = prec_mz
-            .iter()
-            .map(|&pm| {
-                let k = (((pm - 400.0) / step).round() as usize).min(n_steps - 1);
-                (6 * n_steps + k) as u32
-            })
-            .collect();
-        write_table(
-            &path("seed.parquet"),
-            vec![
-                Col::U32("candidate_id".into(), (0..n_prec as u32).collect()),
-                Col::Str("label".into(), vec!["target".to_string(); n_prec]),
-                Col::F64("spectrum_q".into(), vec![0.001; n_prec]),
-                Col::F64("precursor_mz".into(), prec_mz.clone()),
-                Col::I32("charge".into(), vec![2; n_prec]),
-                Col::F64("observed_rt".into(), vec![6.0; n_prec]),
-                Col::U32("scan_index".into(), seed_scan),
-                Col::F64("score".into(), vec![1.0; n_prec]),
-            ],
-        )
-        .unwrap();
-        let mut fc = Vec::new();
-        let mut fm = Vec::new();
-        let mut fi = Vec::new();
-        for i in 0..n_prec {
-            for f in 0..3 {
-                fc.push(i as u32);
-                fm.push(frag_mz(i, f));
-                fi.push(1.0f32 - 0.1 * f as f32);
+            ];
+            if for_extract {
+                cols.push(Col::U32("q1_cycle".into(), cycle));
+                cols.push(Col::U32("q1_step".into(), step));
+            }
+            write_table(&fx.ms2, cols).unwrap();
+            // Seed: each precursor at the step nearest it in cycle 6.
+            let seed_scan: Vec<u32> = prec_mz
+                .iter()
+                .map(|&pm| {
+                    let k = (((pm - 400.0) / STEP).round() as usize).min(N_STEPS - 1);
+                    (6 * N_STEPS + k) as u32
+                })
+                .collect();
+            write_table(
+                &fx.seed,
+                vec![
+                    Col::U32("candidate_id".into(), (0..N_PREC as u32).collect()),
+                    Col::Str("label".into(), vec!["target".to_string(); N_PREC]),
+                    Col::F64("spectrum_q".into(), vec![seed_q; N_PREC]),
+                    Col::F64("precursor_mz".into(), prec_mz.clone()),
+                    Col::I32("charge".into(), vec![2; N_PREC]),
+                    Col::F64("observed_rt".into(), vec![6.0; N_PREC]),
+                    Col::U32("scan_index".into(), seed_scan),
+                    Col::F64("score".into(), vec![1.0; N_PREC]),
+                ],
+            )
+            .unwrap();
+            let (mut fc, mut fm, mut fi, mut name) = (vec![], vec![], vec![], vec![]);
+            for i in 0..N_PREC {
+                for f in 0..3 {
+                    if for_extract && f == 1 {
+                        fc.push(i as u32);
+                        fm.push(120.0 + 0.05 * i as f64);
+                        fi.push(0.5f32);
+                        name.push("b2".to_string());
+                    }
+                    fc.push(i as u32);
+                    fm.push(frag_mz(i, f));
+                    fi.push(1.0f32 - 0.1 * f as f32);
+                    name.push(format!("y{}", 3 + f));
+                }
+            }
+            if for_extract {
+                // The paired decoys a library must hold, after the targets: above every target's
+                // m/z and outside the sweep, their fragments never in the spectra.
+                for i in 0..N_PREC {
+                    for f in 0..3 {
+                        fc.push((N_PREC + i) as u32);
+                        fm.push(150.0 + 0.05 * i as f64 + 0.01 * f as f64);
+                        fi.push(1.0f32 - 0.1 * f as f32);
+                        name.push(format!("y{}", 3 + f));
+                    }
+                }
+            }
+            let ion: Vec<String> = name.iter().map(|n| n[..1].to_string()).collect();
+            let ordinal: Vec<i32> = name.iter().map(|n| n[1..].parse().unwrap()).collect();
+            let nf = fc.len();
+            write_table(
+                &fx.frags,
+                vec![
+                    Col::U32("candidate_id".into(), fc),
+                    Col::F64("mz".into(), fm),
+                    Col::F32("predicted_intensity".into(), fi),
+                    Col::Str("name".into(), name),
+                    Col::Str("ion_type".into(), ion),
+                    Col::I32("ordinal".into(), ordinal),
+                    Col::I32("frag_charge".into(), vec![1; nf]),
+                ],
+            )
+            .unwrap();
+            if for_extract {
+                // The targets, then their decoys (candidate N_PREC + i pairs with i).
+                let n = 2 * N_PREC;
+                let is_target = |k: usize| k < N_PREC;
+                let aa = b"ACDEFGHKMNPQRSTVWY";
+                let pep: Vec<String> = (0..n)
+                    .map(|k| {
+                        let i = k % N_PREC;
+                        let (a, b) = (
+                            aa[i / aa.len() % aa.len()] as char,
+                            aa[i % aa.len()] as char,
+                        );
+                        if is_target(k) {
+                            format!("PEP{a}{b}K")
+                        } else {
+                            format!("{b}{a}PEPK")
+                        }
+                    })
+                    .collect();
+                let ids: Vec<u32> = (0..n as u32).collect();
+                let mut mz = prec_mz.clone();
+                mz.extend((0..N_PREC).map(|i| 600.0 + 0.01 * i as f64));
+                let pick = |t: &str, d: &str| -> Vec<String> {
+                    (0..n)
+                        .map(|k| if is_target(k) { t } else { d }.to_string())
+                        .collect()
+                };
+                write_table(
+                    &fx.prec,
+                    vec![
+                        Col::U32("candidate_id".into(), ids.clone()),
+                        Col::U32("peptidoform_id".into(), ids.clone()),
+                        Col::U32(
+                            "base_peptide_id".into(),
+                            ids.iter().map(|&k| k % N_PREC as u32).collect(),
+                        ),
+                        Col::Str("peptidoform".into(), pep),
+                        Col::I32("charge".into(), vec![2; n]),
+                        Col::F64("precursor_mz".into(), mz),
+                        Col::F32("predicted_irt".into(), vec![6.0; n]),
+                        Col::Str("label".into(), pick("target", "decoy")),
+                        Col::Str("protein".into(), pick("P1", "DECOY_P1")),
+                        Col::I32(
+                            "n_fragments".into(),
+                            (0..n).map(|k| if is_target(k) { 4 } else { 3 }).collect(),
+                        ),
+                    ],
+                )
+                .unwrap();
+                write_table(
+                    &fx.windows,
+                    vec![
+                        Col::U32("candidate_id".into(), ids),
+                        Col::F64("rt_pred_cal".into(), vec![6.0; n]),
+                        Col::F64("rt_lo".into(), vec![0.0; n]),
+                        Col::F64("rt_hi".into(), vec![N_CYCLES as f64; n]),
+                        Col::OptF64("im_pred_cal".into(), vec![None; n]),
+                        Col::OptF64("im_lo".into(), vec![None; n]),
+                        Col::OptF64("im_hi".into(), vec![None; n]),
+                    ],
+                )
+                .unwrap();
+            }
+            mumdia_io::json::write_json(&fx.cal, &json!({"method": "loess"})).unwrap();
+            fx
+        }
+
+        fn path(&self, name: &str) -> String {
+            self.dir.join(name).to_string_lossy().to_string()
+        }
+
+        /// The calibration of the run, learning the decision and deconvolution tolerances.
+        fn params(&self) -> Q1CalParams<'_> {
+            Q1CalParams {
+                seed_psms: &self.seed,
+                ms2: &self.ms2,
+                library_fragments: &self.frags,
+                mass_cal: None,
+                q_max: 0.01,
+                frag_tol_fallback_ppm: 10.0,
+                out_cal: &self.cal,
+                fragment_decision: true,
+                deconvolution: true,
             }
         }
-        write_table(
-            &path("frags.parquet"),
-            vec![
-                Col::U32("candidate_id".into(), fc),
-                Col::F64("mz".into(), fm),
-                Col::F32("predicted_intensity".into(), fi),
-            ],
-        )
-        .unwrap();
-        mumdia_io::json::write_json(&path("cal.json"), &json!({"method": "loess"})).unwrap();
-        run(Q1CalParams {
-            seed_psms: &path("seed.parquet"),
-            ms2: &path("ms2.parquet"),
-            library_fragments: &path("frags.parquet"),
-            mass_cal: None,
-            q_max: 0.01,
-            frag_tol_fallback_ppm: 10.0,
-            out_cal: &path("cal.json"),
-            fragment_decision: true,
-            deconvolution: true,
-        })
-        .unwrap();
-        let cal: serde_json::Value = mumdia_io::json::read_json(&path("cal.json")).unwrap();
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// The whole calibration on the synthetic run: the fit finds the offset, calls the
+    /// target the centre, and the calibrated residuals are centred.
+    #[test]
+    fn a_synthetic_sweep_is_calibrated() {
+        let fx = Fixture::write("fit", 0.001, false);
+        run(fx.params()).unwrap();
+        let cal: serde_json::Value = mumdia_io::json::read_json(&fx.cal).unwrap();
         assert_eq!(cal["method"], "loess", "the rest of cal.json is kept");
         let q = &cal["q1_calibration"];
         assert_eq!(q["status"], "fitted", "{q}");
         assert_eq!(q["target_marks"], "centre", "{q}");
         assert_eq!(q["sweep"]["recorded"], false);
-        assert_eq!(q["sweep"]["cycles"], n_cycles);
+        assert_eq!(q["sweep"]["cycles"], N_CYCLES);
         let off = q["offset"]["median_mz"].as_f64().unwrap();
-        assert!((off - shift).abs() < 0.05, "offset {off}");
+        assert!((off - SHIFT).abs() < 0.05, "offset {off}");
         let nominal = q["residual_steps"]["nominal"]["median"].as_f64().unwrap();
-        assert!((nominal + shift / step).abs() < 0.1, "nominal {nominal}");
+        assert!((nominal + SHIFT / STEP).abs() < 0.1, "nominal {nominal}");
         let after = q["residual_steps"]["calibrated"]["median"]
             .as_f64()
             .unwrap();
@@ -1761,7 +1809,7 @@ mod tests {
         let h = q["half_width_mz"].as_f64().unwrap();
         let e = q["edge_width_mz"].as_f64().unwrap();
         assert!(
-            (h - hw).abs() < 0.1 && (e - step).abs() < 0.2,
+            (h - HW).abs() < 0.1 && (e - STEP).abs() < 0.2,
             "h {h} e {e}"
         );
         // The decision tolerances, learned on the same anchors under the fitted window: their
@@ -1779,6 +1827,130 @@ mod tests {
         // Extract reads the same block back as its model.
         let m = q1frag::model_from_calibration(q, true).unwrap();
         assert_eq!(m.tolerances.offset_steps, off);
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run whose seed has no confident PSM (a blank) gets the nominal window, which extract
+    /// reads as it reads a fitted one: centred on the targets, the half-width as read, one
+    /// step of edge, the decision tolerances at their guards and the seed's deconvolution
+    /// tolerance.
+    #[test]
+    fn a_run_without_profiles_gets_the_nominal_window() {
+        let fx = Fixture::write("blank", 0.5, false);
+        run(fx.params()).unwrap();
+        let cal: serde_json::Value = mumdia_io::json::read_json(&fx.cal).unwrap();
+        let q = &cal["q1_calibration"];
+        assert_eq!(q["status"], "nominal", "{q}");
+        assert_eq!(q["anchors"], 0, "{q}");
+        assert_eq!(q["profiles"], 0, "{q}");
+        let m = q1frag::read_model(&fx.cal).unwrap();
+        assert!(m.offset_terms.is_empty());
+        assert!((m.step_mz - STEP).abs() < 1e-6, "step {}", m.step_mz);
+        assert!((m.half_width_mz - HW).abs() < 1e-6, "h {}", m.half_width_mz);
+        assert_eq!(m.edge_width_mz, m.step_mz);
+        assert_eq!(m.tolerances.offset_steps, q1frag::MIN_OFFSET_TOL);
+        assert_eq!(m.tolerances.centre_steps, q1frag::MIN_CENTRE_TOL);
+        assert_eq!(m.tolerances.corr2d_min, 0.0);
+        assert_eq!(
+            q1frag::read_deconvolution_tol(&fx.cal).unwrap(),
+            q1dec::SEED_TOL_STEPS
+        );
+    }
+
+    /// Extract with the ZT Scan analysis as `mumdia run` resolves and wires it
+    /// (`Config::resolve_ztscan`, `q1frag::configure_extract`) on the calibrated synthetic
+    /// run: every row's decision lists have one entry per chromatogram fragment row of its
+    /// candidate, in their order (the fragment never in the spectra reads absent where its
+    /// chromatogram row is empty), the planted fragments belong, and a second extract writes
+    /// the same bytes.
+    #[test]
+    fn extract_decides_per_fragment_on_the_calibrated_sweep() {
+        use crate::stages::extract;
+        use mumdia_core::config::{Config, ZtScanInputs};
+        use mumdia_io::table::Table;
+        let fx = Fixture::write("extract", 0.001, true);
+        run(fx.params()).unwrap();
+        let mut cfg = Config::default();
+        cfg.resolve_ztscan(ZtScanInputs::All { half_width: HW })
+            .unwrap();
+        assert!(cfg.extract.q1_fragments.on());
+        let mut ext = cfg.extract.clone();
+        q1frag::configure_extract(&cfg, Some(&fx.cal), &mut ext).unwrap();
+        let go = |tag: &str| -> (String, String) {
+            let psms = fx.path(&format!("psms_{tag}.parquet"));
+            let chrom = fx.path(&format!("chrom_{tag}.parquet"));
+            extract::run(extract::ExtractParams {
+                precursor_span: None,
+                fragment_offset: None,
+                rt_windows: None,
+                retrace_skeleton: None,
+                trace_pad: None,
+                chrom_im: false,
+                sibling_bands: 1,
+                scans: None,
+                ms2: &fx.ms2,
+                library_precursors: &fx.prec,
+                library_fragments: &fx.frags,
+                run_windows: &fx.windows,
+                ms1: None,
+                mass_cal: None,
+                out_psms: &psms,
+                out_chrom: &chrom,
+                restrict_candidates: None,
+                cfg: &ext,
+                config_hash: "test",
+            })
+            .unwrap();
+            (psms, chrom)
+        };
+        let (p1, c1) = go("a");
+        let (p2, c2) = go("b");
+        let h = |p: &str| mumdia_io::hash::blake3_file(p).unwrap();
+        assert_eq!(h(&p1), h(&p2), "psms_extracted is not deterministic");
+        assert_eq!(h(&c1), h(&c2), "the chromatograms are not deterministic");
+        let psms = Table::read(&p1).unwrap();
+        let cid = psms.u32("candidate_id").unwrap();
+        let class = psms.list_f32("q1f_frag_class").unwrap();
+        let chrom = Table::read(&c1).unwrap();
+        let ccid = chrom.u32("candidate_id").unwrap();
+        let cname = chrom.str("frag_name").unwrap();
+        // A trace's sum, from either layout (v2 trims each trace to its nonzero span).
+        let v1 = chrom.column_names().iter().any(|c| c == "intensity");
+        let cint = chrom
+            .list_f32(if v1 { "intensity" } else { "intensity_trimmed" })
+            .unwrap();
+        let mut rows: BTreeMap<u32, Vec<(String, f32)>> = BTreeMap::new();
+        for k in 0..ccid.len() {
+            let total: f32 = cint[k].iter().sum();
+            rows.entry(ccid[k])
+                .or_default()
+                .push((cname[k].clone(), total));
+        }
+        let targets: Vec<(&u32, &Vec<f32>)> = cid
+            .iter()
+            .zip(&class)
+            .filter(|(c, _)| (**c as usize) < N_PREC)
+            .collect();
+        assert!(targets.len() > N_PREC / 2, "{} target rows", targets.len());
+        let (mut planted, mut belong) = (0usize, 0usize);
+        for (c, cl) in targets {
+            let r = &rows[c];
+            let names: Vec<&str> = r.iter().map(|x| x.0.as_str()).collect();
+            assert_eq!(
+                names,
+                ["y3", "b2", "y4", "y5"],
+                "candidate {c}: library order"
+            );
+            assert_eq!(cl.len(), r.len(), "candidate {c}");
+            assert_eq!(r[1].1, 0.0, "candidate {c}: b2 is never in the spectra");
+            assert_eq!(cl[1], q1frag::ABSENT as f32, "candidate {c}: {cl:?}");
+            for k in [0, 2, 3] {
+                planted += 1;
+                belong += usize::from(cl[k] == q1frag::BELONGS as f32);
+            }
+        }
+        assert!(
+            belong as f64 > 0.85 * planted as f64,
+            "{belong} of {planted} planted fragments belong"
+        );
     }
 }

@@ -903,12 +903,15 @@ subset sizes without a cap preventing the failure.
 ### 4h. Q1 calibration of scanning-quadrupole spectra (`q1_calibrate`, automatic for ZT Scan files)
 
 `rt_im_train.q1_calibrate` (`stages::q1cal`, called by `chain::extract_to_compete` right
-after the RT fit; the RT bootstrap pass skips it, as it skips retrace) calibrates the Q1
-dimension of a SCIEX ZT Scan DIA run read with `convert.isolation_half_width`
-(docs/04_convert.md, "SCIEX ZT Scan DIA"): where the quadrupole's window really sits
-relative to the target the file records for each step, how wide it is and how soft its
-edges are. It writes a `q1_calibration` block into `cal.json` and changes nothing else:
-no stage reads it yet, so every other artifact of a run with the key is the one without it.
+after the RT fit; the RT bootstrap pass skips it unless its extract decides per fragment)
+calibrates the Q1 dimension of a SCIEX ZT Scan DIA run read with
+`convert.isolation_half_width` (docs/04_convert.md, "SCIEX ZT Scan DIA"): where the
+quadrupole's window really sits relative to the target the file records for each step, how
+wide it is and how soft its edges are. It writes a `q1_calibration` block into `cal.json`.
+Extract reads it for the per-fragment decision (`extract.q1_fragments`) and the
+Q1-deconvolved evidence (docs/09_extract.md, sections 12 and 14), and the features stage reads the
+decision tolerances it learns; with neither on, every other artifact of a run with the key is
+the one without it.
 The block carries its own `version` (1); a `cal.json` without the key is unchanged. The
 standalone `mumdia rt-im-train` reads no spectra and warns that it skips the key. It is
 refused on a layout that is not a scanning quadrupole (the thresholds of extract's
@@ -998,8 +1001,12 @@ step, at which 77.4% of the anchors' peaks and 26.0% of the
 decoys' are kept (0.5 steps 56.7% / 13.3%, 2 steps 90.8% / 48.6%, 4 steps 97.1% / 78.8%); the
 anchors' offsets have a median of +0.09 steps and a robust SD of 0.60.
 
-**`cal.json` `q1_calibration`.** `status` (`fitted`, or `too_few_profiles` under 200),
-`anchors`, `profiles`, `sweep` (`recorded`, `cycles`, `step_mz`, `half_width_as_read_mz`),
+**`cal.json` `q1_calibration`.** `status` (`fitted`; `nominal` under 200 profiles, a blank
+or failed injection: the nominal window, centred on each target with the half-width as read
+and one step of edge, the decision tolerances at their guards of 0.5 steps with no
+correlation floor and the seed's deconvolution tolerance of 2 steps, so the run is searched
+and writes every column a calibrated run writes; an older `cal.json` may hold
+`too_few_profiles`, which extract refuses), `anchors`, `profiles`, `sweep` (`recorded`, `cycles`, `step_mz`, `half_width_as_read_mz`),
 `isotope_model`, `target_marks`, `hypotheses` (sum of squares and median residual of each
 reading), `offset` (`median_mz`, `median_steps`, `terms` with a 20-point grid and offset per
 term, `selection` with the residual spread after each candidate term), `half_width_mz`,

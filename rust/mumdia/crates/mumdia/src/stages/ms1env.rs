@@ -134,21 +134,6 @@ pub fn search_tol(prec_tol_ppm: f64) -> f64 {
     (2.0 * prec_tol_ppm).max(ENV_MIN_TOL_PPM)
 }
 
-/// The peak of `mz` (ascending) nearest `target` within `tol_ppm`, ties to the lower m/z.
-fn nearest(mz: &[f32], target: f64, tol_ppm: f64) -> Option<usize> {
-    let (lo, hi) = mumdia_core::constants::ppm_bounds(target, tol_ppm);
-    let mut j = mz.partition_point(|&m| (m as f64) < lo);
-    let mut best: Option<(f64, usize)> = None;
-    while j < mz.len() && (mz[j] as f64) <= hi {
-        let d = (mz[j] as f64 - target).abs();
-        if best.is_none_or(|(bd, _)| d < bd) {
-            best = Some((d, j));
-        }
-        j += 1;
-    }
-    best.map(|(_, j)| j)
-}
-
 /// The evidence of a precursor of m/z `pm` and charge `z` in the MS1 scans around scan `j`
 /// (the one nearest the apex): `shift(mz, rt)` is the calibrated read factor
 /// (`ExtractConfig::ms1_shift`), `tol_ppm` the search tolerance ([`search_tol`]).
@@ -176,7 +161,7 @@ pub fn read(
         for (k, (ik, wk)) in e.i.iter_mut().zip(wppm.iter_mut()).enumerate() {
             let lib = pm + (k as f64 - 1.0) * sp;
             let at = lib * shift(lib, s.rt_seconds);
-            if let Some(p) = nearest(&s.mz, at, tol_ppm) {
+            if let Some(p) = crate::spectra::nearest_mz(&s.mz, at, tol_ppm) {
                 let v = s.intensity[p] as f64;
                 if v > 0.0 {
                     *ik += v;
@@ -187,7 +172,7 @@ pub fn read(
         for h in [0.5, 1.5] {
             let lib = pm + h * sp;
             let at = lib * shift(lib, s.rt_seconds);
-            if let Some(p) = nearest(&s.mz, at, tol_ppm) {
+            if let Some(p) = crate::spectra::nearest_mz(&s.mz, at, tol_ppm) {
                 e.half += (s.intensity[p] as f64).max(0.0);
             }
         }
