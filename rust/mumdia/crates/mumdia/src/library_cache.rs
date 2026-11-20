@@ -61,11 +61,6 @@ fn min_free_after_store() -> u64 {
     }
 }
 
-/// How long a temporary store directory may go unwritten before the run that was
-/// writing it counts as gone and the directory is removed. A live store writes its files
-/// continuously, and a byte copy of the largest library takes minutes, not an hour.
-const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60 * 60);
-
 /// One stored file in `entry.json`.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 struct StoredFile {
@@ -101,53 +96,6 @@ fn stored_file(path: &Path) -> Result<StoredFile> {
             .len(),
         blake3: mumdia_io::hash::blake3_file(&p)?,
     })
-}
-
-/// A temporary directory this cache writes or sets aside: `<24 hex>.partial-...` (a store
-/// in progress, or abandoned) or `<24 hex>.broken-...` (an unusable entry moved out of the
-/// way). Anything else in the cache directory is not the engine's and is never touched.
-fn leftover_kind(name: &str) -> Option<&'static str> {
-    let (key, rest) = name.split_at_checked(24)?;
-    if !key.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    if rest.starts_with(".partial-") {
-        Some("partial")
-    } else if rest.starts_with(".broken-") {
-        Some("broken")
-    } else {
-        None
-    }
-}
-
-/// Was `dir`, or any file directly inside it, written within [`STALE_AFTER`]? A
-/// modification time in the future counts as recent (clock skew on a shared cache is not
-/// evidence that nobody is writing, docs/31 F9).
-fn written_recently(dir: &Path) -> bool {
-    let recent = |p: &Path| match std::fs::metadata(p).and_then(|m| m.modified()) {
-        Ok(t) => match t.elapsed() {
-            Ok(age) => age < STALE_AFTER,
-            Err(_) => true,
-        },
-        Err(_) => false,
-    };
-    recent(dir)
-        || std::fs::read_dir(dir)
-            .map(|rd| rd.flatten().any(|e| recent(&e.path())))
-            .unwrap_or(false)
-}
-
-/// A name for a directory beside the entries that no other run picks: the key, `what`,
-/// this process's id and the time in nanoseconds.
-fn unique_sibling(dir: &Path, key: &str, what: &str) -> PathBuf {
-    dir.join(format!(
-        "{key}.{what}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ))
 }
 
 /// Remove the digest and peptidoform tables (and their reports) a previous build left in
@@ -419,35 +367,6 @@ impl LibraryCache {
         }
     }
 
-    /// Remove the temporary directories of stores that died (unwritten for
-    /// [`STALE_AFTER`]) and of unusable entries set aside by [`LibraryCache::store`].
-    fn sweep_leftovers(&self) {
-        let Ok(rd) = std::fs::read_dir(&self.dir) else {
-            return;
-        };
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let path = e.path();
-            let Some(kind) = leftover_kind(&name) else {
-                continue;
-            };
-            if !path.is_dir() || (kind == "partial" && written_recently(&path)) {
-                continue;
-            }
-            match std::fs::remove_dir_all(&path) {
-                Ok(()) => info!(
-                    dir = %path.display(),
-                    "library cache: removed an abandoned {kind} directory"
-                ),
-                Err(err) => warn!(
-                    dir = %path.display(),
-                    error = %err,
-                    "library cache: could not remove an abandoned {kind} directory"
-                ),
-            }
-        }
-    }
-
     /// Move an unusable entry out of the way and remove it. Another run may have done
     /// so already, which is not an error.
     fn set_aside(&self, final_dir: &Path, why: &anyhow::Error) {
@@ -457,10 +376,10 @@ impl LibraryCache {
             error = %format!("{why:#}"),
             "library cache: the stored library is unusable; replacing it with this build"
         );
-        let aside = unique_sibling(&self.dir, &self.key, "broken");
+        let aside = crate::cache::unique_sibling(&self.entry_dir(), "broken");
         if std::fs::rename(final_dir, &aside).is_ok() {
             // A reader on a platform that keeps open files undeletable can make this fail;
-            // the next store's sweep retries it.
+            // a later sweep retries it once nothing has written it for an hour.
             let _ = std::fs::remove_dir_all(&aside);
         }
     }
@@ -468,7 +387,9 @@ impl LibraryCache {
     fn try_store(&self, lib_p: &str, lib_f: &str) -> Result<bool> {
         std::fs::create_dir_all(&self.dir)
             .with_context(|| format!("creating {}", self.dir.display()))?;
-        self.sweep_leftovers();
+        // The temporary directories of stores that died, and of entries set aside, that
+        // nothing has written for an hour.
+        crate::cache::remove_stale_leftovers(&self.dir, std::time::SystemTime::now());
         // The cache must not take the space the rest of this run, or anything else on the
         // disk, needs: extract alone writes tens of GB on a large library. Unknown free
         // space (a network share, no `df`) does not block the store.
@@ -501,7 +422,7 @@ impl LibraryCache {
                 Err(e) => self.set_aside(&final_dir, &e),
             }
         }
-        let tmp = unique_sibling(&self.dir, &self.key, "partial");
+        let tmp = crate::cache::unique_sibling(&self.entry_dir(), "partial");
         std::fs::create_dir_all(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         let result = (|| -> Result<bool> {
             let mut files = std::collections::BTreeMap::new();
@@ -1012,7 +933,7 @@ mod tests {
     }
 
     #[test]
-    fn a_store_removes_abandoned_temporary_directories_and_nothing_else() {
+    fn a_store_leaves_recent_and_foreign_directories_alone() {
         let root = tmp("sweep");
         let fasta = root.join("x.fasta");
         std::fs::write(&fasta, ">P1\nPEPTIDEK\n").unwrap();
@@ -1029,7 +950,11 @@ mod tests {
         }
         let (p1, f1) = fake_build(&root.join("run1"), "a");
         cache.store(&p1, &f1);
-        assert!(!broken.exists(), "a set-aside entry is removed");
+        // The cache's one rule (`cache::remove_stale_leftovers`): an hour unwritten first.
+        assert!(
+            broken.exists(),
+            "a set-aside entry written just now is kept"
+        );
         assert!(
             fresh.exists(),
             "a store that is still writing is left alone"
@@ -1038,10 +963,6 @@ mod tests {
             foreign.exists(),
             "a directory that is not the cache's is never touched"
         );
-        assert_eq!(leftover_kind(&format!("{k}.partial-9-9")), Some("partial"));
-        assert_eq!(leftover_kind(&format!("{k}.broken-9-9")), Some("broken"));
-        assert_eq!(leftover_kind(k), None);
-        assert_eq!(leftover_kind("zz3456789abcdef01234567.partial-1"), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1058,7 +979,7 @@ mod tests {
         std::fs::create_dir_all(&stale).unwrap();
         let file = stale.join(TABLES[0]);
         std::fs::write(&file, b"x").unwrap();
-        let old = std::time::SystemTime::now() - 2 * STALE_AFTER;
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
         for p in [&file, &stale] {
             std::fs::File::open(p).unwrap().set_modified(old).unwrap();
         }

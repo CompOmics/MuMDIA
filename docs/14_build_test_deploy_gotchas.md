@@ -404,10 +404,12 @@ things in order.
 
 1. The worker scripts. `predict_frag.sidecar_script_dir` is resolved through
    `python::resolve_script_dir` (`python.rs:372`), and every worker file each
-   needed role runs must exist. This check is skipped entirely when no role is
-   required, so a native configuration is not failed over a directory it never
-   opens. The previous version failed exactly that case, and a missing script
-   directory was the most common misconfiguration.
+   role the run will use runs must exist: a required role, and a wanted one whose
+   interpreter resolved, such as DeepLC under the default `library_irt = auto`,
+   whose `deeplc_finetune.py` the default library search runs. This check is
+   skipped entirely when no role is in use, so a native configuration is not failed
+   over a directory it never opens. The previous version failed exactly that case,
+   and a missing script directory was the most common misconfiguration.
 2. One line per interpreter role, for all four roles (`Role::Rescore`,
    `DeepLc`, `Ms2pip`, `Mbr`; `python.rs:35`). `mbr.python` was previously never
    probed. A role that is neither required by the config nor explicitly named

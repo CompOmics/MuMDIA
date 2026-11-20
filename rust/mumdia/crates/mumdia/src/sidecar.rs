@@ -10,6 +10,8 @@ use anyhow::{bail, Context, Result};
 use mumdia_io::table::{write_table, Col, TableFile};
 use tracing::{info, warn};
 
+use crate::stages::rescore::{keep_handoff, remove_sidecar_files};
+
 /// Per candidate row: `(ion byte, ordinal, fragment charge)` -> linear predicted intensity.
 /// The charge is 1 for every series a single-charge MS2PIP model emits and 2 for the
 /// `b2`/`y2` series of the `*ch2` models.
@@ -73,10 +75,12 @@ pub fn run_ms2pip(
     // the 32 requested cores idle for the whole prediction.
     let processes = rayon::current_num_threads().max(1).to_string();
     info!(n = ids.len(), model, processes = %processes, "sidecar: running MS2PIP");
-    run_worker(python, script, &[&inp, &outp, model, &processes], false)
+    run_worker(python, script, &[&inp, &outp, model, &processes])
         .context("MS2PIP worker failed")?;
 
-    read_fragment_intensities(&outp, ids, "MS2PIP")
+    let map = read_fragment_intensities(&outp, ids, "MS2PIP")?;
+    remove_sidecar_files(&[&inp, &outp], keep_handoff());
+    Ok(map)
 }
 
 /// Write the `id, peptidoform, charge` request the fragment-intensity workers and the
@@ -170,7 +174,13 @@ fn read_fragment_intensities(
 ) -> Result<FragmentIntensityMap> {
     let t = TableFile::open(out_path)?;
     let oid = t.u32("id")?;
-    let ion = t.str("ion_type")?;
+    // Interned, not one `String` per row: MS2PIP returns every ordinal of four series, about
+    // 500 million rows for a 10-million-precursor library, over a handful of values.
+    let (ion_id, ion_vals) = t.str_interned("ion_type")?;
+    let ion_byte: Vec<u8> = ion_vals
+        .iter()
+        .map(|s| s.as_bytes().first().copied().unwrap_or(b'?'))
+        .collect();
     let ord = t.i32("ordinal")?;
     let inten = t.f32("intensity")?;
     // Older workers wrote no `frag_charge`: every row was a singly charged fragment.
@@ -192,7 +202,7 @@ fn read_fragment_intensities(
                 ids.len()
             );
         }
-        let ib = ion[i].as_bytes().first().copied().unwrap_or(b'?');
+        let ib = ion_byte[ion_id[i] as usize];
         let z = fch.as_ref().map(|c| c[i].clamp(1, 255) as u8).unwrap_or(1);
         if map
             .entry(oid[i])
@@ -202,7 +212,7 @@ fn read_fragment_intensities(
         {
             bail!(
                 "{who} worker returned fragment {}{} charge {z} of id {} more than once",
-                ion[i],
+                ion_vals[ion_id[i] as usize],
                 ord[i],
                 oid[i]
             );
@@ -247,10 +257,11 @@ pub fn run_peptdeep(
         python,
         script,
         &[&inp, &outp, model, &nce_s, instrument, &processes],
-        false,
     )
     .context("AlphaPeptDeep worker failed")?;
-    read_fragment_intensities(&outp, ids, "AlphaPeptDeep")
+    let map = read_fragment_intensities(&outp, ids, "AlphaPeptDeep")?;
+    remove_sidecar_files(&[&inp, &outp], keep_handoff());
+    Ok(map)
 }
 
 /// Installed version of a Python distribution as the interpreter reports it
@@ -388,8 +399,8 @@ pub fn run_deeplc(
     // ignored the engine's `--threads` (docs/13, "DeepLC thread cap").
     let threads = rayon::current_num_threads().max(1).to_string();
     info!(n = ids.len(), threads = %threads, "sidecar: running DeepLC");
-    run_worker(python, script, &[&inp, &outp, &threads], true).context("DeepLC worker failed")?;
-    read_id_scalars(
+    run_worker(python, script, &[&inp, &outp, &threads]).context("DeepLC worker failed")?;
+    let map = read_id_scalars(
         &outp,
         ids,
         "DeepLC",
@@ -397,7 +408,9 @@ pub fn run_deeplc(
         "predicted_rt",
         TableFile::f32,
         false,
-    )
+    )?;
+    remove_sidecar_files(&[&inp, &outp], keep_handoff());
+    Ok(map)
 }
 
 /// IM2Deep: one predicted 1/K0 (V s cm^-2) per (peptidoform, charge), from the worker's
@@ -430,8 +443,8 @@ pub fn run_im2deep(
     // (`MUMDIA_IM2DEEP_THREAD_CAP`), as the DeepLC workers do.
     let threads = rayon::current_num_threads().max(1).to_string();
     info!(n = ids.len(), threads = %threads, "sidecar: running IM2Deep");
-    run_worker(python, script, &[&inp, &outp, &threads], true).context("IM2Deep worker failed")?;
-    read_id_scalars(
+    run_worker(python, script, &[&inp, &outp, &threads]).context("IM2Deep worker failed")?;
+    let map = read_id_scalars(
         &outp,
         ids,
         "IM2Deep",
@@ -439,7 +452,9 @@ pub fn run_im2deep(
         "predicted_im",
         TableFile::f64,
         true,
-    )
+    )?;
+    remove_sidecar_files(&[&inp, &outp], keep_handoff());
+    Ok(map)
 }
 
 /// DeepLC multitask fine-tune: adapt the RT model to this run's confident seed
@@ -518,7 +533,7 @@ pub fn run_deeplc_finetune(
     ];
     let sh = shards.to_string();
     push_shards(&mut args, shards, &sh);
-    run_worker(python, script, &args, true).context("DeepLC fine-tune failed")?;
+    run_worker(python, script, &args).context("DeepLC fine-tune failed")?;
     warn_on_retained_imported(lib_out);
     Ok(())
 }
@@ -581,7 +596,7 @@ pub fn run_deeplc_multihead(
     let sh = shards.to_string();
     push_shards(&mut args, shards, &sh);
     push_projection_cache(&mut args, projection_cache);
-    run_worker(python, script, &args, true).context("DeepLC multi-head calibration failed")?;
+    run_worker(python, script, &args).context("DeepLC multi-head calibration failed")?;
     warn_on_retained_imported(lib_out);
     Ok(())
 }
@@ -626,7 +641,7 @@ pub fn run_deeplc_repredict(
     let sh = shards.to_string();
     push_shards(&mut args, shards, &sh);
     push_projection_cache(&mut args, projection_cache);
-    run_worker(python, script, &args, true).context("DeepLC library re-prediction failed")?;
+    run_worker(python, script, &args).context("DeepLC library re-prediction failed")?;
     warn_on_retained_imported(lib_out);
     Ok(())
 }
@@ -727,7 +742,7 @@ pub fn run_deeplc_bands(
     args.extend_from_slice(&["--threads", &th, "--predict-threads", &th]);
     push_shards(&mut args, shards, &sh);
     push_projection_cache(&mut args, projection_cache);
-    run_worker(python, script, &args, true).context("DeepLC band adaptation failed")?;
+    run_worker(python, script, &args).context("DeepLC band adaptation failed")?;
     for (_, lib_out) in pairs {
         if !std::path::Path::new(lib_out).exists() {
             bail!("the DeepLC band worker exited 0 but wrote no {lib_out}");
@@ -791,6 +806,13 @@ pub fn run_mbr(
     consensus_corr_min: f64,
     seed: u64,
 ) -> Result<()> {
+    // mbr_worker.py splits both lists on ','.
+    if let Some(p) = psms.iter().chain(frag).find(|p| p.contains(',')) {
+        bail!(
+            "the MBR worker takes its run tables as one comma-separated list, and {p} contains \
+             a comma; use an output directory without one"
+        );
+    }
     let psms_csv = psms.join(",");
     info!(
         scored,
@@ -827,20 +849,20 @@ pub fn run_mbr(
     if !frag.is_empty() && consensus_corr_min > 0.0 {
         args.extend_from_slice(&["--frag-csv", &frag_csv, "--consensus-corr-min", &cm]);
     }
-    run_worker(python, script, &args, false).context("MBR transfer worker failed")
+    run_worker(python, script, &args).context("MBR transfer worker failed")
 }
 
-/// Invoke a Python worker: `python script arg...`. `utf8` forces UTF-8 I/O
-/// (DeepLC/Keras crash on the Windows cp1252 console otherwise).
-fn run_worker(python: &str, script: &str, args: &[&str], utf8: bool) -> Result<()> {
+/// Invoke a Python worker: `python script arg...`, with UTF-8 I/O for every worker. On
+/// Windows a worker whose output is piped (the desktop) writes the ANSI code page otherwise,
+/// and fails on a printed path that code page cannot encode; DeepLC/Keras crashed on the
+/// cp1252 console the same way.
+fn run_worker(python: &str, script: &str, args: &[&str]) -> Result<()> {
     let mut cmd = Command::new(python);
     cmd.arg(script);
     for a in args {
         cmd.arg(a);
     }
-    if utf8 {
-        cmd.env("PYTHONUTF8", "1").env("PYTHONIOENCODING", "utf-8");
-    }
+    cmd.env("PYTHONUTF8", "1").env("PYTHONIOENCODING", "utf-8");
     // Output is INHERITED, not captured, on purpose: the NN rescorer prints
     // per-iteration progress across hours and a user watching a run needs to see
     // it live. The cost is that on failure the worker's traceback has already
