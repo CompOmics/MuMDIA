@@ -1032,7 +1032,7 @@ Anchors of the multi-head calibration; see `RtImTrainConfig::multihead_anchors`.
 | Value | Default | Description |
 |---|---|---|
 | `auto` | yes | `search` when the adapting run's seed search is short of anchors (`RtImTrainConfig::multihead_search_below`) or its spectra carry 1/K0, else `seed`. |
-| `seed` |  | The run's confident seed PSMs (`spectrum_q <= q_train`). |
+| `seed` |  | The run's confident seed PSMs (`spectrum_q < q_train`). |
 | `search` |  | The confident targets of a bootstrap search of the run on the seed-anchored library (`precursor_q <= q_train`, observed RT = `apex_rt`). |
 
 ### `NegSelect`

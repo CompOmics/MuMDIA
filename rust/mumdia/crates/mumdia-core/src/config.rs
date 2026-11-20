@@ -2192,7 +2192,7 @@ pub enum MultiheadAnchors {
     /// (`RtImTrainConfig::multihead_search_below`) or its spectra carry 1/K0, else `seed`.
     #[default]
     Auto,
-    /// The run's confident seed PSMs (`spectrum_q <= q_train`).
+    /// The run's confident seed PSMs (`spectrum_q < q_train`).
     Seed,
     /// The confident targets of a bootstrap search of the run on the seed-anchored library
     /// (`precursor_q <= q_train`, observed RT = `apex_rt`).

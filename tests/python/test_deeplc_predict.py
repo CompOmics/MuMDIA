@@ -55,6 +55,17 @@ def _deeplc_cap(helpers):
     return helpers["thread_cap"]("MUMDIA_DEEPLC_THREAD_CAP", "auto")
 
 
+def test_the_holdout_cut_rounds_as_the_engine_does():
+    """The fine-tune's held-out split is the one rt-im-train sizes `w_rt` on, so a peptide
+    the engine holds out must never enter the reference: the cut rounds half away from
+    zero, as `f64::round` does in rt_im_train.rs::is_holdout, not to even."""
+    namespace = {}
+    exec(_function_sources("deeplc_finetune.py", ["holdout_cut"])["holdout_cut"],  # noqa: S102
+         namespace)
+    cut = namespace["holdout_cut"]
+    assert [cut(0.0), cut(0.3), cut(0.0125), cut(0.0025), cut(0.9)] == [0, 300, 13, 3, 900]
+
+
 def test_the_torch_workers_share_one_copy_of_the_thread_helpers():
     """One module holds the thread policy; no worker carries a copy that could drift.
 

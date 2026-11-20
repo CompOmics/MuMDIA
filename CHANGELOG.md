@@ -233,6 +233,17 @@ than a number. Both are recorded in every run's `manifest.json`.
   already writes it in `candidate_id` order, so the rows are identical; the parquet row-group
   layout of the output changes (the writer's default row groups instead of one per sort
   bucket), which the engine's range reads accept.
+- **The retention-time and mass calibrations share their helpers.** `Loess::fit` is
+  `Loess::fit_robust` with no iterations instead of a second copy of the fit; the robust-SD
+  factor is one constant (`calibrate::MAD_TO_SIGMA`) instead of seven copies; the fragment mass
+  offset is `calibrate::percentile(.., 0.5)` instead of its own median. The test-only
+  `masscal::fit` and `DEFAULT_TOL_FLOOR_PPM`, the pass-through `rt_im_train::run_hashed` and
+  `rt_im_train::apply` are removed, and the NNLS scratch API, which no caller reused, is
+  private. Every artifact is byte-identical.
+- **The composition RT correction reads the library's peptidoforms as one buffer** instead of
+  one `String` per library row (about 0.6 GB on a 10.9M-row library), and a grouped run learns
+  the MS1 offset on the MS1 scans its extraction phase decodes instead of decoding them once
+  more for it. Both are byte-identical.
 
 ### Removed
 
@@ -253,6 +264,25 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **`mumdia rt-im-train` relaxes the anchor cut through `rt_im_train.anchor_q_ladder`**, as
+  `run` and `run-experiment` do. On a seed short of anchors at `q_train` the standalone stage
+  wrote the fixed fallback window where a run fitted a calibration.
+- **`rt_im_train.rt_window_min_s` floors every RT half-window.** Only the adaptive window read
+  it; the global `w_rt`, held-out or in-sample, had a literal 1 s floor. The default is 1 s, so
+  only a configuration that sets it above a run's `w_rt` changes.
+- **The DeepLC fine-tune and the multi-head calibration take the anchors rt-im-train takes**:
+  `spectrum_q < q_train`, where the worker kept `<=`, so a seed PSM at exactly `q_train` was a
+  reference peptide of the worker and not an anchor of the calibration.
+- **The held-out split of `rt_im_train.window_holdout_frac` rounds the same way in the worker
+  and in the engine** (half away from zero). At a fraction such as 0.0125 the engine held out
+  the peptides with `base_peptide_id % 1000 < 13` and the worker excluded only those below 12,
+  so peptides scored as held out had entered the fine-tune reference.
+- **The `search_seed.mass_cal_loess` grid is fitted on the deviations inside the offset's
+  window.** It was a local mean over every calibrant deviation, random matches of the 50 ppm
+  collection window included, which pulled it toward 0 where the median offset did not move.
+  Off by default.
+- **Three messages of the decoy-corrected 1/K0 window sizing no longer contain a run of
+  spaces.**
 - **Desktop: "Add folder…" selects several spectra folders at once (#335).** A Bruker or Agilent `.d`
   and a Waters `.raw` are directories, so they are added with "Add folder…", and that dialog took
   one folder at a time: the spectra folder picker shared the single-choice setting of the output

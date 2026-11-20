@@ -64,7 +64,7 @@ use rayon::prelude::*;
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::calibrate::{percentile, Loess};
+use crate::calibrate::{percentile, Loess, MAD_TO_SIGMA};
 use crate::stages::extract::{Q1_MAX_STEP, Q1_MIN_OVERLAP, Q1_MIN_WINDOWS};
 use crate::stages::q1dec;
 use crate::stages::q1frag;
@@ -94,9 +94,6 @@ const ROBUST_ITERS: usize = 2;
 const TERM_GAIN: f64 = 0.02;
 /// Most profiles each LOESS of the offset reads (every k-th above it).
 const LOESS_PROFILES: usize = 20_000;
-/// The robust standard deviation of a normal sample per unit of its median absolute
-/// deviation.
-const MAD_TO_SIGMA: f64 = 1.4826;
 /// Most anchors the fragment-decision tolerances are learned from (every k-th above it).
 const LEARN_ANCHORS: usize = 20_000;
 

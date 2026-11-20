@@ -359,7 +359,7 @@ new value from its band's table into `seed_psms_calibrated.parquet`, which is wh
 and only the windows differ, because the precursors do. So it is fitted once:
 `rt_im_train::fit_from_seed` reads the pooled (or refreshed) seed and fits the curve, the
 window width and the optional held-out and adaptive sizing, and every band only applies that
-fit to its own table (`rt_im_train::apply`), writing its `run_windows.parquet` and a
+fit to its own table (`rt_im_train::apply_in_memory`), writing its `run_windows.parquet` and a
 `cal.json` identical to the one it wrote when it fitted for itself
 (`one_fit_applied_writes_what_the_whole_stage_writes`). Before, each band decoded the pooled
 seed and refitted the same curve, one seed decode and one fit per band on the band loop's
@@ -468,8 +468,8 @@ twice:
   counted, under `per_group` each band's own seed, as the confident target peptides at
   `spectrum_q < rt_im_train.q_train` (`rt_im_train::seed_anchor_bound`, the rows the fit
   takes before it joins their iRT). A seed with fewer than two cannot give a fit with two, so
-  the run stops here, before the MS1 offset, the band slices, the DeepLC sidecars and the
-  extraction decode. Under `per_group` one error names every band whose seed has fewer than
+  the run stops here, before the band slices, the DeepLC sidecars, the extraction decode and
+  the MS1 offset learned on it. Under `per_group` one error names every band whose seed has fewer than
   two. A run without anchors therefore stops right after its seed, not after a DeepLC pass
   over the whole library or after most bands have extracted.
 - **On the fit itself.** A seed with anchors can still give a fit on fewer than two, when the
