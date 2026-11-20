@@ -646,9 +646,9 @@ what identifies the cap as the cause.
 "never assembled `presence_min_fragments` distinct fragments", although this document
 previously said so. `extract` writes no per-candidate table, so `audit.rs` sees only
 whether a candidate has an extracted row, and that one label covers presence failures,
-matched-fraction failures and every extraction-gate rejection alike. Read it as "did not survive extract". The
-attribution to the peak cap above stands on the replay experiment, not on the
-label.
+matched-fraction failures and every extraction-gate rejection alike. Read it as "did not
+survive extract". The attribution to the peak cap above stands on the replay experiment,
+not on the label.
 
 When `DID_NOT_SURVIVE_EXTRACTION` dominates an audit ladder, check the conversion cap before
 tuning the presence thresholds or gates here; see docs/04_convert.md for the

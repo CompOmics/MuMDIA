@@ -1756,22 +1756,23 @@ presentation value rounded to one decimal.
 ### audit (`audit.rs:64`, `run`)
 
 The search space is every library precursor (`candidate_id`, `peptidoform`, `charge`,
-`label`, and `protein` when an entrapment substring is given). Survivor sets are built as `HashSet<u32>` of `candidate_id` from
-`psms` (extracted), `competed`, and `scored`; scored also yields `q_by_cid`, read from
-`precursor_q` (the unit the `passed_precursor_fdr` label names; the PSM `q_value` only
-on an older table without that column, recorded as `q_unit` in the metrics JSON;
-docs/29 #16) and, when the table has `peptide_q_value` (a present column of the wrong
-type is an error), `pepq_by_cid`. `rescore` writes the peptide q to each base peptide's
-winning row only and 1.0 to its other charge states and modforms, so a target reads the q
-of its base peptide's winning target row (`report::peptide_winner_q`, the rule
-`precursors.tsv` uses) and a decoy keeps its own cell. A scored table with more than one
-`source` is refused: the audit keys on `candidate_id`, so a pooled table would attribute
-one run's fate to every run. A `run-experiment` split table is no substitute: its grouped
-q columns are experiment-wide, on one winning row across all runs (the per-run unit there
-is `run_psm_q`), so a precursor accepted in every run would fail the gates in all runs but
-its winner's. The audit is valid on a single-file `run` output. Extract writes no
-per-candidate table, so every extract-stage loss is `DID_NOT_SURVIVE_EXTRACTION`. For each
-candidate the earliest rejection reason is assigned along the ladder:
+`label`, and `protein` when an entrapment substring is given). Survivor sets are built as
+`HashSet<u32>` of `candidate_id` from `psms` (extracted), `competed`, and `scored`; scored
+also yields `q_by_cid`, read from `precursor_q` (the unit the `passed_precursor_fdr` label
+names; the PSM `q_value` only on an older table without that column, recorded as `q_unit`
+in the metrics JSON; docs/29 #16) and, when the table has `peptide_q_value` (a present
+column of the wrong type is an error), `pepq_by_cid`. `rescore` writes the peptide q to
+each base peptide's winning row only and 1.0 to its other charge states and modforms, so a
+target reads the q of its base peptide's winning target row (`report::peptide_winner_q`,
+the rule `precursors.tsv` uses) and a decoy keeps its own cell. A scored table with more
+than one `source` is refused: the audit keys on `candidate_id`, so a pooled table would
+attribute one run's fate to every run. A `run-experiment` split table is no substitute:
+its grouped q columns are experiment-wide, on one winning row across all runs (the per-run
+unit there is `run_psm_q`), so a precursor accepted in every run would fail the gates in
+all runs but its winner's. The audit is valid on a single-file `run` output. Extract
+writes no per-candidate table, so every extract-stage loss is
+`DID_NOT_SURVIVE_EXTRACTION`. For each candidate the earliest rejection reason is assigned
+along the ladder:
 - not in `extracted` -> `DID_NOT_SURVIVE_EXTRACTION`;
 - extracted but not in `competed` -> `OUTCOMPETED_BY_DECOY` (decoy) or
   `OUTCOMPETED_BY_TARGET` (target);
