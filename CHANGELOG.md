@@ -319,6 +319,26 @@ than a number. Both are recorded in every run's `manifest.json`.
   compares its file lists with `retain.rs`. A removal that failed (a file held open on
   Windows) ended the prune before `pruned.json` was written, so the files already removed had
   no record; they are recorded before the error is raised.
+- **Prescreen: a search with a terminal modification rule runs with the tag prefilter
+  (docs/34).** The tag alphabet read every modification rule as a residue state, so a variable
+  `protein_n_term` or `peptide_n_term` rule (residue `*`, as the desktop's ZT Scan library preset
+  sets one) stopped the run after convert with "prescreen tag alphabet: no residue '*'". A
+  terminal rule now adds no state, which loses no tag because a terminal modification already
+  breaks the trimers over its end residue, and under `unknown_modification = skip` an unknown name
+  is dropped as the digest drops it. With `prescreen.low_mz_weight` above 1 (the default is 0.5)
+  the pruned fragment-rarity score could fall below the exact score, because the pruning bound
+  left the low-m/z weight out; the bound now includes it, and scores at weights up to 1 are
+  bit-identical. `prescreen.tags.max_charge` above 2, which a tag key cannot hold, and a
+  `prescreen.tags.extra_mods` entry that is not one residue letter and a name (`:Oxidation`
+  panicked, `n:Acetyl` meant asparagine) are refused at load. The prefilters before prediction no
+  longer warn on every run that all candidates lack a retention-time window, which they lack by
+  design there.
+- **Prescreen: less memory, same output.** Loading the spectra no longer holds a second copy of
+  every MS2 peak; the per-candidate row map, repeat scores, score copy and pre-retrieval copy
+  (32 bytes a candidate, about 6.5 GB on a 203M-candidate library) are allocated only when the
+  evaluation sample, the repeat bonus, the scores table or tag retrieval needs them; and window
+  membership scans only the windows that can hold the precursor. `prescreen::run` returns
+  nothing: no caller read its summary, and the report holds the same cutoff and bypass reason.
 
 ### Security
 

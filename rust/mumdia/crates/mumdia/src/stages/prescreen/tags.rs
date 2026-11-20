@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use mumdia_core::config::Config;
+use mumdia_core::config::{Config, ResidueMod, UnknownModPolicy};
 use mumdia_core::constants::{residue_mass, PROTON};
 use mumdia_core::mass::{parse_peptidoform, unimod_mass};
 
@@ -43,18 +43,27 @@ pub struct Alphabet {
 
 impl Alphabet {
     /// From the chemistry configuration (`peptidoforms.fixed_mods` / `variable_mods`) plus
-    /// `prescreen.tags.extra_mods` (`RESIDUE:Name`).
+    /// `prescreen.tags.extra_mods` (`RESIDUE:Name`). Only residue rules become states, read as
+    /// the digest reads them: a terminal rule (residue `*`) is no state, because `tokenise`
+    /// already breaks the modified end residue, and under `unknown_modification = skip` an
+    /// unknown name is dropped.
     pub fn from_config(cfg: &Config) -> Result<Alphabet> {
-        let fixed: Vec<(u8, String)> = cfg
-            .peptidoforms
+        let p = &cfg.peptidoforms;
+        let residue_rule = |m: &&ResidueMod| {
+            m.position.is_anywhere()
+                && (p.unknown_modification == UnknownModPolicy::Error
+                    || unimod_mass(&m.name).is_some())
+        };
+        let fixed: Vec<(u8, String)> = p
             .fixed_mods
             .iter()
+            .filter(residue_rule)
             .map(|m| (m.residue as u8, m.name.clone()))
             .collect();
-        let mut variable: Vec<(u8, String)> = cfg
-            .peptidoforms
+        let mut variable: Vec<(u8, String)> = p
             .variable_mods
             .iter()
+            .filter(residue_rule)
             .map(|m| (m.residue as u8, m.name.clone()))
             .collect();
         for s in &cfg.prescreen.tags.extra_mods {
@@ -573,6 +582,27 @@ mod tests {
             t[0].is_none(),
             "terminal modification breaks its end residue"
         );
+    }
+
+    /// A terminal rule, and an unknown name under `unknown_modification = skip`, leave the
+    /// alphabet as the residue rules make it (a terminal rule used to stop the tag prefilter).
+    #[test]
+    fn terminal_and_skipped_rules_leave_the_alphabet_unchanged() {
+        use mumdia_core::config::ModPosition;
+        let mut c = Config::default();
+        let base = Alphabet::from_config(&c).unwrap().n();
+        c.peptidoforms.variable_mods.push(ResidueMod {
+            residue: '*',
+            name: "Acetyl".into(),
+            position: ModPosition::ProteinNTerm,
+        });
+        c.peptidoforms.unknown_modification = UnknownModPolicy::Skip;
+        c.peptidoforms.variable_mods.push(ResidueMod {
+            residue: 'K',
+            name: "NoSuchModification".into(),
+            position: ModPosition::Anywhere,
+        });
+        assert_eq!((base, Alphabet::from_config(&c).unwrap().n()), (20, 20));
     }
 
     #[test]
