@@ -540,7 +540,7 @@ Options:
           With --experiment-dir: write <run>/localisation.parquet and localisation_experiment.parquet here instead, and leave the experiment untouched
 
       --sources <SOURCES>
-          With --experiment-dir: only these sources (comma-separated run indices)
+          With --experiment-dir and --out-dir: only these sources (comma-separated run indices). A subset is never written into the experiment
 
       --config <CONFIG>
 ```

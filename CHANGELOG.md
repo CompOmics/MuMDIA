@@ -234,6 +234,12 @@ than a number. Both are recorded in every run's `manifest.json`.
   layout of the output changes (the writer's default row groups instead of one per sort
   bucket), which the engine's range reads accept.
 
+- **`localise` keeps one copy of its call, position-ratio, false-localisation-rate and rate
+  code for the run and experiment levels, of the fragment window and slot filter for its
+  evidence readers, and of the composition deltas for its two keys.** It reads the FASTA once
+  per experiment, keeps the apex 1/K0 of the localised rows only, and has a test of the 1/K0
+  evidence path. Output unchanged.
+
 ### Removed
 
 - **`scripts/assemble_survivors.py` and `scripts/shard_parquet.py` (docs/32).**
@@ -319,6 +325,30 @@ than a number. Both are recorded in every run's `manifest.json`.
   compares its file lists with `retain.rs`. A removal that failed (a file held open on
   Windows) ended the prune before `pruned.json` was written, so the files already removed had
   no record; they are recorded before the error is raised.
+
+- **`localise`: the experiment temperature can rise past a prior above 8 (docs/36 section
+  3b).** The fit's grid of temperatures stopped at 7.95 whatever its prior, and the experiment
+  level centres the prior on the run temperature times the square root of the mean number of
+  runs summed, which passes 7.95 at roughly 32 to 99 runs. When the decoy residue then showed
+  the model over-confident, the fit sharpened the posterior to 7.95 instead of flattening it.
+  The grid now reaches eight times a prior above 1; every existing grid point keeps its value,
+  so the run level and every experiment fit that stayed below the old top are unchanged.
+- **`localise`: an identified site outside the configured rules stays a placement (docs/36
+  section 2).** With rules narrower than the library's (an imported library, or `mumdia
+  localise --config` with another configuration), the representative's own site was no
+  hypothesis, so a peak with one configured residue left was `unambiguous` at 1.0 on a residue
+  no row identified (`AGYS[Phospho]PEK` for an accepted `AGY[Phospho]SPEK` with Phospho on S and
+  T). The site is now added to its peak's candidate slots, with a warning per modification.
+- **`localise`: a modification written as a mass is localised.** A bracket within 1e-3 Da of
+  the catalogue mass was taken as the modification and then dropped when more than 1e-6 Da
+  remained, so a library writing Phospho as `+79.9663` left every phospho row out of
+  `localisation.parquet` and `sites.tsv`, without a warning.
+- **`localise.prior_strength` must be above 0.** At 0 a class with all of its ions present, or
+  none, gave a rate of exactly 1 or 0, every hypothesis minus infinity, NaN site probabilities
+  and a `localised` call. Such a configuration is now refused.
+- **`mumdia localise --experiment-dir --sources` requires `--out-dir`.** In place, a subset
+  overwrote those runs' tables and the experiment-level table with a fit on the subset, while
+  the manifest still presented them as the whole experiment's.
 
 ### Security
 

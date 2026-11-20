@@ -38,7 +38,9 @@ use super::{model, status, PeakResult, RunAnalysis, Temperature};
 /// cut moved by a few peaks, one decoy-residue win at a time; with 0.35 it stayed within 1.26
 /// to 1.40 of the temperature fitted on the synthesised peptides alone (docs/36 section 7).
 const SIGMA: f64 = 0.35;
-/// The temperature grid: `ln T` from `ln 0.25` to `ln 8` in steps of `GRID_STEP`.
+/// The temperature grid: `ln T` from `ln 0.25` in steps of `GRID_STEP` up to `ln 8`, or to
+/// `ln (8 prior)` for a prior above 1 (the experiment level's), so that the fit can flatten
+/// past a high prior and not only sharpen below it.
 const LN_T_MIN: f64 = -1.386_294_361_119_890_6;
 const LN_T_MAX: f64 = 2.079_441_541_679_835_7;
 const GRID_STEP: f64 = 0.02;
@@ -102,21 +104,37 @@ fn eligible(res: &PeakResult) -> bool {
     res.status == status::SCORED && res.n_real >= 2
 }
 
+impl<'a> CalPeak<'a> {
+    /// A peak with the log-likelihoods `ll` (its own, or summed over the runs of a consensus
+    /// peak) over the hypotheses of `res`, `n_slots` slots, and `sdi` (site-determining ions,
+    /// present ones).
+    pub(crate) fn new(
+        ll: &'a [f64],
+        res: &'a PeakResult,
+        n_slots: usize,
+        sdi: (u32, u32),
+    ) -> CalPeak<'a> {
+        let (real_positions, decoy_positions) = res.position_counts();
+        CalPeak {
+            ll,
+            hyps: &res.hyps,
+            on_decoy: &res.on_decoy,
+            n_slots,
+            real_positions,
+            decoy_positions,
+            sdi_share: f64::from(sdi.1) / f64::from(sdi.0.max(1)),
+        }
+    }
+}
+
 /// The eligible peaks of a run, before [`super::finish`].
 pub(crate) fn cal_peaks<'a>(a: &'a RunAnalysis) -> Vec<CalPeak<'a>> {
     (0..a.peaks.len())
         .filter(|&pi| !a.rows[a.peaks[pi].rep].decoy && eligible(&a.results[pi]))
         .map(|pi| {
             let res = &a.results[pi];
-            CalPeak {
-                ll: &res.ll,
-                hyps: &res.hyps,
-                on_decoy: &res.on_decoy,
-                n_slots: a.rows[a.peaks[pi].rep].split.n_slots(),
-                real_positions: res.positions.len() - res.n_decoy_positions,
-                decoy_positions: res.n_decoy_positions,
-                sdi_share: f64::from(res.n_sdi_observed) / f64::from(res.n_sdi.max(1)),
-            }
+            let n_slots = a.rows[a.peaks[pi].rep].split.n_slots();
+            CalPeak::new(&res.ll, res, n_slots, (res.n_sdi, res.n_sdi_observed))
         })
         .collect()
 }
@@ -165,14 +183,7 @@ pub(crate) fn fit(peaks: &[CalPeak], prior: f64) -> Fit {
         shares[k - 1]
     };
     let pop: Vec<&CalPeak> = peaks.iter().filter(|p| p.sdi_share >= cut).collect();
-    let (rp, dp) = pop.iter().fold((0usize, 0usize), |acc, p| {
-        (acc.0 + p.real_positions, acc.1 + p.decoy_positions)
-    });
-    let ratio = if dp > 0 {
-        rp as f64 / dp as f64
-    } else {
-        f64::NAN
-    };
+    let ratio = super::position_ratio(pop.iter().map(|p| (p.real_positions, p.decoy_positions)));
     let at = |t: f64| {
         let (real, decoy, err, var) = tally(&pop, t);
         let e_decoy = decoy as f64 * ratio;
@@ -203,7 +214,7 @@ pub(crate) fn fit(peaks: &[CalPeak], prior: f64) -> Fit {
         };
     }
     let mut best: Option<GridPoint> = None;
-    let steps = ((LN_T_MAX - LN_T_MIN) / GRID_STEP).round() as usize;
+    let steps = ((LN_T_MAX.max(ln_prior + LN_T_MAX) - LN_T_MIN) / GRID_STEP).round() as usize;
     for k in 0..=steps {
         let ln_t = LN_T_MIN + k as f64 * GRID_STEP;
         let v = at(ln_t.exp());
@@ -305,6 +316,17 @@ mod tests {
         let f = fit(&peaks(&ll, &hyps, &dec, flat), 1.3);
         assert_eq!(f.temperature, 1.3, "{f:?}");
         assert_eq!(f.decoy_calls, 0);
+    }
+
+    /// A prior above the top of the run grid (the experiment level's, the run temperature
+    /// times the square root of the runs summed): an over-confident model still flattens past
+    /// it rather than sharpening to the grid's old top of 7.95.
+    #[test]
+    fn the_fit_flattens_past_a_high_prior() {
+        let dec = [false, false, true];
+        let (ll, hyps) = population(1600, 40.0, 160);
+        let f = fit(&peaks(&ll, &hyps, &dec, |_| 0.5), 9.0);
+        assert!(f.fitted && f.temperature > 9.0, "{f:?}");
     }
 
     /// Peaks without a right answer (the decoy on top, little site-determining evidence) do
