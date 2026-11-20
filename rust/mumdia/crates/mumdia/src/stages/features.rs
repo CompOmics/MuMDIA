@@ -176,23 +176,15 @@ fn reserved_names() -> std::collections::HashSet<&'static str> {
 /// Extended-battery feature names as `&'static str`, registry order, globally
 /// deduplicated: a name that repeats across families, or collides with a
 /// Minimal/Rich name, is kept only on first appearance. This makes the schema
-/// robust to independently-authored family modules reusing a name.
+/// robust to independently-authored family modules reusing a name. Read off
+/// [`extended_value_plan`], so names and values cannot drift apart.
 fn extended_name_refs(im: impl Into<ImFamily>) -> Vec<&'static str> {
     let im = im.into();
-    let reserved = reserved_names();
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for (names, _) in families(im) {
-        for &n in *names {
-            if reserved.contains(n) {
-                continue;
-            }
-            if seen.insert(n) {
-                out.push(n);
-            }
-        }
-    }
-    out
+    families(im)
+        .iter()
+        .zip(extended_value_plan(im))
+        .flat_map(|((names, _), keep)| keep.iter().map(move |&i| names[i]))
+        .collect()
 }
 
 /// Extended-battery feature names in registry order (deduplicated), with the ion-mobility
@@ -207,9 +199,8 @@ pub fn extended_names(im: impl Into<ImFamily>) -> Vec<String> {
 /// Precomputed dedup plan for the extended battery: for each family, in registry
 /// order, the local value indices that survive the reserved-name and global
 /// first-appearance filter. This mask is a compile-time-static invariant, so it
-/// is computed once (not rebuilt per PSM). It reproduces exactly the same
-/// survivors, in the same order, as the reserved + `seen` filter below and as
-/// [`extended_name_refs`], keeping names and values in lockstep.
+/// is computed once (not rebuilt per PSM). [`extended_name_refs`] reads the
+/// names off this plan, keeping names and values in lockstep.
 fn extended_value_plan(im: impl Into<ImFamily>) -> &'static Vec<Vec<usize>> {
     let im = im.into();
     static PLAN: [std::sync::OnceLock<Vec<Vec<usize>>>; 3] = [
@@ -371,45 +362,7 @@ pub const Q1C_FEATURES: &[&str] = super::q1consist::NAMES;
 /// ([`ImFamily`]): under `extended` it appends the ion-mobility columns after the other
 /// families (`families`); the smaller sets have no family battery and ignore it.
 pub fn active_features(set: FeatureSet, im: impl Into<ImFamily>) -> Vec<String> {
-    active_features_with(set, im, false)
-}
-
-/// [`active_features`], with the Q1-profile family ([`Q1_FEATURES`]) appended last under
-/// `extended` when `q1` (`features.q1_features`) is on.
-pub fn active_features_with(set: FeatureSet, im: impl Into<ImFamily>, q1: bool) -> Vec<String> {
-    active_features_q1(set, im, q1, false)
-}
-
-/// [`active_features_with`], with the per-fragment Q1 decision family ([`Q1F_FEATURES`])
-/// appended after it under `extended` when `q1f` (`features.q1_fragment_features`) is on.
-pub fn active_features_q1(
-    set: FeatureSet,
-    im: impl Into<ImFamily>,
-    q1: bool,
-    q1f: bool,
-) -> Vec<String> {
-    active_features_all(set, im, q1, q1f, false)
-}
-
-/// [`active_features_q1`], with the MS1 isotope-envelope family ([`MS1E_FEATURES`])
-/// appended last under `extended` when `ms1e` (`features.ms1_envelope`) is on.
-pub fn active_features_all(
-    set: FeatureSet,
-    im: impl Into<ImFamily>,
-    q1: bool,
-    q1f: bool,
-    ms1e: bool,
-) -> Vec<String> {
-    active_features_fam(
-        set,
-        im,
-        Q1Families {
-            q1,
-            q1f,
-            ms1e,
-            ..Q1Families::default()
-        },
-    )
+    active_features_fam(set, im, Q1Families::default())
 }
 
 /// The switches of the families appended last under `extended`, in their order.
@@ -449,11 +402,8 @@ impl Q1Families {
     }
 }
 
-/// [`active_features_all`] with every family switch ([`Q1Families`]): after the
-/// MS1-envelope family, the unfragmented-precursor family ([`Q1P_FEATURES`]), the
-/// multi-scale Q1 family ([`q1m_features`]), the Q1-deconvolved evidence family
-/// ([`Q1D_FEATURES`]) and the Q1-consistency family ([`Q1C_FEATURES`]), each only when on,
-/// under `extended`.
+/// [`active_features`] with every family switch ([`Q1Families`]): under `extended`, the
+/// families it names appended last in its order, each only when on.
 pub fn active_features_fam(
     set: FeatureSet,
     im: impl Into<ImFamily>,
@@ -515,29 +465,6 @@ pub fn active_features_fam(
     v
 }
 
-/// [`active_features_all`], with the Q1-consistency family ([`Q1C_FEATURES`]) appended last
-/// under `extended` when `q1c` (`features.q1_consistency`) is on.
-pub fn active_features_q1c(
-    set: FeatureSet,
-    im: impl Into<ImFamily>,
-    q1: bool,
-    q1f: bool,
-    ms1e: bool,
-    q1c: bool,
-) -> Vec<String> {
-    active_features_fam(
-        set,
-        im,
-        Q1Families {
-            q1,
-            q1f,
-            ms1e,
-            q1c,
-            ..Q1Families::default()
-        },
-    )
-}
-
 /// The `q1p_*` and `q1m*` features a features configuration appends (the v8 columns it
 /// reads), in feature order.
 fn q1s_feature_names(cfg: &FeaturesConfig) -> Vec<&'static str> {
@@ -557,17 +484,13 @@ fn q1s_feature_names(cfg: &FeaturesConfig) -> Vec<&'static str> {
     v
 }
 
-/// [`active_features`] for a features configuration, the family switch resolved for spectra
-/// that do (`has_im`) or do not carry 1/K0. An orchestrator resolves it once
-/// (`Config::resolve_im_features`), so `has_im` then changes nothing.
-pub fn active_features_for(cfg: &FeaturesConfig, has_im: bool) -> Vec<String> {
-    active_features_fam(cfg.set, cfg.im_features.on(has_im), Q1Families::of(cfg))
-}
-
 /// The active feature list of a run's search pass, for the schema id an orchestrator
-/// records: [`active_features_for`], with `imc_ref_w` when `retrace.apex_features` is on
-/// (the main pass and the second pass retrace; `Config::validate` refuses the key without
-/// `retrace.enabled` and without the ion-mobility family).
+/// records: [`active_features_fam`] for the configuration, the ion-mobility switch resolved
+/// for spectra that do (`has_im`) or do not carry 1/K0 (an orchestrator resolves it once,
+/// `Config::resolve_im_features`, so `has_im` then changes nothing), with `imc_ref_w` when
+/// `retrace.apex_features` is on (the main pass and the second pass retrace;
+/// `Config::validate` refuses the key without `retrace.enabled` and without the
+/// ion-mobility family).
 pub fn active_features_of(cfg: &mumdia_core::config::Config, has_im: bool) -> Vec<String> {
     let im = cfg.features.im_features.on(has_im);
     active_features_fam(
@@ -1532,7 +1455,6 @@ pub struct FeaturesParams<'a> {
     pub out: &'a str,
     pub out_pin: &'a str,
     pub cfg: &'a FeaturesConfig,
-    pub config_hash: &'a str,
     /// Carry retrace's `imc_ref_w` (`psms_extracted`) as the tenth feature of the
     /// ion-mobility family: `retrace.apex_features` in a pass that retraced. Read only while
     /// the family is on; the column must then be in `psms`.
@@ -1963,10 +1885,11 @@ impl ChromStream {
         let mut open: Option<u32> = None;
         let mut taken = 0usize;
         while taken < want {
-            let b = match self.next_batch()? {
-                Some(b) => b,
-                None => break,
-            };
+            // Every caller asks for the rows its plan counted, so running out is an error: a
+            // prefetch thread that panicked ends its channel exactly like the end of the table.
+            let b = self.next_batch()?.ok_or_else(|| {
+                anyhow!("chromatograms: the table ended {} rows early", want - taken)
+            })?;
             let n = b.num_rows().min(want - taken);
             if n < b.num_rows() {
                 self.pending = Some(b.slice(n, b.num_rows() - n));
@@ -2022,7 +1945,7 @@ impl ChromStream {
             // before it is stored, and the intensities are appended to the flat buffer).
             // They used to go through a per-row scratch buffer, which was a second full
             // copy of the payload plus an `Arc` allocation per row per column; see
-            // [`list_row`]. A v2 row's trace with its zero margins is rebuilt once, in the
+            // [`ListF32::row_slice`]. A v2 row's trace with its zero margins is rebuilt once, in the
             // decoder's buffer, and borrowed from there the same way.
             for k in 0..n {
                 let c = cid.value(k);
@@ -2297,6 +2220,12 @@ macro_rules! col_ix {
             $($field: Option<usize>,)*
             /// One entry per extended-battery feature, in registry order.
             ext: Vec<Option<usize>>,
+            // One entry per name of `Q1_FEATURES`, `Q1F_FEATURES`, `MS1E_FEATURES` and
+            // `Q1C_FEATURES`, in list order: a family's k-th value goes under its k-th name.
+            q1: Vec<Option<usize>>,
+            q1f: Vec<Option<usize>>,
+            ms1e: Vec<Option<usize>>,
+            q1c: Vec<Option<usize>>,
         }
 
         impl ColIx {
@@ -2306,16 +2235,27 @@ macro_rules! col_ix {
                     .enumerate()
                     .map(|(i, c)| (c.as_str(), i))
                     .collect();
+                let by_name = |names: &[&'static str]| -> Vec<Option<usize>> {
+                    names.iter().map(|n| idx.get(n).copied()).collect()
+                };
                 ColIx {
                     $($field: idx.get(stringify!($field)).copied(),)*
-                    ext: ext_names.iter().map(|n| idx.get(n).copied()).collect(),
+                    ext: by_name(ext_names),
+                    q1: by_name(Q1_FEATURES),
+                    q1f: by_name(Q1F_FEATURES),
+                    ms1e: by_name(MS1E_FEATURES),
+                    q1c: by_name(Q1C_FEATURES),
                 }
             }
 
             /// Every non-extended column this resolved, for the coverage test.
             #[cfg(test)]
             fn named(&self) -> Vec<Option<usize>> {
-                vec![$(self.$field,)*]
+                let mut v = vec![$(self.$field,)*];
+                for f in [&self.q1, &self.q1f, &self.ms1e, &self.q1c] {
+                    v.extend(f.iter().copied());
+                }
+                v
             }
 
             /// Each field paired with the feature name it is spelled as, so a test can
@@ -2381,43 +2321,6 @@ col_ix!(
     n_charge_states,
     charge_multi_flag,
     cross_charge_intensity_log,
-    q1_corr,
-    q1_offset,
-    q1_frag_sd,
-    q1_bin_frac,
-    q1f_n_belong,
-    q1f_belong_share,
-    q1f_interfered_share,
-    q1f_offset_median,
-    q1f_offset_mad,
-    q1f_corr2d,
-    q1f_fit_resid,
-    q1f_centre,
-    ms1e_env_r2,
-    ms1e_env_n,
-    ms1e_m1_share,
-    ms1e_half_share,
-    ms1e_spacing_ppm,
-    ms1e_mono_ppm,
-    ms1e_mono_ppm_abs,
-    ms1e_ibar_dev,
-    ms1e_q1_agree,
-    q1c_n,
-    q1c_n_corr,
-    q1c_pred_share,
-    q1c_obs_share,
-    q1c_entropy,
-    q1c_cosine,
-    q1c_top3,
-    q1c_entropy_corr,
-    q1c_soft_pred,
-    q1c_soft_obs,
-    q1c_soft_entropy,
-    q1c_n_tight,
-    q1c_n_loose,
-    q1c_corr2d_mean,
-    q1c_offset_wmean,
-    q1c_offset_top3,
 );
 
 /// Percolator-style PIN written row by row as the chunks are computed. Nothing in the
@@ -2913,8 +2816,8 @@ impl BoundSamples {
     }
 }
 
-/// The global half-widths, or `None` below 20 anchors, in which case the caller keeps the
-/// per-candidate boundary detection.
+/// The global half-widths, or `None` with `bound_from_confident` off or below 20 anchors,
+/// in which case the caller keeps the per-candidate boundary detection.
 ///
 /// The 20 is a floor on the anchor count of the RUN, not of one band. A banded search
 /// splits the run's confident set across `groups.window_groups` chromatogram tables, and
@@ -2922,6 +2825,10 @@ impl BoundSamples {
 /// per band, so every band fell back to per-candidate detection while the unbanded arm
 /// used a global window.
 pub fn bounds_from_samples(s: &BoundSamples, cfg: &FeaturesConfig) -> Option<(f64, f64)> {
+    // A banded run pools and fits unconditionally; off, there is nothing to warn about.
+    if !cfg.bound_from_confident {
+        return None;
+    }
     if s.lefts.len() >= 20 {
         let q = (cfg.bound_confident_pct / 100.0).clamp(0.0, 1.0);
         let (l, r) = (percentile(&s.lefts, q), percentile(&s.rights, q));
@@ -2950,7 +2857,12 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
 /// [`run`], returning the output's row count and the content hash its report records, so
 /// an orchestrator can record the artifact without reading and hashing it again.
 pub fn run_hashed(p: FeaturesParams) -> Result<Written> {
-    // Neither output may be one of the inputs (docs/31 F6).
+    run_refusing(p, BoundsSource::Learn)
+}
+
+/// The pass at the shipped chunk limits, once neither output is one of the inputs
+/// (docs/31 F6): what [`run_hashed`] and [`run_with_bounds_hashed`] share.
+fn run_refusing(p: FeaturesParams, bounds: BoundsSource) -> Result<Written> {
     let mut inputs = vec![("--psms", p.psms), ("--chromatograms", p.chromatograms)];
     if let Some(seed) = p.seed {
         inputs.push(("--seed-psms", seed));
@@ -2964,18 +2876,15 @@ pub fn run_hashed(p: FeaturesParams) -> Result<Written> {
         CHUNK_CHROM_ROWS,
         CHUNK_PSM_ROWS,
         PinFinish::Normal,
-        BoundsSource::Learn,
+        bounds,
         LoaderSource::Leased,
     )
 }
 
 /// [`run_with_chunk_rows`] with the PSM-row bound exposed as well; see `CHUNK_PSM_ROWS`.
 /// Both limits only move chunk boundaries, which move no value.
-pub fn run_with_chunk_limits(
-    p: FeaturesParams,
-    chunk_rows: usize,
-    max_psm_rows: usize,
-) -> Result<u64> {
+#[cfg(test)]
+fn run_with_chunk_limits(p: FeaturesParams, chunk_rows: usize, max_psm_rows: usize) -> Result<u64> {
     run_chunked(
         p,
         chunk_rows,
@@ -3039,35 +2948,14 @@ pub fn run_with_chunk_rows(p: FeaturesParams, chunk_rows: usize) -> Result<u64> 
     .map(|w| w.rows)
 }
 
-/// [`run`] with the run's pooled confident elution half-widths supplied.
+/// [`run_hashed`] with the run's pooled confident elution half-widths supplied.
 ///
 /// A banded search calls [`confident_bound_samples`] on every band, pools the samples and
 /// fits [`bounds_from_samples`] once, then passes the pair here. Without it each band fits
 /// its own and falls below the 20-anchor floor: measured on a seven-file
 /// immunopeptidomics search, 735 pooled anchors arrived as 0 or 1 per band.
-pub fn run_with_bounds(p: FeaturesParams, bounds: Option<(f64, f64)>) -> Result<u64> {
-    run_with_bounds_hashed(p, bounds).map(|w| w.rows)
-}
-
-/// [`run_with_bounds`], returning the output's row count and the content hash its report
-/// records, so an orchestrator can record the artifact without reading and hashing it again.
 pub fn run_with_bounds_hashed(p: FeaturesParams, bounds: Option<(f64, f64)>) -> Result<Written> {
-    let mut inputs = vec![("--psms", p.psms), ("--chromatograms", p.chromatograms)];
-    if let Some(seed) = p.seed {
-        inputs.push(("--seed-psms", seed));
-    }
-    mumdia_io::refuse_output_over_input(p.out, &inputs)?;
-    if !p.out_pin.is_empty() {
-        mumdia_io::refuse_output_over_input(p.out_pin, &inputs)?;
-    }
-    run_chunked(
-        p,
-        CHUNK_CHROM_ROWS,
-        CHUNK_PSM_ROWS,
-        PinFinish::Normal,
-        BoundsSource::Given(bounds),
-        LoaderSource::Leased,
-    )
+    run_refusing(p, BoundsSource::Given(bounds))
 }
 
 /// This table's confident anchors' elution half-widths, without computing any feature.
@@ -3656,64 +3544,51 @@ fn run_chunked(
     let pform = ps.str("peptidoform")?;
     let protein = ps.str("protein")?;
     let mz = ps.f64("precursor_mz")?;
-    // The Q1-profile family (`features.q1_features`) from psms_extracted v5. The switch comes
-    // from the configuration, as the schema id the orchestrator records does, so a table
-    // without the columns is an error rather than a column of zeros.
-    let q1_cols: Vec<Vec<f64>> = if p.cfg.q1_features {
-        Q1_FEATURES
+    // The optional families' psms_extracted columns, read by name in list order. The switch
+    // comes from the configuration, as the schema id the orchestrator records does, so with
+    // the family on a table without the columns is an error rather than a column of zeros.
+    let read_on = |on: bool, names: &[&str], key: &str, how: &str| -> Result<Vec<Vec<f64>>> {
+        if !on {
+            return Ok(Vec::new());
+        }
+        names
             .iter()
             .map(|c| {
                 if !ps.has_column(c) {
                     anyhow::bail!(
-                        "features: features.q1_features is on, but {} has no {c} column; \
-                         extract writes the Q1-profile columns under extract.q1_profile",
+                        "features: {key} is on, but {} has no {c} column; {how}",
                         p.psms
                     );
                 }
                 ps.f64(c)
             })
-            .collect::<Result<_>>()?
-    } else {
-        Vec::new()
+            .collect()
     };
+    // The Q1-profile family (`features.q1_features`) from psms_extracted v5.
+    let q1_cols = read_on(
+        p.cfg.q1_features,
+        Q1_FEATURES,
+        "features.q1_features",
+        "extract writes the Q1-profile columns under extract.q1_profile",
+    )?;
     // The per-fragment Q1 decision family (`features.q1_fragment_features`) from
-    // psms_extracted v6, the same way.
-    let q1f_cols: Vec<Vec<f64>> = if p.cfg.q1_fragment_features.on() {
-        Q1F_FEATURES
-            .iter()
-            .map(|c| {
-                if !ps.has_column(c) {
-                    anyhow::bail!(
-                        "features: features.q1_fragment_features is on, but {} has no {c} \
-                         column; extract writes the per-fragment Q1 decision columns under \
-                         extract.q1_fragments",
-                        p.psms
-                    );
-                }
-                ps.f64(c)
-            })
-            .collect::<Result<_>>()?
-    } else {
-        Vec::new()
-    };
+    // psms_extracted v6.
+    let q1f_cols = read_on(
+        p.cfg.q1_fragment_features.on(),
+        Q1F_FEATURES,
+        "features.q1_fragment_features",
+        "extract writes the per-fragment Q1 decision columns under extract.q1_fragments",
+    )?;
     // The MS1 isotope-envelope family (`features.ms1_envelope`): its features per row, from
     // the psms_extracted v7 evidence and the row's precursor m/z and charge
-    // (`ms1env::values`), one column per feature. An error without the evidence, as above.
+    // (`ms1env::values`), one column per feature.
     let ms1e_cols: Vec<Vec<f64>> = if p.cfg.ms1_envelope {
-        let ev: Vec<Vec<f64>> = super::ms1env::EVIDENCE_COLUMNS
-            .iter()
-            .map(|c| {
-                if !ps.has_column(c) {
-                    anyhow::bail!(
-                        "features: features.ms1_envelope is on, but {} has no {c} column; \
-                         extract writes the MS1 isotope-envelope evidence under \
-                         features.ms1_envelope",
-                        p.psms
-                    );
-                }
-                ps.f64(c)
-            })
-            .collect::<Result<_>>()?;
+        let ev = read_on(
+            true,
+            &super::ms1env::EVIDENCE_COLUMNS[..],
+            "features.ms1_envelope",
+            "extract writes the MS1 isotope-envelope evidence under features.ms1_envelope",
+        )?;
         let mut cols = vec![Vec::with_capacity(ps.nrows); MS1E_FEATURES.len()];
         for i in 0..ps.nrows {
             let mut e = [0.0f64; 16];
@@ -3732,23 +3607,14 @@ fn run_chunked(
         Vec::new()
     };
     // The unfragmented-precursor and multi-scale Q1 families (`features.q1_precursor`,
-    // `features.q1_multiscale`) from psms_extracted v8, read by name; an error without the
-    // columns, as above.
+    // `features.q1_multiscale`) from psms_extracted v8; empty with every key off.
     let q1s_names = q1s_feature_names(p.cfg);
-    let q1s_cols: Vec<Vec<f64>> = q1s_names
-        .iter()
-        .map(|c| {
-            if !ps.has_column(c) {
-                anyhow::bail!(
-                    "features: features.q1_precursor / q1_multiscale / q1_deconvolved / \
-                     q1_separable is on, but {} has no {c} column; extract writes it under the \
-                     same key with extract.q1_fragments",
-                    p.psms
-                );
-            }
-            ps.f64(c)
-        })
-        .collect::<Result<_>>()?;
+    let q1s_cols = read_on(
+        true,
+        &q1s_names[..],
+        "features.q1_precursor / q1_multiscale / q1_deconvolved / q1_separable",
+        "extract writes it under the same key with extract.q1_fragments",
+    )?;
     // The Q1-consistency family (`features.q1_consistency`): the per-fragment Q1 decision
     // lists of psms_extracted v6, one flat buffer each, and the run's decision tolerances.
     // Only the extended set carries the family. An error without the lists or the
@@ -4463,54 +4329,23 @@ fn run_chunked(
                         put(ix.n_charge_states, f_n_charge[i]);
                         put(ix.charge_multi_flag, f_charge_multi[i]);
                         put(ix.cross_charge_intensity_log, f_cross_charge_int[i]);
-                        if !q1_cols.is_empty() {
-                            put(ix.q1_corr, q1_cols[0][i]);
-                            put(ix.q1_offset, q1_cols[1][i]);
-                            put(ix.q1_frag_sd, q1_cols[2][i]);
-                            put(ix.q1_bin_frac, q1_cols[3][i]);
-                        }
-                        if !q1f_cols.is_empty() {
-                            put(ix.q1f_n_belong, q1f_cols[0][i]);
-                            put(ix.q1f_belong_share, q1f_cols[1][i]);
-                            put(ix.q1f_interfered_share, q1f_cols[2][i]);
-                            put(ix.q1f_offset_median, q1f_cols[3][i]);
-                            put(ix.q1f_offset_mad, q1f_cols[4][i]);
-                            put(ix.q1f_corr2d, q1f_cols[5][i]);
-                            put(ix.q1f_fit_resid, q1f_cols[6][i]);
-                            put(ix.q1f_centre, q1f_cols[7][i]);
-                        }
-                        if !ms1e_cols.is_empty() {
-                            put(ix.ms1e_env_r2, ms1e_cols[0][i]);
-                            put(ix.ms1e_env_n, ms1e_cols[1][i]);
-                            put(ix.ms1e_m1_share, ms1e_cols[2][i]);
-                            put(ix.ms1e_half_share, ms1e_cols[3][i]);
-                            put(ix.ms1e_spacing_ppm, ms1e_cols[4][i]);
-                            put(ix.ms1e_mono_ppm, ms1e_cols[5][i]);
-                            put(ix.ms1e_mono_ppm_abs, ms1e_cols[6][i]);
-                            put(ix.ms1e_ibar_dev, ms1e_cols[7][i]);
-                            put(ix.ms1e_q1_agree, ms1e_cols[8][i]);
-                        }
-                        for (k, c) in q1s_ix.iter().enumerate() {
-                            put(*c, q1s_cols[k][i]);
+                        // The families appended last, by name: value k under the k-th
+                        // column its list names (none while a family is off).
+                        for (cs_ix, vals) in [
+                            (&ix.q1, &q1_cols),
+                            (&ix.q1f, &q1f_cols),
+                            (&ix.ms1e, &ms1e_cols),
+                            (&q1s_ix, &q1s_cols),
+                        ] {
+                            for (c, col) in cs_ix.iter().zip(vals) {
+                                put(*c, col[i]);
+                            }
                         }
                         if n_q1c > 0 {
                             let q = &ext_vals[r * n_buf + n_ext..(r + 1) * n_buf];
-                            put(ix.q1c_n, q[0]);
-                            put(ix.q1c_n_corr, q[1]);
-                            put(ix.q1c_pred_share, q[2]);
-                            put(ix.q1c_obs_share, q[3]);
-                            put(ix.q1c_entropy, q[4]);
-                            put(ix.q1c_cosine, q[5]);
-                            put(ix.q1c_top3, q[6]);
-                            put(ix.q1c_entropy_corr, q[7]);
-                            put(ix.q1c_soft_pred, q[8]);
-                            put(ix.q1c_soft_obs, q[9]);
-                            put(ix.q1c_soft_entropy, q[10]);
-                            put(ix.q1c_n_tight, q[11]);
-                            put(ix.q1c_n_loose, q[12]);
-                            put(ix.q1c_corr2d_mean, q[13]);
-                            put(ix.q1c_offset_wmean, q[14]);
-                            put(ix.q1c_offset_top3, q[15]);
+                            for (c, v) in ix.q1c.iter().zip(q) {
+                                put(*c, *v);
+                            }
                         }
 
                         pr[rl] = n_matched[i] as f64 * (0.5 + ff.frag_corr.max(0.0))
@@ -5269,10 +5104,9 @@ fn quantile_select(v: &mut [f64], q: f64) -> f64 {
 /// Best cross-correlation of two traces over integer lags in [-maxlag, maxlag].
 /// Returns (lag_of_max, normalized_max_value).
 ///
-/// The one-call form, for a family that correlates a pair once. The shipped callers
-/// correlate every pair of a PSM and pass cached norms to [`best_xcorr_normed`] instead
-/// (through [`PairStats`] or directly), so outside the tests nothing calls this today.
-#[cfg_attr(not(test), allow(dead_code))]
+/// The one-call form the tests check against. Every caller correlates every pair of a PSM
+/// and passes cached norms to [`best_xcorr_normed`] (through [`PairStats`] or directly).
+#[cfg(test)]
 fn best_xcorr(a: &[f64], b: &[f64], maxlag: i32) -> (i32, f64) {
     if a.len() < 2 {
         return (0, 0.0);
@@ -5280,9 +5114,8 @@ fn best_xcorr(a: &[f64], b: &[f64], maxlag: i32) -> (i32, f64) {
     best_xcorr_normed(a, b, maxlag, xcorr_norm(a), xcorr_norm(b))
 }
 
-/// The Euclidean norm of one trace, exactly as [`best_xcorr`] computes it for each of its
-/// two arguments. A pair matrix calls `best_xcorr` K - 1 times per trace, so the norms are
-/// computed once per trace with this and handed to [`best_xcorr_normed`].
+/// The Euclidean norm of one trace. A pair matrix correlates each trace K - 1 times, so
+/// the norms are computed once per trace with this and handed to [`best_xcorr_normed`].
 fn xcorr_norm(a: &[f64]) -> f64 {
     (a.iter().map(|x| x * x).sum::<f64>()).sqrt()
 }
@@ -5291,8 +5124,9 @@ fn xcorr_norm(a: &[f64]) -> f64 {
 const XCORR_MAXLAG: usize = 5;
 const XCORR_LAGS: usize = 2 * XCORR_MAXLAG + 1;
 
-/// [`best_xcorr`] with both norms supplied; `na` and `nb` must be [`xcorr_norm`] of `a`
-/// and `b`, which makes the two functions agree bit for bit.
+/// Best cross-correlation of two traces over integer lags in [-maxlag, maxlag], as
+/// (lag_of_max, normalized_max_value), with both norms supplied: `na` and `nb` must be
+/// [`xcorr_norm`] of `a` and `b`.
 ///
 /// The correlation used to be one serial pass per lag: each lag's dot product a single
 /// dependent chain of adds with a bounds branch inside, 11 chains one after another.
@@ -5400,6 +5234,11 @@ fn isotope_features(
 mod tests {
     use super::*;
     use mumdia_core::config::ZtSwitch;
+
+    /// The active list of a features configuration alone, 1/K0 resolved by `has_im`.
+    fn active_features_for(cfg: &FeaturesConfig, has_im: bool) -> Vec<String> {
+        active_features_fam(cfg.set, cfg.im_features.on(has_im), Q1Families::of(cfg))
+    }
 
     #[test]
     fn bands_below_the_anchor_floor_clear_it_once_pooled() {
@@ -6318,13 +6157,27 @@ mod tests {
     #[test]
     fn the_q1_family_is_appended_last_and_only_when_asked() {
         let off = active_features(FeatureSet::Extended, false);
-        let on = active_features_with(FeatureSet::Extended, false, true);
+        let on = active_features_fam(
+            FeatureSet::Extended,
+            false,
+            Q1Families {
+                q1: true,
+                ..Default::default()
+            },
+        );
         assert_eq!(on.len(), off.len() + Q1_FEATURES.len());
         assert_eq!(&on[..off.len()], &off[..]);
         assert_eq!(&on[off.len()..], Q1_FEATURES);
         for set in [FeatureSet::Minimal, FeatureSet::Rich] {
             assert_eq!(
-                active_features_with(set, false, true),
+                active_features_fam(
+                    set,
+                    false,
+                    Q1Families {
+                        q1: true,
+                        ..Default::default()
+                    }
+                ),
                 active_features(set, false)
             );
         }
@@ -6352,20 +6205,43 @@ mod tests {
     #[test]
     fn the_q1f_family_is_appended_last_and_only_when_asked() {
         let off = active_features(FeatureSet::Extended, false);
-        let on = active_features_q1(FeatureSet::Extended, false, false, true);
+        let on = active_features_fam(
+            FeatureSet::Extended,
+            false,
+            Q1Families {
+                q1f: true,
+                ..Default::default()
+            },
+        );
         assert_eq!(on.len(), off.len() + Q1F_FEATURES.len());
         assert_eq!(&on[..off.len()], &off[..]);
         assert_eq!(&on[off.len()..], Q1F_FEATURES);
-        let both = active_features_q1(FeatureSet::Extended, false, true, true);
+        let both = active_features_fam(
+            FeatureSet::Extended,
+            false,
+            Q1Families {
+                q1: true,
+                q1f: true,
+                ..Default::default()
+            },
+        );
         assert_eq!(&both[off.len()..off.len() + Q1_FEATURES.len()], Q1_FEATURES);
         assert_eq!(&both[off.len() + Q1_FEATURES.len()..], Q1F_FEATURES);
         assert_eq!(
-            active_features_q1(FeatureSet::Extended, false, false, false),
+            active_features_fam(FeatureSet::Extended, false, Q1Families::default()),
             off
         );
         for set in [FeatureSet::Minimal, FeatureSet::Rich] {
             assert_eq!(
-                active_features_q1(set, false, true, true),
+                active_features_fam(
+                    set,
+                    false,
+                    Q1Families {
+                        q1: true,
+                        q1f: true,
+                        ..Default::default()
+                    }
+                ),
                 active_features(set, false)
             );
         }
@@ -6400,7 +6276,14 @@ mod tests {
     /// columns only with both on; the schema id changes only with them.
     #[test]
     fn the_q1p_and_q1m_families_are_appended_last_and_only_when_asked() {
-        let q1f = active_features_q1(FeatureSet::Extended, false, false, true);
+        let q1f = active_features_fam(
+            FeatureSet::Extended,
+            false,
+            Q1Families {
+                q1f: true,
+                ..Default::default()
+            },
+        );
         let p = active_features_fam(
             FeatureSet::Extended,
             false,
@@ -6512,17 +6395,50 @@ mod tests {
     #[test]
     fn the_ms1e_family_is_appended_last_and_only_when_asked() {
         let off = active_features(FeatureSet::Extended, false);
-        let on = active_features_all(FeatureSet::Extended, false, false, false, true);
+        let on = active_features_fam(
+            FeatureSet::Extended,
+            false,
+            Q1Families {
+                ms1e: true,
+                ..Default::default()
+            },
+        );
         assert_eq!(on.len(), off.len() + MS1E_FEATURES.len());
         assert_eq!(&on[..off.len()], &off[..]);
         assert_eq!(&on[off.len()..], MS1E_FEATURES);
-        let all = active_features_all(FeatureSet::Extended, false, true, true, true);
-        let q1_both = active_features_q1(FeatureSet::Extended, false, true, true);
+        let all = active_features_fam(
+            FeatureSet::Extended,
+            false,
+            Q1Families {
+                q1: true,
+                q1f: true,
+                ms1e: true,
+                ..Default::default()
+            },
+        );
+        let q1_both = active_features_fam(
+            FeatureSet::Extended,
+            false,
+            Q1Families {
+                q1: true,
+                q1f: true,
+                ..Default::default()
+            },
+        );
         assert_eq!(&all[..q1_both.len()], &q1_both[..]);
         assert_eq!(&all[q1_both.len()..], MS1E_FEATURES);
         for set in [FeatureSet::Minimal, FeatureSet::Rich] {
             assert_eq!(
-                active_features_all(set, false, true, true, true),
+                active_features_fam(
+                    set,
+                    false,
+                    Q1Families {
+                        q1: true,
+                        q1f: true,
+                        ms1e: true,
+                        ..Default::default()
+                    }
+                ),
                 active_features(set, false)
             );
         }
@@ -6554,17 +6470,53 @@ mod tests {
     #[test]
     fn the_q1c_family_is_appended_last_and_only_when_asked() {
         let off = active_features(FeatureSet::Extended, false);
-        let on = active_features_q1c(FeatureSet::Extended, false, false, false, false, true);
+        let on = active_features_fam(
+            FeatureSet::Extended,
+            false,
+            Q1Families {
+                q1c: true,
+                ..Default::default()
+            },
+        );
         assert_eq!(on.len(), off.len() + Q1C_FEATURES.len());
         assert_eq!(&on[..off.len()], &off[..]);
         assert_eq!(&on[off.len()..], Q1C_FEATURES);
-        let all = active_features_q1c(FeatureSet::Extended, false, true, true, true, true);
-        let rest = active_features_all(FeatureSet::Extended, false, true, true, true);
+        let all = active_features_fam(
+            FeatureSet::Extended,
+            false,
+            Q1Families {
+                q1: true,
+                q1f: true,
+                ms1e: true,
+                q1c: true,
+                ..Default::default()
+            },
+        );
+        let rest = active_features_fam(
+            FeatureSet::Extended,
+            false,
+            Q1Families {
+                q1: true,
+                q1f: true,
+                ms1e: true,
+                ..Default::default()
+            },
+        );
         assert_eq!(&all[..rest.len()], &rest[..]);
         assert_eq!(&all[rest.len()..], Q1C_FEATURES);
         for set in [FeatureSet::Minimal, FeatureSet::Rich] {
             assert_eq!(
-                active_features_q1c(set, false, true, true, true, true),
+                active_features_fam(
+                    set,
+                    false,
+                    Q1Families {
+                        q1: true,
+                        q1f: true,
+                        ms1e: true,
+                        q1c: true,
+                        ..Default::default()
+                    }
+                ),
                 active_features(set, false)
             );
         }
@@ -6578,11 +6530,10 @@ mod tests {
                 .collect();
             seen.sort_unstable();
             assert_eq!(seen, (0..cols.len()).collect::<Vec<_>>());
-            // The assembly writes the family's values in NAMES order through these fields.
-            let pairs = ix.named_pairs();
+            // The assembly writes the family's values in NAMES order through these columns.
             for (k, name) in Q1C_FEATURES.iter().enumerate() {
-                let got = pairs.iter().find(|(n, _)| n == name).and_then(|(_, c)| *c);
-                assert_eq!(got, Some(cols.len() - Q1C_FEATURES.len() + k), "{name}");
+                let want = Some(cols.len() - Q1C_FEATURES.len() + k);
+                assert_eq!(ix.q1c[k], want, "{name}");
             }
         }
         let mut cfg = FeaturesConfig {
@@ -6837,7 +6788,10 @@ mod tests {
             .to_string();
         let (confident, apex_rt) = craft_chrom_for_bounds(&path);
         let ch = TableFile::open(&path).unwrap();
-        let cfg = FeaturesConfig::default();
+        let cfg = FeaturesConfig {
+            bound_from_confident: true,
+            ..Default::default()
+        };
 
         let mut sorted: Vec<u32> = confident.keys().copied().collect();
         sorted.sort_unstable();
@@ -7124,58 +7078,6 @@ mod tests {
         );
     }
 
-    #[test]
-    #[ignore = "benchmark: decodes one batch of production-shaped traces many times"]
-    fn bench_list_row_against_append_row() {
-        // Both arms do the SAME final work -- copy the row into the flat buffer a chunk
-        // keeps -- so the only difference is the scratch buffer and the `Arc` that
-        // `append_row` needs to reach the values. Arm A allocates its scratch once,
-        // outside the timed loop but inside the arm, which is the best case for the old
-        // path rather than a straw man.
-        let dir = std::env::temp_dir().join("mumdia_features_bench");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("chrom_rows.parquet").to_string_lossy().to_string();
-        craft_big_chrom(&path, 200); // 4,000 rows of 220 points
-        let ch = TableFile::open(&path).unwrap();
-        let mut reader = ch.batches(Some(&["rt", "intensity"]), 1 << 12).unwrap();
-        let b = reader.next().unwrap().unwrap();
-        let n = b.num_rows();
-        let rt = ListF32::of(b.column(0), "rt").unwrap();
-        let reps = 400;
-
-        let mut sink: Vec<f32> = Vec::with_capacity(n * 220);
-        let t = Instant::now();
-        let mut scratch: Vec<f32> = Vec::new();
-        for _ in 0..reps {
-            sink.clear();
-            for k in 0..n {
-                scratch.clear();
-                rt.append_row(k, &mut scratch, "rt").unwrap();
-                sink.extend_from_slice(&scratch);
-            }
-        }
-        let old = t.elapsed();
-        let checksum_old = sink.len();
-
-        let t = Instant::now();
-        for _ in 0..reps {
-            sink.clear();
-            for k in 0..n {
-                sink.extend_from_slice(rt.row_slice(k, "rt").unwrap());
-            }
-        }
-        let new = t.elapsed();
-        assert_eq!(checksum_old, sink.len());
-        println!(
-            "{} rows x {} reps: append_row + scratch {:?}, list_row {:?}, {:.2}x",
-            n,
-            reps,
-            old,
-            new,
-            old.as_secs_f64() / new.as_secs_f64().max(1e-9)
-        );
-    }
-
     /// `coelution::weighted_reference` exactly as it stood before the fold: EVERY trace,
     /// weight `pred.get(i).unwrap_or(0.0)`, `n = t.min(tr.len())`. A transcription of
     /// deleted code, kept so the equality claim is pinned against the old build rather
@@ -7360,83 +7262,6 @@ mod tests {
         let mut wrong = build();
         wrong.ref_profile_full = vec![1.0e9; tf];
         assert_ne!(bits(&interference::values(&wrong)), want_intf);
-    }
-
-    #[test]
-    fn list_row_borrows_exactly_what_append_row_copied() {
-        use arrow::array::{Float32Builder, LargeListBuilder, ListBuilder};
-        // Rows of several lengths, an empty row and a NULL row: `append_row` leaves the
-        // cleared scratch buffer empty for a null, and `list_row` must return an empty
-        // slice for the same rows.
-        //
-        // BOTH offset widths. `ListF32::Large` is a separate arm of `list_row` with its own
-        // `value_offsets()` (i64 rather than i32), and it is the arm a polars-written
-        // chromatogram table takes -- the large_* foot-gun CLAUDE.md records for string
-        // columns applies to list columns too. Testing only `ListBuilder` would leave the
-        // arm the engine can actually meet on foreign input unexecuted.
-        let mut b = ListBuilder::new(Float32Builder::new());
-        let mut lb = LargeListBuilder::new(Float32Builder::new());
-        for k in 0..12usize {
-            match k % 4 {
-                0 => {
-                    b.append(false); // null row
-                    lb.append(false);
-                }
-                1 => {
-                    b.append(true); // empty row
-                    lb.append(true);
-                }
-                _ => {
-                    for j in 0..(k % 5 + 1) {
-                        b.values().append_value(k as f32 * 10.0 + j as f32);
-                        lb.values().append_value(k as f32 * 10.0 + j as f32);
-                    }
-                    b.append(true);
-                    lb.append(true);
-                }
-            }
-        }
-        let small: ArrayRef = std::sync::Arc::new(b.finish());
-        let large: ArrayRef = std::sync::Arc::new(lb.finish());
-        // A LargeList is accepted and read through the same path as a List. The offset
-        // width is resolved inside `ListF32::of`, so there is no variant left to match on;
-        // what matters is that the wide form reads back, which the loop below checks value
-        // by value against `append_row`.
-        assert_eq!(ListF32::of(&large, "trace").unwrap().len(), 12);
-        // Whole array, and the slices the loader takes at a chunk boundary: `value_offsets`
-        // is adjusted for a sliced list, and this is where a hand-rolled offset would be
-        // wrong.
-        for arr in [&small, &large] {
-            for (off, len) in [(0usize, 12usize), (3, 5), (7, 5), (11, 1)] {
-                let sliced = arr.slice(off, len);
-                let l = ListF32::of(&sliced, "trace").unwrap();
-                for k in 0..len {
-                    let mut want: Vec<f32> = vec![7.0; 3]; // non-empty: append_row appends
-                    want.clear();
-                    l.append_row(k, &mut want, "trace").unwrap();
-                    assert_eq!(
-                        l.row_slice(k, "trace").unwrap(),
-                        want.as_slice(),
-                        "slice {off}..{} row {k}",
-                        off + len
-                    );
-                }
-            }
-        }
-        // A non-f32 list is still an error rather than a silent reinterpretation, at both
-        // offset widths. The error now surfaces when the column is OPENED rather than when
-        // a row is read: `ListF32::of` resolves the child once instead of downcasting per
-        // row, so a wrong inner type is refused before any row is handed out.
-        let mut ib = ListBuilder::new(arrow::array::Int32Builder::new());
-        ib.values().append_value(1);
-        ib.append(true);
-        let iarr: ArrayRef = std::sync::Arc::new(ib.finish());
-        assert!(ListF32::of(&iarr, "trace").is_err());
-        let mut ilb = LargeListBuilder::new(arrow::array::Int32Builder::new());
-        ilb.values().append_value(1);
-        ilb.append(true);
-        let ilarr: ArrayRef = std::sync::Arc::new(ilb.finish());
-        assert!(ListF32::of(&ilarr, "trace").is_err());
     }
 
     #[test]
@@ -7667,6 +7492,7 @@ mod tests {
         let psms = dir.join("psms_ext.parquet").to_string_lossy().to_string();
         let chrom = dir.join("chrom_ext.parquet").to_string_lossy().to_string();
         let (mut cid, mut base): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+        let (mut rt_lo, mut rt_hi): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
         let (mut apex_rt, mut cal, mut mz): (Vec<f64>, Vec<f64>, Vec<f64>) =
             (Vec::new(), Vec::new(), Vec::new());
         let mut apex_int: Vec<f32> = Vec::new();
@@ -7715,6 +7541,9 @@ mod tests {
             base.push(c / 3);
             apex_rt.push(apex);
             cal.push(apex - 1.5);
+            let (left, right) = rt_window_sides(c);
+            rt_lo.push(apex - 1.5 - left);
+            rt_hi.push(apex - 1.5 + right);
             mz.push(500.0 + c as f64);
             apex_int.push(1000.0 + c as f32);
             nmatch.push(3);
@@ -7786,6 +7615,8 @@ mod tests {
                 Col::OptF64("ms1_iso1".into(), vec![Some(450.0); n]),
                 Col::OptF64("ms1_iso2".into(), vec![Some(120.0); n]),
                 Col::OptF64("ms1_isom1".into(), vec![Some(30.0); n]),
+                Col::F64("rt_lo".into(), rt_lo),
+                Col::F64("rt_hi".into(), rt_hi),
             ]
             .into_iter()
             .chain(
@@ -7817,6 +7648,64 @@ mod tests {
         )
         .unwrap();
         (psms, chrom)
+    }
+
+    /// The fixture's RT window around candidate `c`'s prediction, left and right: the
+    /// global 8 s, the right side widened for 5, both sides for 10, and none for 3.
+    fn rt_window_sides(c: u32) -> (f64, f64) {
+        match c {
+            3 => (f64::NAN, f64::NAN),
+            5 => (8.0, 24.0),
+            10 => (12.0, 20.0),
+            _ => (8.0, 8.0),
+        }
+    }
+
+    /// The default-on RT-window family through the stage: each row is scaled by its own
+    /// window and by the run's narrowest half-width (8 s, the widened rows ignored), and a
+    /// row without a window reads 0.
+    #[test]
+    fn the_rt_window_family_reads_each_rows_window_and_the_narrowest_half_width() {
+        let dir = std::env::temp_dir().join("mumdia_features_rtw");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (psms, chrom) = craft_extended_inputs(&dir, 13);
+        let out = dir.join("features.parquet").to_string_lossy().to_string();
+        let cfg = FeaturesConfig {
+            set: FeatureSet::Extended,
+            ..Default::default()
+        };
+        run(FeaturesParams {
+            psms: &psms,
+            chromatograms: &chrom,
+            seed: None,
+            out: &out,
+            out_pin: "",
+            cfg: &cfg,
+            imc_ref_w: false,
+            q1_tolerances: None,
+        })
+        .unwrap();
+        let t = mumdia_io::table::Table::read(&out).unwrap();
+        let cols: Vec<Vec<f32>> = rt_window::NAMES.iter().map(|n| t.f32(n).unwrap()).collect();
+        for (r, c) in t.u32("candidate_id").unwrap().into_iter().enumerate() {
+            let (left, right) = rt_window_sides(c);
+            let w = 8.0;
+            // Every apex is 1.5 s after its prediction, so the right side scales it; a row
+            // without chromatogram rows (c % 7 == 6) has no extended values at all.
+            let want = if left.is_nan() || c % 7 == 6 {
+                [0.0; 5]
+            } else {
+                [
+                    1.5 / right,
+                    1.5 / right,
+                    1.5 / w,
+                    0.0,
+                    (left + right) / (2.0 * w),
+                ]
+            };
+            let got: Vec<f32> = cols.iter().map(|v| v[r]).collect();
+            assert_eq!(got, want.map(|x| x as f32), "candidate {c}");
+        }
     }
 
     fn fnv(h: &mut u64, b: &[u8]) {
@@ -8007,7 +7896,6 @@ mod tests {
                 out: &out,
                 out_pin: &pin,
                 cfg: &cfg,
-                config_hash: "t",
                 imc_ref_w: false,
                 q1_tolerances: tolerances,
             })
@@ -8192,7 +8080,6 @@ mod tests {
                         out,
                         out_pin: pin,
                         cfg: &cfg,
-                        config_hash: "test",
                         imc_ref_w: false,
                         q1_tolerances: None,
                     },
@@ -8612,7 +8499,6 @@ mod tests {
                         out,
                         out_pin: "",
                         cfg: &cfg,
-                        config_hash: "test",
                         imc_ref_w: false,
                         q1_tolerances: None,
                     },
@@ -8689,7 +8575,6 @@ mod tests {
                 out,
                 out_pin: "",
                 cfg: &cfg,
-                config_hash: "test",
                 imc_ref_w: false,
                 q1_tolerances: None,
             })
@@ -8706,7 +8591,6 @@ mod tests {
                 features,
                 out,
                 cfg: c,
-                config_hash: "test",
                 features_hash: None,
             })
             .unwrap();
@@ -8830,7 +8714,6 @@ mod tests {
                     out: &out,
                     out_pin: &pin,
                     cfg: &cfg,
-                    config_hash: "test",
                     imc_ref_w: false,
                     q1_tolerances: None,
                 },
@@ -9055,7 +8938,6 @@ mod tests {
                         out: &out,
                         out_pin: "",
                         cfg: &cfg,
-                        config_hash: "test",
                         imc_ref_w: false,
                         q1_tolerances: None,
                     },
@@ -9112,7 +8994,6 @@ mod tests {
                     out: &out,
                     out_pin: "",
                     cfg: &cfg,
-                    config_hash: "test",
                     imc_ref_w: false,
                     q1_tolerances: None,
                 },
@@ -9237,6 +9118,13 @@ mod tests {
         assert!(format!("{err}").contains("no retention-time axis"), "{err}");
         let mut s = ChromStream::open_at(&t2, first, 5).unwrap();
         assert_eq!(s.read_chunk(5, &mut names).unwrap().frag.nrows(), 5);
+        // Fewer rows than planned is an error, never a short chunk.
+        let mut s = ChromStream::open_at(&t2, first, 5).unwrap();
+        let err = s
+            .read_chunk(6, &mut names)
+            .err()
+            .expect("a short read must fail");
+        assert!(format!("{err}").contains("ended 1 rows early"), "{err}");
     }
 
     /// What [`ChunkLoader::take`] handed over for one chunk.
@@ -9430,7 +9318,6 @@ mod tests {
                     out,
                     out_pin: "",
                     cfg: &cfg,
-                    config_hash: "test",
                     imc_ref_w: false,
                     q1_tolerances: None,
                 },
@@ -9515,7 +9402,6 @@ mod tests {
                     out: &out,
                     out_pin: &pin,
                     cfg: &cfg,
-                    config_hash: "test",
                     imc_ref_w: false,
                     q1_tolerances: None,
                 },
@@ -9562,7 +9448,6 @@ mod tests {
                     out: &o2,
                     out_pin: &pin2,
                     cfg: &cfg,
-                    config_hash: "test",
                     imc_ref_w: false,
                     q1_tolerances: None,
                 },
@@ -9623,7 +9508,6 @@ mod tests {
             out: &out,
             out_pin: &pin,
             cfg: &cfg,
-            config_hash: "test",
             imc_ref_w: false,
             q1_tolerances: None,
         };

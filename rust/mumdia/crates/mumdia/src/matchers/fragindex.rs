@@ -4,9 +4,9 @@
 //!
 //! Posting m/z is stored f32 (adequate for MuMDIA's 20-50 ppm regime: f32 ULP is
 //! ~0.12 ppm, 200-400x below the tolerance window) and widened to f64 for the
-//! canonical [`within_ppm`] verify. The equivalence gate compares against the
-//! [`super::naive`] band-join under the SAME f32-stored / f64-verify predicate, so
-//! the storage precision is not a source of gate disagreement.
+//! canonical [`within_ppm`] verify. The equivalence gate (tests) compares against the
+//! `naive` band-join under the SAME f32-stored / f64-verify predicate, so the storage
+//! precision is not a source of gate disagreement.
 //!
 //! Single global index over all candidates. The precursor-window narrowing that a
 //! per-block index would give for free is recovered here by binary-searching the
@@ -91,14 +91,14 @@ impl FragIndex {
     /// fragment ordinal (6 bytes per posting less). The seed never reads either -- its
     /// accumulator counts matches and sums OBSERVED intensity
     /// ([`SeedScratch::accumulate`], through [`FragIndex::probe_peak_cand`]) -- and this is
-    /// what an m/z-only library ([`Library::load_mz_only`]) can be indexed with. The
+    /// what an m/z-only library ([`Library::load_mz_only_for_stage`]) can be indexed with. The
     /// geometry, `bin_start`, `post_cand` and `post_mz` are the full index's bit for bit.
     ///
     /// The entry points that hand out a posting's intensity or ordinal
     /// ([`FragIndex::probe_peak`], [`FragIndex::window_narrow`]) refuse an index built this
     /// way rather than returning zeros.
     ///
-    /// [`Library::load_mz_only`]: crate::index::Library::load_mz_only
+    /// [`Library::load_mz_only_for_stage`]: crate::index::Library::load_mz_only_for_stage
     pub fn build_mz_only(lib: &Library, tol_ppm: f64) -> FragIndex {
         Self::build_chunked(lib, tol_ppm, None, false, false)
     }
@@ -402,10 +402,6 @@ impl FragIndex {
         &self.bins
     }
 
-    pub fn tol_ppm(&self) -> f64 {
-        self.tol_ppm
-    }
-
     /// Candidate-id half-open range `[lo, hi)` whose precursor m/z lies in the
     /// isolation window `[win_lo, win_hi]` (prec_mz ascending). Matches the
     /// bucketed `Library::candidate_range` semantics.
@@ -660,8 +656,8 @@ impl FragIndex {
     ///
     /// Worth -5.7 to -9.3% OF THIS LOOP, at 1, 8, 64 and 512 postings in the range,
     /// measured against the indexed loop it replaced in the same binary and over the
-    /// same index (`bench_emit_range` below; 1.28 against 1.37 ns/posting at 512, both
-    /// cache-hot). That is not -5.7 to -9.3% of the probe. At the harness's widest arm
+    /// same index (1.28 against 1.37 ns/posting at 512, both cache-hot). That is not
+    /// -5.7 to -9.3% of the probe. At the harness's widest arm
     /// (65 emitted postings per peak, 798 ns/peak) the whole verify loop is about 11%
     /// of the probe, so the ceiling here is about -0.8% of a probe and less on a narrow
     /// candidate window; the earlier "-4 to -6% of the probe" in this comment came from
@@ -1190,36 +1186,36 @@ impl SeedScratch {
     }
 }
 
-/// Score one scan under both the Count and Dot semirings
-/// (docs/06_predict_frag_index_matchers.md), returning `(candidate_id, count, dot)`
-/// for every touched candidate. Used by the equivalence gate against
-/// [`super::naive`]. Dot = sum over matched postings of
-/// `predicted_intensity * peak_intensity` (both widened to f64).
-pub fn score_scan_count_dot(
-    idx: &FragIndex,
-    peaks: &[(f64, f32)],
-    cand_lo: u32,
-    cand_hi: u32,
-) -> Vec<(u32, u32, f64)> {
-    use std::collections::HashMap;
-    let mut acc: HashMap<u32, (u32, f64)> = HashMap::new();
-    for &(mz, inten) in peaks {
-        idx.probe_peak(mz, cand_lo, cand_hi, |cid, _pmz, pint, _pfrag| {
-            let e = acc.entry(cid).or_insert((0, 0.0));
-            e.0 += 1;
-            e.1 += pint as f64 * inten as f64;
-        });
-    }
-    let mut out: Vec<(u32, u32, f64)> = acc.into_iter().map(|(c, (n, d))| (c, n, d)).collect();
-    out.sort_by_key(|r| r.0);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::index::{Candidate, Library};
     use crate::matchers::naive;
+
+    /// Score one scan under both the Count and Dot semirings
+    /// (docs/06_predict_frag_index_matchers.md), returning `(candidate_id, count, dot)`
+    /// for every touched candidate: the fragindex side of the equivalence gate against
+    /// `naive`. Dot = sum over matched postings of `predicted_intensity * peak_intensity`
+    /// (both widened to f64).
+    fn score_scan_count_dot(
+        idx: &FragIndex,
+        peaks: &[(f64, f32)],
+        cand_lo: u32,
+        cand_hi: u32,
+    ) -> Vec<(u32, u32, f64)> {
+        use std::collections::HashMap;
+        let mut acc: HashMap<u32, (u32, f64)> = HashMap::new();
+        for &(mz, inten) in peaks {
+            idx.probe_peak(mz, cand_lo, cand_hi, |cid, _pmz, pint, _pfrag| {
+                let e = acc.entry(cid).or_insert((0, 0.0));
+                e.0 += 1;
+                e.1 += pint as f64 * inten as f64;
+            });
+        }
+        let mut out: Vec<(u32, u32, f64)> = acc.into_iter().map(|(c, (n, d))| (c, n, d)).collect();
+        out.sort_by_key(|r| r.0);
+        out
+    }
 
     /// Build a tiny in-memory Library from per-candidate (fragments, precursor_mz).
     /// precursor_mz values must be passed ascending (candidate_range precondition).
@@ -1455,126 +1451,6 @@ mod tests {
             cached.push((c, m.to_bits(), it.to_bits(), fr))
         });
         assert_eq!(got, cached);
-    }
-
-    /// The indexed verify loop `emit_range` replaced, kept verbatim so the two can be
-    /// timed against each other in the same binary. `tests/bench_fragindex.rs` cannot
-    /// do it: `emit_range` is private and every arm of that harness calls the same one,
-    /// so no arm varies it.
-    fn emit_range_indexed<F: FnMut(u32, f64, f32, u16)>(
-        idx: &FragIndex,
-        a: usize,
-        z: usize,
-        peak_mz: f64,
-        f: &mut F,
-    ) {
-        for p in a..z {
-            let pmz = idx.post_mz[p] as f64;
-            if within_ppm(pmz, peak_mz, idx.tol_ppm) {
-                f(idx.post_cand[p], pmz, idx.post_int[p], idx.post_frag[p]);
-            }
-        }
-    }
-
-    /// Microbenchmark: `emit_range`'s slice-and-zip against the indexed loop above, at
-    /// several range lengths, over the SAME index and the same peak m/z sequence, with
-    /// the checksum asserted equal. `#[ignore]`d.
-    ///
-    ///   cargo test --release -p mumdia bench_emit_range -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn bench_emit_range() {
-        let tol = 20.0;
-        println!("emit_range: sliced-and-zipped (shipped) vs the indexed loop it replaced");
-        // Fix the geometry with two anchor fragments present in every fixture, so the
-        // bin around 600 is the same bin whatever else the library holds.
-        let anchors = vec![(200.0f64, 1.0f32), (1500.0, 1.0)];
-        let probe_lib = lib_from(&[(
-            {
-                let mut v = anchors.clone();
-                v.push((600.0, 1.0));
-                v
-            },
-            900.0,
-        )]);
-        let geom = FragIndex::build(&probe_lib, tol);
-        let b0 = geom.bins.bin(600.0);
-        // Every m/z within 9 ppm of 600 (so every posting verifies at 20 ppm) that the
-        // geometry puts in that one bin, as the index will see it after the f32 store.
-        let in_bin: Vec<f64> = (-45..=45)
-            .map(|k| ((600.0 * (1.0 + k as f64 * 0.2e-6)) as f32) as f64)
-            .filter(|&mz| geom.bins.bin(mz) == b0)
-            .collect();
-        assert!(in_bin.len() >= 8, "the bin holds too few distinct m/z");
-        for &n_post in &[1usize, 8, 64, 512] {
-            // `n_post` postings inside that one bin, each on its own candidate, plus the
-            // anchors so the index is not degenerate. m/z repeat once the bin runs out
-            // of distinct values, which is what a crowded bin looks like anyway.
-            let mut cands: Vec<(Vec<(f64, f32)>, f64)> = (0..n_post)
-                .map(|i| {
-                    (
-                        vec![(in_bin[i % in_bin.len()], i as f32)],
-                        400.0 + i as f64 * 1e-3,
-                    )
-                })
-                .collect();
-            cands.push((anchors.clone(), 900.0));
-            let lib = lib_from(&cands);
-            let idx = FragIndex::build(&lib, tol);
-            let b = idx.bins.bin(600.0);
-            let (a, z) = (idx.bin_start.get(b), idx.bin_start.get(b + 1));
-            assert_eq!(z - a, n_post, "fixture did not put the run in one bin");
-            let iters = 4_000_000 / (n_post + 2);
-            let mut best = (f64::INFINITY, f64::INFINITY);
-            let (mut hs, mut hi_) = (0u64, 0u64);
-            for r in 0..14 {
-                // rotate, so warm-cache position cannot favour one side
-                for s in [r % 2, 1 - r % 2] {
-                    let mut acc = 0u64;
-                    let t = std::time::Instant::now();
-                    for it in 0..iters {
-                        // perturbation far below tolerance, so no posting changes side
-                        let q = 600.0 * (1.0 + (it % 4) as f64 * 1e-12);
-                        if s == 0 {
-                            idx.emit_range(a, z, q, &mut |c, m, i, f| {
-                                acc = acc
-                                    .wrapping_add(c as u64)
-                                    .wrapping_add(m.to_bits())
-                                    .wrapping_add(i.to_bits() as u64)
-                                    .wrapping_add(f as u64);
-                            });
-                        } else {
-                            emit_range_indexed(&idx, a, z, q, &mut |c, m, i, f| {
-                                acc = acc
-                                    .wrapping_add(c as u64)
-                                    .wrapping_add(m.to_bits())
-                                    .wrapping_add(i.to_bits() as u64)
-                                    .wrapping_add(f as u64);
-                            });
-                        }
-                    }
-                    let el = t.elapsed().as_secs_f64() * 1e9 / (iters as f64);
-                    std::hint::black_box(acc);
-                    if s == 0 {
-                        best.0 = best.0.min(el);
-                        hs = acc;
-                    } else {
-                        best.1 = best.1.min(el);
-                        hi_ = acc;
-                    }
-                }
-            }
-            assert_eq!(hs, hi_, "the two verify loops emit different postings");
-            println!(
-                "  range {n_post:4} postings: sliced {:8.1} ns/range, indexed {:8.1} ns/range  \
-                 delta {:+6.1}%  ({:.2} vs {:.2} ns/posting)",
-                best.0,
-                best.1,
-                100.0 * (best.0 - best.1) / best.1,
-                best.0 / n_post as f64,
-                best.1 / n_post as f64
-            );
-        }
     }
 
     /// Every array of a parallel build equals the serial build's, bit for bit.
@@ -2138,7 +2014,7 @@ mod tests {
     }
 
     /// The three-array accumulator the slot accumulator replaced, verbatim, as the
-    /// reference it is compared against and timed against.
+    /// reference it is compared against.
     struct SoaScratch {
         count: Vec<u32>,
         obs_sum: Vec<f64>,
@@ -2248,76 +2124,6 @@ mod tests {
                 got.sort_unstable();
                 assert_eq!(got, want, "scan {k} min {min}");
             }
-        }
-    }
-
-    /// Microbenchmark: the slot accumulator plus its qualified list against the three-array
-    /// accumulator plus the filter over `touched` the seed used to run, over dense scans of
-    /// one wide window. `#[ignore]`d.
-    ///
-    ///   cargo test --release -p mumdia bench_seed_accumulator -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn bench_seed_accumulator() {
-        // A window that fits in cache (60k candidates, ~1 MB of slots) and one that does not
-        // (2M candidates, ~32 MB), where the slot's single cache line per posting counts.
-        for (n_cand, n_scans, per_scan) in
-            [(60_000usize, 200usize, 2_000usize), (2_000_000, 60, 4_000)]
-        {
-            let lib = random_lib(n_cand, 0x7);
-            let idx = FragIndex::build_mz_only(&lib, 20.0);
-            let scans = dense_scans(&lib, n_scans, per_scan);
-            let hi = n_cand as u32;
-            let min = 4usize;
-            let mut best = (f64::INFINITY, f64::INFINITY);
-            let (mut ha, mut hb) = (0u64, 0u64);
-            for r in 0..6 {
-                for arm in [r % 2, 1 - r % 2] {
-                    let t = std::time::Instant::now();
-                    let mut acc = 0u64;
-                    if arm == 0 {
-                        let mut sc = SeedScratch::with_min_count(n_cand + 1, min);
-                        for peaks in &scans {
-                            sc.accumulate(&idx, peaks, 0, hi);
-                            for &c in sc.qualified() {
-                                acc = acc
-                                    .wrapping_add(c as u64)
-                                    .wrapping_add(sc.obs_sum(c).to_bits());
-                            }
-                        }
-                    } else {
-                        let mut sc = SoaScratch::new(n_cand + 1);
-                        for peaks in &scans {
-                            sc.accumulate(&idx, peaks, 0, hi);
-                            for &c in sc.touched.iter() {
-                                let cc = (c - sc.base) as usize;
-                                if sc.count[cc] as usize >= min {
-                                    acc = acc
-                                        .wrapping_add(c as u64)
-                                        .wrapping_add(sc.obs_sum[cc].to_bits());
-                                }
-                            }
-                        }
-                    }
-                    let el = t.elapsed().as_secs_f64();
-                    std::hint::black_box(acc);
-                    if arm == 0 {
-                        best.0 = best.0.min(el);
-                        ha = acc;
-                    } else {
-                        best.1 = best.1.min(el);
-                        hb = acc;
-                    }
-                }
-            }
-            assert_eq!(ha, hb, "the two accumulators disagree");
-            println!(
-                "seed accumulator, {n_scans} scans x {per_scan} peaks over {n_cand} candidates: \
-                 slots + qualified {:.1} ms, three arrays + filter {:.1} ms ({:+.1}%)",
-                best.0 * 1e3,
-                best.1 * 1e3,
-                100.0 * (best.0 - best.1) / best.1
-            );
         }
     }
 

@@ -5,12 +5,9 @@
 //! selection. Deterministic (weights start at zero, no RNG). Port features, not
 //! classifiers; the model is intentionally simple and swappable.
 
-use crate::fdr::target_decoy_q_split;
+use crate::fdr::{count_targets_at_q, target_decoy_q_split};
 use rayon::prelude::*;
 
-/// Column mean/std over a SUBSET of rows (guarded; std < 1e-9 -> 1.0). Fitting the
-/// scaler on the training fold only avoids leaking test-fold statistics into the
-/// standardization.
 /// Row-major feature matrix: ONE flat allocation of `rows * n_features` values, instead of
 /// a `Vec<f64>` per PSM.
 ///
@@ -117,6 +114,9 @@ impl FeatureMatrix {
     }
 }
 
+/// Column mean/std over a SUBSET of rows (guarded; std < 1e-9 -> 1.0). Fitting the
+/// scaler on the training fold only avoids leaking test-fold statistics into the
+/// standardization.
 fn fit_standardizer(x: &FeatureMatrix, idx: &[u32]) -> (Vec<f64>, Vec<f64>) {
     let d = x.n_features();
     let n = idx.len().max(1) as f64;
@@ -474,7 +474,7 @@ pub fn percolator_lite(inp: RescoreInput) -> Vec<f64> {
     // Three earlier numbers are WITHDRAWN. "1.51x at 3 folds, 0.91x at 5" and "0.24x at 5
     // folds" on the 30,000-PSM fixture were single shots against a reference arm that was
     // NOT the parent: it reintroduced a `Vec<Vec<f32>>` the parent had already removed. That
-    // arm is measurable here (`MUMDIA_BENCH_BASELINE=per_row`) and it is 1.03x the parent's
+    // arm measured 1.03x the parent's
     // wall at 3 folds but 1.56x at 5 (211.6 s against 135.8), so it inflated exactly the
     // configuration where the change is weakest. It also perturbs the arm it is compared
     // against: at 5 folds it keeps ~800,000 live heap blocks, and the interleaved sequential
@@ -673,12 +673,7 @@ pub fn prefilter_scores(inp: PrefilterInput) -> Option<Vec<f64>> {
             let q = target_decoy_q_split(&scores, &decoy);
             // A pool whose top is mostly decoys can leave no column with 10 targets at
             // `train_fdr`; the positives are then the targets at the first looser level that has.
-            let passing = |f: f64| {
-                q.iter()
-                    .zip(&decoy)
-                    .filter(|(q, d)| !**d && **q <= f)
-                    .count()
-            };
+            let passing = |f: f64| count_targets_at_q(&q, &decoy, f);
             let fdr = [inp.train_fdr, 0.05, 0.1]
                 .into_iter()
                 .filter(|&f| f >= inp.train_fdr)
@@ -719,11 +714,7 @@ pub fn prefilter_scores(inp: PrefilterInput) -> Option<Vec<f64>> {
 
 /// How many targets pass `fdr` under `scores`.
 fn confident_targets(scores: &[f64], decoy: &[bool], fdr: f64) -> usize {
-    let q = target_decoy_q_split(scores, decoy);
-    q.iter()
-        .zip(decoy)
-        .filter(|(q, d)| !**d && **q <= fdr)
-        .count()
+    count_targets_at_q(&target_decoy_q_split(scores, decoy), decoy, fdr)
 }
 
 /// The column of `d`, in either direction, under which the most targets pass `fdr`, as that
@@ -769,6 +760,11 @@ fn prefilter_order(scores: &[f64]) -> Vec<u32> {
     order
 }
 
+/// How many of `n_dec` decoys a cut at `keep_decoys` keeps.
+pub fn prefilter_decoys_kept(n_dec: usize, keep_decoys: f64) -> usize {
+    ((n_dec as f64) * keep_decoys.clamp(0.0, 1.0)).ceil() as usize
+}
+
 /// Which rows a decoy-fraction cut keeps: the highest-scoring rows down to the one that
 /// brings in the `keep_decoys` fraction of the decoys, targets and decoys alike above it.
 /// The share of rows kept then follows the pool: a pool with many identifiable targets keeps
@@ -776,7 +772,7 @@ fn prefilter_order(scores: &[f64]) -> Vec<u32> {
 pub fn prefilter_decoy_cut_mask(scores: &[f64], is_decoy: &[bool], keep_decoys: f64) -> Vec<bool> {
     let n = scores.len();
     let n_dec = is_decoy.iter().filter(|&&d| d).count();
-    let want = ((n_dec as f64) * keep_decoys.clamp(0.0, 1.0)).ceil() as usize;
+    let want = prefilter_decoys_kept(n_dec, keep_decoys);
     let mut mask = vec![false; n];
     let mut seen = 0usize;
     for &i in &prefilter_order(scores) {
@@ -1102,105 +1098,6 @@ mod tests {
         (x, y)
     }
 
-    /// `percolator_lite` two layouts back, before the training slice was flattened:
-    /// `xtr` as a `Vec<Vec<f32>>`, and the test fold scored through a materialised
-    /// `std_row`. Kept as the OLDEST form the current scores are still pinned against, so
-    /// the equality claim reaches back past the parent as well.
-    ///
-    /// This is NOT the arm to time against. It is one heap block per training row, which
-    /// the parent had already removed; see `percolator_lite_parent` for the baseline the
-    /// benchmark uses.
-    fn percolator_lite_per_row_reference(inp: RescoreInput) -> Vec<f64> {
-        let n = inp.features.rows();
-        if n == 0 {
-            return Vec::new();
-        }
-        let folds = inp.folds.max(1);
-        let fold_of: Vec<usize> = fold_assignment(inp.fold_key, folds)
-            .into_iter()
-            .map(|f| f as usize)
-            .collect();
-        let per_fold: Vec<Vec<(usize, f64)>> = (0..folds)
-            .into_par_iter()
-            .map(|test_fold| {
-                let train_idx: Vec<usize> = (0..n).filter(|&i| fold_of[i] != test_fold).collect();
-                let test_idx: Vec<usize> = (0..n).filter(|&i| fold_of[i] == test_fold).collect();
-                if train_idx.is_empty() || test_idx.is_empty() {
-                    return Vec::new();
-                }
-                let (mean, std) = fit_standardizer_reference(inp.features, &train_idx);
-                let xtr: Vec<Vec<f32>> = train_idx
-                    .iter()
-                    .map(|&i| std_row_ref(inp.features.row(i), &mean, &std))
-                    .collect();
-                let mut train_scores: Vec<f64> =
-                    train_idx.iter().map(|&i| inp.init_score[i]).collect();
-                let mut w = vec![0.0; inp.features.n_features() + 1];
-                let mut sd: Vec<(f64, bool)> = Vec::with_capacity(train_idx.len());
-                for _ in 0..inp.num_iter.max(1) {
-                    sd.clear();
-                    sd.extend(
-                        train_idx
-                            .iter()
-                            .enumerate()
-                            .map(|(k, &i)| (train_scores[k], inp.is_decoy[i])),
-                    );
-                    let q = target_decoy_q(&sd);
-                    let mut rows: Vec<&[f32]> = Vec::new();
-                    let mut ys: Vec<f64> = Vec::new();
-                    let mut n_pos = 0;
-                    for (k, &i) in train_idx.iter().enumerate() {
-                        if inp.is_decoy[i] {
-                            rows.push(&xtr[k]);
-                            ys.push(0.0);
-                        } else if q[k] <= inp.train_fdr {
-                            rows.push(&xtr[k]);
-                            ys.push(1.0);
-                            n_pos += 1;
-                        }
-                    }
-                    if n_pos < 10 {
-                        let mut order: Vec<usize> = (0..train_idx.len()).collect();
-                        order.sort_by(|&a, &b| train_scores[b].total_cmp(&train_scores[a]));
-                        let take = (train_idx.len() / 2).max(1);
-                        rows.clear();
-                        ys.clear();
-                        for (rank, &k) in order.iter().enumerate() {
-                            let i = train_idx[k];
-                            if inp.is_decoy[i] {
-                                rows.push(&xtr[k]);
-                                ys.push(0.0);
-                            } else if rank < take {
-                                rows.push(&xtr[k]);
-                                ys.push(1.0);
-                            }
-                        }
-                    }
-                    w = logreg_fit_reference(&rows, &ys, 1e-3, 200, 0.5);
-                    train_scores = (0..train_idx.len())
-                        .map(|k| score_row(&w, &xtr[k]))
-                        .collect();
-                }
-                test_idx
-                    .iter()
-                    .map(|&i| {
-                        (
-                            i,
-                            score_row(&w, &std_row_ref(inp.features.row(i), &mean, &std)),
-                        )
-                    })
-                    .collect()
-            })
-            .collect();
-        let mut final_score = inp.init_score.to_vec();
-        for fold_scores in per_fold {
-            for (i, s) in fold_scores {
-                final_score[i] = s;
-            }
-        }
-        final_score
-    }
-
     /// The parent's `std_row_into`: appends into a `Vec<f32>` rather than writing into a
     /// caller-provided slice, which is what made its `xtr` fill serial.
     fn std_row_into_parent(row: &[f32], mean: &[f64], std: &[f64], out: &mut Vec<f32>) {
@@ -1215,8 +1112,8 @@ mod tests {
     /// `score_std_row`.
     ///
     /// This is the baseline `percolator_lite_fold_cost` times, and getting it right is the
-    /// whole point of the function. An earlier version of that benchmark timed the per-row
-    /// reference above instead, which reintroduces a `Vec<Vec<f32>>` the parent had already
+    /// whole point of the function. An earlier version of that benchmark timed a per-row
+    /// layout two steps back instead, which reintroduces a `Vec<Vec<f32>>` the parent had already
     /// removed. Measured at 200,000 x 387 x 10 iters, that arm costs 1.03x the parent's wall
     /// at 3 folds and 1.56x at 5, so it flattered the new arrangement most in the
     /// configuration where the new arrangement is weakest. Nothing here may be
@@ -1339,11 +1236,28 @@ mod tests {
         (features.finish().unwrap(), is_decoy, key, init)
     }
 
+    /// `score_std_row` scores the standardised value after its f32 rounding, as
+    /// `score_row(w, &std_row(..))` did. Production and `percolator_lite_parent` both score
+    /// through it, so this is the one check on that narrowing.
     #[test]
-    fn sequential_folds_score_bit_identically_to_both_older_layouts() {
-        // Against the PARENT (the code actually replaced) and against the per-row layout
-        // two steps back, because each pins a different claim: the parent pins this
-        // series, the per-row one pins that the flattening before it still holds.
+    fn score_std_row_scores_the_f32_rounded_standardised_row() {
+        let (features, ..) = crafted_population(200, 9);
+        let idx: Vec<usize> = (0..features.rows()).collect();
+        let (mean, std) = fit_standardizer_reference(&features, &idx);
+        let w: Vec<f64> = (0..10).map(|j| 0.37 * j as f64 - 1.1).collect();
+        for i in 0..features.rows() {
+            let row = features.row(i);
+            assert_eq!(
+                score_std_row(&w, row, &mean, &std).to_bits(),
+                score_row(&w, &std_row_ref(row, &mean, &std)).to_bits(),
+                "row {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn sequential_folds_score_bit_identically_to_the_parent() {
+        // Against the PARENT, the code actually replaced.
         let bits = |v: Vec<f64>| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
         let (features, is_decoy, key, init) = crafted_population(600, 9);
         let mk = || RescoreInput {
@@ -1361,11 +1275,6 @@ mod tests {
             bits(percolator_lite_parent(mk())),
             "against the parent"
         );
-        assert_eq!(
-            got,
-            bits(percolator_lite_per_row_reference(mk())),
-            "against the per-row layout"
-        );
         // And the fallback branch (too few confident targets to train on) as well.
         let (features, is_decoy, key, init) = crafted_population(40, 5);
         let mk = || RescoreInput {
@@ -1382,11 +1291,6 @@ mod tests {
             got,
             bits(percolator_lite_parent(mk())),
             "against the parent"
-        );
-        assert_eq!(
-            got,
-            bits(percolator_lite_per_row_reference(mk())),
-            "against the per-row layout"
         );
     }
 
@@ -1592,7 +1496,7 @@ mod tests {
     /// and each of which changed the answer:
     ///
     /// - the baseline is `percolator_lite_parent`, the parent commit's production code. It
-    ///   was `percolator_lite_per_row_reference`, which reintroduces a `Vec<Vec<f32>>` the
+    ///   was a per-row layout two steps back, which reintroduces a `Vec<Vec<f32>>` the
     ///   parent had already removed and is 1.4-1.7x slower than what is actually being
     ///   replaced;
     /// - `MUMDIA_BENCH_ITERS` defaults to the SHIPPED `rescore.num_iter` of 10, not to 2.
@@ -1644,18 +1548,7 @@ mod tests {
             let v = f();
             (t.elapsed().as_secs_f64(), bits(v))
         };
-        // `MUMDIA_BENCH_BASELINE=per_row` times the OLD, WRONG baseline instead. It is here
-        // only so the gap between the two baselines can be measured rather than asserted;
-        // `parent` is the default and is the code this change actually replaced.
-        let per_row = std::env::var("MUMDIA_BENCH_BASELINE").as_deref() == Ok("per_row");
-        let base_name = if per_row { "per_row" } else { "parent" };
-        let old = || {
-            if per_row {
-                percolator_lite_per_row_reference(mk())
-            } else {
-                percolator_lite_parent(mk())
-            }
-        };
+        let old = || percolator_lite_parent(mk());
         let new = || percolator_lite(mk());
         let (mut olds, mut news) = (Vec::new(), Vec::new());
         for rep in 0..reps {
@@ -1672,7 +1565,7 @@ mod tests {
             };
             assert_eq!(a.1, b.1, "the benchmark arms must agree bit for bit");
             println!(
-                "  rep {rep} ({}): {base_name} {:.3} s, sequential {:.3} s ({:.2}x)",
+                "  rep {rep} ({}): parent {:.3} s, sequential {:.3} s ({:.2}x)",
                 if rep % 2 == 0 {
                     "baseline first"
                 } else {
@@ -1689,7 +1582,7 @@ mod tests {
         let hi = |v: &[f64]| v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         println!(
             "percolator_lite {n} PSMs x {d} features, {folds} folds x {num_iter} iters, \
-             {} rayon threads, {reps} reps: parallel folds + serial fit [{base_name}] \
+             {} rayon threads, {reps} reps: parallel folds + serial fit [parent] \
              {:.3} s (spread {:.2}x), sequential folds + parallel fit {:.3} s \
              (spread {:.2}x), best-of ratio {:.2}x",
             rayon::current_num_threads(),

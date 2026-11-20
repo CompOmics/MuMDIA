@@ -20,10 +20,10 @@
 //! two: [`input_has_im`] for library-build keys, decided before anything is converted, and
 //! [`spectra_has_im`] for a stage that reads converted spectra.
 //!
-//! The header is read as text, as `convert`'s declared spectrum count is: the instrument
-//! description precedes `<run>` (the first few KiB of a Thermo or Bruker mzML, 559 KB into
-//! a SCIEX MS Data Converter file), and mzdata does not expose the `referenceableParamGroup`
-//! an instrument configuration refers to. ThermoRawFileParser writes the model there
+//! The header is read as text, in the same read as `convert`'s declared spectrum count:
+//! the instrument description precedes `<run>` (the first few KiB of a Thermo or Bruker
+//! mzML, 559 KB into a SCIEX MS Data Converter file), and mzdata does not expose the
+//! `referenceableParamGroup` an instrument configuration refers to. ThermoRawFileParser writes the model there
 //! (`MS:1003378` "Orbitrap Astral"), ProteoWizard `msconvert` in the same place or directly
 //! in the `instrumentConfiguration`, and the SCIEX MS Data Converter directly in the
 //! configuration (`MS:1003443` "ZenoTOF 8600"). Only the configurations and the groups they
@@ -66,14 +66,15 @@ const SPECTRUM_TERMS: [&str; 9] = [
 ];
 
 /// How much of the file the header is looked for in, at most. The instrument description
-/// precedes `<run>`, which the read stops at. It sits in the first few KiB of a Thermo or
+/// precedes `<run>`, and the spectrum count `convert` checks is on the `<spectrumList>`
+/// that follows it, where the read stops. Both sit in the first few KiB of a Thermo or
 /// Bruker mzML, but the SCIEX MS Data Converter writes two parameter groups per experiment
-/// of the method before it (559 KB into a 664-experiment ZT Scan DIA run), so a method
-/// with a few thousand experiments puts it past the 1 MiB `convert` reads for the spectrum
-/// count.
+/// of the method before them (559 KB into a 664-experiment ZT Scan DIA run), so a method
+/// with a few thousand experiments puts them past 1 MiB.
 const HEADER_BYTES: usize = 16 << 20;
 
-/// The header is read in pieces of this size, and the read stops at the first `<run`.
+/// The header is read in pieces of this size, and the read stops at the end of the
+/// `<spectrumList` start tag.
 const HEADER_STEP: usize = 1 << 20;
 
 /// The instrument model a file declares, and whether it lists an Astral analyzer.
@@ -177,13 +178,19 @@ pub fn from_configurations<'a>(
     inst.astral_analyzer.then_some(inst)
 }
 
-/// The instrument the mzML at `path` declares, or `None` when the header cannot be read or
-/// names no instrument.
-pub fn from_mzml(path: &str) -> Option<Instrument> {
+/// The head of the mzML at `path` through the end of its `<spectrumList` start tag: the
+/// header [`parse_header`] reads the instrument from, and the spectrum count `convert`
+/// checks completeness against. At most [`HEADER_BYTES`]; `None` when the file cannot be
+/// read.
+pub(crate) fn mzml_head(path: &str) -> Option<String> {
     use std::io::Read as _;
+    const LIST: &[u8] = b"<spectrumList";
     let mut f = std::fs::File::open(path).ok()?.take(HEADER_BYTES as u64);
     let mut head: Vec<u8> = Vec::with_capacity(HEADER_STEP);
     let mut buf = vec![0u8; HEADER_STEP];
+    // Where the search resumes: a few bytes before the new piece, so a tag split across two
+    // reads is found once the second arrives, or at the tag while its `>` is still to come.
+    let mut from = 0;
     loop {
         // `read` may return less than asked before the end of the file.
         let k = match f.read(&mut buf) {
@@ -191,15 +198,14 @@ pub fn from_mzml(path: &str) -> Option<Instrument> {
             Ok(k) => k,
             Err(_) => return None,
         };
-        // A `<run` split across two reads is found once the second arrives: the search
-        // starts a few bytes before the new piece.
-        let from = head.len().saturating_sub(4);
         head.extend_from_slice(&buf[..k]);
-        if head[from..].windows(4).any(|w| w == b"<run") {
-            break;
+        match head[from..].windows(LIST.len()).position(|w| w == LIST) {
+            Some(at) if head[from + at..].contains(&b'>') => break,
+            Some(at) => from += at,
+            None => from = head.len().saturating_sub(LIST.len() - 1),
         }
     }
-    parse_header(&String::from_utf8_lossy(&head))
+    Some(String::from_utf8_lossy(&head).into_owned())
 }
 
 /// Which reader wrote a spectra artifact (`params.reader`).
@@ -630,11 +636,15 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mumdia_instr_big_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("big.mzML");
-        // The spectra follow the header; the read stops at `<run`.
+        // The spectra follow the header; the read stops once the `<spectrumList` start tag,
+        // which carries the count `convert` checks, is complete.
         let mut body = t.clone();
         body.push_str(&"<spectrum/>".repeat(100_000));
-        std::fs::write(&path, body).unwrap();
-        let i = from_mzml(path.to_str().unwrap()).unwrap();
+        std::fs::write(&path, &body).unwrap();
+        let head = mzml_head(path.to_str().unwrap()).unwrap();
+        assert!(head.contains(r#"count="2150032">"#));
+        assert!(head.len() < body.len());
+        let i = parse_header(&head).unwrap();
         assert_eq!(i.name, "ZenoTOF 8600");
         std::fs::remove_dir_all(&dir).ok();
     }

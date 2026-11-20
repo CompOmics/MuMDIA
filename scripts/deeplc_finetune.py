@@ -420,6 +420,14 @@ def unique_standard_bases(bases):
     return uniq.filter(pc.match_substring_regex(stripped, pattern=STD_FULL_RE))
 
 
+def holdout_cut(frac):
+    """`round(frac * 1000)` of the held-out rule, rounded as rt_im_train.rs::is_holdout
+    rounds it: half away from zero (`f64::round`), where Python's round() rounds half to
+    even (0.0125 gives 13 there and 12 here)."""
+    x = frac * 1000
+    return int(x) + (x % 1 >= 0.5)
+
+
 def build_reference(args):
     """The run's confident seed PSMs as a `PSMList`: peptidoform plus observed RT.
 
@@ -432,9 +440,11 @@ def build_reference(args):
     hf = args.window_holdout_frac
     if not (0.0 <= hf <= 0.9):
         raise SystemExit(f"--window-holdout-frac must be in [0.0, 0.9], got {hf}")
-    is_holdout = lambda bid: bid % 1000 < round(hf * 1000)
+    cut = holdout_cut(hf)
+    is_holdout = lambda bid: bid % 1000 < cut
     if hf > 0.0:
-        assert [299 % 1000 < round(0.3 * 1000), 300 % 1000 < round(0.3 * 1000)] == [True, False]
+        assert [299 < holdout_cut(0.3), 300 < holdout_cut(0.3),
+                12 < holdout_cut(0.0125), 13 < holdout_cut(0.0125)] == [True, False, True, False]
     # reference: confident target seed PSMs (peptidoform + observed RT, seconds). Only the
     # columns the rule reads, and only the confident targets become Python objects: the
     # label and q filter runs in Arrow and keeps row order, so the dict below is built from
@@ -460,7 +470,7 @@ def build_reference(args):
             ref[pf] = seed["observed_rt"][i]
     if hf > 0.0:
         print(f"window holdout: excluded {n_held} confident seed rows "
-              f"(base_peptide_id %% 1000 < {round(hf * 1000)}) from the fine-tune reference", flush=True)
+              f"(base_peptide_id %% 1000 < {cut}) from the fine-tune reference", flush=True)
     ref_items = list(ref.items())
     if args.max_ref and len(ref_items) > args.max_ref:
         ref_items = ref_items[: args.max_ref]

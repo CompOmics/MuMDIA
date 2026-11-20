@@ -94,7 +94,7 @@ no fallback.
 ### `test_nn_rescore_worker.py` (needs torch)
 
 The hard contract from `CLAUDE.md`, enforced by `align_sidecar_scores`
-(`rescore.rs:1046-1082`): every input row gets exactly one finite out-of-fold
+in `stages/rescore.rs`: every input row gets exactly one finite out-of-fold
 score, output rows equal input rows, no row silently dropped. Asserted for all
 three input paths - the tab-separated PIN, the `rescore.handoff = parquet`
 feature table, and the streaming memmap backend, which must also delete its

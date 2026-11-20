@@ -78,9 +78,6 @@ pub fn parse_version3(s: &str) -> Option<(u32, u32, u32)> {
 /// Monoisotopic mass of a neutral water molecule (H2O), Da.
 pub const WATER: f64 = 18.010_564_684;
 
-/// Monoisotopic mass of ammonia (NH3), Da.
-pub const AMMONIA: f64 = 17.026_549_1;
-
 /// Mass difference between two adjacent isotope peaks of a peptide (Da): the
 /// true 13C - 12C mass difference (13.003_354_835 - 12 = 1.003_354_835), used as
 /// the isotope-peak spacing for MS1 envelope extraction. Public physical fact
@@ -157,12 +154,6 @@ pub fn mass_to_mz(neutral_mass: f64, charge: i32) -> f64 {
 #[inline]
 pub fn ppm_diff(observed: f64, theoretical: f64) -> f64 {
     1e6 * (observed - theoretical) / theoretical
-}
-
-/// True when `observed` is within `tol` ppm of `theoretical`.
-#[inline]
-pub fn ppm_match(observed: f64, theoretical: f64, tol_ppm: f64) -> bool {
-    (ppm_diff(observed, theoretical)).abs() <= tol_ppm
 }
 
 /// Lower/upper m/z bounds of a `tol` ppm window around `mz`, in f64.

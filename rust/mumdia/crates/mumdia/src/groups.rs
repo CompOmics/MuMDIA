@@ -517,7 +517,7 @@ where
 
 /// Write the precursor rows `[first_row, first_row + n)` of `precursors` to `out` with
 /// `candidate_id` renumbered to `0..n`: the band's own precursor table, which the DeepLC
-/// sidecars rewrite and every stage of the group loads (`Library::load_with_fragment_offset`
+/// sidecars rewrite and every stage of the group loads (`Library::load_for_stage`
 /// with `first_row` as the fragment offset). Streams batch by batch. Returns `n`.
 pub fn write_band_slice(precursors: &str, first_row: usize, n: usize, out: &str) -> Result<u64> {
     use arrow::array::{Array, UInt32Array};

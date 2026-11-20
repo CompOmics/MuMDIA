@@ -32,13 +32,12 @@ use mumdia_core::config::Config;
 use mumdia_io::table::{write_table, Col, TableFile};
 use rayon::prelude::*;
 use serde::Serialize;
-use timsrust::{Frame, MSLevel};
 use tracing::{info, warn};
 
 use crate::chromatograms;
 use crate::masscal::read_mass_cal;
 use crate::stages::convert::tims_frames::{
-    bin_events, scan_band, scan_mobilities, slot_scans, tof_window, TofFrame,
+    bin_events, raw_of_spectra, scan_band, slot_scans, tof_window, FrameIndex, TofFrame,
 };
 use crate::stages::convert::RawTdf;
 use crate::stages::extract::nearest_index;
@@ -195,29 +194,6 @@ fn spectra_of(dir: &Path) -> Option<String> {
     existing(exp.join(name).join("spectra").join("spectra_ms2.parquet"))
 }
 
-/// The diaPASEF `.d` the spectra at `spectra` were read from by the native reader.
-fn raw_of_spectra(spectra: &str) -> Result<String> {
-    match crate::instrument::provenance(spectra) {
-        Some(p) if p.has_im() => {
-            let raw = p.source.ok_or_else(|| {
-                anyhow!("{spectra}: its report does not name the .d it was read from; pass --raw")
-            })?;
-            if !Path::new(&raw).is_dir() {
-                bail!(
-                    "{spectra} was converted from {raw}, which is not there any more; pass \
-                     --raw with the .d's current path"
-                );
-            }
-            Ok(raw)
-        }
-        _ => bail!(
-            "{spectra} was not read natively from a diaPASEF .d (an mzML input, including a \
-             timsTOF mzML written by msconvert, has no raw events); a mobilogram needs the \
-             .d (docs/35_diapasef.md section 17)"
-        ),
-    }
-}
-
 /// The configuration a run recorded: `config_json` of `<dir>/manifest.json`, else of the
 /// `experiment_manifest.json` one or two levels up (a run of an experiment, or of its second
 /// pass). `None` when there is none or it does not parse.
@@ -296,7 +272,12 @@ pub fn resolve(p: &mut MobilogramParams) -> Result<(Inputs, Config)> {
                     d.display()
                 )
             })?;
-            raw_of_spectra(&spectra)?
+            raw_of_spectra(&spectra).map_err(|e| {
+                anyhow!(
+                    "{e}; a mobilogram needs the .d: pass --raw with its path \
+                     (docs/35_diapasef.md section 17)"
+                )
+            })?
         }
         (None, None) => bail!("--raw is required without --run-dir"),
     };
@@ -490,51 +471,6 @@ pub(crate) fn frames_around(rts: &[f64], t: f64, n: usize) -> Vec<(usize, i32)> 
     (a..=b).map(|k| (k, k as i32 - j as i32)).collect()
 }
 
-/// The frame index of a `.d`: headers only, by MS level, in RT order.
-struct FrameIndex {
-    heads: Vec<Frame>,
-    ms1: Vec<usize>,
-    ms1_rt: Vec<f64>,
-    ms2: Vec<usize>,
-}
-
-impl FrameIndex {
-    fn read(raw: &RawTdf, path: &str) -> Result<FrameIndex> {
-        let heads: Vec<Frame> = (0..raw.reader.len())
-            .into_par_iter()
-            .map(|i| {
-                raw.reader
-                    .get_frame_without_coordinates(i)
-                    .map_err(|e| anyhow!("{path}: frame header {i}: {e}"))
-            })
-            .collect::<Result<_>>()?;
-        let (mut ms1, mut ms1_rt, mut ms2) = (Vec::new(), Vec::new(), Vec::new());
-        for (i, f) in heads.iter().enumerate() {
-            match f.ms_level {
-                MSLevel::MS1 => {
-                    ms1.push(i);
-                    ms1_rt.push(f.rt_in_seconds);
-                }
-                MSLevel::MS2 => ms2.push(i),
-                MSLevel::Unknown => {}
-            }
-        }
-        let rt_order = |v: &[usize]| {
-            v.windows(2)
-                .all(|w| heads[w[0]].rt_in_seconds <= heads[w[1]].rt_in_seconds)
-        };
-        if ms1.is_empty() || ms2.is_empty() || !rt_order(&ms1) || !rt_order(&ms2) {
-            bail!("{path}: frames are not in RT order, or MS1/MS2 frames are missing");
-        }
-        Ok(FrameIndex {
-            heads,
-            ms1,
-            ms1_rt,
-            ms2,
-        })
-    }
-}
-
 /// Half-open scan ranges of one frame.
 type Scans = Vec<(usize, usize)>;
 
@@ -649,13 +585,7 @@ pub fn run(mut p: MobilogramParams) -> Result<Mobilograms> {
 
     let raw = RawTdf::open(&inputs.raw)?;
     let fx = FrameIndex::read(&raw, &inputs.raw)?;
-    let n_scans = raw
-        .frame(fx.ms1[0])
-        .map_err(|e| anyhow!("{}: frame {}: {e}", inputs.raw, fx.ms1[0]))?
-        .scan_offsets
-        .len()
-        .saturating_sub(1);
-    let scan_im = scan_mobilities(n_scans, |s| raw.im_of_scan(s), &inputs.raw)?;
+    let scan_im = fx.scan_im(&raw, &inputs.raw)?;
 
     let mut done = Vec::new();
     let mut errors = Vec::new();
@@ -961,8 +891,8 @@ mod tests {
         };
         let raw = RawTdf::open(&path).unwrap();
         let fx = FrameIndex::read(&raw, &path).unwrap();
-        let n_scans = raw.frame(fx.ms1[0]).unwrap().scan_offsets.len() - 1;
-        let scan_im = scan_mobilities(n_scans, |s| raw.im_of_scan(s), &path).unwrap();
+        let scan_im = fx.scan_im(&raw, &path).unwrap();
+        let n_scans = scan_im.len();
         let mut checked = 0;
         for &fi in fx.ms2.iter().take(40) {
             let f = raw.frame(fi).unwrap();

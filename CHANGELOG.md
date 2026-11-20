@@ -216,6 +216,52 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **The engine's shared crates lose code nothing used (docs/02, docs/03).** `mumdia-core`
+  drops `ppm_match`, the `AMMONIA` constant and the five candidate-audit reason codes nothing
+  produced (`PEPTIDE_NOT_GENERATED`, `MODIFICATION_NOT_ALLOWED`, `CHARGE_OUT_OF_RANGE`,
+  `PRECURSOR_MZ_OUT_OF_RANGE`, `CANDIDATE_CAP_REACHED`), with the ladder helpers only their
+  tests called; the codes the audit writes keep their spelling. `mumdia-io` drops
+  `init_logging`, `write_batches_hashed`, the unhashed `write_table_chunked` and its unused
+  `thiserror` dependency. The file-publication code (`AtomicPath`, `publish_copy_of`,
+  `publish_byte_copy`) moves from `table.rs` to `publish.rs` and stays reachable under
+  `mumdia_io::table`, and the typed column getters of `Table` and `TableFile` share one decode
+  loop per reader. Every artifact is byte-identical. docs/14 no longer says that zstd Parquet
+  cannot be read.
+- **`build-library` counts its targets without holding the library's label column.** The
+  count read the whole `label` column into Arrow strings first, about 2 GB on a
+  203-million-row library; it now streams the column in 65,536-row batches.
+- **The prescreen uses the engine's 13C-12C spacing.** It defined its own `ISOTOPE_SPACING`,
+  7e-11 Da from the shared constant. Only a search with `prescreen.enabled` reads it, and only
+  a peak at a tolerance edge can tell the two apart.
+- **The rescore stage lost its duplicated and dead code (docs/11).** The target-decoy
+  and entrapment q kernels share one walk (`fdr.rs`, bit-identical), the strict-or-native
+  classifier fallback and the distinct counts at 1% are one helper each, `rescoring.rs`
+  reuses `fdr::count_targets_at_q`, `HandoffWriter::with_block_size` folds into `new`,
+  and five doc comments sit on their own items again. The developer guide cites
+  `stages/rescore.rs` by item instead of by line number; most of those numbers were stale.
+  Scored tables are unchanged.
+- **The entrapment sidecar receives f32 feature columns (docs/13).** They were widened
+  f32 values already, and the worker widens every column to f64 on read, so its input and
+  scores are the same (checked on a 4,000-row input written both ways), at half the
+  table's size. The configuration reference says who receives what: mokapot the
+  tab-separated PIN, the entrapment sidecar its own parquet table.
+- **`rescore.max_feature_matrix_gib` is judged on the rows the prefilter keeps**, the
+  matrix that is actually built; a pool whose uncut size was over the ceiling but whose
+  kept rows are under it now runs.
+- **Extract: one claimant test, one per-peak claim, and tables for the default gate and apex
+  rule.** The candidate test of the two-pass claims (window, Q1 decision, allowlist) was
+  pasted into five closures and is now `Guard::claims`; the `none` / `winner_predicted_intensity`
+  / `proportional` claim was pasted into the streamed and the serial path and is now
+  `apply_claim`; the two-pass path takes the window groups the stage already builds. The
+  window-mean gate (`window_summed`, `window_mean_score`) and the apex choice (`pick_apex`)
+  are plain functions with table tests, which pin the f32 tie of the evidence-rank apex: past
+  about 2e6 to 8e6 of signature intensity, scans of equal count tie and, without the RT prior,
+  the earliest wins (docs/09 said the RT prior always decides). The MS1 rescue's fragment floor
+  is gone, because `presence_min_fragments` already held where it is read; the configuration
+  reference now says that `presence_min_matched` and `presence_min_fragments`, and
+  `fixed_scan_window` and `min_coelution_run`, floor the same number and the larger of each pair
+  applies, and documents `fixed_scan_window`. Default output is unchanged (checked byte for
+  byte on a 3D, a diaPASEF and a ZT Scan run).
 - **The library helpers share their peptidoform and fragment-table rules
   (`scripts/_lib_io.py`).** The stripped sequence, the `DECOY_` marker, the I/L key, the
   ProForma N-terminal group, the fragment-table schema and the 0.01 Da cardinality bins were
@@ -233,9 +279,163 @@ than a number. Both are recorded in every run's `manifest.json`.
   already writes it in `candidate_id` order, so the rows are identical; the parquet row-group
   layout of the output changes (the writer's default row groups instead of one per sort
   bucket), which the engine's range reads accept.
+- **A converted mzML that needs a disambiguating suffix is named with blake3.** When two
+  vendor inputs in one folder share a name (`sample.raw` beside `sample.d`), each is
+  converted to `<stem>.<8 hex>.mzML`, and that suffix came from the standard library's
+  default hasher, which may change between Rust releases: a toolchain update would rename
+  the file, so `convert.reuse_converted` missed it and the input was converted again. The
+  switch renames these files once. Each such input is converted again on its first run
+  after the update, and the previous mzML stays beside it until removed by hand. Inputs
+  with a name of their own keep `<stem>.mzML`.
+- **`convert`, `run` and `run-experiment` key the convert artifacts' provenance through one
+  function (`convert::provenance_hash`).** Each built the hash of the configuration and the
+  conversion caps by hand, and the copies had already disagreed once. The hashes are
+  unchanged.
+
+- **The features stage writes its optional families by name.** The 37 Q1-profile,
+  per-fragment Q1, MS1-envelope and Q1-consistency columns were written through
+  hand-numbered positions that had to follow the order of their name lists, so reordering a
+  list would have put values under the wrong names without an error; they are resolved by
+  name once and written in a loop, as the other appended families already were, and the
+  extended names are read off the same plan as the values. Unused or test-only entry points
+  are removed (`features::run_with_bounds`, `active_features_with` / `_q1` / `_all` /
+  `_q1c` / `_for` and the unread `FeaturesParams::config_hash`), and a test now checks how
+  the stage feeds the default-on RT-window family. Every table, the PIN and the
+  configuration hash are unchanged.
+- **Retrace and `mumdia mobilogram` share their `.d` reading.** The frame index, the scan to
+  1/K0 axis and the lookup of the `.d` a spectra artifact was read from were written twice,
+  once per stage; they now live once in `convert::tims_frames`. A missing `.d`, or spectra
+  that were not read natively, is reported in the same words by both, each adding its own way
+  out. Retrace's MS1 mass-residual median uses the shared median, and the unread
+  `CompeteParams::config_hash` is gone. Every output is byte-identical.
+- **The `quant-lfq` combine lives beside the MaxLFQ core.** `run_lfq_combine_grouped`, the size
+  factors, `write_size_factors_tsv` and the sibling-matrix paths moved from `stages/quant.rs` to
+  `quant_lfq.rs`, and the `run_lfq_combine` wrapper, which only a test called, is gone. The
+  profiles of the protein, precursor and peptide matrices are solved in parallel, in group
+  order, so the matrices are byte-identical. The export passes of the cross-run step no longer
+  write, hash and then delete a peptide and a protein table per run
+  (`QuantParams::out_peptide` and `out_protein` are optional), and `CidSet` takes over the
+  first-apex count `CidMarks` kept. Every output is the same.
+- **`quant.peak_window_mode = consensus` warns under a fixed window.** It sets the half-widths
+  of the walked window, and under `fixed_scan_halfwidth` or `fixed_window_s` (the default is a
+  fixed window) every candidate with an apex is integrated over the fixed window instead, so
+  the setting changes no quantity. It is still accepted.
+- **The ZT Scan analysis computes each shared rule once, with the same output.** The expected
+  Q1 centres of a candidate and of its fragments (four copies) and a fragment's transmission
+  through the window (two) are each one function; the Q1 calibration reads its seed anchors and
+  decoys, its library fragments and its peak matches with one reader each, and takes a
+  fragment's charge from its name as extract does (the same charge for every library the
+  engine and its helpers write); the Q1 calibration and the MS1 envelope use the nearest-peak
+  rule of `spectra::nearest_peak`; `mumdia run` and `mumdia extract` set extract's ZT Scan keys
+  through one function, so the two cannot drift; extract builds the sweep's Q1 grid once
+  instead of twice; and `features.q1_consistency` computes the sixteen scores the classifier is
+  given instead of 24. A test now runs extract with the per-fragment Q1 decision on a
+  calibrated synthetic sweep. A ZT Scan search and a search of other data write the same
+  tables as before.
+- **`predict-frag` holds only the fragments it keeps.** Every b/y fragment of every
+  candidate, at both charges, stayed in memory from the parse until after the top-N cut: about
+  1.5 KB per candidate for a 15-mer, of which the library keeps 6 to 12 fragments. Each
+  candidate's fragments are now generated when its intensities are assigned, cut to the m/z
+  limits and the top-N there, and only the kept ones are stored. The native heuristic is
+  computed only for the candidates whose fragments read it, which on the default `HCDch2` model
+  is none. Libraries are byte-identical.
+- **A fragment model without a charge-2 series warns when charge-2 fragments take the
+  heuristic.** With a single-charge MS2PIP model (`HCD2021`, `TTOF5600`, ...) and charge-2
+  fragments, those fragments take the native heuristic, each charge group normalised to its own
+  peak, which on a whole-proteome FASTA library left the seed without a confident PSM (docs/06).
+  `predict-frag` now says so once, with the count and the two remedies: a `*ch2` model, or
+  `predict_frag.charge2_from_precursor_charge = 99`. The library is unchanged.
+- Internal, with no output change: the native predictors are plain functions instead of
+  one-implementation traits, the DeepLC request deduplicates peptidoforms with the helper the
+  IM2Deep request uses, the seed computes the observed 1/K0 of its anchors and of the 1/K0
+  window sizing with one function, and the unread `config_hash` field of the digest,
+  peptidoform, predict-frag and search-seed parameters is gone.
+- **`run-experiment` searches a run whose multi-head calibration is skipped on base-model
+  retention times, as `run` does.** A run whose seed is short of anchors at every
+  `rt_im_train.anchor_q_ladder` rung skips the multi-head calibration. `run` then re-predicted
+  an imported library with the DeepLC base model, but `run-experiment` searched the imported
+  iRT, because its experiment-level re-prediction is not made when a calibration is planned.
+  The experiment now makes that re-prediction once, on the first run that skips, as
+  `fragment_library_precursors_deeplc.parquet` at the experiment root, and every run that
+  skips reads it. Under `rt_im_train.library_irt = library` both keep the imported iRT, which
+  `run` replaced before when `multihead_calibration` was set explicitly. Both orchestrators
+  now run one retention-time adaptation (`chain::adapt_rt_library`). Output changes only where
+  a calibration is skipped. On two Q Exactive E. coli runs against an E. coli library with
+  human entrapment, with the calibration skipped in both (`min_seed_for_calibration` above
+  their anchors), the base-model retention times gave 7,287 and 7,242 precursors at a
+  run-level q of 1% against 5,339 and 5,323, at a combined entrapment FDP of 1.34-1.35%
+  against 1.56-1.68%.
+- **A grouped search with `rt_im_train.finetune_deeplc` is refused when the configuration
+  loads.** A grouped run (`groups.window_groups > 1`) cannot fine-tune, and it said so only
+  when it started, after the library build and the conversion. `Config::validate` refuses the
+  combination now, beside the other grouped refusals.
+- **`extract.emit_candidate_audit` no longer makes a grouped run of `run-experiment` pool its
+  tables.** Only a single `run` runs the candidate audit, yet under `run-experiment` the
+  setting made every grouped run read and rewrite its bands' extracted rows (and, under
+  `groups.pool_competed = false`, its competed rows) for no reader. `run-experiment` warns
+  once that the setting has no effect there; scored and quantification tables are unchanged.
+- **Contradictory configurations are refused at load, not hours into a run.**
+  `rt_im_train.window_holdout_frac` above 0.9 (the load accepted values up to 1, which the
+  retention-time stage then refused), `window_holdout_frac` together with
+  `adaptive_rt_window`, a `local_window_multiplier` that is not positive,
+  `rescore.features` together with `rescore.features_file`, and an empty `rescore.features`
+  list were refused only by the stage that reads them: after conversion, the seed and the
+  multi-head step, or for the rescore after every run of an experiment. Each such
+  configuration failed then and fails at load now, for every subcommand. A `features_file`
+  that turns out to be empty is still refused by the rescore, which reads it.
+- **A FASTA `run` or `run-experiment` refuses `digest.decoy.strategy = none` before the
+  digest.** That strategy writes targets only, and the library was refused when the seed
+  loaded it, after the whole prediction. `digest` and `build-library` still accept it, for a
+  target-only library.
+- **`run` checks that an explicit `predict_frag.deeplc_python` exists before an
+  imported-library search under `rt_im_train.library_irt = auto`**, as `run-experiment`
+  already did. Such a search always starts the retention-time worker, and a wrong path
+  failed there, after conversion and the seed. The interpreter checks in the preflight of
+  both orchestrators that the interpreter resolution before them can no longer reach are
+  removed, and the one warning they shared is one function.
+- **`mumdia extract` and the orchestrated search set extract's copies of the `features` and
+  `retrace` keys in one place (`ExtractConfig::set_search_keys`)**, so a key added later
+  cannot reach one and not the other. The evidence written is unchanged.
+- **A test pins the default canonical configuration**
+  (`crates/mumdia-core/src/default_canonical.json`), the text the manifest's `config_hash`
+  hashes. A new field serialized at its default, or a default changed by mistake, moved the
+  hash of every run without failing a test. None of the changes above moves a canonical
+  configuration: the default, every example and Docker configuration, and their diaPASEF and
+  ZT Scan resolutions serialize as before.
+- **The retention-time and mass calibrations share their helpers.** `Loess::fit` is
+  `Loess::fit_robust` with no iterations instead of a second copy of the fit; the robust-SD
+  factor is one constant (`calibrate::MAD_TO_SIGMA`) instead of seven copies; the fragment mass
+  offset is `calibrate::percentile(.., 0.5)` instead of its own median. The test-only
+  `masscal::fit` and `DEFAULT_TOL_FLOOR_PPM`, the pass-through `rt_im_train::run_hashed` and
+  `rt_im_train::apply` are removed, and the NNLS scratch API, which no caller reused, is
+  private. Every artifact is byte-identical.
+- **The composition RT correction reads the library's peptidoforms as one buffer** instead of
+  one `String` per library row (about 0.6 GB on a 10.9M-row library), and a grouped run learns
+  the MS1 offset on the MS1 scans its extraction phase decodes instead of decoding them once
+  more for it. Both are byte-identical.
+
+- **`localise` keeps one copy of its call, position-ratio, false-localisation-rate and rate
+  code for the run and experiment levels, of the fragment window and slot filter for its
+  evidence readers, and of the composition deltas for its two keys.** It reads the FASTA once
+  per experiment, keeps the apex 1/K0 of the localised rows only, and has a test of the 1/K0
+  evidence path. Output unchanged.
 
 ### Removed
 
+- **`MUMDIA_PARQUET_PLAN` (docs/03).** It turned off the float-encoding plan of capped
+  writers, for a byte comparison against binaries from before 0.5.0; release checks compare
+  decoded tables. A set variable is now ignored.
+- **`rescore.classifier = "percolator"`.** It was never wired: configuration validation
+  already refused it ("rescore.classifier=percolator is not wired"), so no configuration
+  that loaded could select it. A configuration naming it now fails to parse with an
+  unknown-variant error instead, and the desktop application, which builds its options from
+  `configs/config-schema.json`, no longer offers it. `rescore.percolator_bin` stays a dead
+  field.
+- **The index form of the per-run q for a source column that decreases**, which `rescore`
+  never builds (it refuses such inputs, and its row gathers keep the order); such a column
+  is now a panic rather than a second code path. Also the per-row percolator reference
+  test, whose one remaining job, pinning the f32 rounding of `score_std_row`, is a direct
+  test now, and the `MUMDIA_BENCH_BASELINE=per_row` arm of the fold-cost benchmark.
 - **`scripts/assemble_survivors.py` and `scripts/shard_parquet.py` (docs/32).**
   `assemble_survivors.py` was a deprecated copy of `mumdia sub-library --survivors`, which
   applies the same pair link on `peptidoform_id` while streaming both tables (1.6 GB against
@@ -250,9 +450,186 @@ than a number. Both are recorded in every run's `manifest.json`.
   rebuilt every decoy of the library that way, predicted ones included; a library predicted
   with `--met-excision`, which the desktop's build passes, closes that gap at the source.
   Decoys are built with `make_reverse_decoys.py` followed by `predict_decoys.py build`.
+- **Dead code of the library index and the matchers.** Six `Library` loaders that only tests
+  called (`load`, `load_with`, `load_range_with`, `load_with_fragment_offset`, `load_mz_only`,
+  `load_row_span_with`; stages use `load_for_stage` and `load_mz_only_for_stage`),
+  `Library::release_fragment_payload`, `index::deconvolve`, `FragIndex::tol_ppm`,
+  `chromatograms::Encoder::rows`, and three ignored micro-benchmarks of settled decisions
+  (their numbers stay in the code comments and docs/06, docs/15). The equivalence-gate
+  scorers (`matchers::naive`, `score_scan_count_dot`) are compiled for tests only. The seven
+  private copies of the median in quant, the cross-run LFQ, the Q1 fragment model and two
+  feature families now call one kernel, `stats::median` / `stats::median_or`; every table is
+  byte-identical.
+- **`compete.mode = features_only`.** It kept the same candidates as `none` through the same
+  code; the name only described an intent. A configuration that sets it still loads and runs
+  as `none`, with the same identifications, but its config hash and the compete report's
+  `params.mode` now say `none`.
+- **Compete's row-group splice.** When competition removed a few rows, compete copied the
+  features row groups that lost none as bytes and rewrote only the others. The shipped
+  grouping removes no row, and a grouping that removes many dirties every row group and was
+  rewritten anyway, so the path ran only for a handful of duplicate rows. Such a table is now
+  rewritten, with the same rows, order and values; its row groups and file hash can differ, and
+  the compete report no longer carries `publish = spliced`, `rewritten_row_groups` or
+  `row_groups`.
+- **Unreachable and duplicated orchestration code.** The seed pool's combination of the
+  bands' scalar mass calibrations, kept for band directories without a calibrant sidecar,
+  which every band now writes (a missing one is an error naming it); the grouped run's
+  fine-tune branches; an unreachable log line of `run`; and output fields nothing read. The
+  union-mode band libraries and the prescreen survivors are hashed only when a manifest
+  records them, and a grouped run removes the pooled tables an earlier run left with the
+  shared helper, a stale pooled `psms_extracted.parquet` included. Output is unchanged.
 
 ### Fixed
 
+- **Desktop: a diaPASEF search is no longer split into bands (#351).** "Bands: Automatic" (the
+  default) planned the search from the machine's memory alone, so a large search space on a timsTOF
+  diaPASEF `.d` was given several bands, and the engine stopped it after Start: bands are refused on
+  spectra that carry 1/K0, and the diaPASEF recipe's retrace is refused with bands (`invalid config:
+  retrace.enabled is not supported with groups.window_groups > 1`). With a diaPASEF input selected,
+  Automatic is now one band, written over a preset's own bands; the note under Bands says why, and
+  says when the estimate exceeds the memory budget, naming `extract.windows_in_flight` 1 as the
+  lever that works there (bands for diaPASEF are #350). A custom band count above one on such input is
+  refused before Start, which checks every file again first. In a batch searched separately, the
+  files that are not diaPASEF keep Automatic's plan. Other inputs are planned as before
+  (desktop/README.md, "Prescreen, bands and modifications on the Search screen").
+- **Desktop: a prescreen on diaPASEF input is refused before Start (#351).** The engine refuses
+  all three prescreen modes on spectra that carry 1/K0, which the Search screen let through to
+  Start; it now names the files and asks to set Prescreen to Off, and the band plan no longer
+  counts a prescreen that cannot run there.
+- **A build whose `git status` fails no longer claims a clean tree.** The build script read
+  a failed `git status` as a clean worktree, so the binary's `git_sha`, which every manifest
+  records, could name a commit without `-dirty` for code that differed from it. An unknown
+  state now counts as dirty; a build without git still records `unknown`.
+- **The bucketed matcher reads every posting at the lower edge of its tolerance.** A run of
+  equal fragment m/z (a shared ion such as y1) can end one bucket of the bucketed index and
+  start the next; a probe whose lower bound equalled that m/z started at the last such bucket
+  and missed the postings before it. Only a configuration that sets `search_seed.matcher` or
+  `extract.matcher` to `"bucketed"` reaches this; the default `fragindex` matcher is
+  unchanged, and so is every default output.
+- **Retrace keeps the frames of a candidate whose rows continue into the next row group.**
+  Retrace reads the chromatograms one row group at a time and holds only the MS2 frames of the
+  isolation windows that the row group's candidates need. It counted those candidates from one
+  past the previous row group's last, so a candidate whose rows straddle the boundary, which is
+  routine, was left out: when no other candidate of the new row group shared its window, the
+  frames were dropped and its remaining fragment points were rebuilt as zeros, with only a warning
+  about grid points without a decoded frame. The windows are now wanted from the row group's first
+  candidate. Only a diaPASEF search with `retrace.enabled` (the diaPASEF recipe) can change, and
+  only for such a candidate; 3D searches are byte-identical. It takes a window edge between two
+  adjacent library precursors at a row-group boundary: on a timsTOF Ultra 2 E. coli entrapment
+  run searched with the recipe, 376 of the 405 row groups opened with a straddling candidate (6,061
+  of 6,472 with `MUMDIA_CHROM_ROW_GROUP_ROWS` at 4,096) and none of them needed a window the rest
+  of its row group did not hold, so every table of that search is unchanged.
+- **Shadow demotion is per run in a pooled rescore (docs/11, "rescore: shadow demotion and its
+  Q1 term").** Its first pass grouped the precursor q on peptidoform and charge over the whole
+  pool, and a grouped q goes to the group's best row only, so a precursor accepted in several
+  runs was accepted, and lent its fragments, in its best run alone: every other run lost that
+  lender and the share of its examined region (`shadow_region x accepted`) that it sized. The
+  first pass now groups on run, peptidoform and charge, as the demotion is described. One run
+  has the same groups and writes the same tables; a pooled rescore (`run` with several
+  `--mzml`, `run-experiment`) demotes about three times as many shadows over three runs, so its
+  scores and counts change: on the ProteoBench Astral entrapment set (three runs pooled, three
+  NN seeds) +1.8% precursors at an experiment-wide 1% with the paired entrapment FDP
+  0.89% -> 0.86%, and +1.5% per run at 0.67% -> 0.62%. The stage interns peptidoform and
+  charge once instead of twice, and the shadow test no longer holds an apex 1/K0 and an isolation window for every pooled row (24 bytes a
+  row, about 6 GB at a 259M-row pool): it keeps 1/K0 values only with `shadow_im_tolerance`
+  set and finds the window of the rows it reads, and its rows drop the label it never read,
+  with the same output.
+- **The rescore prefilter no longer sends a pool to the untrained ranking.** Its guard
+  counted the decoys before the cut: a pool with 100 to 285 decoys passed it, the cut at
+  0.35 kept fewer than `rescore.min_train_decoys`, and the stage then ranked the pool by
+  `prelim_score`. The guard now counts the decoys the cut keeps, so such a pool goes to the
+  classifier whole. Only reachable with `rescore.prefilter_min_psms` lowered from its
+  default; every other pool is scored as before.
+- **Two successful rescore paths no longer leave the sidecar handoff in the work
+  directory.** A pool with too few decoys to train on streamed a handoff it never used, and
+  a worker that found no training signal left its handoff behind; neither is written or
+  kept now (`MUMDIA_KEEP_HANDOFF=1` still keeps them).
+- **A scored column of the wrong length is an error.** `write_scored` sliced every column
+  at the table's rows, so a column a row gather (the prefilter cut, the top-K collapse)
+  missed would have been written misaligned; it now refuses it, and one test reaches both
+  gathers.
+- **Extract's opt-in peak claims do what their documentation says.** No shipped
+  configuration, example or desktop setting sets any of them, so default runs are unchanged.
+  - `extract.peak_claim = winner_predicted_intensity` and `proportional` compared a peak's
+    claimants only within a candidate sub-range of the streamed path, whose width follows the
+    thread count and `windows_in_flight`: a peak went whole to several winners, its
+    proportional shares added up to more than the peak, and the hits changed with the
+    machine. Under these two claims each window is now probed as one task.
+  - `extract.emit_contested_features` takes the two-pass path, which applies only the
+    co-elution claims, so beside `winner_predicted_intensity` or `proportional` every claimant
+    kept the full peak without a word. The pair is now refused.
+  - `extract.apex_refine_intensity` moved the apex to the region's first scan when none of the
+    signature fragments was seen in the region, the lowest-RT fallback `apex_evidence_rank`
+    was made the default to remove. A scan without signature intensity no longer moves it.
+  - The destructive `peak_claim = coelution_demix` solved over every co-isolated claimant of a
+    scan, ignoring `extract.demix_max_candidates`; it keeps to the cap now, as the demix
+    features do, and a claimant past it gets no abundance.
+- **Smaller extract slips.** A standalone `mumdia extract` with both `--fragment-offset` and
+  `--restrict-candidates` read the allowlist's library-wide ids as band-local ones, so it
+  extracted nothing or another band's candidates; the ids are rebased onto the band. A
+  `chromatograms_q1.parquet` left in a reused output directory by an earlier ZT Scan run was
+  recorded in the new run's manifest; it is recorded only when this run's extract writes one.
+  The chromatogram tables were published before `psms_extracted` was finished, so a failure
+  of that last write left new chromatograms beside the previous PSM table; they are published
+  after it. The footprint refusal told a run that holds the whole run's matches at once (a
+  co-elution claim, the contested features, the bucketed matcher) to lower
+  `windows_in_flight`, which does not bound that path; it now names the setting that put the
+  run there. It also called every band with one window an all-ion layout, which it now does
+  only for a window that holds every spectrum of the run (or more than 100,000).
+- **A ZT Scan run with too few confident seed PSMs for a Q1 calibration is searched on the
+  nominal Q1 window (docs/08, section 4h).** Below 200 seed fragment profiles (about 35
+  confident PSMs: a blank, a failed injection, a wrong library) the calibration recorded
+  `too_few_profiles` and extract stopped the search, and in an experiment every run with it;
+  the analysis is automatic for ZT Scan files, so it could only be turned off for every run.
+  Such a run now gets the nominal window (centred on each step's target, the half-width as
+  read, one step of edge), the decision tolerances at their floors and the seed's
+  deconvolution tolerance, with a warning, and writes every column a calibrated run writes, so
+  a pooled rescore keeps one feature set. A run with a calibration is searched as before.
+- **Extract accepts a ZT Scan sweep from which convert dropped a spectrum.** Convert skips an
+  MS2 spectrum whose scan time is not finite, with a warning, and records each spectrum's step
+  as its position in the cycle, so every later step of that cycle was recorded one too low,
+  and the per-fragment Q1 decision refused the run after the seed, the RT fit and the Q1
+  calibration had accepted it. Extract now places each spectrum by its target's rank, as the
+  Q1 calibration already did, and the dropped spectrum is an empty cell. A sweep without a
+  dropped spectrum is read as before.
+- **A FASTA search finds the library `build-library` stored.** With
+  `predict_frag.defer_deeplc_to_multihead` (the default) and DeepLC retention times, `run` and
+  `run-experiment` keyed the library cache on a library with placeholder retention times, while
+  `build-library` always stores the library with DeepLC's, so the search missed the entry and
+  built the library again (about an hour on a 9.8M-peptidoform FASTA), although `library.json`,
+  the command's summary and the desktop said it would be reused. The search now decides the
+  deferral once, before the library is built: when the cache holds that entry it restores it and
+  runs without the deferral. The final tables are those of the deferred search, because the
+  multi-head calibration re-predicts every row either way; the run's library table and the
+  seed's pass-through iRT carry DeepLC's retention times instead of the placeholder. Without
+  such an entry nothing changes.
+- **`mumdia sub-library` no longer pair-links a FASTA-built library into an unpaired one.**
+  The default `--pair-link` unions the keep decision over `peptidoform_id`, which a target and
+  its decoy share only in an imported library; a FASTA-built library gives each decoy its own
+  id, so a list of identified targets gave a sub-library with few or no decoys and exit 0. A
+  library with both labels in which no `peptidoform_id` repeats is now refused, naming
+  `--no-pair-link` with a pair-complete list and `run-experiment`'s second pass, which pairs on
+  the base peptide and charge.
+- **A FASTA that yields no peptide fails at the digest.** A file without `>` headers, or a
+  length range no peptide fits, gave an empty library and a failure much later, at a predictor
+  or at the seed's library load, with a message that pointed away from the FASTA. The digest
+  now stops, naming the proteins read and the length range.
+- **`mumdia rt-im-train` relaxes the anchor cut through `rt_im_train.anchor_q_ladder`**, as
+  `run` and `run-experiment` do. On a seed short of anchors at `q_train` the standalone stage
+  wrote the fixed fallback window where a run fitted a calibration.
+- **`rt_im_train.rt_window_min_s` floors every RT half-window.** Only the adaptive window read
+  it; the global `w_rt`, held-out or in-sample, had a literal 1 s floor. The default is 1 s, so
+  only a configuration that sets it above a run's `w_rt` changes.
+- **The held-out split of `rt_im_train.window_holdout_frac` rounds the same way in the worker
+  and in the engine** (half away from zero). At a fraction such as 0.0125 the engine held out
+  the peptides with `base_peptide_id % 1000 < 13` and the worker excluded only those below 12,
+  so peptides scored as held out had entered the fine-tune reference.
+- **The `search_seed.mass_cal_loess` grid is fitted on the deviations inside the offset's
+  window.** It was a local mean over every calibrant deviation, random matches of the 50 ppm
+  collection window included, which pulled it toward 0 where the median offset did not move.
+  Off by default.
+- **Three messages of the decoy-corrected 1/K0 window sizing no longer contain a run of
+  spaces.**
 - **Desktop: "Add folder…" selects several spectra folders at once (#335).** A Bruker or Agilent `.d`
   and a Waters `.raw` are directories, so they are added with "Add folder…", and that dialog took
   one folder at a time: the spectra folder picker shared the single-choice setting of the output
@@ -335,6 +712,130 @@ than a number. Both are recorded in every run's `manifest.json`.
   winner-only entry) every table is byte-identical; on eight wells of a single-cell plate (five
   sharing 388 to 1,289, 17 winner-only entries) 53 of 7,808 entries moved, by at most 6.8 s.
   `localise.combine_runs` aligns its runs with the same curves.
+- **The native Thermo read ends with its error instead of hanging (`convert.thermo_native`).**
+  When the spectra could not be written part-way through a file (a full disk), the reader
+  thread blocked for ever on its full queue, and the conversion neither ended nor reported
+  the error. Only an engine built with the opt-in `thermo` feature reads a `.raw` this way;
+  a test now drives the same decode into an error.
+- **`convert` finds the spectrum count of an mzML whose header runs past 1 MiB.** The count on
+  `<spectrumList>` was looked for in the first mebibyte only, and a SCIEX method with more
+  than about 1,250 experiments writes it later. The conversion then skipped its truncation
+  check and its parallel decode without a word, so a truncated copy of such a file converted
+  at exit 0. The header is now read once, up to 16 MiB, for the count and the instrument.
+  Converted spectra are unchanged.
+- **Smaller convert slips.** The `spectra: decoded MS2` log line gave the size of a memory
+  report (2 or 3) as its part count; the configuration reference (docs/24) and the `raw.rs`
+  module doc said that the engine reads mzML only, though it reads a diaPASEF `.d` natively
+  and, in a `thermo` build, a Thermo `.raw`; and the log line of
+  `convert.keep_converted_mzml = false` carried 14 stray spaces. The unused
+  `raw::is_thermo_raw` and the test-only copies of the serial spectra decoders are removed,
+  and the vendor converter run has its first test: a stand-in converter that fills both
+  output pipes, and one that exits 0 without writing a file.
+
+- **`features` refuses a chromatogram read that ends early.** With more than one thread
+  each chunk loader decodes its batches one ahead on a helper thread. A panic there (a
+  corrupt page, a decoder bug) closed the channel exactly as the end of the table does, so
+  the chunk came back short without an error: the missing candidates' PSMs got default
+  fragment features and zero extended values, and the stage published the table. A chunk
+  with fewer rows than its plan counted is now an error, as it already was for the
+  confident-bounds reader.
+- **A banded run no longer warns that `bound_from_confident` is set when it is off.** The
+  pooled elution bounds were fitted whatever the key, and with it off (the default) every
+  run with window groups, the desktop's memory bands included, logged that the key was set
+  but had fewer than 20 anchors. The fit now returns at once with the key off; the result
+  was already no global bounds.
+- **A shadow test that cannot demote is refused.** With the test on (`rescore.shadow_min_shared`
+  above 0, the default), a zero or negative `rescore.shadow_ppm` or `rescore.shadow_rt_s`, or
+  `rescore.shadow_region = 0`, demoted nothing while the run still reported the test as on. The
+  configuration is now refused, and the message names `shadow_min_shared = 0` as the off
+  switch.
+- **The help of `compete.group_by` and `compete.unique_evidence_min_fragments`, which the
+  desktop application's settings show.** The first named `precursor`, a value the parser has
+  refused since it became `base_peptide`; the second promised a `unique_fragment_count` feature
+  that no build writes, and a fallback that cannot happen. Both now say what the code does:
+  the unique evidence is `n_matched_fragments` x (1 - `peak_contested_frac`).
+- **Cross-run size factors survive a run with no quantified precursor.** The median-ratio
+  factors of the cross-run LFQ were fitted on the features quantified in every run, so one
+  blank well or failed injection left none, and every run kept factor 1 with only an info
+  line to show it. Such a run now keeps factor 1 with `n_features` 0, the other runs are
+  normalised over the features they share, and `quant-lfq` warns, naming the runs, and when
+  the factors rest on fewer than 20 features. This changes `lfq_maxlfq.parquet` and its
+  precursor and peptide siblings, `lfq_size_factors.tsv`, the `lfq_<run>` columns of
+  `proteins.tsv` and the `normalised_<run>` columns of `precursors.tsv` of an experiment with
+  such a run; an experiment in which every run quantified a precursor is byte-identical.
+- **`proteins.tsv` leaves the `lfq_<run>` cell of a run without the protein group empty.** The
+  cross-run matrix holds 0 for a run in which the group has no feature, which is a missing
+  value; `precursors.tsv` already printed it empty, and `proteins.tsv` printed `0.0`. The
+  Parquet matrix is unchanged.
+- **`quant.fixed_scan_halfwidth_scale` no longer subtracts a background measured inside the
+  window.** Where a candidate's chosen window covered its whole trace in every run, no flank
+  beyond it was measured, and the fragment kept the background measured beyond the narrower
+  `fixed_scan_halfwidth` window, inside the wider window it was subtracted from. Such a
+  fragment now takes no experiment background (the per-run fallback). Only experiments that
+  set the opt-in key change.
+- **`quant` refuses `--out-peak-bounds` over one of its inputs**, as it refuses the other
+  outputs (docs/31 F6): given the `--psms-scored` path, it replaced the scored table with the
+  peak-window diagnostic. `--psms-extracted` and `--spectra-ms2`, read under the Q1 keys, are
+  guarded too.
+- **The manifest records `peptide_quant` v4 under `quant.q1_fragments`.** `run` and
+  `run-experiment` recorded v2 or v3 for the v4 table quant wrote, with its `q1_quant` column.
+- **`quant.window_centre = profile` is refused on a chromatogram table without
+  `predicted_intensity`**, as the rules that rank by prediction are: every prediction read 0,
+  and the window was placed on the first fragments in table order. Only an explicit profile
+  centre with a rule that does not rank by prediction reached it.
+- **The run manifest names the retention-time model that ran.** A run whose multi-head
+  calibration was skipped for want of anchors recorded `multihead-80` as its
+  `model_identities.rt_predictor`, and a grouped FASTA run without a DeepLC step recorded
+  `imported-library`. They now record the base-model re-prediction (`deeplc-<version>-base`),
+  or the library's own model (`imported-library` for an imported library, the configured
+  `rt_predictor` for a FASTA one). No table changes. docs/33 no longer describes a per-band
+  view of the pooled seed that no code writes.
+- **Configuration help that contradicted the code (docs/24 and the desktop's settings help
+  are generated from it).** `extract.gate_min_score` named `apex_pearson` as the default gate
+  mode (it is `window_mean`, one of seven); `extract.emit_candidate_audit` promised a
+  `<psms>.audit.parquet` that extraction never writes (the flag gates the audit stage);
+  `extract.ms1_rescue` named only the single-scan Pearson gate (it applies under every
+  `gate_mode`); `rt_im_train.multihead_calibration` said it cannot be shared across an
+  experiment (`experiment.rt_library_scope = first_run_only` shares it);
+  `rt_im_train.local_window_anchors` called itself mutually exclusive with
+  `adaptive_rt_window` (the adaptive window takes its place); `quant.q_filter = run_psm_q`
+  cited a script that does not exist; the diaPASEF support gate went off on 2026-11-19, not
+  2026-11-17. docs/02 listed `apex_pearson` and a `train_neg_ratio` of 3.0 as defaults, and
+  configs/README.md listed the support gate as on for diaPASEF input.
+- **The refusal of `search_seed.q1_deconvolved` together with `count_fragments_once` printed
+  runs of spaces in the middle of its message.**
+- **A search whose interpreter was found on PATH no longer stops at the start.** Discovery
+  stores such an interpreter as its bare name (`python3`), and the second, strict resolution
+  in `run` and `run-experiment`, as well as `run-experiment`'s check that every configured
+  interpreter exists, tested that name as a file in the working directory: a required role
+  (`nn_torch`, `mokapot`, the FASTA predictors) or, in `run-experiment`, a DeepLC found only
+  on PATH refused the run with "points at python3, which does not exist". A bare program
+  name now counts as found, and a path must name a file (`python::interpreter_missing`,
+  used by every such check).
+
+- **`localise`: the experiment temperature can rise past a prior above 8 (docs/36 section
+  3b).** The fit's grid of temperatures stopped at 7.95 whatever its prior, and the experiment
+  level centres the prior on the run temperature times the square root of the mean number of
+  runs summed, which passes 7.95 at roughly 32 to 99 runs. When the decoy residue then showed
+  the model over-confident, the fit sharpened the posterior to 7.95 instead of flattening it.
+  The grid now reaches eight times a prior above 1; every existing grid point keeps its value,
+  so the run level and every experiment fit that stayed below the old top are unchanged.
+- **`localise`: an identified site outside the configured rules stays a placement (docs/36
+  section 2).** With rules narrower than the library's (an imported library, or `mumdia
+  localise --config` with another configuration), the representative's own site was no
+  hypothesis, so a peak with one configured residue left was `unambiguous` at 1.0 on a residue
+  no row identified (`AGYS[Phospho]PEK` for an accepted `AGY[Phospho]SPEK` with Phospho on S and
+  T). The site is now added to its peak's candidate slots, with a warning per modification.
+- **`localise`: a modification written as a mass is localised.** A bracket within 1e-3 Da of
+  the catalogue mass was taken as the modification and then dropped when more than 1e-6 Da
+  remained, so a library writing Phospho as `+79.9663` left every phospho row out of
+  `localisation.parquet` and `sites.tsv`, without a warning.
+- **`localise.prior_strength` must be above 0.** At 0 a class with all of its ions present, or
+  none, gave a rate of exactly 1 or 0, every hypothesis minus infinity, NaN site probabilities
+  and a `localised` call. Such a configuration is now refused.
+- **`mumdia localise --experiment-dir --sources` requires `--out-dir`.** In place, a subset
+  overwrote those runs' tables and the experiment-level table with a fit on the subset, while
+  the manifest still presented them as the whole experiment's.
 
 ### Security
 

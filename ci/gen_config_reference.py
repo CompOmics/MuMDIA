@@ -1242,10 +1242,6 @@ COMPUTED_ENV_DEFAULTS: dict[str, str] = {
         "coalesced scan or inside a rayon pool. `k` asks for k groups, `1` is one reader "
         "(`table.rs` `automatic_decode_groups`)"
     ),
-    "MUMDIA_PARQUET_PLAN": (
-        "on (capped writers plan their float encodings). `0` / `off` / `false` / `no` "
-        "restores the unplanned layout (`table.rs` `plan_enabled`)"
-    ),
     "MUMDIA_PARQUET_THREADS": (
         "min(`--threads`, 8), or min(cores, 8) without `--threads`. `0` or `1` is serial "
         "(`codec.rs` `codec_threads`)"

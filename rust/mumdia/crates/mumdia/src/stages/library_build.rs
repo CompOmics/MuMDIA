@@ -86,6 +86,38 @@ pub struct Library {
 pub type PeptidoformFilter<'f> =
     &'f mut dyn FnMut(&str, &mut Manifest, &mut PreStageTimer) -> Result<String>;
 
+/// Whether a search writes a placeholder iRT and leaves DeepLC to the multi-head calibration
+/// (`Config::defers_library_deeplc`), decided once, before the library is built, so the
+/// build, the checks after the calibration and the model identity agree. Not when the library
+/// cache already holds this library with DeepLC's retention times, as `build-library` stores
+/// it: the deferred build keys the cache on its placeholder and would miss that entry, while
+/// the calibration re-predicts every row either way, so restoring it gives the same final
+/// tables without the build. `use_cache` is [`BuildParams::use_cache`].
+pub fn defers_deeplc(
+    cfg: &Config,
+    library_input: bool,
+    fasta: Option<&str>,
+    run_has_im: bool,
+    engine: (&str, &str),
+    use_cache: bool,
+    caller: &str,
+) -> bool {
+    let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
+    if !cfg.defers_library_deeplc(library_input, has_deeplc) {
+        return false;
+    }
+    let stored = use_cache
+        && fasta.is_some_and(|f| LibraryCache::holds_predicted(cfg, f, run_has_im, engine));
+    if stored {
+        info!(
+            "{caller}: the library cache holds this library with DeepLC's retention times, as \
+             build-library stores it; restoring it instead of deferring DeepLC to the \
+             multi-head calibration (predict_frag.defer_deeplc_to_multihead)"
+        );
+    }
+    !stored
+}
+
 /// Build the library of a FASTA search, or restore it from the library cache.
 ///
 /// With `man`, every table is recorded in it as `run` records them; `run-experiment`
@@ -151,7 +183,6 @@ pub fn build(
         out: &dig,
         cfg: &cfg.digest,
         rng_seed: cfg.rng_seed,
-        config_hash: ch,
         protein_n_term: cfg.peptidoforms.has_protein_n_term_rule(),
     })?;
     if let Some(m) = man.as_deref_mut() {
@@ -169,7 +200,6 @@ pub fn build(
         peptides: &dig,
         out: &pf,
         cfg: &cfg.peptidoforms,
-        config_hash: ch,
     })?;
     if let Some(m) = man.as_deref_mut() {
         m.record(w.record(
@@ -209,7 +239,6 @@ pub fn build(
         out_fragments: &lib_f,
         work_dir: &d("sidecar_work"),
         cfg: &cfg.predict_frag,
-        config_hash: ch,
         run_has_im: p.run_has_im,
     })?;
     if let Some(m) = man {
@@ -349,15 +378,14 @@ pub fn run(p: BuildLibraryParams) -> Result<serde_json::Value> {
     crate::stages::rt_health::refuse_native_predictors(cfg, true, "build-library")?;
     require_build_interpreters(cfg, p.ion_mobility)?;
     // The placeholder iRT of `defer_deeplc_to_multihead` is filled in by a search's
-    // multi-head calibration, so a library built here always carries its predictions.
+    // multi-head calibration, so a library built here always carries its predictions, and a
+    // search with the setting looks for this entry first (`defers_deeplc`).
     let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
     if cfg.defers_library_deeplc(false, has_deeplc) {
-        warn!(
-            "build-library: predict_frag.defer_deeplc_to_multihead is set and ignored here: \
-             this library carries DeepLC retention times, not the placeholders a search with \
-             that setting builds, so such a search does not find it in the library cache. \
-             Search it with --lib-precursors / --lib-fragments, or turn the setting off for \
-             the search."
+        info!(
+            "build-library: predict_frag.defer_deeplc_to_multihead does not apply here: the \
+             library carries DeepLC's retention times, and a FASTA search with the setting \
+             restores it from the library cache instead of building one with placeholders"
         );
     }
     let im = cfg.predict_frag.im_predictor_for(p.ion_mobility);
@@ -410,7 +438,7 @@ pub fn run(p: BuildLibraryParams) -> Result<serde_json::Value> {
 
     let n_prec = mumdia_io::table::nrows(&lib.precursors)?;
     let n_frag = mumdia_io::table::nrows(&lib.fragments)?;
-    let targets = mumdia_io::table::Table::read_cols(&lib.precursors, &["label"])?
+    let targets = mumdia_io::table::TableFile::open(&lib.precursors)?
         .str_eq("label", "target")?
         .iter()
         .filter(|t| **t)

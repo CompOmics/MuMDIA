@@ -283,7 +283,6 @@ fn features_compete_rescore_run_on_crafted_input() {
         out: &feats,
         out_pin: &pin,
         cfg: &cfg.features,
-        config_hash: "test",
         imc_ref_w: false,
         q1_tolerances: None,
     })
@@ -297,7 +296,6 @@ fn features_compete_rescore_run_on_crafted_input() {
         features: &feats,
         out: &competed,
         cfg: &cfg.compete,
-        config_hash: "test",
         features_hash: None,
     })
     .unwrap();
@@ -353,7 +351,6 @@ fn library_build_stages_return_the_hashes_of_the_files_they_wrote() {
         out: &peptides,
         cfg: &cfg.digest,
         rng_seed: cfg.rng_seed,
-        config_hash: "test",
         protein_n_term: cfg.peptidoforms.has_protein_n_term_rule(),
     })
     .unwrap();
@@ -365,7 +362,6 @@ fn library_build_stages_return_the_hashes_of_the_files_they_wrote() {
         peptides: &peptides,
         out: &pforms,
         cfg: &cfg.peptidoforms,
-        config_hash: "test",
     })
     .unwrap();
     assert!(wp.rows > 0);
@@ -381,7 +377,6 @@ fn library_build_stages_return_the_hashes_of_the_files_they_wrote() {
             out_fragments: &frag,
             cfg: &cfg.predict_frag,
             work_dir: &tmp("predict_frag_work"),
-            config_hash: "test",
             run_has_im: false,
         })
         .unwrap();
@@ -437,7 +432,6 @@ fn search_stages_return_the_hashes_of_the_files_they_wrote() {
         out: &feats,
         out_pin: &tmp("hashed.pin"),
         cfg: &cfg.features,
-        config_hash: "test",
         imc_ref_w: false,
         q1_tolerances: None,
     })
@@ -449,7 +443,6 @@ fn search_stages_return_the_hashes_of_the_files_they_wrote() {
         features: &feats,
         out: &competed,
         cfg: &cfg.compete,
-        config_hash: "test",
         features_hash: Some(&wfeat.content_hash),
     })
     .unwrap();
@@ -475,8 +468,8 @@ fn search_stages_return_the_hashes_of_the_files_they_wrote() {
     let wq = stages::quant::run_hashed(stages::quant::QuantParams {
         psms_scored: &scored,
         chromatograms: &[stages::quant::ChromTable::whole(&chrom)],
-        out_peptide: &qpep,
-        out_protein: &qprot,
+        out_peptide: Some(&qpep),
+        out_protein: Some(&qprot),
         out_fragment: Some(&qfrag),
         out_peak_bounds: None,
         out_quant_fragments: None,
@@ -488,8 +481,8 @@ fn search_stages_return_the_hashes_of_the_files_they_wrote() {
         q1: None,
     })
     .unwrap();
-    assert_written(&wq.peptide, &qpep);
-    assert_written(&wq.protein, &qprot);
+    assert_written(wq.peptide.as_ref().unwrap(), &qpep);
+    assert_written(wq.protein.as_ref().unwrap(), &qprot);
     assert_written(wq.fragment.as_ref().expect("out_fragment was set"), &qfrag);
 }
 
@@ -504,7 +497,6 @@ fn downstream_bytes(psms: &str, chrom: &str, cfg: &Config, tag: &str) -> Vec<Vec
         out: &feats,
         out_pin: "",
         cfg: &cfg.features,
-        config_hash: "test",
         imc_ref_w: false,
         q1_tolerances: None,
     })
@@ -514,7 +506,6 @@ fn downstream_bytes(psms: &str, chrom: &str, cfg: &Config, tag: &str) -> Vec<Vec
         features: &feats,
         out: &competed,
         cfg: &cfg.compete,
-        config_hash: "test",
         features_hash: None,
     })
     .unwrap();
@@ -538,8 +529,8 @@ fn downstream_bytes(psms: &str, chrom: &str, cfg: &Config, tag: &str) -> Vec<Vec
     stages::quant::run(stages::quant::QuantParams {
         psms_scored: &scored,
         chromatograms: &[stages::quant::ChromTable::whole(chrom)],
-        out_peptide: &qpep,
-        out_protein: &qprot,
+        out_peptide: Some(&qpep),
+        out_protein: Some(&qprot),
         out_fragment: Some(&qfrag),
         out_peak_bounds: None,
         out_quant_fragments: None,
@@ -785,7 +776,6 @@ fn features_chunking_is_value_preserving() {
                 out: &feats,
                 out_pin: &pin,
                 cfg: &cfg.features,
-                config_hash: "test",
                 imc_ref_w: false,
                 q1_tolerances: None,
             },
@@ -1232,7 +1222,6 @@ fn search_seed_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
             out: &out,
             cfg: &cfg.search_seed,
             bucket_size: cfg.extract.bucket_size,
-            config_hash: "test",
         })
         .unwrap();
         (out, rows)
@@ -1281,7 +1270,6 @@ fn search_seed_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
         out: &out,
         cfg: &uncapped.search_seed,
         bucket_size: uncapped.extract.bucket_size,
-        config_hash: "test",
     })
     .unwrap();
     assert_ne!(
@@ -1376,7 +1364,6 @@ fn the_seed_records_observed_im_for_every_psm_up_to_the_sizing_cut_only_when_ask
             out: &out,
             cfg: &cfg.search_seed,
             bucket_size: Config::default().extract.bucket_size,
-            config_hash: "test",
         })
         .unwrap();
         out
@@ -1437,7 +1424,6 @@ fn the_seed_writes_observed_im_only_for_spectra_with_ion_mobility() {
             out: &out,
             cfg,
             bucket_size: Config::default().extract.bucket_size,
-            config_hash: "test",
         })
         .unwrap();
         assert!(rows > 0, "{tag}: the fixture must give seed rows");
@@ -2102,7 +2088,6 @@ fn pooled_mass_calibration_equals_the_unbanded_fit(overlap: bool) {
             out: &out,
             cfg: &cfg.search_seed,
             bucket_size: cfg.extract.bucket_size,
-            config_hash: "test",
         })
         .unwrap();
         out
@@ -2124,7 +2109,7 @@ fn pooled_mass_calibration_equals_the_unbanded_fit(overlap: bool) {
         let slice = tmp(&format!("two_band_slice_{arm}_{k}.parquet"));
         mumdia::groups::write_band_slice(&f.prec, first, rows, &slice).unwrap();
         let out = seed(&slice, Some(first as u32), true, &format!("band{k}"));
-        bands.push((out, first as u32, rows as u32));
+        bands.push((out, first as u32));
     }
     // The fixture does what it is for: band B's own q rejects hundreds of the targets the
     // pooled q will accept, more than a 2,000-target prefix could make up for.
@@ -2147,18 +2132,13 @@ fn pooled_mass_calibration_equals_the_unbanded_fit(overlap: bool) {
     let pooled = tmp(&format!("two_band_pooled_{arm}.parquet"));
     let seeds: Vec<stages::seed_pool::BandSeed> = bands
         .iter()
-        .map(|(path, offset, rows)| stages::seed_pool::BandSeed {
+        .map(|(path, offset)| stages::seed_pool::BandSeed {
             path: path.clone(),
             offset: *offset,
-            rows: *rows,
         })
         .collect();
     stages::seed_pool::run(stages::seed_pool::SeedPoolParams {
         seeds: &seeds,
-        masscals: &bands
-            .iter()
-            .map(|b| mumdia::masscal::json_path(&b.0))
-            .collect::<Vec<_>>(),
         calibrants: &bands
             .iter()
             .map(|b| mumdia::masscal::calibrants_path(&b.0))
@@ -2174,7 +2154,7 @@ fn pooled_mass_calibration_equals_the_unbanded_fit(overlap: bool) {
         // band's sidecar carries their deviations.
         assert!(f.shared_rows >= 10, "{} shared rows", f.shared_rows);
         let shared = f.spans[1].0 as u32..(f.spans[1].0 + f.shared_rows) as u32;
-        for (path, _, _) in &bands {
+        for (path, _) in &bands {
             let c =
                 mumdia::masscal::read_calibrants(&mumdia::masscal::calibrants_path(path)).unwrap();
             let n = c
@@ -2237,7 +2217,6 @@ fn the_seed_hands_back_its_decode_and_extract_over_it_is_byte_identical() {
             out,
             cfg: &cfg.search_seed,
             bucket_size: cfg.extract.bucket_size,
-            config_hash: "test",
         })
         .unwrap()
     };
@@ -2376,7 +2355,6 @@ fn a_lent_seed_library_gives_the_seed_it_would_have_loaded() {
                 out,
                 cfg: &cfg.search_seed,
                 bucket_size: cfg.extract.bucket_size,
-                config_hash: "test",
             })
         };
         let own = tmp(&format!("seed_lend_own_{matcher:?}.parquet"));
@@ -2666,7 +2644,6 @@ fn the_chain_without_retrace_is_byte_identical_and_refuses_retrace_on_3d_input()
         out: &seed,
         cfg: &base.search_seed,
         bucket_size: base.extract.bucket_size,
-        config_hash: "test",
     })
     .unwrap();
     let co = stages::convert::ConvertOutputs {
@@ -2853,7 +2830,6 @@ fn a_trace_pad_widens_the_traces_and_nothing_the_scores_read() {
             out: &out,
             out_pin: "",
             cfg: &cfg.features,
-            config_hash: "test",
             imc_ref_w: false,
             q1_tolerances: None,
         })

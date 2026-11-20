@@ -765,15 +765,25 @@ fn setup_read(path: String) -> Result<setups::Document, String> {
 /// The run configuration for the built-in library path: the chosen preset (or the
 /// engine defaults when none) with the Search screen's digest fields merged on top,
 /// validated by the engine like a saved settings file.
+///
+/// `other` writes the configuration of the files of a batch searched separately that take
+/// other bands than its diaPASEF files, to a file of its own: the batch reads both, one run
+/// after another, so neither may replace the other.
 #[tauri::command]
 fn derive_config(
     base: Option<String>,
     overrides: std::collections::BTreeMap<String, serde_json::Value>,
+    other: Option<bool>,
 ) -> Result<String, String> {
     // The Search screen's m/z limits, before a configuration is written: a highest
     // fragment m/z of 1 is a positive number the engine would accept, and an empty library.
     mumdia_console::mzlimits::MzLimits::of_overrides(&overrides)?.check()?;
-    let path = settings::derive("search-derived", base.as_deref(), overrides)?;
+    let name = if other.unwrap_or(false) {
+        "search-derived-other"
+    } else {
+        "search-derived"
+    };
+    let path = settings::derive(name, base.as_deref(), overrides)?;
     settings::validate(&path)?;
     Ok(path)
 }
