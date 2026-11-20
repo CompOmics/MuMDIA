@@ -33,9 +33,9 @@ stages that operate across multiple runs.
 
 | path | role |
 |---|---|
-| `rust/mumdia/crates/mumdia/src/stages/quant.rs` | `quant` stage + `run_lfq_combine`/`size_factors` for `quant-lfq` |
+| `rust/mumdia/crates/mumdia/src/stages/quant.rs` | `quant` stage, its chromatogram reader and the cross-run fit (`fit_cross_run`) |
 | `rust/mumdia/crates/mumdia/src/stages/quant_norm.rs` | cross-run normalisation (`quant-normalise`, `quant.normalisation`, default `stable_set`) |
-| `rust/mumdia/crates/mumdia/src/quant_lfq.rs` | MaxLFQ/directLFQ ratio-alignment core (`lfq_profile`, `maxlfq`, `directlfq`) |
+| `rust/mumdia/crates/mumdia/src/quant_lfq.rs` | MaxLFQ/directLFQ ratio-alignment core (`lfq_profile`, `maxlfq`, `directlfq`) and the `quant-lfq` combine with its size factors (`run_lfq_combine_grouped`) |
 | `rust/mumdia/crates/mumdia/src/stages/align.rs` | Stage D2 cross-run RT alignment |
 | `rust/mumdia/crates/mumdia/src/stages/report.rs` | `peptides.tsv` + `precursors.tsv` + `proteins.tsv` writer |
 | `rust/mumdia/crates/mumdia/src/stages/audit.rs` | candidate identification-loss ladder |
@@ -130,7 +130,7 @@ sequence) and `<out>.precursor.parquet` (by peptidoform + charge), each with col
 `group` (str), `charge` (i32; -1 for peptide level), `run`, `quantity`, `n_features`,
 from the same normalized feature matrix and LFQ engine. The protein output is
 unchanged. Unlike `quant` and
-`align`, `run_lfq_combine` writes no `<out>.report.json`: it calls `write_table` and
+`align`, `run_lfq_combine_grouped` writes no `<out>.report.json`: it calls `write_table` and
 logs, with no `ArtifactReport` (`quant.rs:720`). `--quantity-column` names the input
 intensity column (`quantity` by default; `quantity_normalised` for the tables below).
 `--condition`, once per input in input order, estimates the size factors within each
@@ -252,7 +252,8 @@ handler prints a one-line summary (`main.rs:806`).
 experiment root, rows selected on the experiment-wide `peptide_q_value` /
 `pg_q_value`, an `n_runs` column counting the runs whose own `run_psm_q` accepts
 the precursor or group, and one quantity column per run (`quantity_<run>` from each
-run's `peptide_quant.parquet`, `lfq_<run>` from `lfq_maxlfq.parquet`). When every
+run's `peptide_quant.parquet`, `lfq_<run>` from `lfq_maxlfq.parquet`, empty for a run in
+which the group has no feature, where the matrix holds 0). When every
 run's `peptide_quant` is v3 (`mbr.first_pass_flag`), one `first_pass_<run>` column per run
 follows the quantity columns: `true` or `false` from the run's `first_pass_id`, empty where
 the run has no quant row for the precursor; otherwise there is no such column. No per-run
@@ -1191,14 +1192,14 @@ one cycle), or the key itself on the cycle traces of `q1_fragments`; on any othe
 20 to the last digit), the identifications unchanged. The ZT Scan recipe uses 4
 (docs/37_ztscan.md, section 6, has the mechanism, the table and why not wider).
 
-### quant-lfq (`quant.rs:657`, `run_lfq_combine`)
+### quant-lfq (`quant_lfq.rs`, `run_lfq_combine_grouped`)
 
 Reads each input table and builds `data: protein_group -> feature_key -> Vec<Option<f64>>`
-of length N runs (`quant.rs:666`). The feature key is `peptidoform|charge` for MaxLFQ
-and `peptidoform|charge|fragment_name` for directLFQ (`quant.rs:682`). Missing entries
-stay `None`. `size_factors` (`quant.rs:753`) computes one global size factor per run;
+of length N runs. The feature key is `peptidoform|charge` for MaxLFQ
+and `peptidoform|charge|fragment_name` for directLFQ. Missing entries
+stay `None`. `size_factors_counted` (`quant_lfq.rs`) computes one global size factor per run;
 when `normalize != None` every present value is divided by its run factor before
-rollup (`quant.rs:703`). For each protein group the feature-by-run matrix is passed to
+rollup. For each protein group the feature-by-run matrix is passed to
 `lfq_profile` (`quant_lfq.rs:84`) and the per-run abundances are written long-form.
 
 `lfq_profile` is the MaxLFQ least-squares reconstruction:
@@ -1214,21 +1215,26 @@ rollup (`quant.rs:703`). For each protein group the feature-by-run matrix is pas
   with partial pivoting), giving log-abundances. The exp-profile is then scaled so the
   component preserves its measured total intensity (`quant_lfq.rs:176`).
 
-`size_factors` methods (`quant.rs:753`):
-- `MedianRatio` (default, DESeq-style): over complete-case features (positive in all
-  runs) take each run's log2 deviation from the per-feature mean; the run factor is
-  `2^median` of those deviations. Robust so a spike-in design's real fold changes are
-  not flattened (test `median_ratio_recovers_global_scale_not_real_changes`,
-  `quant.rs:918`).
+Size factor methods (`size_factors_counted`):
+- `MedianRatio` (default, DESeq-style): over complete-case features (positive in every
+  run that holds a quantified feature) take each run's log2 deviation from the
+  per-feature mean; the run factor is `2^median` of those deviations. Robust so a
+  spike-in design's real fold changes are not flattened (test
+  `median_ratio_recovers_global_scale_not_real_changes`). A run with no quantified
+  feature (a blank well, a failed injection) keeps factor 1 with `n_features` 0, and
+  the others are estimated without it; before 2026-11-19 such a run left no complete
+  feature, and every run kept factor 1.
 - `Median`: align each run's median log2 intensity to the median of the per-run
   medians.
 - `None`: all factors 1.0.
 
 Determinism: medians sort in place, the matrix is iterated in `BTreeMap` key order.
-With a single input, `run_lfq_combine` reduces to the per-run sum.
-If no positive feature is complete across all runs, `MedianRatio` returns identity
-factors (`1.0`) without estimating a scale correction. Inspect the logged
-`size_factors`; identity may mean either balanced data or no usable complete cases.
+With a single input, `run_lfq_combine_grouped` reduces to the per-run sum.
+If no positive feature is complete across the runs that hold one, `MedianRatio` returns
+identity factors (`1.0`) without estimating a scale correction. It warns, naming the
+runs, when a run holds no quantified feature or when the factors rest on fewer than 20
+complete features; `lfq_size_factors.tsv` gives every run's `n_features`, and 0 there
+means that no factor was estimated for it.
 
 `MedianRatio` is blind to sample composition. On a mixed-proteome design every
 complete-case feature of a changed species pulls the median, so the factors shift every
@@ -1798,7 +1804,7 @@ FDR/reporting); `audit.rs` tests the stages in that order and keeps the first lo
 | `add_protein_base_quantity` | quant.rs:220 | record one base peptide's max quantity for protein rollup |
 | `rollup_protein_bases` | quant.rs:238 | TopNSum/Sum over unique quantifiable base peptides |
 | `quant::run` | quant.rs:259 | full quant stage |
-| `run_lfq_combine` | quant.rs:657 | build the protein-by-run matrix for `quant-lfq` |
+| `run_lfq_combine_grouped` | quant_lfq.rs | build the protein-by-run matrix for `quant-lfq` |
 | `size_factors` | quant.rs:753 | per-run normalization factors (MedianRatio/Median/None) |
 | `median_sorted` | quant.rs:818 | in-place median helper (empty = 0.0; assumes finite, no NaN) |
 | `lfq_profile` | quant_lfq.rs:84 | MaxLFQ least-squares per-sample profile |
@@ -2021,4 +2027,4 @@ but do not affect the wired `mumdia mbr` path.
   emitting it from the in-extract sidecar so `load_extract_reasons` can pass it through.
 - **New quant artifact column:** add the `Col` in the relevant `write_table`
   (`quant.rs:487`/`519`/`558`), bump the schema version in
-  `mumdia-core/src/schema.rs`, and update the consumer (`report.rs`, `run_lfq_combine`).
+  `mumdia-core/src/schema.rs`, and update the consumer (`report.rs`, `run_lfq_combine_grouped`).

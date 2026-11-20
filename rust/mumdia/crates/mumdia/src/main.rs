@@ -2838,8 +2838,8 @@ fn real_main() -> Result<()> {
             stages::quant::run(stages::quant::QuantParams {
                 psms_scored: &psms_scored,
                 chromatograms: &tables,
-                out_peptide: &out_peptide,
-                out_protein: &out_protein,
+                out_peptide: Some(&out_peptide),
+                out_protein: Some(&out_protein),
                 out_fragment: out_fragment.as_deref(),
                 out_peak_bounds: out_peak_bounds.as_deref(),
                 out_quant_fragments: out_quant_fragments.as_deref(),
@@ -2903,7 +2903,7 @@ fn real_main() -> Result<()> {
                     })
                     .collect()
             });
-            let (_, factors) = stages::quant::run_lfq_combine_grouped(
+            let (_, factors) = mumdia::quant_lfq::run_lfq_combine_grouped(
                 &inputs,
                 by_fragment,
                 norm,
@@ -2913,7 +2913,7 @@ fn real_main() -> Result<()> {
             )?;
             if let Some(path) = &size_factors_out {
                 let runs: Vec<String> = (0..inputs.len()).map(|i| i.to_string()).collect();
-                stages::quant::write_size_factors_tsv(path, &runs, &conditions, &factors)?;
+                mumdia::quant_lfq::write_size_factors_tsv(path, &runs, &conditions, &factors)?;
             }
         }
         Cmd::QuantNormalise {
@@ -3126,7 +3126,7 @@ fn real_main() -> Result<()> {
                 // from before it has none, and precursors.tsv then has no normalised_<run>.
                 let prec_lfq = lfq
                     .as_deref()
-                    .and_then(stages::quant::precursor_lfq_sibling);
+                    .and_then(mumdia::quant_lfq::precursor_lfq_sibling);
                 let counts = stages::report::run_experiment_localised(
                     stages::report::ExperimentReportParams {
                         scored: &scored,

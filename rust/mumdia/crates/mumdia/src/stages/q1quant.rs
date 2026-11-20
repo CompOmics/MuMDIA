@@ -959,8 +959,8 @@ mod run_tests {
         run(QuantParams {
             psms_scored: &fx.scored,
             chromatograms: &[ChromTable::whole(&fx.chrom)],
-            out_peptide: &pep,
-            out_protein: &prot,
+            out_peptide: Some(&pep),
+            out_protein: Some(&prot),
             out_fragment: None,
             out_peak_bounds: None,
             out_quant_fragments: None,
@@ -1057,8 +1057,8 @@ mod run_tests {
         let err = run(QuantParams {
             psms_scored: &fx.scored,
             chromatograms: &[ChromTable::whole(&fx.chrom)],
-            out_peptide: &path("need_pep.parquet"),
-            out_protein: &path("need_prot.parquet"),
+            out_peptide: Some(&path("need_pep.parquet")),
+            out_protein: Some(&path("need_prot.parquet")),
             out_fragment: None,
             out_peak_bounds: None,
             out_quant_fragments: None,
@@ -1133,8 +1133,8 @@ mod run_tests {
         run(QuantParams {
             psms_scored: &fx.scored,
             chromatograms: &[ChromTable::whole(&fx.chrom)],
-            out_peptide: &pep,
-            out_protein: &path("cyc_plain_prot.parquet"),
+            out_peptide: Some(&pep),
+            out_protein: Some(&path("cyc_plain_prot.parquet")),
             out_fragment: None,
             out_peak_bounds: None,
             out_quant_fragments: None,
@@ -1158,8 +1158,8 @@ mod run_tests {
         let err = run(QuantParams {
             psms_scored: &fx.scored,
             chromatograms: &[ChromTable::whole(&fx.chrom)],
-            out_peptide: &path("cyc_need_pep.parquet"),
-            out_protein: &path("cyc_need_prot.parquet"),
+            out_peptide: Some(&path("cyc_need_pep.parquet")),
+            out_protein: Some(&path("cyc_need_prot.parquet")),
             out_fragment: None,
             out_peak_bounds: None,
             out_quant_fragments: None,

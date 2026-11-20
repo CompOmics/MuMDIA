@@ -29,6 +29,7 @@ use rayon::prelude::*;
 use serde_json::json;
 use tracing::{info, warn};
 
+use crate::quant_lfq;
 use crate::stages::quant::ChromTable;
 use crate::stages::*;
 
@@ -2794,12 +2795,12 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     let cross_run = if qcfg.needs_cross_run_fit() {
         let frag_tables = quant_plan.map_pooled(&run_idx, |&i| {
             let ft = d(&format!("{}/fragment_quant.parquet", names[i]));
-            let tmp = |n: &str| d(&format!("{}/{n}.pass1.parquet", names[i]));
+            // The export alone: the pass's peptide and protein tables are never read.
             let written = quant::run_hashed(quant::QuantParams {
                 psms_scored: &split_paths[i],
                 chromatograms: &chroms[i],
-                out_peptide: &tmp("peptide_quant"),
-                out_protein: &tmp("protein_group_quant"),
+                out_peptide: None,
+                out_protein: None,
                 out_fragment: Some(&ft),
                 out_peak_bounds: None,
                 out_quant_fragments: None,
@@ -2810,12 +2811,6 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 first_pass_ids: None,
                 q1: q1_of(i),
             })?;
-            for n in ["peptide_quant", "protein_group_quant"] {
-                for path in [tmp(n), format!("{}.report.json", tmp(n))] {
-                    std::fs::remove_file(&path)
-                        .with_context(|| format!("removing the first-pass table {path}"))?;
-                }
-            }
             Ok((ft, written.fragment.expect("out_fragment was set")))
         })?;
         let paths: Vec<String> = frag_tables.iter().map(|(p, _)| p.clone()).collect();
@@ -2828,12 +2823,11 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             };
             let tables_b = quant_plan.map_pooled(&run_idx, |&i| {
                 let ft = d(&format!("{}/fragment_quant_background.parquet", names[i]));
-                let tmp = |n: &str| d(&format!("{}/{n}.pass1b.parquet", names[i]));
                 let written = quant::run_hashed(quant::QuantParams {
                     psms_scored: &split_paths[i],
                     chromatograms: &chroms[i],
-                    out_peptide: &tmp("peptide_quant"),
-                    out_protein: &tmp("protein_group_quant"),
+                    out_peptide: None,
+                    out_protein: None,
                     out_fragment: Some(&ft),
                     out_peak_bounds: None,
                     out_quant_fragments: None,
@@ -2844,12 +2838,6 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                     first_pass_ids: None,
                     q1: q1_of(i),
                 })?;
-                for n in ["peptide_quant", "protein_group_quant"] {
-                    for path in [tmp(n), format!("{}.report.json", tmp(n))] {
-                        std::fs::remove_file(&path)
-                            .with_context(|| format!("removing the export-pass table {path}"))?;
-                    }
-                }
                 Ok((ft, written.fragment.expect("out_fragment was set")))
             })?;
             let paths_b: Vec<String> = tables_b.iter().map(|(p, _)| p.clone()).collect();
@@ -2911,8 +2899,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         let written = quant::run_hashed(quant::QuantParams {
             psms_scored: &split_paths[i],
             chromatograms: &chroms[i],
-            out_peptide: &pq,
-            out_protein: &gq,
+            out_peptide: Some(&pq),
+            out_protein: Some(&gq),
             out_fragment: None,
             out_peak_bounds: None,
             out_quant_fragments: qf.as_deref(),
@@ -2968,7 +2956,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         _ => mumdia_core::config::NormalizeMethod::MedianRatio,
     };
     let (n_lfq, size_factors) = match (&normalised, lfq_reads_normalised) {
-        (Some((tables, _, _)), true) => quant::run_lfq_combine_grouped(
+        (Some((tables, _, _)), true) => quant_lfq::run_lfq_combine_grouped(
             tables,
             false,
             lfq_method,
@@ -2976,7 +2964,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             "quantity_normalised",
             &lfq,
         )?,
-        _ => quant::run_lfq_combine_grouped(
+        _ => quant_lfq::run_lfq_combine_grouped(
             &peptide_quants,
             false,
             lfq_method,
@@ -2987,8 +2975,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     };
     // The factors, at the experiment root under every scope, so a viewer reads them rather
     // than deriving them back from the tables.
-    let size_factors_tsv = d(quant::LFQ_SIZE_FACTORS_TSV);
-    quant::write_size_factors_tsv(&size_factors_tsv, &names, &conditions, &size_factors)?;
+    let size_factors_tsv = d(quant_lfq::LFQ_SIZE_FACTORS_TSV);
+    quant_lfq::write_size_factors_tsv(&size_factors_tsv, &names, &conditions, &size_factors)?;
     info!(
         scope = scope.as_str(),
         factors = ?size_factors.iter().map(|f| f.factor).collect::<Vec<_>>(),
@@ -3015,7 +3003,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         out_sites: &sites_tsv,
     });
     // The cross-run precursor matrix `quant-lfq` writes next to the protein matrix.
-    let prec_lfq = quant::precursor_lfq_sibling(&lfq);
+    let prec_lfq = quant_lfq::precursor_lfq_sibling(&lfq);
     // The protein annotations, at the experiment root for `mumdia report --experiment-dir`,
     // with the producer the manifest records them under. Without any the TSVs' three
     // annotation columns are empty, which is said again here and recorded in the manifest
@@ -3400,17 +3388,24 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         ));
         artifacts.push((
             format!("peptide_quant[{name}]"),
-            artifact::peptide_quant(first_pass_ids.is_some()),
+            // The schema quant wrote: v4 under `quant.q1_fragments` (the `q1_quant` column).
+            artifact::peptide_quant_q1(first_pass_ids.is_some(), qcfg.q1_fragments),
             peptide_quants[i].clone(),
             "quant",
-            Some(quant_written[i].peptide.content_hash.clone()),
+            quant_written[i]
+                .peptide
+                .as_ref()
+                .map(|w| w.content_hash.clone()),
         ));
         artifacts.push((
             format!("protein_group_quant[{name}]"),
             artifact::PROTEIN_GROUP_QUANT,
             protein_quants[i].clone(),
             "quant",
-            Some(quant_written[i].protein.content_hash.clone()),
+            quant_written[i]
+                .protein
+                .as_ref()
+                .map(|w| w.content_hash.clone()),
         ));
         // `quant.fragment_detail` only, so every other manifest keeps its entries.
         if let (Some(path), Some(w)) =

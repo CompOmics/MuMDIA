@@ -471,8 +471,8 @@ fn search_stages_return_the_hashes_of_the_files_they_wrote() {
     let wq = stages::quant::run_hashed(stages::quant::QuantParams {
         psms_scored: &scored,
         chromatograms: &[stages::quant::ChromTable::whole(&chrom)],
-        out_peptide: &qpep,
-        out_protein: &qprot,
+        out_peptide: Some(&qpep),
+        out_protein: Some(&qprot),
         out_fragment: Some(&qfrag),
         out_peak_bounds: None,
         out_quant_fragments: None,
@@ -484,8 +484,8 @@ fn search_stages_return_the_hashes_of_the_files_they_wrote() {
         q1: None,
     })
     .unwrap();
-    assert_written(&wq.peptide, &qpep);
-    assert_written(&wq.protein, &qprot);
+    assert_written(wq.peptide.as_ref().unwrap(), &qpep);
+    assert_written(wq.protein.as_ref().unwrap(), &qprot);
     assert_written(wq.fragment.as_ref().expect("out_fragment was set"), &qfrag);
 }
 
@@ -532,8 +532,8 @@ fn downstream_bytes(psms: &str, chrom: &str, cfg: &Config, tag: &str) -> Vec<Vec
     stages::quant::run(stages::quant::QuantParams {
         psms_scored: &scored,
         chromatograms: &[stages::quant::ChromTable::whole(chrom)],
-        out_peptide: &qpep,
-        out_protein: &qprot,
+        out_peptide: Some(&qpep),
+        out_protein: Some(&qprot),
         out_fragment: Some(&qfrag),
         out_peak_bounds: None,
         out_quant_fragments: None,

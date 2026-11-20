@@ -1,10 +1,10 @@
 //! Stage G `mumdia quant` (docs/12_quant_lfq_align_mbr_report_audit.md): quantify
 //! identified peptidoforms and roll up to protein groups. Integrate each fragment
-//! chromatogram over the apex region by the trapezoidal rule, sum the top-N
-//! fragments into a per-run peptidoform quantity, then roll up to protein groups.
-//! MVP is single-run, so cross-run normalization and MaxLFQ/directLFQ (which need
-//! multiple runs) reduce to a top-N sum; the method is a config strategy for
-//! later.
+//! chromatogram over the candidate's window by the trapezoidal rule, turn the fragments
+//! into a per-run peptidoform quantity under `quant.fragment_selection`, then roll up to
+//! protein groups. The file also holds the chromatogram reader this stage uses and the
+//! cross-run step of `run-experiment` ([`fit_cross_run`]); the cross-run MaxLFQ matrix and
+//! its size factors (`quant-lfq`) are in [`crate::quant_lfq`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Instant;
@@ -13,8 +13,8 @@ use anyhow::{anyhow, Context as _, Result};
 use arrow::array::{Array, Float32Array, StringArray, UInt32Array};
 use arrow::record_batch::RecordBatch;
 use mumdia_core::config::{
-    BaselineSource, FragmentSelection, NormalizeMethod, PeakWindowMode, Q1Integration, QuantConfig,
-    QuantQColumn, RollupMethod, WindowCentre,
+    BaselineSource, FragmentSelection, PeakWindowMode, Q1Integration, QuantConfig, QuantQColumn,
+    RollupMethod, WindowCentre,
 };
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
@@ -59,8 +59,11 @@ pub struct QuantParams<'a> {
     /// The run's chromatogram tables, in row order: one, or a grouped run's band tables
     /// (see [`ChromTable`]).
     pub chromatograms: &'a [ChromTable],
-    pub out_peptide: &'a str,
-    pub out_protein: &'a str,
+    /// The peptide and protein-group tables. `None` computes them without writing, hashing
+    /// or reporting them: the export passes of the cross-run step, which keep only
+    /// `out_fragment`.
+    pub out_peptide: Option<&'a str>,
+    pub out_protein: Option<&'a str>,
     /// Optional per-fragment area export (for ion-level directLFQ across runs).
     pub out_fragment: Option<&'a str>,
     /// Optional per-candidate peak-window diagnostic (candidate_id, lo_rt, hi_rt,
@@ -100,18 +103,6 @@ pub struct QuantParams<'a> {
 /// The `peptide_quant` v3 column that says whether the row's precursor had a first-pass
 /// identification in its run (`mbr.first_pass_flag`).
 pub const FIRST_PASS_ID: &str = "first_pass_id";
-
-/// The cross-run precursor matrix `quant-lfq` writes next to the protein matrix at `lfq`.
-pub fn precursor_lfq_path(lfq: &str) -> String {
-    format!("{lfq}.precursor.parquet")
-}
-
-/// [`precursor_lfq_path`] when that file exists (an experiment from before the sibling
-/// matrices has none).
-pub fn precursor_lfq_sibling(lfq: &str) -> Option<String> {
-    let p = precursor_lfq_path(lfq);
-    std::path::Path::new(&p).is_file().then_some(p)
-}
 
 /// The candidate ids of a second-pass run whose precursor the first pass identified in the
 /// same run: every id `c` of the empirical library whose entry `entry_of[c]` is in
@@ -360,22 +351,43 @@ impl CidSet {
 
     /// `ids` need not be sorted or distinct: a repeated id sets the same bit twice.
     fn from_ids(ids: &[u32]) -> CidSet {
+        let mut set = CidSet::over(ids);
+        for &c in ids {
+            set.insert(c);
+        }
+        set
+    }
+
+    /// An empty set over `min(ids)..=max(ids)`; every id later inserted must lie there.
+    fn over(ids: &[u32]) -> CidSet {
         let (Some(&base), Some(&top)) = (ids.iter().min(), ids.iter().max()) else {
             return CidSet::empty();
         };
         // In u64: `top - base` reaches `u32::MAX`, and `+ 1` on a 32-bit `usize` would wrap
-        // to a zero-length allocation that the fill below then indexes out of.
+        // to a zero-length allocation that `insert` then indexes out of.
         let span = u64::from(top - base) + 1;
         if span.div_ceil(64) * 8 > CID_BITSET_MAX_BYTES as u64 {
-            return CidSet::Hashed(ids.iter().copied().collect());
+            return CidSet::Hashed(std::collections::HashSet::new());
         }
-        let span = span as usize;
-        let mut bits = vec![0u64; span.div_ceil(64)];
-        for &c in ids {
-            let k = (c - base) as usize;
-            bits[k >> 6] |= 1u64 << (k & 63);
+        CidSet::Bits {
+            base,
+            bits: vec![0u64; (span as usize).div_ceil(64)],
         }
-        CidSet::Bits { base, bits }
+    }
+
+    /// Add `c` (inside the range the set was built over), returning whether it was new.
+    #[inline]
+    fn insert(&mut self, c: u32) -> bool {
+        match self {
+            CidSet::Bits { base, bits } => {
+                let k = (c - *base) as usize;
+                let (w, b) = (k >> 6, 1u64 << (k & 63));
+                let new = bits[w] & b == 0;
+                bits[w] |= b;
+                new
+            }
+            CidSet::Hashed(h) => h.insert(c),
+        }
     }
 
     #[inline]
@@ -436,64 +448,6 @@ impl CidSet {
 fn any_in_range(sorted: &[u32], lo: f64, hi: f64) -> bool {
     let at = sorted.partition_point(|&c| f64::from(c) < lo);
     at < sorted.len() && f64::from(sorted[at]) <= hi
-}
-
-/// Distinct candidate ids marked so far, one bit per id over a range fixed up front (the
-/// hashed fallback past [`CID_BITSET_MAX_BYTES`], as for [`CidSet`]). For a count over a
-/// whole table that must not cost a map entry per candidate.
-struct CidMarks {
-    base: u32,
-    bits: Vec<u64>,
-    hashed: Option<std::collections::HashSet<u32>>,
-    count: usize,
-}
-
-impl CidMarks {
-    /// Marks for ids in `min(ids)..=max(ids)`; every id later inserted must lie there.
-    fn over(ids: &[u32]) -> CidMarks {
-        let empty = CidMarks {
-            base: 0,
-            bits: Vec::new(),
-            hashed: None,
-            count: 0,
-        };
-        let (Some(&base), Some(&top)) = (ids.iter().min(), ids.iter().max()) else {
-            return empty;
-        };
-        let span = u64::from(top - base) + 1;
-        if span.div_ceil(64) * 8 > CID_BITSET_MAX_BYTES as u64 {
-            return CidMarks {
-                hashed: Some(std::collections::HashSet::new()),
-                ..empty
-            };
-        }
-        CidMarks {
-            base,
-            bits: vec![0u64; (span as usize).div_ceil(64)],
-            ..empty
-        }
-    }
-
-    /// Mark `c`, returning whether it was unmarked before.
-    #[inline]
-    fn insert(&mut self, c: u32) -> bool {
-        let new = match &mut self.hashed {
-            Some(h) => h.insert(c),
-            None => {
-                let k = (c - self.base) as usize;
-                let (w, b) = (k >> 6, 1u64 << (k & 63));
-                let new = self.bits[w] & b == 0;
-                self.bits[w] |= b;
-                new
-            }
-        };
-        self.count += usize::from(new);
-        new
-    }
-
-    fn count(&self) -> usize {
-        self.count
-    }
 }
 
 /// The fragment chromatogram rows quant keeps, in table order, in flat buffers.
@@ -1519,6 +1473,8 @@ fn finite_option(value: f64) -> Option<f64> {
     value.is_finite().then_some(value)
 }
 
+/// Whether a scored row is quantified: a target at or below the q threshold, or an
+/// accepted match-between-runs transfer.
 ///
 /// `is_decoy` is the one bit of the `label` column this stage ever tested (`label ==
 /// "decoy"`, and anything that is neither spelling is treated as a target exactly as
@@ -2447,8 +2403,12 @@ fn page_aligned_runs(keep: &[bool], starts: &[usize]) -> Vec<(usize, bool)> {
     push(n - cursor, true, &mut runs);
     runs
 }
+
+/// [`run_hashed`], returning the rows of the peptide and protein-group tables (0 for a
+/// table it was not asked to write).
 pub fn run(p: QuantParams) -> Result<(u64, u64)> {
-    run_hashed(p).map(|w| (w.peptide.rows, w.protein.rows))
+    let rows = |w: Option<Written>| w.map_or(0, |w| w.rows);
+    run_hashed(p).map(|w| (rows(w.peptide), rows(w.protein)))
 }
 
 /// What `quant.q1_fragments` did to the chromatogram store ([`q1_apply`]).
@@ -2789,8 +2749,10 @@ fn q1_cycle_window(
 /// The quant outputs as written and reported: row count and report content hash of each.
 #[derive(Clone, Debug)]
 pub struct QuantWritten {
-    pub peptide: Written,
-    pub protein: Written,
+    /// `Some` exactly when `QuantParams::out_peptide` was set.
+    pub peptide: Option<Written>,
+    /// `Some` exactly when `QuantParams::out_protein` was set.
+    pub protein: Option<Written>,
     /// `Some` exactly when `QuantParams::out_fragment` was set.
     pub fragment: Option<Written>,
     /// `Some` exactly when `QuantParams::out_quant_fragments` was set.
@@ -2811,10 +2773,15 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             .iter()
             .map(|t| ("--chromatograms", t.path.as_str())),
     );
+    if let Some(q1) = &p.q1 {
+        inputs.extend(q1.psms_extracted.map(|x| ("--psms-extracted", x)));
+        inputs.push(("--spectra-ms2", q1.spectra_ms2));
+    }
     for out in [
-        Some(p.out_peptide),
-        Some(p.out_protein),
+        p.out_peptide,
+        p.out_protein,
         p.out_fragment,
+        p.out_peak_bounds,
         p.out_quant_fragments,
     ]
     .into_iter()
@@ -3006,23 +2973,28 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     // report's `candidates_with_scored_apex` still counts the WHOLE table's candidates with
     // a finite apex, as it always did, through one bit per candidate id.
     let mut apex_by_cid: HashMap<u32, f64> = HashMap::new();
-    let mut scored_apex = CidMarks::over(&cid);
+    let mut scored_apex = CidSet::over(&cid);
+    let mut candidates_with_scored_apex = 0usize;
     let apex_column_present = ps
         .visit_f64("apex_rt", |first, vals| {
             for (k, &a) in vals.iter().enumerate() {
                 let c = cid[first + k];
-                if a.is_finite() && scored_apex.insert(c) && (keep_all || wanted.contains(c)) {
-                    apex_by_cid.insert(c, a);
+                if a.is_finite() && scored_apex.insert(c) {
+                    candidates_with_scored_apex += 1;
+                    if keep_all || wanted.contains(c) {
+                        apex_by_cid.insert(c, a);
+                    }
                 }
             }
             Ok(())
         })
         .is_ok();
+    drop(scored_apex);
     if !apex_column_present {
         // A column that is absent or not f64 carries no hint, exactly as before; nothing a
         // failed read left behind may count.
         apex_by_cid.clear();
-        scored_apex = CidMarks::over(&[]);
+        candidates_with_scored_apex = 0;
         warn!(
             psms_scored = p.psms_scored,
             "quant: scored table has no apex_rt column (pre-v3 artifact); every \
@@ -3030,8 +3002,6 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
              the identification apex only about half the time"
         );
     }
-    let candidates_with_scored_apex = scored_apex.count();
-    drop(scored_apex);
     // Nothing below reads a column of the scored table per row any more: the outputs walk
     // the accepted rows, whose values were gathered above.
     drop((cid, is_decoy, pep_q, is_transferred, is_target));
@@ -3061,14 +3031,19 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     }
     let has_pred = has_pred.unwrap_or(false);
     // `cross_run` and the pattern rules rank by the same column wherever they fall back to
-    // `predicted`.
-    if !has_pred && p.cfg.fragment_selection.ranks_by_predicted() {
+    // `predicted`, and the profile centre places the window on the top predicted fragments.
+    if !has_pred
+        && (p.cfg.fragment_selection.ranks_by_predicted()
+            || p.cfg.window_centre == WindowCentre::Profile)
+    {
         anyhow::bail!(
-            "quant.fragment_selection = {:?} ranks fragments by the \
-             `predicted_intensity` column, which {} does not carry. Re-run `extract` to \
-             write a current chromatogram artifact, or set \
-             quant.fragment_selection = observed_area.",
+            "quant.fragment_selection = {:?} with quant.window_centre = {:?} reads the \
+             `predicted_intensity` column (to rank fragments, or to place the profile \
+             window), which {} does not carry. Re-run `extract` to write a current \
+             chromatogram artifact, or set quant.fragment_selection = observed_area and \
+             quant.window_centre = apex.",
             p.cfg.fragment_selection,
+            p.cfg.window_centre,
             p.chromatograms[0].path
         );
     }
@@ -3949,6 +3924,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     let n_first_pass_rows = q_first
         .as_ref()
         .map(|v| v.iter().filter(|&&x| x).count() as u64);
+    let n_pep = q_cid.len() as u64;
     let mut pep_cols = vec![
         Col::U32("candidate_id".into(), q_cid),
         Col::U32("base_peptide_id".into(), q_base),
@@ -3972,7 +3948,9 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     if q1a.is_some() {
         pep_cols.push(Col::Str("q1_quant".into(), q_q1));
     }
-    let n_pep = write_table(p.out_peptide, pep_cols)?;
+    if let Some(path) = p.out_peptide {
+        write_table(path, pep_cols)?;
+    }
 
     // Protein-group rollup over unique, quantifiable base peptides only.
     let (mut g_name, mut g_val, mut g_status, mut g_npep) =
@@ -3989,15 +3967,18 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         g_status.push(status.to_string());
         g_npep.push(n_bases as i32);
     }
-    let n_pg = write_table(
-        p.out_protein,
-        vec![
-            Col::Str("protein_group".into(), g_name),
-            Col::OptF64("quantity".into(), g_val),
-            Col::Str("quant_status".into(), g_status),
-            Col::I32("n_peptides".into(), g_npep),
-        ],
-    )?;
+    let n_pg = g_name.len() as u64;
+    if let Some(path) = p.out_protein {
+        write_table(
+            path,
+            vec![
+                Col::Str("protein_group".into(), g_name),
+                Col::OptF64("quantity".into(), g_val),
+                Col::Str("quant_status".into(), g_status),
+                Col::I32("n_peptides".into(), g_npep),
+            ],
+        )?;
+    }
 
     // Optional per-fragment area export for ion-level directLFQ across runs.
     let mut fragment_output: Option<(&str, u64)> = None;
@@ -4352,7 +4333,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             );
         }
     }
-    let mut written: Vec<Written> = Vec::with_capacity(2);
+    let mut written: Vec<Option<Written>> = Vec::with_capacity(2);
     // The first-pass flag's count goes into the peptide table's report alone, and only when
     // the column was written, so every other report keeps its bytes.
     let mut pep_stats = stats.clone();
@@ -4368,6 +4349,10 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         ),
         (p.out_protein, artifact::PROTEIN_GROUP_QUANT, n_pg, &stats),
     ] {
+        let Some(path) = path else {
+            written.push(None);
+            continue;
+        };
         let report = ArtifactReport {
             logical_name: schema.0.to_string(),
             schema_name: schema.0.to_string(),
@@ -4381,7 +4366,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             elapsed_ms: elapsed,
         };
         report.write_for(path)?;
-        written.push(report.written());
+        written.push(Some(report.written()));
     }
     let mut detail_written: Option<Written> = None;
     if let Some((path, rows, candidates, selected)) = detail_output {
@@ -4433,8 +4418,8 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         elapsed_ms = elapsed,
         "quant: done"
     );
-    let protein = written.pop().expect("two reports written");
-    let peptide = written.pop().expect("two reports written");
+    let protein = written.pop().expect("one entry per table");
+    let peptide = written.pop().expect("one entry per table");
     Ok(QuantWritten {
         peptide,
         protein,
@@ -4798,7 +4783,9 @@ pub fn fit_cross_run(fragment_tables: &[String], cfg: &QuantConfig) -> Result<Cr
                 )
             })
             .collect();
-        // Under the width the background is the flank beyond the chosen window.
+        // Under the width the background is the flank beyond the chosen window. Where the
+        // window covers the whole trace in every run there is none: the base flank lies
+        // inside the wider window, and subtracting it would take peak signal for background.
         if let Some(half) = &half {
             for (c, frags) in flank_h {
                 let Some(&h) = half.get(&c) else { continue };
@@ -4807,6 +4794,8 @@ pub fn fit_cross_run(fragment_tables: &[String], cfg: &QuantConfig) -> Result<Cr
                     let (sum, k) = per[h - CROSS_RUN_HALFWIDTH_MIN];
                     if k > 0 {
                         lv.insert(n, sum / k as f64);
+                    } else {
+                        lv.remove(&n);
                     }
                 }
             }
@@ -4843,404 +4832,35 @@ pub fn fit_cross_run(fragment_tables: &[String], cfg: &QuantConfig) -> Result<Cr
     })
 }
 
-/// Combine several per-run quant tables into a protein-by-run abundance matrix
-/// with MaxLFQ (peptide-level: `by_fragment=false`, reads `peptide_quant`) or
-/// directLFQ (ion-level: `by_fragment=true`, reads `fragment_quant`). Each
-/// protein's feature-by-run intensity matrix is passed to the ratio-alignment
-/// core in [`crate::quant_lfq`]. Output is long form: protein_group, run,
-/// quantity, n_features. With one input this reduces to the per-run sum.
+/// Distinct values of the scored table's `source` column, or `None` when the column is
+/// absent (a single-run table from before pooled rescoring stamped it).
 ///
-/// `normalize` applies a cross-run size factor to the feature-by-run matrix
-/// before rollup (see `size_factors`). `quantity_column` names the intensity column of
-/// the inputs: `quantity`, or `quantity_normalised` of the `peptide_quant_normalised`
-/// tables of the cross-run normalisation (`stages::quant_norm`), which are then read
-/// with `NormalizeMethod::None`.
-pub fn run_lfq_combine(
-    inputs: &[String],
-    by_fragment: bool,
-    normalize: NormalizeMethod,
-    quantity_column: &str,
-    out: &str,
-) -> Result<u64> {
-    run_lfq_combine_grouped(inputs, by_fragment, normalize, None, quantity_column, out)
-        .map(|(rows, _)| rows)
-}
-
-/// The size factor of each run of a cross-run LFQ, as [`run_lfq_combine_grouped`] applied
-/// it, and the number of features it was estimated from.
-#[derive(Clone, Debug, PartialEq)]
-pub struct SizeFactor {
-    pub factor: f64,
-    /// Complete-case features of the run's group (`median_ratio`), the run's own features
-    /// (`median`), or 0 when no factor was estimated (`none`, a group of one run, or no
-    /// complete feature).
-    pub n_features: usize,
-}
-
-/// [`run_lfq_combine`] with the size factors estimated within groups of runs: `groups`
-/// holds one group index per input (`quant.normalisation_scope = condition`), and each
-/// group's factors are those of `normalize` over that group's runs alone, so a group of one
-/// run keeps factor 1. `None` estimates one set over every run, as `run_lfq_combine`.
-/// Returns the row count and each run's factor.
-pub fn run_lfq_combine_grouped(
-    inputs: &[String],
-    by_fragment: bool,
-    normalize: NormalizeMethod,
-    groups: Option<&[usize]>,
-    quantity_column: &str,
-    out: &str,
-) -> Result<(u64, Vec<SizeFactor>)> {
-    use std::collections::BTreeMap;
-    let n = inputs.len();
-    // protein_group -> feature key -> per-run intensity
-    let mut data: BTreeMap<String, BTreeMap<String, Vec<Option<f64>>>> = BTreeMap::new();
-    for (ri, path) in inputs.iter().enumerate() {
-        let t = TableFile::open(path)?;
-        let pform = t.str("peptidoform")?;
-        let z = t.i32("charge")?;
-        let pgc = t.str("protein_group")?;
-        let q = t.opt_f64(quantity_column)?;
-        let fname = if by_fragment {
-            Some(t.str("fragment_name")?)
-        } else {
-            None
-        };
-        for i in 0..t.nrows {
-            let Some(quantity) = q[i].filter(|v| v.is_finite() && *v > 0.0) else {
-                continue;
-            };
-            let key = match &fname {
-                Some(fnm) => format!("{}|{}|{}", pform[i], z[i], fnm[i]),
-                None => format!("{}|{}", pform[i], z[i]),
-            };
-            // Same reason as `add_protein_base_quantity`: `entry` would clone the protein
-            // group name on every row, and a run's quant table repeats each group many
-            // times over.
-            if !data.contains_key(&pgc[i]) {
-                data.insert(pgc[i].clone(), BTreeMap::new());
-            }
-            let slot = &mut data
-                .get_mut(&pgc[i])
-                .expect("the group was just inserted")
-                .entry(key)
-                .or_insert_with(|| vec![None; n])[ri];
-            *slot = Some(slot.map_or(quantity, |previous| previous.max(quantity)));
-        }
+/// `rescore` writes `source` as u32. The previous guard read it as i32 and treated the
+/// resulting type error like an absent column, so the pooled-table refusal above never
+/// ran on the engine's own output: a pooled table quantified against one run's
+/// chromatograms produced one identical row per run without a word (docs/29 #1). A
+/// present column that is neither u32 nor i32 is an error now, not a shrug.
+pub(crate) fn pooled_source_count(ps: &TableFile, path: &str) -> Result<Option<usize>> {
+    if !ps.has_column("source") {
+        return Ok(None);
     }
-    // Cross-run normalization: one global size factor per run, estimated from the
-    // whole feature-by-run matrix and applied before protein rollup so both the
-    // MaxLFQ profile and any downstream ratio inherit the corrected scale.
-    if let Some(g) = groups {
-        anyhow::ensure!(
-            g.len() == n,
-            "quant-lfq: {} condition labels for {n} input tables",
-            g.len()
-        );
-    }
-    let sized = match groups {
-        Some(g) => grouped_size_factors(&data, g, normalize),
-        None => size_factors_counted(&data, &(0..n).collect::<Vec<_>>(), normalize),
-    };
-    let factors: Vec<f64> = sized.iter().map(|s| s.factor).collect();
-    if normalize != NormalizeMethod::None {
-        for feats in data.values_mut() {
-            for vec in feats.values_mut() {
-                for r in 0..n {
-                    if let Some(v) = vec[r] {
-                        vec[r] = Some(v / factors[r]);
-                    }
-                }
-            }
-        }
-    }
-    let (mut c_pg, mut c_run, mut c_q, mut c_nf) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    // The rollup levels below read the SAME feature vectors, so each level borrows them
-    // from `data` rather than cloning them: with the protein level and the two sibling
-    // levels this held three or four copies of every feature vector at once.
-    let mut mat: Vec<&Vec<Option<f64>>> = Vec::new();
-    for (pgname, feats) in &data {
-        mat.clear();
-        mat.extend(feats.values());
-        let prof = crate::quant_lfq::lfq_profile(&mat, n);
-        for (r, &v) in prof.iter().enumerate() {
-            c_pg.push(pgname.clone());
-            c_run.push(r as i32);
-            c_q.push(v);
-            c_nf.push(feats.len() as i32);
-        }
-    }
-    let rows = write_table(
-        out,
-        vec![
-            Col::Str("protein_group".into(), c_pg),
-            Col::I32("run".into(), c_run),
-            Col::F64("quantity".into(), c_q),
-            Col::I32("n_features".into(), c_nf),
-        ],
-    )?;
-
-    // Peptide- and precursor-level matrices from the SAME normalized features,
-    // written as sibling files next to the protein matrix (the protein output is
-    // unchanged). Precursor = one (peptidoform, charge); peptide = one stripped
-    // base sequence. Both roll their member features up with the same LFQ engine.
-    // Purely additive analysis granularity; strictly post-FDR, no identification
-    // or FDR change.
-    let mut prec: BTreeMap<(String, i32), Vec<&Vec<Option<f64>>>> = BTreeMap::new();
-    let mut pep: BTreeMap<String, Vec<&Vec<Option<f64>>>> = BTreeMap::new();
-    for feats in data.values() {
-        for (key, vec) in feats {
-            // key = "peptidoform|charge" (maxlfq) or "peptidoform|charge|fragment"
-            // (directlfq); peptidoform strings never contain '|'.
-            let mut it = key.splitn(3, '|');
-            let pform = it.next().unwrap_or("");
-            let charge: i32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-            prec.entry((pform.to_string(), charge))
-                .or_default()
-                .push(vec);
-            pep.entry(base_sequence(pform)).or_default().push(vec);
-        }
-    }
-    // (group key, charge, feature-by-run matrix) for one sibling-matrix level. The matrix
-    // borrows its rows from `data`.
-    type LevelGroup<'a> = (String, i32, Vec<&'a Vec<Option<f64>>>);
-    let write_level = |path: String, groups: Vec<LevelGroup>| -> Result<()> {
-        let (mut g_key, mut g_z, mut g_run, mut g_q, mut g_nf) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        for (key, z, mat) in &groups {
-            let prof = crate::quant_lfq::lfq_profile(mat, n);
-            for (r, &v) in prof.iter().enumerate() {
-                g_key.push(key.clone());
-                g_z.push(*z);
-                g_run.push(r as i32);
-                g_q.push(v);
-                g_nf.push(mat.len() as i32);
-            }
-        }
-        write_table(
-            &path,
-            vec![
-                Col::Str("group".into(), g_key),
-                Col::I32("charge".into(), g_z),
-                Col::I32("run".into(), g_run),
-                Col::F64("quantity".into(), g_q),
-                Col::I32("n_features".into(), g_nf),
-            ],
-        )?;
-        Ok(())
-    };
-    write_level(
-        precursor_lfq_path(out),
-        prec.into_iter().map(|((p, z), m)| (p, z, m)).collect(),
-    )?;
-    write_level(
-        format!("{out}.peptide.parquet"),
-        pep.into_iter().map(|(p, m)| (p, -1, m)).collect(),
-    )?;
-
-    info!(
-        proteins = data.len(),
-        runs = n,
-        method = if by_fragment { "directlfq" } else { "maxlfq" },
-        normalize = ?normalize,
-        size_factors = ?factors,
-        "quant-lfq: done (+ .peptide/.precursor sibling matrices)"
-    );
-    Ok((rows, sized))
-}
-
-/// The file name of the size-factor table `run-experiment` writes at the experiment root.
-pub const LFQ_SIZE_FACTORS_TSV: &str = "lfq_size_factors.tsv";
-
-/// Write the size factor of every run of a cross-run LFQ as a tab-separated table: `run`,
-/// `condition` (empty when the run has none), `size_factor` (what the run's feature
-/// intensities were divided by; 1 when none was applied) and `n_features` (the features it
-/// was estimated from). One row per run, in run order.
-pub fn write_size_factors_tsv(
-    path: &str,
-    runs: &[String],
-    conditions: &[Option<String>],
-    factors: &[SizeFactor],
-) -> Result<()> {
-    use std::io::Write;
-    anyhow::ensure!(
-        runs.len() == factors.len() && conditions.len() == runs.len(),
-        "{path}: {} runs, {} conditions and {} size factors",
-        runs.len(),
-        conditions.len(),
-        factors.len()
-    );
-    let mut w = std::io::BufWriter::new(
-        std::fs::File::create(path).with_context(|| format!("creating {path}"))?,
-    );
-    writeln!(w, "run\tcondition\tsize_factor\tn_features")?;
-    for ((run, cond), f) in runs.iter().zip(conditions).zip(factors) {
-        writeln!(
-            w,
-            "{run}\t{}\t{}\t{}",
-            cond.as_deref().unwrap_or(""),
-            f.factor,
-            f.n_features
-        )?;
-    }
-    w.flush()?;
-    Ok(())
-}
-
-/// Stripped base amino-acid sequence of a peptidoform: drop bracketed or
-/// parenthesized modification blocks and any DECOY_ prefix, keep the residues.
-/// Used to roll precursors up to peptide-level LFQ groups.
-fn base_sequence(peptidoform: &str) -> String {
-    let s = peptidoform.strip_prefix("DECOY_").unwrap_or(peptidoform);
-    let mut out = String::new();
-    let mut depth = 0i32;
-    for c in s.chars() {
-        match c {
-            '[' | '(' => depth += 1,
-            ']' | ')' => depth = (depth - 1).max(0),
-            c if depth == 0 && c.is_ascii_alphabetic() => out.push(c),
-            _ => {}
-        }
-    }
-    out
-}
-
-/// Per-run size factors for cross-run normalization of the feature-by-run matrix.
-///
-/// - `MedianRatio` (DESeq-style): for every complete-case feature (present and
-///   positive in all runs) take its ratio to a geometric-mean pseudo-reference;
-///   the run factor is the median of those ratios. Robust to a minority of
-///   genuinely changing features, so a spike-in design's real fold changes are
-///   preserved, not flattened.
-/// - `Median`: align each run's median log2 intensity to the median of the
-///   per-run medians.
-/// - `None`: all factors 1.0.
-///
-/// Medians are taken over sorted values and the matrix is iterated in `BTreeMap`
-/// key order, so the result is deterministic (docs/14_build_test_deploy_gotchas.md).
-#[cfg(test)]
-fn size_factors(
-    data: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, Vec<Option<f64>>>>,
-    n: usize,
-    method: NormalizeMethod,
-) -> Vec<f64> {
-    size_factors_counted(data, &(0..n).collect::<Vec<_>>(), method)
-        .into_iter()
-        .map(|s| s.factor)
-        .collect()
-}
-
-/// [`size_factors`] over the runs `runs` of the matrix alone, one entry per entry of `runs`,
-/// with the number of features each factor was estimated from. Over every run (`0..n`) it
-/// is `size_factors` exactly: the same features in the same order, summed in the same order.
-fn size_factors_counted(
-    data: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, Vec<Option<f64>>>>,
-    runs: &[usize],
-    method: NormalizeMethod,
-) -> Vec<SizeFactor> {
-    let n = runs.len();
-    match method {
-        NormalizeMethod::None => vec![
-            SizeFactor {
-                factor: 1.0,
-                n_features: 0
-            };
-            n
-        ],
-        NormalizeMethod::MedianRatio => {
-            let mut lr: Vec<Vec<f64>> = vec![Vec::new(); n];
-            for feats in data.values() {
-                for vec in feats.values() {
-                    if runs.iter().all(|&r| vec[r].is_some_and(|v| v > 0.0)) {
-                        let logs: Vec<f64> = runs.iter().map(|&r| vec[r].unwrap().log2()).collect();
-                        let refm = logs.iter().sum::<f64>() / n as f64;
-                        for k in 0..n {
-                            lr[k].push(logs[k] - refm);
-                        }
-                    }
-                }
-            }
-            (0..n)
-                .map(|k| SizeFactor {
-                    n_features: lr[k].len(),
-                    factor: if lr[k].is_empty() {
-                        1.0
-                    } else {
-                        2f64.powf(crate::stats::median_or(&mut lr[k], 0.0))
-                    },
-                })
-                .collect()
-        }
-        NormalizeMethod::Median => {
-            let mut logs: Vec<Vec<f64>> = vec![Vec::new(); n];
-            for feats in data.values() {
-                for vec in feats.values() {
-                    for (k, &r) in runs.iter().enumerate() {
-                        if let Some(v) = vec[r] {
-                            if v > 0.0 {
-                                logs[k].push(v.log2());
-                            }
-                        }
-                    }
-                }
-            }
-            let counts: Vec<usize> = logs.iter().map(Vec::len).collect();
-            let med: Vec<f64> = (0..n)
-                .map(|k| {
-                    if logs[k].is_empty() {
-                        0.0
-                    } else {
-                        crate::stats::median_or(&mut logs[k], 0.0)
-                    }
-                })
-                .collect();
-            let mut m2 = med.clone();
-            let target = if m2.is_empty() {
-                0.0
-            } else {
-                crate::stats::median_or(&mut m2, 0.0)
-            };
-            (0..n)
-                .map(|k| SizeFactor {
-                    factor: 2f64.powf(med[k] - target),
-                    n_features: counts[k],
-                })
-                .collect()
-        }
-    }
-}
-
-/// Size factors estimated separately within each group of runs (`groups[r]` is run `r`'s
-/// group), scattered back to run order. A group of one run has nothing to be normalised
-/// against and keeps factor 1 (`n_features` 0).
-fn grouped_size_factors(
-    data: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, Vec<Option<f64>>>>,
-    groups: &[usize],
-    method: NormalizeMethod,
-) -> Vec<SizeFactor> {
-    let mut members: std::collections::BTreeMap<usize, Vec<usize>> =
-        std::collections::BTreeMap::new();
-    for (r, &g) in groups.iter().enumerate() {
-        members.entry(g).or_default().push(r);
-    }
-    let mut out = vec![
-        SizeFactor {
-            factor: 1.0,
-            n_features: 0
-        };
-        groups.len()
-    ];
-    for runs in members.values() {
-        if runs.len() < 2 {
-            continue;
-        }
-        for (k, f) in size_factors_counted(data, runs, method)
+    let distinct = match ps.u32("source") {
+        Ok(v) => v
             .into_iter()
-            .enumerate()
-        {
-            out[runs[k]] = f;
-        }
-    }
-    out
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        Err(u32_err) => match ps.i32("source") {
+            Ok(v) => v
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            Err(_) => anyhow::bail!(
+                "column `source` in {path} is present but neither u32 (what rescore writes) \
+                 nor i32: {u32_err:#}"
+            ),
+        },
+    };
+    Ok(Some(distinct))
 }
 
 #[cfg(test)]
@@ -5368,13 +4988,6 @@ mod tests {
     }
 
     #[test]
-    fn base_sequence_strips_mods_and_decoy() {
-        assert_eq!(base_sequence("PEPTIDEK"), "PEPTIDEK");
-        assert_eq!(base_sequence("M[Oxidation]PEC[Carbamidomethyl]K"), "MPECK");
-        assert_eq!(base_sequence("DECOY_VAVGDGVAK"), "VAVGDGVAK");
-    }
-
-    #[test]
     fn center_envelope_clips_wing_interference() {
         // A clean rise-then-fall peak is left unchanged.
         let clean = [1.0f32, 3.0, 6.0, 3.0, 1.0];
@@ -5436,174 +5049,6 @@ mod tests {
         assert_eq!(hi1, 7.0);
         // grace=0 stops at the first sub-threshold scan -> last above-threshold rt 5.
         assert_eq!(hi0, 5.0);
-    }
-
-    #[test]
-    fn median_ratio_recovers_global_scale_not_real_changes() {
-        use std::collections::BTreeMap;
-        // Two runs. Run 1 is a global 2x of run 0 for the bulk (unchanged) features,
-        // plus one genuinely-up and one genuinely-down feature. Median-of-ratios must
-        // recover the 2x global scale (f[1]/f[0] ~ 2) without being pulled by the two
-        // real changes, and after dividing by the factors the bulk ratio -> 1 while
-        // the real changes survive.
-        let mut feats: BTreeMap<String, Vec<Option<f64>>> = BTreeMap::new();
-        for i in 0..8 {
-            let a = 100.0 * (i as f64 + 1.0);
-            feats.insert(format!("bulk{i:02}"), vec![Some(a), Some(2.0 * a)]);
-        }
-        feats.insert("up".into(), vec![Some(100.0), Some(800.0)]); // +2 log2 vs global
-        feats.insert("down".into(), vec![Some(400.0), Some(200.0)]); // -2 log2 vs global
-        let mut data: BTreeMap<String, BTreeMap<String, Vec<Option<f64>>>> = BTreeMap::new();
-        data.insert("PG".into(), feats);
-
-        let f = size_factors(&data, 2, NormalizeMethod::MedianRatio);
-        assert!(
-            (f[1] / f[0] - 2.0).abs() < 0.02,
-            "expected ~2x scale, got {f:?}"
-        );
-        // Bulk normalizes to ratio 1; the up/down real changes are preserved.
-        let bulk = (100.0 / f[0], 200.0 / f[1]);
-        assert!(
-            (bulk.0 / bulk.1 - 1.0).abs() < 1e-9,
-            "bulk should flatten to 1"
-        );
-        let up = (100.0 / f[0]) / (800.0 / f[1]);
-        assert!(
-            (up - 0.25).abs() < 1e-9,
-            "up feature run0/run1 should stay 1:4"
-        );
-    }
-
-    #[test]
-    fn none_leaves_matrix_unnormalized() {
-        use std::collections::BTreeMap;
-        let mut feats: BTreeMap<String, Vec<Option<f64>>> = BTreeMap::new();
-        feats.insert("f".into(), vec![Some(10.0), Some(40.0)]);
-        let mut data: BTreeMap<String, BTreeMap<String, Vec<Option<f64>>>> = BTreeMap::new();
-        data.insert("PG".into(), feats);
-        assert_eq!(
-            size_factors(&data, 2, NormalizeMethod::None),
-            vec![1.0, 1.0]
-        );
-    }
-
-    /// A four-run design, two conditions of two replicates, where condition B has a real
-    /// 4x more of every feature and run 1 a 2x loading error within A. Per condition, the
-    /// factors are the factors of each condition's runs alone (geometric mean 1 within a
-    /// condition), so the loading error goes and the difference between conditions stays as
-    /// measured; over all runs that difference is taken for loading and removed. A condition of one
-    /// run keeps factor 1, and the ungrouped kernel equals the subset kernel over `0..n`.
-    #[test]
-    fn size_factors_within_conditions_keep_the_difference_between_them() {
-        use std::collections::BTreeMap;
-        let mut feats: BTreeMap<String, Vec<Option<f64>>> = BTreeMap::new();
-        for i in 0..9 {
-            let a = 100.0 * (i as f64 + 1.0);
-            feats.insert(
-                format!("f{i}"),
-                vec![Some(a), Some(2.0 * a), Some(4.0 * a), Some(4.0 * a)],
-            );
-        }
-        let mut data: BTreeMap<String, BTreeMap<String, Vec<Option<f64>>>> = BTreeMap::new();
-        data.insert("PG".into(), feats);
-        let m = NormalizeMethod::MedianRatio;
-        let by_cond = grouped_size_factors(&data, &[0, 0, 1, 1], m);
-        let f: Vec<f64> = by_cond.iter().map(|s| s.factor).collect();
-        assert!((f[1] / f[0] - 2.0).abs() < 1e-9, "{f:?}");
-        assert!(
-            (f[0] * f[1] - 1.0).abs() < 1e-9,
-            "geometric mean 1 within A: {f:?}"
-        );
-        assert!(
-            (f[2] - 1.0).abs() < 1e-9 && (f[3] - 1.0).abs() < 1e-9,
-            "{f:?}"
-        );
-        assert!(by_cond.iter().all(|s| s.n_features == 9));
-        // Normalised, run 0 and run 1 agree, and B over A is the measured ratio of B to A's
-        // geometric mean, 400 / sqrt(100 x 200).
-        let v = |r: usize, x: f64| x / f[r];
-        assert!((v(1, 200.0) / v(0, 100.0) - 1.0).abs() < 1e-9);
-        assert!((v(2, 400.0) / v(0, 100.0) - 400.0 / 20_000f64.sqrt()).abs() < 1e-9);
-        // Over all runs the 4x between conditions is removed as if it were loading.
-        let all = size_factors(&data, 4, m);
-        assert!(
-            ((400.0 / all[2]) / (100.0 / all[0]) - 4.0).abs() > 1.0,
-            "{all:?}"
-        );
-        // The subset kernel over every run is the ungrouped kernel, bit for bit.
-        let every: Vec<f64> = size_factors_counted(&data, &[0, 1, 2, 3], m)
-            .iter()
-            .map(|s| s.factor)
-            .collect();
-        assert_eq!(every, all);
-        // A condition with one run keeps 1; `none` gives 1 everywhere.
-        let lone = grouped_size_factors(&data, &[0, 0, 0, 1], m);
-        assert_eq!(
-            lone[3],
-            SizeFactor {
-                factor: 1.0,
-                n_features: 0
-            }
-        );
-        assert!(lone[..3].iter().all(|s| s.n_features == 9));
-        let none = grouped_size_factors(&data, &[0, 0, 1, 1], NormalizeMethod::None);
-        assert!(none.iter().all(|s| s.factor == 1.0));
-        // A feature missing in run 3 leaves condition A's complete cases untouched.
-        data.get_mut("PG")
-            .unwrap()
-            .insert("gap".into(), vec![Some(1.0), Some(9.0), Some(5.0), None]);
-        let gap = grouped_size_factors(&data, &[0, 0, 1, 1], m);
-        assert_eq!(gap[0].n_features, 10);
-        assert_eq!(gap[2].n_features, 9);
-    }
-
-    /// End to end through the parquet tables: the grouped combine writes the same LFQ
-    /// table as the ungrouped one when every run is its own group under `none`, and refuses
-    /// a group list that does not match the inputs.
-    #[test]
-    fn grouped_lfq_combine_checks_its_groups() {
-        let dir = std::env::temp_dir().join(format!("mumdia_lfq_groups_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut inputs = Vec::new();
-        for (r, scale) in [1.0f64, 2.0, 8.0].iter().enumerate() {
-            let path = dir
-                .join(format!("pq{r}.parquet"))
-                .to_string_lossy()
-                .to_string();
-            write_table(
-                &path,
-                vec![
-                    Col::Str("peptidoform".into(), vec!["PEPTIDEK".into(), "AAAK".into()]),
-                    Col::I32("charge".into(), vec![2, 2]),
-                    Col::Str("protein_group".into(), vec!["P1".into(), "P1".into()]),
-                    Col::F64("quantity".into(), vec![100.0 * scale, 50.0 * scale]),
-                ],
-            )
-            .unwrap();
-            inputs.push(path);
-        }
-        let out = dir.join("lfq.parquet").to_string_lossy().to_string();
-        let (_, f) = run_lfq_combine_grouped(
-            &inputs,
-            false,
-            NormalizeMethod::MedianRatio,
-            Some(&[0, 0, 1]),
-            "quantity",
-            &out,
-        )
-        .unwrap();
-        assert!((f[1].factor / f[0].factor - 2.0).abs() < 1e-9, "{f:?}");
-        assert_eq!(f[2].factor, 1.0);
-        assert!(run_lfq_combine_grouped(
-            &inputs,
-            false,
-            NormalizeMethod::MedianRatio,
-            Some(&[0, 1]),
-            "quantity",
-            &out,
-        )
-        .is_err());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -5771,8 +5216,8 @@ mod tests {
             run(QuantParams {
                 psms_scored: &scored,
                 chromatograms: &[ChromTable::whole(&chrom)],
-                out_peptide: &pep,
-                out_protein: &prot,
+                out_peptide: Some(&pep),
+                out_protein: Some(&prot),
                 out_fragment: None,
                 out_peak_bounds: None,
                 out_quant_fragments: None,
@@ -5898,8 +5343,8 @@ mod tests {
         let rows = run(QuantParams {
             psms_scored: &scored,
             chromatograms: &[ChromTable::whole(&chrom)],
-            out_peptide: &peptide,
-            out_protein: &protein,
+            out_peptide: Some(&peptide),
+            out_protein: Some(&protein),
             out_fragment: Some(&fragment),
             out_peak_bounds: Some(&bounds),
             out_quant_fragments: None,
@@ -5960,6 +5405,32 @@ mod tests {
         let fq = Table::read(&fragment).unwrap();
         assert_eq!(fq.nrows, 3, "the all-zero ion must not be exported");
         assert!(fq.f64("quantity").unwrap().iter().all(|area| *area > 0.0));
+
+        // The profile centre places the window on the top predicted fragments, so it is
+        // refused on this table too, even under a rule that ranks by observed area: every
+        // prediction would read 0, and the window would follow table order.
+        let profile = QuantConfig {
+            window_centre: WindowCentre::Profile,
+            ..QuantConfig::previous_defaults()
+        };
+        let err = run(QuantParams {
+            psms_scored: &scored,
+            chromatograms: &[ChromTable::whole(&chrom)],
+            out_peptide: Some(&peptide),
+            out_protein: Some(&protein),
+            out_fragment: None,
+            out_peak_bounds: None,
+            out_quant_fragments: None,
+            cfg: &profile,
+            config_hash: "test",
+            cross_run: None,
+            export_cross_run: false,
+            first_pass_ids: None,
+            q1: None,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("quant.window_centre = Profile"), "{err}");
     }
 
     #[test]
@@ -6168,8 +5639,8 @@ mod tests {
         let rows = run(QuantParams {
             psms_scored: &scored,
             chromatograms: &[ChromTable::whole(&chrom)],
-            out_peptide: &peptide,
-            out_protein: &protein,
+            out_peptide: Some(&peptide),
+            out_protein: Some(&protein),
             out_fragment: None,
             out_peak_bounds: None,
             out_quant_fragments: None,
@@ -6207,8 +5678,8 @@ mod tests {
             let rows = run(QuantParams {
                 psms_scored: &scored,
                 chromatograms: &[ChromTable::whole(&chrom)],
-                out_peptide: &peptide,
-                out_protein: &protein,
+                out_peptide: Some(&peptide),
+                out_protein: Some(&protein),
                 out_fragment: None,
                 out_peak_bounds: None,
                 out_quant_fragments: None,
@@ -6311,8 +5782,8 @@ mod tests {
         run(QuantParams {
             psms_scored: &input.0,
             chromatograms: &[ChromTable::whole(&input.1)],
-            out_peptide: &out[0],
-            out_protein: &out[1],
+            out_peptide: Some(&out[0]),
+            out_protein: Some(&out[1]),
             out_fragment: Some(&out[2]),
             out_peak_bounds: None,
             out_quant_fragments: None,
@@ -6434,10 +5905,11 @@ mod tests {
         assert_eq!(e.f64("peak_hwhm").unwrap(), vec![1.75; 4]);
         // directLFQ reads the export as it reads v1: the zero-area row is not a feature.
         let lfq = quant_test_path("crx_lfq.parquet");
-        run_lfq_combine(
+        crate::quant_lfq::run_lfq_combine_grouped(
             &[ex[2].clone()],
             true,
-            NormalizeMethod::None,
+            mumdia_core::config::NormalizeMethod::None,
+            None,
             "quantity",
             &lfq,
         )
@@ -6445,6 +5917,30 @@ mod tests {
         assert_eq!(
             Table::read(&lfq).unwrap().i32("n_features").unwrap(),
             vec![3]
+        );
+        // The export passes of run-experiment ask for the export alone: no peptide or
+        // protein table is written or reported, and the export is the same.
+        let alone = quant_test_path("crx_alone_frag.parquet");
+        let w = run_hashed(QuantParams {
+            psms_scored: &input.0,
+            chromatograms: &[ChromTable::whole(&input.1)],
+            out_peptide: None,
+            out_protein: None,
+            out_fragment: Some(&alone),
+            out_peak_bounds: None,
+            out_quant_fragments: None,
+            cfg: &cross_run_cfg(),
+            config_hash: "test",
+            cross_run: None,
+            export_cross_run: true,
+            first_pass_ids: None,
+            q1: None,
+        })
+        .unwrap();
+        assert!(w.peptide.is_none() && w.protein.is_none());
+        assert_eq!(
+            std::fs::read(&alone).unwrap(),
+            std::fs::read(&ex[2]).unwrap()
         );
     }
 
@@ -6593,8 +6089,8 @@ mod tests {
             let w = run_hashed(QuantParams {
                 psms_scored: &input.0,
                 chromatograms: &[ChromTable::whole(&input.1)],
-                out_peptide: &out[0],
-                out_protein: &out[1],
+                out_peptide: Some(&out[0]),
+                out_protein: Some(&out[1]),
                 out_fragment: Some(&out[2]),
                 out_peak_bounds: None,
                 out_quant_fragments: with.then_some(acc.as_str()),
@@ -6927,8 +6423,8 @@ mod tests {
         let rows = run(QuantParams {
             psms_scored: &scored,
             chromatograms: &[ChromTable::whole(&chrom)],
-            out_peptide: &peptide,
-            out_protein: &protein,
+            out_peptide: Some(&peptide),
+            out_protein: Some(&protein),
             out_fragment: None,
             out_peak_bounds: None,
             out_quant_fragments: None,
@@ -6969,8 +6465,8 @@ mod tests {
         let err = run(QuantParams {
             psms_scored: &scored,
             chromatograms: &[ChromTable::whole(&chrom)],
-            out_peptide: &quant_test_path("err_peptide.parquet"),
-            out_protein: &quant_test_path("err_protein.parquet"),
+            out_peptide: Some(&quant_test_path("err_peptide.parquet")),
+            out_protein: Some(&quant_test_path("err_protein.parquet")),
             out_fragment: None,
             out_peak_bounds: None,
             out_quant_fragments: None,
@@ -7411,8 +6907,8 @@ mod tests {
         let rows = run(QuantParams {
             psms_scored: &scored,
             chromatograms: &[ChromTable::whole(&chrom)],
-            out_peptide: &peptide,
-            out_protein: &protein,
+            out_peptide: Some(&peptide),
+            out_protein: Some(&protein),
             out_fragment: Some(&fragment),
             out_peak_bounds: Some(&bounds),
             out_quant_fragments: None,
@@ -7543,8 +7039,8 @@ mod tests {
             run(QuantParams {
                 psms_scored: &scored,
                 chromatograms: &[ChromTable::whole(&chrom)],
-                out_peptide: &peptide,
-                out_protein: &protein,
+                out_peptide: Some(&peptide),
+                out_protein: Some(&protein),
                 out_fragment: None,
                 out_peak_bounds: bounds.as_deref(),
                 out_quant_fragments: None,
@@ -8428,8 +7924,8 @@ mod tests {
         run(QuantParams {
             psms_scored: scored,
             chromatograms: tables,
-            out_peptide: &pep,
-            out_protein: &prot,
+            out_peptide: Some(&pep),
+            out_protein: Some(&prot),
             out_fragment: None,
             out_peak_bounds: None,
             out_quant_fragments: None,
@@ -8635,8 +8131,8 @@ mod tests {
             run(QuantParams {
                 psms_scored: &scored,
                 chromatograms: tables,
-                out_peptide: &pep,
-                out_protein: &prot,
+                out_peptide: Some(&pep),
+                out_protein: Some(&prot),
                 out_fragment: Some(&frag),
                 out_peak_bounds: bounds.then_some(pb.as_str()),
                 out_quant_fragments: None,
@@ -8763,8 +8259,8 @@ mod tests {
             run(QuantParams {
                 psms_scored: &scored,
                 chromatograms: &[ChromTable::whole(chrom)],
-                out_peptide: &pep,
-                out_protein: &prot,
+                out_peptide: Some(&pep),
+                out_protein: Some(&prot),
                 out_fragment: Some(&frag),
                 out_peak_bounds: Some(&pb),
                 out_quant_fragments: None,
@@ -8904,8 +8400,8 @@ mod tests {
                 run(QuantParams {
                     psms_scored: &scored,
                     chromatograms: &t,
-                    out_peptide: &pep,
-                    out_protein: &prot,
+                    out_peptide: Some(&pep),
+                    out_protein: Some(&prot),
                     out_fragment: Some(&frag),
                     out_peak_bounds: None,
                     out_quant_fragments: None,
@@ -9102,8 +8598,8 @@ mod tests {
             run(QuantParams {
                 psms_scored: &scored,
                 chromatograms: &[ChromTable::whole(chrom)],
-                out_peptide: &peptide,
-                out_protein: &protein,
+                out_peptide: Some(&peptide),
+                out_protein: Some(&protein),
                 out_fragment: Some(&fragment),
                 out_peak_bounds: None,
                 out_quant_fragments: None,
@@ -9560,37 +9056,6 @@ mod tests {
     }
 }
 
-/// Distinct values of the scored table's `source` column, or `None` when the column is
-/// absent (a single-run table from before pooled rescoring stamped it).
-///
-/// `rescore` writes `source` as u32. The previous guard read it as i32 and treated the
-/// resulting type error like an absent column, so the pooled-table refusal above never
-/// ran on the engine's own output: a pooled table quantified against one run's
-/// chromatograms produced one identical row per run without a word (docs/29 #1). A
-/// present column that is neither u32 nor i32 is an error now, not a shrug.
-pub(crate) fn pooled_source_count(ps: &TableFile, path: &str) -> Result<Option<usize>> {
-    if !ps.has_column("source") {
-        return Ok(None);
-    }
-    let distinct = match ps.u32("source") {
-        Ok(v) => v
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>()
-            .len(),
-        Err(u32_err) => match ps.i32("source") {
-            Ok(v) => v
-                .into_iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-            Err(_) => anyhow::bail!(
-                "column `source` in {path} is present but neither u32 (what rescore writes) \
-                 nor i32: {u32_err:#}"
-            ),
-        },
-    };
-    Ok(Some(distinct))
-}
-
 #[cfg(test)]
 mod source_guard_tests {
     use super::*;
@@ -9769,6 +9234,33 @@ mod source_guard_tests {
         let fit = fit_cross_run(&tables, &off).unwrap();
         assert!(fit.halfwidth.is_none());
         assert_eq!(fit.background.unwrap()[&7]["a"], 100.0);
+    }
+
+    /// Where the chosen window covers the whole trace in every run, no flank beyond it was
+    /// measured, and the fragment gets no experiment background: the base `flank_mean` lies
+    /// inside that window, so subtracting it would remove peak signal.
+    #[test]
+    fn the_halfwidth_scale_takes_no_background_where_no_flank_was_measured() {
+        let mut cols = vec![
+            Col::U32("candidate_id".into(), vec![7]),
+            Col::Str("fragment_name".into(), vec!["a".into()]),
+            Col::F64("quantity".into(), vec![10.0]),
+            Col::F64("apex_corr".into(), vec![0.9]),
+            Col::F64("flank_mean".into(), vec![100.0]),
+            Col::F64("peak_hwhm".into(), vec![2.0]),
+        ];
+        for h in CROSS_RUN_HALFWIDTH_MIN..=CROSS_RUN_HALFWIDTH_MAX {
+            cols.push(Col::F64(format!("flank_mean_h{h}"), vec![f64::NAN]));
+        }
+        let cfg = QuantConfig {
+            baseline_subtract: mumdia_core::config::BaselineSubtract::On,
+            baseline_source: BaselineSource::Experiment,
+            fixed_scan_halfwidth_scale: 2.5,
+            ..QuantConfig::previous_defaults()
+        };
+        let fit = fit_cross_run(&[table("crw_noflank", cols)], &cfg).unwrap();
+        assert_eq!(fit.halfwidth.unwrap()[&7], 5);
+        assert!(!fit.background.unwrap()[&7].contains_key("a"));
     }
 
     #[test]
@@ -10013,8 +9505,8 @@ mod pattern_tests {
         run(QuantParams {
             psms_scored: &tables.0,
             chromatograms: &[ChromTable::whole(&tables.1)],
-            out_peptide: &pep,
-            out_protein: &prot,
+            out_peptide: Some(&pep),
+            out_protein: Some(&prot),
             out_fragment: fragment,
             out_peak_bounds: None,
             out_quant_fragments: None,
@@ -10339,8 +9831,8 @@ mod pattern_tests {
         run(QuantParams {
             psms_scored: &tables.0,
             chromatograms: &[ChromTable::whole(&tables.1)],
-            out_peptide: &pep,
-            out_protein: &prot,
+            out_peptide: Some(&pep),
+            out_protein: Some(&prot),
             out_fragment: None,
             out_peak_bounds: None,
             out_quant_fragments: Some(&acc),
