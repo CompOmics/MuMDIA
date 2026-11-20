@@ -352,12 +352,14 @@ impl Default for DecoyConfig {
 /// Vendor-format conversion, read by every subcommand that takes a spectra path
 /// (`raw.rs`; docs/04_convert.md, "Vendor formats").
 ///
-/// The engine itself reads mzML only, deliberately: `mzdata` is pinned to its
-/// pure-Rust `mzml` + `miniz_oxide` features so the build needs no C or .NET
-/// toolchain, and its vendor readers would reintroduce both. A vendor file is
-/// therefore converted to mzML first by an external converter run as a child
-/// process, in the same way the Python sidecars are: ThermoRawFileParser for Thermo
-/// `.raw`, ProteoWizard `msconvert` for everything else and as the Thermo fallback.
+/// The engine reads two vendor formats natively: a timsTOF diaPASEF `.d`, always, and a
+/// Thermo `.raw` under `thermo_native`, only in an engine built with the `thermo` feature.
+/// Otherwise `mzdata` is pinned to its pure-Rust `mzml` + `miniz_oxide` features so the
+/// build needs no vendor SDK, C++ or .NET toolchain, which its vendor readers would
+/// reintroduce. Every other vendor file is therefore converted to mzML first by an
+/// external converter run as a child process, in the same way the Python sidecars are:
+/// ThermoRawFileParser for Thermo `.raw`, ProteoWizard `msconvert` for everything else
+/// and as the Thermo fallback.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ConvertConfig {

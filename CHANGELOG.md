@@ -233,6 +233,18 @@ than a number. Both are recorded in every run's `manifest.json`.
   already writes it in `candidate_id` order, so the rows are identical; the parquet row-group
   layout of the output changes (the writer's default row groups instead of one per sort
   bucket), which the engine's range reads accept.
+- **A converted mzML that needs a disambiguating suffix is named with blake3.** When two
+  vendor inputs in one folder share a name (`sample.raw` beside `sample.d`), each is
+  converted to `<stem>.<8 hex>.mzML`, and that suffix came from the standard library's
+  default hasher, which may change between Rust releases: a toolchain update would rename
+  the file, so `convert.reuse_converted` missed it and the input was converted again. The
+  switch renames these files once. Each such input is converted again on its first run
+  after the update, and the previous mzML stays beside it until removed by hand. Inputs
+  with a name of their own keep `<stem>.mzML`.
+- **`convert`, `run` and `run-experiment` key the convert artifacts' provenance through one
+  function (`convert::provenance_hash`).** Each built the hash of the configuration and the
+  conversion caps by hand, and the copies had already disagreed once. The hashes are
+  unchanged.
 
 ### Removed
 
@@ -319,6 +331,25 @@ than a number. Both are recorded in every run's `manifest.json`.
   compares its file lists with `retain.rs`. A removal that failed (a file held open on
   Windows) ended the prune before `pruned.json` was written, so the files already removed had
   no record; they are recorded before the error is raised.
+- **The native Thermo read ends with its error instead of hanging (`convert.thermo_native`).**
+  When the spectra could not be written part-way through a file (a full disk), the reader
+  thread blocked for ever on its full queue, and the conversion neither ended nor reported
+  the error. Only an engine built with the opt-in `thermo` feature reads a `.raw` this way;
+  a test now drives the same decode into an error.
+- **`convert` finds the spectrum count of an mzML whose header runs past 1 MiB.** The count on
+  `<spectrumList>` was looked for in the first mebibyte only, and a SCIEX method with more
+  than about 1,250 experiments writes it later. The conversion then skipped its truncation
+  check and its parallel decode without a word, so a truncated copy of such a file converted
+  at exit 0. The header is now read once, up to 16 MiB, for the count and the instrument.
+  Converted spectra are unchanged.
+- **Smaller convert slips.** The `spectra: decoded MS2` log line gave the size of a memory
+  report (2 or 3) as its part count; the configuration reference (docs/24) and the `raw.rs`
+  module doc said that the engine reads mzML only, though it reads a diaPASEF `.d` natively
+  and, in a `thermo` build, a Thermo `.raw`; and the log line of
+  `convert.keep_converted_mzml = false` carried 14 stray spaces. The unused
+  `raw::is_thermo_raw` and the test-only copies of the serial spectra decoders are removed,
+  and the vendor converter run has its first test: a stand-in converter that fills both
+  output pipes, and one that exits 0 without writing a file.
 
 ### Security
 

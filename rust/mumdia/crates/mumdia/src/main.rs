@@ -1979,15 +1979,13 @@ fn real_main() -> Result<()> {
                     cfg.convert.isolation_half_width = Some(l.half_width);
                 }
             }
-            // Fold the conversion CLI caps into the convert artifacts' provenance
-            // key: they change the spectra output but are not part of the config, so
-            // two different caps would otherwise produce an identical config_hash
-            // (docs/18_findings_and_decisions.md). The caps are also recorded in
-            // the convert report.
-            let config_hash = mumdia_io::hash::blake3_str(&format!(
-                "{}\u{1f}max_spectra={max_spectra}\u{1f}top_peaks_ms2={top_peaks_ms2}\u{1f}top_peaks_ms1={top_peaks_ms1}",
-                cfg.canonical_json()
-            ));
+            // The caps are also recorded in the convert report.
+            let config_hash = stages::convert::provenance_hash(
+                &cfg.canonical_json(),
+                max_spectra,
+                top_peaks_ms2,
+                top_peaks_ms1,
+            );
             stages::convert::run(stages::convert::ConvertParams {
                 mzml: &mzml,
                 out_dir: &out_dir,
