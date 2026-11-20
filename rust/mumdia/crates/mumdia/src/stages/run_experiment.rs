@@ -332,7 +332,6 @@ fn search_second_pass(
         let co = convert::ConvertOutputs::existing(&format!("{}/spectra", run_dirs[i]))?;
         let seed = seed_run(
             cfg2,
-            ch,
             &library.precursors,
             &library.fragments,
             &co,
@@ -501,7 +500,7 @@ fn process_run(
             Some(format!("{out}/groups")),
         ));
     }
-    let seed = seed_run(cfg, ch, lib_p_base, lib_f, &co, out, None)?;
+    let seed = seed_run(cfg, lib_p_base, lib_f, &co, out, None)?;
     chain_after_seed(
         cfg,
         ch,
@@ -556,7 +555,6 @@ fn convert_run(
 /// Returns the seed path.
 fn seed_run(
     cfg: &Config,
-    ch: &str,
     lib_p_base: &str,
     lib_f: &str,
     co: &convert::ConvertOutputs,
@@ -578,7 +576,6 @@ fn seed_run(
         out: &seed,
         cfg: &cfg.search_seed,
         bucket_size: cfg.extract.bucket_size,
-        config_hash: ch,
     })?;
     Ok(seed)
 }
@@ -1579,10 +1576,17 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
 
     // A FASTA build may leave DeepLC to the multi-head calibration of each run, which
     // re-predicts every row before anything reads the iRT
-    // (`predict_frag.defer_deeplc_to_multihead`).
-    let irt_placeholder = cfg.defers_library_deeplc(
+    // (`predict_frag.defer_deeplc_to_multihead`), unless the library cache holds the library
+    // with its predictions (`library_build::defers_deeplc`).
+    let run_has_im = p.mzmls.iter().any(|m| crate::instrument::input_has_im(m));
+    let irt_placeholder = library_build::defers_deeplc(
+        cfg,
         p.lib_precursors.is_some(),
-        cfg.predict_frag.deeplc_python.is_some(),
+        p.fasta,
+        run_has_im,
+        (&prov.mumdia_version, &prov.git_sha),
+        true,
+        "run-experiment",
     );
 
     // --- shared library (imported or digested once) ---
@@ -1604,7 +1608,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                     fasta,
                     out_dir: p.out_dir,
                     rt_placeholder: irt_placeholder,
-                    run_has_im: p.mzmls.iter().any(|m| crate::instrument::input_has_im(m)),
+                    run_has_im,
                     engine: (&prov.mumdia_version, &prov.git_sha),
                     use_cache: true,
                     caller: "run-experiment",
@@ -1868,7 +1872,6 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: seed");
             seed_run(
                 cfg,
-                &ch,
                 &lib_p_base,
                 &lib_f,
                 &conv[i],
@@ -1972,7 +1975,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             p.max_spectra,
             library_input,
         )?;
-        let seed0 = seed_run(cfg, &ch, &lib_p_base, &lib_f, &co0, &out0, None)?;
+        let seed0 = seed_run(cfg, &lib_p_base, &lib_f, &co0, &out0, None)?;
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(front_threads)
             .build()
@@ -2030,7 +2033,6 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                         info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: seed, overlapped");
                         seeds.push(seed_run(
                             cfg,
-                            &ch,
                             &lib_p_base,
                             &lib_f,
                             co,

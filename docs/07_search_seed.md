@@ -435,7 +435,7 @@ tolerance (falling back to the config value if the file is absent,
 | `run` | `search_seed.rs:175` | stage entry point; orchestrates load, score, q, masscal, write |
 | `run_hashed` | `search_seed.rs:181` | `run`, returning the row count and the report content hash (`mumdia_io::report::Written`) |
 | `run_returning_scans` | `search_seed.rs:189` | `run_hashed`, also handing back the MS2 scans it decoded itself (`None` when they were lent), for a caller that lends them on to extract |
-| `SearchSeedParams` | `search_seed.rs:27` | input struct (`ms2`, `library_precursors`, `library_fragments`, `out` output-path prefix, `cfg`, `bucket_size`, `config_hash`, `fragment_offset`, `ms2_scans`, `emit_calibrants`, `library`) |
+| `SearchSeedParams` | `search_seed.rs:27` | input struct (`ms2`, `library_precursors`, `library_fragments`, `out` output-path prefix, `cfg`, `bucket_size`, `fragment_offset`, `ms2_scans`, `emit_calibrants`, `library`) |
 | `SeedLibrary` / `SeedLibrary::load` | `search_seed.rs:92` / `:120` | a seed's library and index, loaded once and lent to every seed of `run-experiment`; records how it was built and is refused by a seed with other settings |
 | `Best` | `search_seed.rs:168` | per-candidate best `{ score, rt, matched, scan_index }` |
 | `seed_fragindex_windows` | `search_seed.rs:695` | parallel per-window fragindex scoring + deterministic merge |
@@ -533,11 +533,9 @@ takes `--ms2`, `--lib-precursors`, `--lib-fragments`, `--out`, and
   `load_ms2` sorts scans by RT but never re-sorts peaks (`spectra.rs:20-97`), so the
   invariant is inherited from `convert`. The fragindex scoring path does not need
   it (it bins each peak independently); only mass-cal relies on it.
-- **`config_hash` is carried but unused** inside `run` (part of `SearchSeedParams`
-  for call-site uniformity, `search_seed.rs:34`). In the standalone CLI it is
-  `blake3_str(cfg.canonical_json())` (`main.rs:466`); in the `run` orchestrator it
-  is the shared chain hash `ch` (`run.rs:226`). Either way the report's
-  `content_hash` is the blake3 of the output Parquet, not this value.
+- **No configuration hash in `SearchSeedParams`.** The report's `content_hash` is
+  the blake3 of the output Parquet, and the manifest records the configuration hash;
+  the unread `config_hash` field the parameters carried was removed.
 - **`top_n_peaks` is seed-only.** It caps the probe set to reduce index probing on
   the dominant cost, but abundant peptides supply the calibration anchors anyway;
   the downstream `extract` stage still sees all converted peaks.

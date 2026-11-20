@@ -37,7 +37,7 @@ DeepLC.
 | path | role |
 |---|---|
 | `rust/mumdia/crates/mumdia/src/stages/predict_frag.rs` | Stage C: build the library (parse, fragments, intensity, iRT, top-N, sort, write Parquet) |
-| `rust/mumdia/crates/mumdia/src/predict.rs` | `RtPredictor`/`FragmentPredictor` traits + `NativeRt`/`NativeFrag` fallbacks |
+| `rust/mumdia/crates/mumdia/src/predict.rs` | the native fallbacks `native_irt` / `native_intensities` and their identities |
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | Python sidecar clients (MS2PIP, DeepLC, DeepLC fine-tune, MBR) over the file contract |
 | `rust/mumdia/crates/mumdia/src/index.rs` | `Library` (SoA model + optional bucketed inverted index), `load_for_stage` preconditions, `page_search`, `candidate_range`, `local_frag_index` |
 | `rust/mumdia/crates/mumdia/src/matchers/mod.rs` | matcher module tree; `MatcherKind` selects the backend |
@@ -140,14 +140,17 @@ imported path has no equivalent check.
 `predict_frag::run` is driven by `PredictFragParams` (`predict_frag.rs:24-31`):
 `peptidoforms` (input path), `out_precursors` / `out_fragments` (the two output
 paths), `cfg` (`&PredictFragConfig`), `work_dir` (scratch dir for sidecar
-Parquet), and `config_hash` (carried for provenance).
+Parquet), `rt_placeholder` and `run_has_im`.
 
 ## How it works
 
 ### predict-frag (`stages/predict_frag.rs:50`)
 
 **Phase A: parse and enumerate fragments** (`predict_frag.rs:60-129`). Each
-peptidoform row is parsed with `parse_peptidoform` and fragmented independently,
+peptidoform row is parsed with `parse_peptidoform` and fragmented independently
+(`fragments_of`), only to drop a row without a fragment: the fragments are generated
+again when the intensities are assigned, so the library's untruncated fragments are never
+all in memory at once,
 so rows are mapped in parallel with rayon (`into_par_iter`, line 72). The closure
 returns `RowOut::Raw`, `RowOut::ParseErr`, or `RowOut::Empty`. Fragment charges
 are chosen per row by one of two rules. The default rule is charge 1 always, plus
@@ -163,9 +166,10 @@ struct so intensity/iRT assignment reuses it instead of re-parsing
 (`predict_frag.rs:45-47`).
 
 **iRT assignment** (`assign_rt`, `predict_frag.rs:308`). Native path calls
-`NativeRt::predict_irt` per candidate. DeepLC path deduplicates by peptidoform
-string (RT is charge-independent, `predict_frag.rs:324-334`), runs the sidecar
-once over the unique set, then maps results back. Peptidoforms DeepLC returns no
+`native_irt` per candidate. DeepLC path deduplicates by peptidoform
+string in first-seen row order (RT is charge-independent; `first_seen`, shared with the
+IM2Deep request), runs the sidecar once over the unique set, then maps results back by
+each row's index. Peptidoforms DeepLC returns no
 prediction for are reported to `run`, which drops them together with every candidate
 sharing their pair key (base peptide, charge, modification set), so a target and its
 paired decoy leave together; the counts land in the library report as
@@ -174,8 +178,7 @@ used to be anchored at `irt = 0.0` with a warning, which collapsed the RT window
 the gradient origin for those candidates (docs/29 #17). `run_deeplc` also rejects a
 returned id that was not requested or that appears twice. The DeepLC branch requires `deeplc_python`
 and errors otherwise (`predict_frag.rs:318-321`); its returned model id is
-`deeplc-<installed version>-base`, the version read from the interpreter, not a trait
-`identity()` (the sidecar path has no `RtPredictor` impl to query). It was the literal
+`deeplc-<installed version>-base`, the version read from the interpreter. It was the literal
 `"deeplc-4.0-mt"` until docs/30, which named a family, not the release that predicted.
 
 **1/K0 assignment** (`ImRequest`). Only under `predict_frag.im_predictor`. The request
@@ -185,8 +188,11 @@ the m/z sort. A candidate IM2Deep returns no value for joins the iRT and intensi
 in `drop_unpredicted`: it leaves with its pair, under the same 2% ceiling, and the warning
 counts it as `without_im`. The worker and its contract are in docs/13.
 
-**intensity assignment** (`assign_intensities`, `predict_frag.rs:359`). Native
-path calls `NativeFrag::predict_intensities`. MS2PIP path runs the sidecar over
+**intensity assignment** (`assign_intensities`, `predict_frag.rs:359`). Each
+candidate's fragments are generated here, not at the parse (`keep_fragments`): the
+intensities are assigned over all of them, then the fragment m/z limits and the top-N
+cut apply, and only the kept fragments are stored. Native path calls
+`native_intensities`. MS2PIP path runs the sidecar over
 all candidates; an empty whole-map result is a hard error (`bail`,
 `predict_frag.rs`). Per candidate, `ms2pip_values` looks each fragment up by
 `(ion_byte, ordinal, charge)` and decides the regime from what the model emitted.
@@ -240,7 +246,11 @@ identity says `(placeholder: DeepLC deferred to the multi-head calibration)`), l
 do, and fail if a multi-head summary reports any row it kept (`retained_imported > 0`,
 `sidecar::require_every_row_repredicted`), because that row would keep the placeholder.
 Ignored where the multi-head calibration does not run, with a log line, and by the standalone
-`predict-frag`. Measured on the fixture with DeepLC 4.5.0 on CPU and the native fragment
+`predict-frag` and `build-library`. Also not applied when the library cache already holds the
+library as `build-library` stores it, with DeepLC's retention times
+(`library_build::defers_deeplc`, decided once before the build): the search restores that
+library and runs as with the setting off, since its placeholder key would miss the entry.
+Measured on the fixture with DeepLC 4.5.0 on CPU and the native fragment
 model: every output from the multi-head library on is byte-identical to a default run's,
 including `psms_scored.parquet` and `peptides.tsv`; only the library table and the seed's
 pass-through iRT column differ, and the run took 11 s against 21 s. On a real FASTA (the
@@ -250,14 +260,16 @@ byte-identical and the run went from 14:56 to 12:29, which is why it is the defa
 library table is then no longer a DeepLC library: set `false` for a build that is meant
 to be reused as `--lib-precursors`.
 
-**finite guard** (`predict_frag.rs:140-153`). Between assignment and top-N, every
-candidate's iRT and every fragment intensity is checked for finiteness and a
-non-finite value is a hard error. A NaN from a misbehaving sidecar would otherwise
+**finite guard** (`predict_frag.rs:140-153`). Every candidate's iRT and every fragment
+intensity, over all fragments as assigned (recorded per candidate before the m/z limits and
+the top-N cut), is checked for finiteness after the unpredicted candidates are dropped, and
+a non-finite value is a hard error. A NaN from a misbehaving sidecar would otherwise
 misorder the top-N sort and corrupt every downstream spectral-similarity feature.
 
 **Fragment m/z limits** (opt-in). With `predict_frag.fragment_mz_min` and/or
 `fragment_mz_max` set (Th, inclusive), every fragment outside the range is removed after
-the finite guard and before the top-N selection (`retain_fragments`). The order matters
+the intensities are assigned and before the top-N selection (`retain_fragments`, in
+`keep_fragments`). The order matters
 both ways: filtering before prediction would change what the models see and how their
 intensities are normalised, and filtering after the top-N would leave a slot to a
 fragment the MS2 scan range cannot record. The kept fragments keep their predicted
@@ -273,12 +285,12 @@ seeds on two acquisitions and an entrapment pool (CLAUDE.md, acquisition-specifi
 fragment caps). The precursor-side counterpart, which changes no identification inside
 its range, is `peptidoforms.precursor_mz_min` / `precursor_mz_max` (docs/05).
 
-**top-N and candidate_id** (`predict_frag.rs:155-173`). For each candidate,
-fragments are ranked by predicted intensity descending, truncated to
-`top_n_fragments`, then re-sorted ascending to restore stored order; an in-place
-forward-swap gather compacts the kept fragments without reallocating. Candidates
-are independent here, so the pass runs under `par_iter_mut` (line 158). Candidates
-left with zero fragments are dropped (`retain`, line 173). Then `raws` is sorted
+**top-N and candidate_id** (`keep_fragments`). For each candidate, as its intensities
+are assigned, fragments are ranked by predicted intensity descending (a stable sort, ties in
+fragment order), truncated to `top_n_fragments`, then re-sorted ascending to restore stored
+order; an in-place forward-swap gather compacts the kept fragments, and the vectors are
+shrunk to them. Candidates are independent here, so the pass runs under `par_iter_mut`.
+Candidates left with zero fragments are dropped (`retain`, line 173). Then `raws` is sorted
 by `precursor_mz` with a parallel STABLE `par_sort_by` (`predict_frag.rs:178`,
 same result as the serial stable `sort_by`), and `candidate_id` is assigned by
 `enumerate` over that order (`predict_frag.rs:210-211`). This is the single most
@@ -290,17 +302,16 @@ lets `candidate_id` directly index the dense accumulator.
 ### The native predictor models (`predict.rs`)
 
 Both native fallbacks are deterministic and Python-free, so the engine runs with
-zero external dependencies. `NativeRt` (`predict.rs:55-70`) sums a self-derived
+zero external dependencies. `native_irt` (`predict.rs`) sums a self-derived
 per-residue hydrophobicity coefficient (`rt_coeff`, `predict.rs:27-53`, clean-room,
 not a borrowed vector), adds `0.01 * mod_mass` per modified residue, and adds a
 `sqrt(length)` term so very long peptides do not elute infinitely late; `identity`
-is `native-rt-v1`. `NativeFrag` (`predict.rs:75-105`) weights y ions at 1.0 and b
+is `native-rt-v1`. `native_intensities` (`predict.rs`) weights y ions at 1.0 and b
 ions at 0.75, scales by a mid-sequence positional factor `1 - 0.5*|ordinal-L/2|/(L/2)`
 (mid-sequence fragments are more intense), halves charge-2 fragments, then
-max-normalizes the whole vector to its peak; `identity` is `native-frag-v1`. The
-predictor traits `RtPredictor` / `FragmentPredictor` (`predict.rs:13-22`) each
-expose `predict*` plus `identity`; only the native structs implement them (the
-sidecar paths bypass the traits and emit their own id strings, above).
+max-normalizes the whole vector to its peak; `identity` is `native-frag-v1`. The two
+identities are the constants `NATIVE_RT` and `NATIVE_FRAG`; the sidecar paths emit their
+own id strings, above.
 
 **A search refuses them unless told otherwise.** The native models are a fallback, and a
 fallback that runs silently is how a search ends up without retention-time calibration:
@@ -689,15 +700,14 @@ m/z (`Library::local_frag_index`, `index.rs:325`).
 
 | name | file:line | what it does |
 |---|---|---|
-| `PredictFragParams` | `predict_frag.rs:24` | Stage C entry args: in/out paths, `cfg`, `work_dir`, `config_hash` |
+| `PredictFragParams` | `predict_frag.rs:24` | Stage C entry args: in/out paths, `cfg`, `work_dir`, `rt_placeholder`, `run_has_im` |
 | `predict_frag::run` | `predict_frag.rs:50` | Stage C entry: parse, fragment, assign intensity/iRT, top-N, sort, write; returns `(n_prec, n_frag)` |
 | `Raw` | `predict_frag.rs:34` | one candidate pre-assignment; caches the `ParsedPeptidoform` so RT/intensity reuse the parse |
 | `assign_rt` | `predict_frag.rs:308` | native or DeepLC iRT; emits the DeepLC-miss warning; DeepLC id `deeplc-<version>-base` |
 | `assign_intensities` | `predict_frag.rs:359` | native or MS2PIP intensity with per-charge-group normalization + native charge-2 fallback; MS2PIP id `ms2pip-<version>-{model}` |
 | `fragment_cardinality` | `predict_frag.rs:457` | distinct precursors per 0.01 Da fragment-m/z bin, per fragment row; diagnostic column, no consumer yet |
-| `RtPredictor` / `FragmentPredictor` | `predict.rs:13` / `predict.rs:19` | predictor traits (predict + `identity`); implemented only by the native structs |
-| `NativeRt` | `predict.rs:25` | additive retention-coefficient model + `sqrt(len)` + `0.01*mod` term (terminal groups included; 0 for a peptidoform without one, so every earlier prediction is unchanged), `identity` `native-rt-v1` |
-| `NativeFrag` | `predict.rs:73` | heuristic b/y intensity model (y=1.0, b=0.75, mid-seq positional, charge-2 x0.5), max-normalized, `identity` `native-frag-v1` |
+| `native_irt` | `predict.rs` | additive retention-coefficient model + `sqrt(len)` + `0.01*mod` term (terminal groups included; 0 for a peptidoform without one, so every earlier prediction is unchanged), identity `NATIVE_RT` = `native-rt-v1` |
+| `native_intensities` | `predict.rs` | heuristic b/y intensity model (y=1.0, b=0.75, mid-seq positional, charge-2 x0.5), max-normalized, identity `NATIVE_FRAG` = `native-frag-v1` |
 | `resolve_script` | `sidecar.rs:20` | locate a worker script (an absolute directory as given, else exe dir/dir, exe dir/scripts, and the working directory LAST; docs/31 F3) |
 | `run_ms2pip` | `sidecar.rs:42` | MS2PIP client; in `id`/`peptidoform`/`charge`, out `id`/`ion_type`/`ordinal`/`intensity`; returns `cid -> (ion_byte, ordinal) -> intensity` |
 | `run_deeplc` | `sidecar.rs:81` | DeepLC client; in `id`/`peptidoform`, out `id`/`predicted_rt`; returns `id -> predicted_rt` |
@@ -852,10 +862,11 @@ an error before the digest.
 - `prescreen.tag_prefilter` and `prescreen.score_before_prediction` are refused: their
   library depends on a run's spectra, and a search with either builds its own library
   without the cache. The prescreen after calibration does not change the library.
-- `predict_frag.defer_deeplc_to_multihead` is ignored with a warning. Its placeholder
-  retention times are filled in by a search's multi-head calibration, so a library built
-  here carries DeepLC's predictions under a different key, and a search with the setting
-  does not find it; search it with `--lib-precursors` / `--lib-fragments` instead.
+- `predict_frag.defer_deeplc_to_multihead` does not apply (a log line says so): the library
+  carries DeepLC's predictions, under the key of a build without placeholders. A FASTA search
+  with the setting looks that key up before it builds (`library_build::defers_deeplc`) and,
+  on a hit, restores the library and runs without the deferral, with the final tables of the
+  deferred search (see "Deferred DeepLC" above).
 
 A cache hit requires the same FASTA content, configuration sections, predictor versions,
 worker scripts and engine executable as the search that later looks the library up. The
@@ -962,10 +973,9 @@ Matcher selection (both stages default to `Fragindex`):
 
 ## How to extend / modify
 
-- **Add a fragment or RT predictor.** Implement `FragmentPredictor` /
-  `RtPredictor` (`predict.rs:13,19`) for a native model, or add a variant to
+- **Add a fragment or RT predictor.** Add a variant to
   `FragPredictorKind` / `RtPredictorKind` (`config.rs:90,79`) plus a branch in
-  `assign_intensities` / `assign_rt`. Match the existing `identity()` convention;
+  `assign_intensities` / `assign_rt`. Match the existing identity convention;
   the id flows into `model_identity` and the artifact report. Keep the native
   fallback path intact so the engine still runs with no Python (behind
   `predict_frag.allow_native_predictors`).

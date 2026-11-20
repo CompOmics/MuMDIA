@@ -332,6 +332,24 @@ than a number. Both are recorded in every run's `manifest.json`.
   given instead of 24. A test now runs extract with the per-fragment Q1 decision on a
   calibrated synthetic sweep. A ZT Scan search and a search of other data write the same
   tables as before.
+- **`predict-frag` holds only the fragments it keeps.** Every b/y fragment of every
+  candidate, at both charges, stayed in memory from the parse until after the top-N cut: about
+  1.5 KB per candidate for a 15-mer, of which the library keeps 6 to 12 fragments. Each
+  candidate's fragments are now generated when its intensities are assigned, cut to the m/z
+  limits and the top-N there, and only the kept ones are stored. The native heuristic is
+  computed only for the candidates whose fragments read it, which on the default `HCDch2` model
+  is none. Libraries are byte-identical.
+- **A fragment model without a charge-2 series warns when charge-2 fragments take the
+  heuristic.** With a single-charge MS2PIP model (`HCD2021`, `TTOF5600`, ...) and charge-2
+  fragments, those fragments take the native heuristic, each charge group normalised to its own
+  peak, which on a whole-proteome FASTA library left the seed without a confident PSM (docs/06).
+  `predict-frag` now says so once, with the count and the two remedies: a `*ch2` model, or
+  `predict_frag.charge2_from_precursor_charge = 99`. The library is unchanged.
+- Internal, with no output change: the native predictors are plain functions instead of
+  one-implementation traits, the DeepLC request deduplicates peptidoforms with the helper the
+  IM2Deep request uses, the seed computes the observed 1/K0 of its anchors and of the 1/K0
+  window sizing with one function, and the unread `config_hash` field of the digest,
+  peptidoform, predict-frag and search-seed parameters is gone.
 
 ### Removed
 
@@ -483,6 +501,28 @@ than a number. Both are recorded in every run's `manifest.json`.
   calibration had accepted it. Extract now places each spectrum by its target's rank, as the
   Q1 calibration already did, and the dropped spectrum is an empty cell. A sweep without a
   dropped spectrum is read as before.
+- **A FASTA search finds the library `build-library` stored.** With
+  `predict_frag.defer_deeplc_to_multihead` (the default) and DeepLC retention times, `run` and
+  `run-experiment` keyed the library cache on a library with placeholder retention times, while
+  `build-library` always stores the library with DeepLC's, so the search missed the entry and
+  built the library again (about an hour on a 9.8M-peptidoform FASTA), although `library.json`,
+  the command's summary and the desktop said it would be reused. The search now decides the
+  deferral once, before the library is built: when the cache holds that entry it restores it and
+  runs without the deferral. The final tables are those of the deferred search, because the
+  multi-head calibration re-predicts every row either way; the run's library table and the
+  seed's pass-through iRT carry DeepLC's retention times instead of the placeholder. Without
+  such an entry nothing changes.
+- **`mumdia sub-library` no longer pair-links a FASTA-built library into an unpaired one.**
+  The default `--pair-link` unions the keep decision over `peptidoform_id`, which a target and
+  its decoy share only in an imported library; a FASTA-built library gives each decoy its own
+  id, so a list of identified targets gave a sub-library with few or no decoys and exit 0. A
+  library with both labels in which no `peptidoform_id` repeats is now refused, naming
+  `--no-pair-link` with a pair-complete list and `run-experiment`'s second pass, which pairs on
+  the base peptide and charge.
+- **A FASTA that yields no peptide fails at the digest.** A file without `>` headers, or a
+  length range no peptide fits, gave an empty library and a failure much later, at a predictor
+  or at the seed's library load, with a message that pointed away from the FASTA. The digest
+  now stops, naming the proteins read and the length range.
 - **Desktop: "Add folder…" selects several spectra folders at once (#335).** A Bruker or Agilent `.d`
   and a Waters `.raw` are directories, so they are added with "Add folder…", and that dialog took
   one folder at a time: the spectra folder picker shared the single-choice setting of the output
