@@ -927,9 +927,15 @@ retrace, which config validation refuses with bands. When a selected input is a 
 diaPASEF `.d` (the same `vendor_of` check that labels it in the file list), "Automatic"
 is one band and writes it over the preset's own `groups` block
 (`sizing::in_one_piece`). The note under Bands says so, and says when the estimate
-exceeds the memory budget, where a smaller search space or a machine with more memory
-is the answer instead of bands. A "Custom" count above one on such input is refused
-before Start.
+exceeds the memory budget, where a smaller search space (a smaller library, for an
+existing one) or a machine with more memory is the answer instead of bands. A "Custom"
+count above one on such input is refused before Start. Start checks every file again
+first, so a `.d` added while it was still being copied, which reads as a plain Bruker
+`.d` until its `analysis.tdf_bin` is there, is planned on what it is when the search
+starts. In a pooled experiment one diaPASEF input makes the whole search one band (the
+engine refuses bands for the experiment). In a batch searched separately each file is
+its own run: the diaPASEF files take one band and the other files keep Automatic's plan,
+from a second configuration (`search-derived-other.json`).
 
 The size comes from the library footer in library mode (`mumdia inspect`, rows only)
 and from the FASTA otherwise (`sizing::fasta_space`): a digest under the screen's

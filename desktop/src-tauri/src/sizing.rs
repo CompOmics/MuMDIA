@@ -291,7 +291,7 @@ pub fn estimate(req: &SpaceRequest, engine: Option<&Path>) -> Space {
     let threads = req.threads.filter(|&t| t > 0).unwrap_or(m.threads);
     let plan = band_plan(searched, m.total_memory_bytes, threads);
     let plan = if req.diapasef {
-        in_one_piece(plan)
+        in_one_piece(plan, req.mode == "library")
     } else {
         plan
     };
@@ -543,15 +543,22 @@ pub fn band_plan(precursors: Option<u64>, memory: Option<u64>, threads: usize) -
 /// diaPASEF run share m/z ranges and differ in their 1/K0 slots. The diaPASEF recipe also
 /// turns on retrace, which config validation refuses with bands. Splitting is therefore no
 /// answer to a search that does not fit, and the note says so instead of proposing bands.
-pub fn in_one_piece(plan: BandPlan) -> BandPlan {
+/// `library` says the size is an existing library's, which the Search screen's digest
+/// fields do not change, so the advice is a smaller library instead.
+pub fn in_one_piece(plan: BandPlan, library: bool) -> BandPlan {
     const WHY: &str = "diaPASEF spectra are searched in one piece: the engine cannot split \
                        their windows into bands.";
+    let smaller = if library {
+        "a smaller library (built with fewer variable modifications, missed cleavages or \
+         charges)"
+    } else {
+        "a smaller search space (fewer variable modifications, missed cleavages or charges)"
+    };
     let note = match plan.unbanded_gb {
         Some(gb) if gb > plan.budget_gb => format!(
             "{WHY} About {gb:.0} GB estimated, more than the {:.0} GB this machine can give a \
-             search, so it may run out of memory; a smaller search space (fewer variable \
-             modifications, missed cleavages or charges) or a machine with more memory avoids \
-             that.",
+             search, so it may run out of memory; {smaller} or a machine with more memory \
+             avoids that.",
             plan.budget_gb
         ),
         Some(gb) => format!(
@@ -784,7 +791,7 @@ ACDEFGHIKL
         // diaPASEF input, so the plan is one band and the note says it may not fit.
         let split = band_plan(Some(60_000_000), Some(68_000_000_000), 24);
         assert_eq!((split.bands, split.parallel), (4, 1));
-        let p = in_one_piece(split.clone());
+        let p = in_one_piece(split.clone(), false);
         assert_eq!((p.bands, p.parallel), (1, 1));
         assert_eq!(p.band_gb, split.unbanded_gb);
         assert_eq!(
@@ -798,13 +805,22 @@ ACDEFGHIKL
             p.note
         );
         assert!(p.note.contains("may run out of memory"), "{}", p.note);
+        assert!(p.note.contains("a smaller search space"), "{}", p.note);
+        // An existing library's size does not follow the Search screen's digest fields, so
+        // the advice is a smaller library.
+        let lib = in_one_piece(split.clone(), true);
+        assert!(lib.note.contains("a smaller library"), "{}", lib.note);
+        assert!(!lib.note.contains("search space"), "{}", lib.note);
         // A search that fits is one band as before, with no warning.
-        let fits = in_one_piece(band_plan(Some(10_900_000), Some(128_000_000_000), 32));
+        let fits = in_one_piece(
+            band_plan(Some(10_900_000), Some(128_000_000_000), 32),
+            false,
+        );
         assert_eq!((fits.bands, fits.parallel), (1, 1));
         assert!(fits.note.contains("within the"), "{}", fits.note);
         assert!(!fits.note.contains("run out of memory"), "{}", fits.note);
         // Without an estimate the reason the plan gave is kept.
-        let unknown = in_one_piece(band_plan(Some(60_000_000), None, 24));
+        let unknown = in_one_piece(band_plan(Some(60_000_000), None, 24), false);
         assert_eq!(unknown.bands, 1);
         assert!(
             unknown.note.contains("could not be read"),

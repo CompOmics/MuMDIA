@@ -164,6 +164,7 @@ function load() {
     "resolveBands",
     "vendorOf",
     "diapasefInputs",
+    "separateRestBands",
     "runOverrides",
     "captureSearch",
     "currentSetup",
@@ -1466,22 +1467,68 @@ test("a custom band count on diaPASEF input is a problem before Start", async ()
   assert.deepEqual(diapasefProblem(), []);
 });
 
-test("a vendor check that could not answer is asked again, an answer is kept", async () => {
+test("a fresh vendor check replaces an answer from before a copy completed", async () => {
   const p = load();
-  let up = false;
+  // A .d still being copied has no analysis.tdf_bin yet and reads as a plain Bruker .d.
+  let copied = false;
+  let down = false;
   p.answers.vendor_of = (args) => {
-    if (!up) throw "the backend is not ready";
-    return vendorAnswer(args);
+    if (down) throw "the backend is not ready";
+    return copied ? vendorAnswer(args) : { label: "Bruker .d", needs: "Msconvert" };
   };
+  const asked = () => p.calls.filter(([n]) => n === "vendor_of").length;
   p.api.state.picks.mzml = ["/d/run.d"];
-  assert.equal(await p.api.vendorOf("/d/run.d"), null);
+  assert.equal((await p.api.vendorOf("/d/run.d", true)).label, "Bruker .d");
   assert.deepEqual([...p.api.diapasefInputs()], []);
-  up = true;
-  assert.equal((await p.api.vendorOf("/d/run.d")).label, "Bruker timsTOF diaPASEF .d");
+  copied = true;
+  // Without `fresh` the kept answer serves, as the synchronous checks read it.
+  const before = asked();
+  assert.equal((await p.api.vendorOf("/d/run.d")).label, "Bruker .d");
+  assert.equal(asked(), before);
+  // The list and Start ask again, and the answer is replaced.
+  assert.equal((await p.api.vendorOf("/d/run.d", true)).label, "Bruker timsTOF diaPASEF .d");
   assert.deepEqual([...p.api.diapasefInputs()], ["/d/run.d"]);
-  const asked = p.calls.filter(([n]) => n === "vendor_of").length;
-  await p.api.vendorOf("/d/run.d");
-  assert.equal(p.calls.filter(([n]) => n === "vendor_of").length, asked);
+  // A check that cannot answer keeps the last answer.
+  down = true;
+  assert.equal((await p.api.vendorOf("/d/run.d", true)).label, "Bruker timsTOF diaPASEF .d");
+  assert.deepEqual([...p.api.diapasefInputs()], ["/d/run.d"]);
+  // With no answer at all, the file is not taken for diaPASEF.
+  p.api.state.picks.mzml = ["/d/other.d"];
+  assert.equal(await p.api.vendorOf("/d/other.d", true), null);
+  assert.deepEqual([...p.api.diapasefInputs()], []);
+});
+
+test("a batch searched separately keeps Automatic's bands for its files that are not diaPASEF", async () => {
+  const p = await profile();
+  p.answers.vendor_of = vendorAnswer;
+  const asked = [];
+  p.answers.search_space = ({ req }) => {
+    asked.push(req.diapasef);
+    return { plan: { bands: 4, parallel: 1, budget_gb: 41, unbanded_gb: 124, note: `plan ${req.diapasef}` }, machine: null };
+  };
+  const select = async (files) => {
+    p.api.state.picks.mzml = files;
+    for (const f of files) await p.api.vendorOf(f);
+  };
+  // A .d with an mzML: the selection is one band, the mzML keeps the plan's four.
+  await select(["/d/run.d", "/d/REP01.mzML"]);
+  assert.deepEqual({ ...(await p.api.resolveBands(null)) }, { bands: 1, parallel: 1, explicit: true });
+  const shown = p.api.state.space;
+  assert.deepEqual({ ...(await p.api.separateRestBands(null)) }, { bands: 4, parallel: 1, explicit: false });
+  assert.deepEqual(asked, [true, false]);
+  // Planning the other files does not change what the Bands note describes.
+  assert.equal(p.api.state.space, shown);
+  assert.equal(p.api.state.spaceDiapasef, true);
+  // Nothing to separate when every file, or no file, is diaPASEF, or Bands is not Automatic.
+  await select(["/d/run.d", "/d/run2.d"]);
+  assert.equal(await p.api.separateRestBands(null), null);
+  await select(["/d/REP01.mzML", "/d/REP02.mzML"]);
+  assert.equal(await p.api.separateRestBands(null), null);
+  await select(["/d/run.d", "/d/REP01.mzML"]);
+  for (const mode of ["off", "custom"]) {
+    p.el("bands").value = mode;
+    assert.equal(await p.api.separateRestBands(null), null, mode);
+  }
 });
 
 let failed = 0;

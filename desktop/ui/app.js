@@ -2899,7 +2899,7 @@ async function renderMzmlList() {
 
     // Say which files need something that is not installed, per file, here rather
     // than as one aggregate blocker after Start.
-    const v = await vendorOf(f);
+    const v = await vendorOf(f, true);
     if (v && v.label === DIAPASEF_LABEL) anyDiapasef = true;
     if (v && v.needs !== "Nothing") {
       const ok =
@@ -2920,6 +2920,7 @@ async function renderMzmlList() {
       state.picks.mzml.splice(i, 1);
       delete state.picks.conditions[f];
       delete state.conditionTyped[f];
+      delete state.vendors[f];
       renderMzmlList();
       updateRawNote();
     });
@@ -3221,11 +3222,13 @@ function ztscanOverrides() {
 // What `vendor_of` calls a .d the engine reads natively, with its ion mobility.
 const DIAPASEF_LABEL = "Bruker timsTOF diaPASEF .d";
 
-// The vendor check of one spectra file, asked once and kept (`state.vendors`). Null when
-// the check could not answer, which is asked again next time: detection is advisory, and
-// the engine's preflight is the authority.
-async function vendorOf(f) {
-  if (state.vendors[f]) return state.vendors[f];
+// The vendor check of one spectra file, kept in `state.vendors` for the checks that cannot
+// wait for it (`diapasefInputs`). `fresh` asks again: the list does on every render and
+// Start does before it plans, as a `.d` still being copied reads as a plain Bruker `.d`
+// until its `analysis.tdf_bin` is there. A check that could not answer keeps the last
+// answer; detection is advisory, and the engine's preflight is the authority.
+async function vendorOf(f, fresh = false) {
+  if (!fresh && state.vendors[f]) return state.vendors[f];
   let v = null;
   try {
     v = await invoke("vendor_of", { path: f });
@@ -3233,7 +3236,7 @@ async function vendorOf(f) {
     /* Advisory, as above. */
   }
   if (v) state.vendors[f] = v;
-  return v;
+  return v || state.vendors[f] || null;
 }
 
 // The selected inputs the engine reads as diaPASEF (`raw::Vendor::BrukerTdf`), by the
@@ -4104,7 +4107,9 @@ function prescreenKeep() {
     : 1;
 }
 
-function spaceRequest(libPrecursors) {
+// `diapasef` says whether to plan for diaPASEF input: by default whether any selected file
+// is diaPASEF; a batch searched separately plans its other files without it.
+function spaceRequest(libPrecursors, diapasef = diapasefInputs().length > 0) {
   const d = libraryParams("");
   const threads = parseInt($("threads").value, 10);
   const library = libPrecursors || (state.mode === "library" ? state.picks.lib_precursors : "");
@@ -4125,7 +4130,7 @@ function spaceRequest(libPrecursors) {
     max_variable_mods: maxVariableMods(),
     keep_fraction: prescreenKeep(),
     threads: Number.isFinite(threads) && threads > 0 ? threads : null,
-    diapasef: diapasefInputs().length > 0,
+    diapasef,
   };
 }
 
@@ -4217,22 +4222,40 @@ function renderSpace() {
 // stale plan from before the last change cannot decide it. On diaPASEF input Automatic is
 // one band (the plan says why, `sizing::in_one_piece`), written out so that a preset with
 // bands of its own cannot split the search either: the engine refuses bands there.
-async function resolveBands(libPrecursors) {
+// `diapasef` overrides whether to plan for diaPASEF input (`separateRestBands`), and such a
+// plan is not shown: the note keeps describing the selection.
+async function resolveBands(libPrecursors, diapasef = undefined) {
   const mode = $("bands").value;
   if (mode === "off") return { bands: 1, parallel: 1, explicit: true };
   if (mode === "custom") return { ...customBands(), explicit: true };
-  const req = spaceRequest(libPrecursors);
+  const shown = diapasef === undefined;
+  const req = shown ? spaceRequest(libPrecursors) : spaceRequest(libPrecursors, diapasef);
   const onePiece = { bands: 1, parallel: 1, explicit: true };
   try {
     const s = await invoke("search_space", { req });
-    state.space = s;
-    state.spaceDiapasef = req.diapasef;
-    renderSpace();
+    if (shown) {
+      state.space = s;
+      state.spaceDiapasef = req.diapasef;
+      renderSpace();
+    }
     if (req.diapasef) return onePiece;
     return { bands: s.plan.bands, parallel: s.plan.parallel, explicit: false };
   } catch {
     return req.diapasef ? onePiece : { bands: 1, parallel: 1, explicit: false };
   }
+}
+
+// The bands of the files that are not diaPASEF in a batch searched separately, when they
+// differ from the selection's. Each file of a batch is its own run, and the engine refuses
+// bands only on a run whose input carries 1/K0, so the other files keep Automatic's plan
+// instead of the one band a diaPASEF file needs. Null when every file takes the same bands:
+// Off or Custom, or a selection that is all diaPASEF or has none. (A pooled experiment is
+// one run, which the engine refuses bands for as soon as one input carries 1/K0.)
+async function separateRestBands(libPrecursors) {
+  if ($("bands").value !== "auto") return null;
+  const diapasef = diapasefInputs().length;
+  if (!diapasef || diapasef === state.picks.mzml.length) return null;
+  return resolveBands(libPrecursors, false);
 }
 
 // What the viewer reads beyond the defaults. `quant.fragment_detail` writes, beside each
@@ -4746,7 +4769,9 @@ async function importDiannLibrary() {
 // two at once would compete for the same cores and memory while making the progress
 // display meaningless. The engine's own `experiment.parallel_runs` exists for the
 // pooled case where it can be reasoned about.
-async function runBatch(p, built, threads, config) {
+// `configOf(file)` is that file's configuration: the shared one, except where diaPASEF and
+// other files of the batch take different bands (`separateRestBands`).
+async function runBatch(p, built, threads, config, configOf = () => config) {
   const files = p.mzml.slice();
   state.batch = { total: files.length, done: 0, failed: 0, results: [] };
 
@@ -4766,7 +4791,7 @@ async function runBatch(p, built, threads, config) {
       fasta: state.mode === "fasta" && !built ? p.fasta || null : null,
       lib_precursors: built ? built[0] : state.mode === "library" ? p.lib_precursors || null : null,
       lib_fragments: built ? built[1] : state.mode === "library" ? p.lib_fragments || null : null,
-      config,
+      config: configOf(file),
       threads: Number.isFinite(threads) && threads > 0 ? threads : null,
     };
 
@@ -5239,9 +5264,10 @@ async function startSearch() {
     return;
   }
 
-  // Which inputs are diaPASEF decides the bands: a check the list has not finished yet is
-  // finished here, before the problems are read and the bands resolved.
-  await Promise.all(p.mzml.map(vendorOf));
+  // Which inputs are diaPASEF decides the bands: every file is checked again here, before
+  // the problems are read and the bands resolved, so neither a check the list has not
+  // finished nor an answer from before a copy completed decides them.
+  await Promise.all(p.mzml.map((f) => vendorOf(f, true)));
   const problems = searchProblems();
   if (problems.length) {
     banner($("start-error"), problems.join("\n\n"));
@@ -5326,6 +5352,7 @@ async function startSearch() {
   const libraryIrt =
     state.mode === "library" ? await libraryIrtOf(p.lib_precursors) : null;
   const overrides = runOverrides({ bands, built, libraryIrt });
+  const base = config;
   if (Object.keys(overrides).length) {
     try {
       config = await invoke("derive_config", { base: config, overrides });
@@ -5341,7 +5368,24 @@ async function startSearch() {
   // cost is that closing the window ends the queue, which the per-file output folders
   // make recoverable.
   if (p.mzml.length > 1 && currentRunMode() === "separate") {
-    return runBatch(p, built, threads, config);
+    // A batch that mixes diaPASEF files with others: the diaPASEF files take the one band
+    // above, the others Automatic's plan for them, from a configuration of their own.
+    const rest = await separateRestBands(built ? built[0] : null);
+    if (!rest) return runBatch(p, built, threads, config);
+    let restConfig;
+    try {
+      restConfig = await invoke("derive_config", {
+        base,
+        overrides: runOverrides({ bands: rest, built, libraryIrt }),
+        other: true,
+      });
+    } catch (e) {
+      banner($("start-error"), String(e));
+      screen("input");
+      return;
+    }
+    const diapasef = new Set(diapasefInputs());
+    return runBatch(p, built, threads, config, (f) => (diapasef.has(f) ? config : restConfig));
   }
 
   const req = {

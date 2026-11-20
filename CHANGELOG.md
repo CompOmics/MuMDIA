@@ -260,8 +260,9 @@ than a number. Both are recorded in every run's `manifest.json`.
   retrace.enabled is not supported with groups.window_groups > 1`). With a diaPASEF input selected,
   Automatic is now one band, written over a preset's own bands; the note under Bands says why, and
   says when the estimate exceeds the memory budget. A custom band count above one on such input is
-  refused before Start. Other inputs are planned as before (desktop/README.md, "Prescreen, bands and
-  modifications on the Search screen").
+  refused before Start, which checks every file again first. In a batch searched separately, the
+  files that are not diaPASEF keep Automatic's plan. Other inputs are planned as before
+  (desktop/README.md, "Prescreen, bands and modifications on the Search screen").
 - **Desktop: "Add folder…" selects several spectra folders at once (#335).** A Bruker or Agilent `.d`
   and a Waters `.raw` are directories, so they are added with "Add folder…", and that dialog took
   one folder at a time: the spectra folder picker shared the single-choice setting of the output
