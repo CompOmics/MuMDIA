@@ -216,7 +216,7 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
-- **Quant and report code keep one copy of each helper (docs/12).** The candidate audit no
+- **Quant and report code keep one copy of each helper (#358, docs/12).** The candidate audit no
   longer looks for `<psms>.audit.parquet`, which nothing writes, so every extraction loss is
   `DID_NOT_SURVIVE_EXTRACTION` as before, and it writes the library's columns as read instead
   of copying them (the `protein` column is read only for an entrapment substring).
@@ -492,12 +492,12 @@ than a number. Both are recorded in every run's `manifest.json`.
 ### Fixed
 
 - **`run-experiment` refuses a `quant.normalisation_rank` the run count cannot carry before
-  it searches.** The cross-run normalisation needs a rank of at most the number of runs less
+  it searches (#358).** The cross-run normalisation needs a rank of at most the number of runs less
   two and checked it only when it ran, after every run's search, rescore and quant, so two
   runs with `normalisation_rank: 1` lost the cross-run LFQ, the TSVs and the experiment
   manifest that `mumdia report --experiment-dir` rebuilds from. The preflight now applies the
   same rule when `quant.normalisation` is on (docs/12, "Cross-run normalisation").
-- **The candidate audit gates a sibling precursor on its peptide's q (docs/12, "audit").**
+- **The candidate audit gates a sibling precursor on its peptide's q (#358, docs/12, "audit").**
   `rescore` writes `peptide_q_value` to each base peptide's winning row only and 1.0 to its
   other charge states and modforms, and the audit read each row's own cell, so every accepted
   sibling of an accepted peptide read `FAILED_PEPTIDE_FDR` with `reported = false` while
@@ -506,7 +506,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   error. In `run`, the audit also gates on `quant.q_threshold`, the report's threshold, where
   it used a fixed 0.01. Only `candidate_audit.parquet` and its metrics change.
 - **The audit's refusal of a pooled scored table no longer sends the user to the
-  `run-experiment` split tables.** Their precursor and peptide q are experiment-wide, on one
+  `run-experiment` split tables (#358).** Their precursor and peptide q are experiment-wide, on one
   winning row across all runs, so an audit of one of them failed most accepted precursors of
   the run; the message names a single-file `run` output.
 - **Desktop: a diaPASEF search is no longer split into bands (#351).** "Bands: Automatic" (the
