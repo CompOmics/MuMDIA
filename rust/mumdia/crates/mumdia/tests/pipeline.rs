@@ -353,7 +353,6 @@ fn library_build_stages_return_the_hashes_of_the_files_they_wrote() {
         out: &peptides,
         cfg: &cfg.digest,
         rng_seed: cfg.rng_seed,
-        config_hash: "test",
         protein_n_term: cfg.peptidoforms.has_protein_n_term_rule(),
     })
     .unwrap();
@@ -365,7 +364,6 @@ fn library_build_stages_return_the_hashes_of_the_files_they_wrote() {
         peptides: &peptides,
         out: &pforms,
         cfg: &cfg.peptidoforms,
-        config_hash: "test",
     })
     .unwrap();
     assert!(wp.rows > 0);
@@ -381,7 +379,6 @@ fn library_build_stages_return_the_hashes_of_the_files_they_wrote() {
             out_fragments: &frag,
             cfg: &cfg.predict_frag,
             work_dir: &tmp("predict_frag_work"),
-            config_hash: "test",
             run_has_im: false,
         })
         .unwrap();
@@ -1232,7 +1229,6 @@ fn search_seed_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
             out: &out,
             cfg: &cfg.search_seed,
             bucket_size: cfg.extract.bucket_size,
-            config_hash: "test",
         })
         .unwrap();
         (out, rows)
@@ -1281,7 +1277,6 @@ fn search_seed_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
         out: &out,
         cfg: &uncapped.search_seed,
         bucket_size: uncapped.extract.bucket_size,
-        config_hash: "test",
     })
     .unwrap();
     assert_ne!(
@@ -1376,7 +1371,6 @@ fn the_seed_records_observed_im_for_every_psm_up_to_the_sizing_cut_only_when_ask
             out: &out,
             cfg: &cfg.search_seed,
             bucket_size: Config::default().extract.bucket_size,
-            config_hash: "test",
         })
         .unwrap();
         out
@@ -1437,7 +1431,6 @@ fn the_seed_writes_observed_im_only_for_spectra_with_ion_mobility() {
             out: &out,
             cfg,
             bucket_size: Config::default().extract.bucket_size,
-            config_hash: "test",
         })
         .unwrap();
         assert!(rows > 0, "{tag}: the fixture must give seed rows");
@@ -2102,7 +2095,6 @@ fn pooled_mass_calibration_equals_the_unbanded_fit(overlap: bool) {
             out: &out,
             cfg: &cfg.search_seed,
             bucket_size: cfg.extract.bucket_size,
-            config_hash: "test",
         })
         .unwrap();
         out
@@ -2237,7 +2229,6 @@ fn the_seed_hands_back_its_decode_and_extract_over_it_is_byte_identical() {
             out,
             cfg: &cfg.search_seed,
             bucket_size: cfg.extract.bucket_size,
-            config_hash: "test",
         })
         .unwrap()
     };
@@ -2376,7 +2367,6 @@ fn a_lent_seed_library_gives_the_seed_it_would_have_loaded() {
                 out,
                 cfg: &cfg.search_seed,
                 bucket_size: cfg.extract.bucket_size,
-                config_hash: "test",
             })
         };
         let own = tmp(&format!("seed_lend_own_{matcher:?}.parquet"));
@@ -2666,7 +2656,6 @@ fn the_chain_without_retrace_is_byte_identical_and_refuses_retrace_on_3d_input()
         out: &seed,
         cfg: &base.search_seed,
         bucket_size: base.extract.bucket_size,
-        config_hash: "test",
     })
     .unwrap();
     let co = stages::convert::ConvertOutputs {

@@ -62,23 +62,22 @@ mumdia-core   types, mass model, Config (per-stage sections + strategy enums),
               schema (frozen artifact names/versions), manifest, errors
 mumdia-io     Col/Table over arrow+parquet (SNAPPY), blake3 hashing, JSON,
               inspect, per-artifact report.json
-mumdia        bin + lib: fragment index, stages/, predictor + rescorer traits,
+mumdia        bin + lib: fragment index, stages/, native predictors, rescorers,
               sidecar dispatch; main.rs is a thin CLI over the lib
 ```
 
-The two ML predictors are traits with a deterministic native fallback and an
-optional Python sidecar, selected by config (the sidecar replaces the native
-path without changing callers, `predict.rs:1-8`). The rescorer is not a trait: a
-free function plus the `RescorerKind` enum.
+The two ML predictors each have a deterministic native function and optional Python
+sidecars, selected by config (`predict.rs`, `stages/predict_frag.rs`). Neither they nor
+the rescorer are traits: the rescorer is a free function plus the `RescorerKind` enum.
 
 ```
-RtPredictor        (trait, predict.rs:13)
-   |-- NativeRt     (predict.rs:25, additive RT-coefficient model, deterministic)
+retention time      predict_frag.rt_predictor
+   |-- native_irt   (predict.rs, additive RT-coefficient model, deterministic)
    \-- DeepLC       (Python sidecar; predict_frag.rt_predictor = deeplc)
 
-FragmentPredictor  (trait, predict.rs:19)
-   |-- NativeFrag   (predict.rs:73, heuristic b/y intensities, deterministic)
-   \-- MS2PIP       (Python sidecar; predict_frag.predictor = ms2pip)
+fragment intensity  predict_frag.predictor
+   |-- native_intensities (predict.rs, heuristic b/y intensities, deterministic)
+   \-- MS2PIP / AlphaPeptDeep (Python sidecars; predictor = ms2pip / peptdeep)
 
 Rescorer           (free fn + RescorerKind enum, no trait)
    native_tda (percolator_lite) | nn_torch | mokapot | entrapment

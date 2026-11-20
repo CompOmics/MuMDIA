@@ -1039,8 +1039,9 @@ sensitivity result for it.
   workers at the same time, which leaves the library byte-identical; it is off because
   each worker sizes itself from the whole thread count and neither the wall time nor the
   peak of the pair was measured at that scale. `predict_frag.defer_deeplc_to_multihead`
-  (opt-in) skips the DeepLC pass when the multi-head calibration re-predicts every row
-  anyway (docs/06).
+  (default `true` since 2026-09-27) skips the DeepLC pass when the multi-head calibration
+  re-predicts every row anyway, unless the library cache holds the library `build-library`
+  stored, which is then restored instead (docs/06).
 
 ## Changes that remain benchmark-gated
 

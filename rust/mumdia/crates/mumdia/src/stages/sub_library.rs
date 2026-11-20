@@ -8,12 +8,15 @@
 //! (`groups::write_band_slice` plus `Library::load_with_fragment_offset`); this stage is for
 //! an arbitrary set of ids scattered through the library.
 //!
-//! Pair-linked by construction: a target and its decoy share `peptidoform_id` (the decoy
-//! builders copy the target row), so the decision is taken once per pair and no member of a
-//! pair can be kept while the other is dropped. Target/decoy exchangeability downstream is
-//! then exactly what it was in the full library. `base_peptide_id` would additionally union
-//! the charge states, which on a 9-mer immunopeptidomics library turned 23% survivors into
-//! 60% kept, so it is not the key.
+//! Pair-linked by default: in an imported library a target and its decoy share
+//! `peptidoform_id` (the decoy builders copy the target row), so the decision is taken once
+//! per pair and no member of a pair can be kept while the other is dropped. Target/decoy
+//! exchangeability downstream is then exactly what it was in the full library.
+//! `base_peptide_id` would additionally union the charge states, which on a 9-mer
+//! immunopeptidomics library turned 23% survivors into 60% kept, so it is not the key. A
+//! FASTA-built library gives every decoy its own `peptidoform_id`, so the union would keep the
+//! listed rows alone; pair-linking refuses a library with both labels in which no id repeats.
+//! `run-experiment`'s second pass pairs such a library itself (`second_pass::plan_rows`).
 //!
 //! Streaming: both tables are read one batch at a time and written the same way. What is
 //! resident is one batch of each, two `u32` per library precursor (the pair key and the
@@ -107,17 +110,41 @@ pub fn run(p: SubLibraryParams) -> Result<SubLibraryStats> {
     }
 
     // Pass 1: the pair key per row, and the row-aligned id invariant the fragment index
-    // depends on (`index.rs`).
+    // depends on (`index.rs`). Under pair-linking also which labels the library holds.
     let mut pair: Vec<u32> = Vec::with_capacity(n);
+    let (mut has_target, mut has_decoy) = (false, false);
     {
-        let reader = pt.batches(Some(&["candidate_id", "peptidoform_id"]), BATCH_ROWS)?;
+        let cols: &[&str] = if p.pair_linked {
+            &["candidate_id", "peptidoform_id", "label"]
+        } else {
+            &["candidate_id", "peptidoform_id"]
+        };
+        let reader = pt.batches(Some(cols), BATCH_ROWS)?;
         let schema = reader.schema();
         let cid_ix = column_index(&schema, "candidate_id", p.precursors)?;
         let pf_ix = column_index(&schema, "peptidoform_id", p.precursors)?;
+        let label_ix = if p.pair_linked {
+            Some(column_index(&schema, "label", p.precursors)?)
+        } else {
+            None
+        };
         for b in reader {
             let b = b?;
             let cid = ids_of(&b, cid_ix, p.precursors)?;
             let pf = ids_of(&b, pf_ix, p.precursors)?;
+            if let Some(ix) = label_ix {
+                let label = b
+                    .column(ix)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| anyhow!("{}: label is not utf8", p.precursors))?;
+                for i in 0..label.len() {
+                    match label.value(i) {
+                        "decoy" => has_decoy = true,
+                        _ => has_target = true,
+                    }
+                }
+            }
             for i in 0..b.num_rows() {
                 if cid.value(i) as usize != pair.len() {
                     bail!(
@@ -139,6 +166,22 @@ pub fn run(p: SubLibraryParams) -> Result<SubLibraryStats> {
     if p.pair_linked {
         let max_pair = pair.iter().copied().max().unwrap_or(0) as usize;
         let mut group_kept = vec![false; max_pair + 1];
+        // A native-digest library gives each decoy its own `peptidoform_id`, so no id repeats
+        // and the union would keep the listed rows alone: an unpaired population.
+        let repeats = pair
+            .iter()
+            .any(|&g| std::mem::replace(&mut group_kept[g as usize], true));
+        if has_target && has_decoy && !repeats {
+            bail!(
+                "{}: no peptidoform_id is shared by two precursors, so a target and its decoy \
+                 cannot be kept together by it (a FASTA-built library gives each decoy its own \
+                 id). Pass --no-pair-link with a survivor list that already holds both members \
+                 of every pair, or let run-experiment's second pass build the sub-library, \
+                 which pairs on the base peptide and charge",
+                p.precursors
+            );
+        }
+        group_kept.fill(false);
         for &c in &surv {
             let c = c as usize;
             if c >= n {
@@ -507,13 +550,18 @@ mod tests {
     /// Six precursors: three peptidoforms, each a target and its decoy sharing
     /// `peptidoform_id`, with two fragments each.
     fn lib(dir: &std::path::Path) -> (String, String) {
+        lib_with(dir, vec![0, 0, 1, 1, 2, 2])
+    }
+
+    /// [`lib`] with these `peptidoform_id`s.
+    fn lib_with(dir: &std::path::Path, peptidoform_ids: Vec<u32>) -> (String, String) {
         let p = dir.join("prec.parquet").to_str().unwrap().to_string();
         let f = dir.join("frag.parquet").to_str().unwrap().to_string();
         write_table(
             &p,
             vec![
                 Col::U32("candidate_id".into(), (0..6).collect()),
-                Col::U32("peptidoform_id".into(), vec![0, 0, 1, 1, 2, 2]),
+                Col::U32("peptidoform_id".into(), peptidoform_ids),
                 Col::U32("base_peptide_id".into(), vec![0, 0, 1, 1, 2, 2]),
                 Col::Str(
                     "peptidoform".into(),
@@ -690,6 +738,36 @@ mod tests {
             TableFile::open(&of2).unwrap().u32("candidate_id").unwrap(),
             vec![0, 0, 1, 1]
         );
+    }
+
+    /// A FASTA-built library gives each decoy its own `peptidoform_id`, so pair-linking on it
+    /// would keep the listed rows alone; it is refused, and `--no-pair-link` still runs.
+    #[test]
+    fn pair_linking_refuses_a_library_whose_decoys_have_their_own_ids() {
+        let dir =
+            std::env::temp_dir().join(format!("mumdia_sublib_unpaired_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (p, f) = lib_with(&dir, (0..6).collect());
+        let s = dir.join("surv.parquet").to_str().unwrap().to_string();
+        write_table(&s, vec![Col::U32("candidate_id".into(), vec![0, 2])]).unwrap();
+        let op = dir.join("out_prec.parquet").to_str().unwrap().to_string();
+        let of = dir.join("out_frag.parquet").to_str().unwrap().to_string();
+        let params = |pair_linked| SubLibraryParams {
+            precursors: &p,
+            fragments: &f,
+            survivors: &s,
+            out_precursors: &op,
+            out_fragments: &of,
+            pair_linked,
+            overrides: None,
+        };
+        let err = run(params(true)).unwrap_err().to_string();
+        assert!(err.contains("no peptidoform_id is shared"), "{err}");
+        assert!(!std::path::Path::new(&op).exists(), "nothing written");
+        let st = run(params(false)).unwrap();
+        assert_eq!((st.targets, st.decoys), (2, 0));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A fragment table of `n_rows` rows over `n_cand` candidates (ascending, or shuffled

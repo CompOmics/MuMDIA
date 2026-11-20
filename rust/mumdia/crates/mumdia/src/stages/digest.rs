@@ -167,7 +167,10 @@ fn make_decoy(pep: &str, strategy: DecoyStrategy, seed: u64) -> Option<String> {
             Some(String::from_utf8(interior).unwrap())
         }
         DecoyStrategy::Scramble => {
-            // Deterministic Fisher-Yates with a splitmix64 PRNG seeded per peptide.
+            // Deterministic Fisher-Yates with a splitmix64 PRNG seeded from `seed ^ fnv1a(pep)`.
+            // `collision_safe_decoy` mixes `fnv1a(pep)` into `seed` as well, and the two
+            // cancel: through it the shuffle depends on `rng_seed` and the attempt alone, one
+            // fixed permutation per peptide length and attempt (as valid a decoy as reversal).
             let mut interior: Vec<u8> = b[..n - 1].to_vec();
             let mut state = seed ^ fnv1a(pep);
             for i in (1..interior.len()).rev() {
@@ -178,7 +181,7 @@ fn make_decoy(pep: &str, strategy: DecoyStrategy, seed: u64) -> Option<String> {
             interior.push(b[n - 1]);
             Some(String::from_utf8(interior).unwrap())
         }
-        DecoyStrategy::DiannShift => None, // realized at predict-frag, not here
+        DecoyStrategy::DiannShift => None, // refused by `Config::validate`; realized nowhere
         DecoyStrategy::None => None,
     }
 }
@@ -194,9 +197,10 @@ fn il_key(sequence: &str) -> String {
 /// does not collide with any target peptide, and is unique among emitted decoys,
 /// all compared up to I/L ([`il_key`]). `targets` and `used_decoys` hold I/L keys.
 ///
-/// The configured transform is tried first. A collision is retried with
-/// independently seeded interior scrambles while preserving the C terminus.
-/// Returns the sequence and number of collision retries.
+/// The configured transform is tried first. A collision is retried with interior
+/// scrambles seeded per attempt (the same permutation for every peptide of one length,
+/// see `make_decoy`) while preserving the C terminus. Returns the sequence and number of
+/// collision retries.
 fn collision_safe_decoy(
     pep: &str,
     strategy: DecoyStrategy,
@@ -242,7 +246,6 @@ pub struct DigestParams<'a> {
     pub out: &'a str,
     pub cfg: &'a DigestConfig,
     pub rng_seed: u64,
-    pub config_hash: &'a str,
     /// Record which peptides start a protein, as the Boolean column `protein_n_term`
     /// (peptides v2). Set when a modification rule is placed at the protein N-terminus
     /// ([`mumdia_core::config::PeptidoformsConfig::has_protein_n_term_rule`]); without it
@@ -396,6 +399,19 @@ pub fn run_hashed(p: DigestParams) -> Result<Written> {
             dropped_pairs,
             max_attempts = MAX_DECOY_ATTEMPTS,
             "digest: dropped target/decoy pairs with no collision-free decoy permutation"
+        );
+    }
+    // An empty library would otherwise surface much later, at a predictor or the seed's
+    // library load, as an error that points away from the FASTA.
+    if n_targets == 0 {
+        anyhow::bail!(
+            "digest: {} gives no peptide ({} proteins read, lengths {}..={}, {dropped_pairs} \
+             target/decoy pairs dropped without a collision-free decoy); --fasta must be a \
+             protein FASTA with a '>' header line before each sequence",
+            p.fasta,
+            proteins.len(),
+            p.cfg.min_len,
+            p.cfg.max_len
         );
     }
     let n_protein_n_term_targets = nterm_c
@@ -812,7 +828,6 @@ mod tests {
             out: &out,
             cfg: &cfg,
             rng_seed: 7,
-            config_hash: "h",
             protein_n_term,
         })
         .unwrap();
@@ -939,5 +954,26 @@ mod tests {
             &HashSet::new()
         )
         .is_none());
+    }
+
+    #[test]
+    fn a_fasta_without_a_peptide_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("mumdia_digest_empty_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("p.fasta").to_string_lossy().into_owned();
+        // Sequence lines without a '>' header give no protein.
+        std::fs::write(&fa, "MSEQPEPTIDEKAAAGGGLLLR\n").unwrap();
+        let err = run(DigestParams {
+            fasta: &fa,
+            out: &dir.join("peptides.parquet").to_string_lossy(),
+            cfg: &DigestConfig::default(),
+            rng_seed: 0,
+            protein_n_term: false,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("gives no peptide (0 proteins"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

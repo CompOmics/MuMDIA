@@ -273,19 +273,27 @@ pub fn run(p: RunParams) -> Result<()> {
     let mut library_input_records: Vec<LibraryInputRecord> = Vec::new();
     pre.step("provenance");
 
-    // A FASTA build may leave DeepLC to the multi-head calibration, which re-predicts every
-    // row before anything reads the iRT (`predict_frag.defer_deeplc_to_multihead`).
-    let rt_placeholder = cfg.defers_library_deeplc(
-        p.lib_precursors.is_some(),
-        cfg.predict_frag.deeplc_python.is_some(),
-    );
-
     // `prescreen.tag_prefilter`: the spectra are converted first so the database-free tag
     // prefilter can run on the peptidoforms (FASTA mode) or the imported library before any
     // prediction or calibration. It uses no retention time; every later stage does.
     let before_prediction = cfg.prescreen.tag_prefilter || cfg.prescreen.score_before_prediction;
     let spectra_dir = d("spectra");
     let mut early_co: Option<convert::ConvertOutputs> = None;
+
+    // A FASTA build may leave DeepLC to the multi-head calibration, which re-predicts every
+    // row before anything reads the iRT (`predict_frag.defer_deeplc_to_multihead`), unless
+    // the library cache holds the library with its predictions (`library_build::defers_deeplc`).
+    // Whether the spectra carry 1/K0 is decided from the raw dispatch, before conversion.
+    let run_has_im = crate::instrument::input_has_im(p.mzml);
+    let rt_placeholder = library_build::defers_deeplc(
+        cfg,
+        p.lib_precursors.is_some(),
+        p.fasta,
+        run_has_im,
+        (&man.mumdia_version, &man.git_sha),
+        !before_prediction,
+        "run",
+    );
 
     // --- experiment-wide artifacts: the spectral library ---
     // Either digest the FASTA (default) or consume a prebuilt library
@@ -369,7 +377,7 @@ pub fn run(p: RunParams) -> Result<()> {
                     // before anything is converted: the library-build keys resolve on it
                     // (`predict_frag.im_predictor = auto`), and conversion decides the same
                     // way.
-                    run_has_im: crate::instrument::input_has_im(p.mzml),
+                    run_has_im,
                     engine: (&engine.0, &engine.1),
                     // A tag-prefiltered library depends on this run's spectra, so it is
                     // neither restored from nor stored in the library cache.
@@ -532,7 +540,6 @@ pub fn run(p: RunParams) -> Result<()> {
                 out: &seed,
                 cfg: &cfg.search_seed,
                 bucket_size: cfg.extract.bucket_size,
-                config_hash: &ch,
             })?;
             man.record(w.record(
                 artifact::SEED_PSMS.0,

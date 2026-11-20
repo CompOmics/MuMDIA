@@ -717,7 +717,6 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 out: &seed,
                 cfg: &cfg.search_seed,
                 bucket_size: cfg.extract.bucket_size,
-                config_hash: ch,
                 fragment_offset: None,
                 ms2_scans: Some(&ms2_scans),
                 // The band writes its calibrant deviations so `seed-pool` can fit the

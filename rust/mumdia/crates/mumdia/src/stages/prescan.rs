@@ -729,6 +729,97 @@ mod tests {
         }
     }
 
+    /// `run` end to end on one spectrum with an A-A-A ladder: a candidate with the
+    /// (NaN, -inf, +inf) sentinel window or with no `run_windows` row is screened over the
+    /// whole gradient and survives (docs/31 F1), one whose window misses the spectrum does
+    /// not, and a library none of whose trimers occur is an error, not an empty table.
+    #[test]
+    fn run_keeps_unbounded_candidates_and_refuses_an_empty_survivor_set() {
+        let dir = std::env::temp_dir().join(format!("mumdia_prescan_run_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |n: &str| dir.join(n).to_string_lossy().into_owned();
+        let am = residue_mass(b'A').unwrap() as f32;
+        let ladder: Vec<f32> = (0..4).map(|k| 200.0 + k as f32 * am).collect();
+        write_table(
+            &path("ms2.parquet"),
+            vec![
+                Col::U32("window_id".into(), vec![0]),
+                Col::F64("rt_seconds".into(), vec![100.0]),
+                Col::ListF32("mz".into(), vec![ladder]),
+                Col::ListF32("intensity".into(), vec![vec![1.0; 4]]),
+            ],
+        )
+        .unwrap();
+        write_table(
+            &path("windows.parquet"),
+            vec![
+                Col::U32("window_id".into(), vec![0]),
+                Col::F64("lower".into(), vec![400.0]),
+                Col::F64("upper".into(), vec![1200.0]),
+            ],
+        )
+        .unwrap();
+        let library = |name: &str, peptidoforms: &[&str]| {
+            let n = peptidoforms.len() as u32;
+            write_table(
+                &path(name),
+                vec![
+                    Col::U32("candidate_id".into(), (0..n).collect()),
+                    Col::Str(
+                        "peptidoform".into(),
+                        peptidoforms.iter().map(|s| s.to_string()).collect(),
+                    ),
+                    Col::F64("precursor_mz".into(), vec![500.0; n as usize]),
+                    Col::Str(
+                        "label".into(),
+                        (0..n)
+                            .map(|i| if i == 1 { "decoy" } else { "target" }.to_string())
+                            .collect(),
+                    ),
+                ],
+            )
+            .unwrap();
+        };
+        // Candidate 0 carries the sentinel, candidate 1 has no row, candidate 2's window is
+        // far from the spectrum's 100 s.
+        write_table(
+            &path("run_windows.parquet"),
+            vec![
+                Col::U32("candidate_id".into(), vec![0, 2]),
+                Col::F64("rt_lo".into(), vec![f64::NEG_INFINITY, 5000.0]),
+                Col::F64("rt_hi".into(), vec![f64::INFINITY, 5100.0]),
+            ],
+        )
+        .unwrap();
+        let cfg = PrescanConfig {
+            anchor_all: true,
+            ..Default::default()
+        };
+        let screen = |lib: &str, out: &str| {
+            run(PrescanParams {
+                ms2: &path("ms2.parquet"),
+                isolation_windows: &path("windows.parquet"),
+                library_precursors: &path(lib),
+                run_windows: &path("run_windows.parquet"),
+                out: &path(out),
+                cfg: &cfg,
+                config_hash: "h",
+            })
+        };
+        library("lib.parquet", &["GAAAK", "DECOY_AAAGK", "GAAAK"]);
+        assert_eq!(screen("lib.parquet", "surv.parquet").unwrap(), 2);
+        let surv = TableFile::open(&path("surv.parquet")).unwrap();
+        assert_eq!(surv.u32("candidate_id").unwrap(), [0, 1]);
+
+        library("lib_none.parquet", &["GGGGK", "DECOY_GGGGK"]);
+        let err = screen("lib_none.parquet", "surv_none.parquet")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("none survived"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn bad_mod_spec_is_an_error() {
         assert!(parse_mod_spec("Farnesyl").is_err());

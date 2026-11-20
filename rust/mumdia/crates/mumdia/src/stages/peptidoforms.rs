@@ -333,7 +333,6 @@ pub struct PeptidoformsParams<'a> {
     pub peptides: &'a str,
     pub out: &'a str,
     pub cfg: &'a PeptidoformsConfig,
-    pub config_hash: &'a str,
 }
 
 /// The warning for a search on an imported library whose configuration sets library m/z
@@ -999,7 +998,6 @@ mod tests {
             peptides: &path("peptides.parquet"),
             out: &out,
             cfg,
-            config_hash: "h",
         })
         .map(|_| {
             let t = TableFile::open(&out).unwrap();

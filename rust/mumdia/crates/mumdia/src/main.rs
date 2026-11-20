@@ -285,8 +285,10 @@ enum Cmd {
         #[arg(long)]
         out_fragments: String,
         /// Keep exactly the listed candidates instead of unioning the decision over
-        /// `peptidoform_id`. A target and its decoy share that id, so the default keeps
-        /// pairs together and this breaks pairing unless the list is already pair-complete.
+        /// `peptidoform_id`. In an imported library a target and its decoy share that id, so
+        /// the default keeps pairs together; a FASTA-built library gives each decoy its own
+        /// id and is refused by the default. This breaks pairing unless the list is already
+        /// pair-complete.
         #[arg(long, default_value_t = false)]
         no_pair_link: bool,
         #[arg(long)]
@@ -2001,13 +2003,11 @@ fn real_main() -> Result<()> {
         }
         Cmd::Digest { fasta, out, config } => {
             let cfg = load_config(&config)?;
-            let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::digest::run(stages::digest::DigestParams {
                 fasta: &fasta,
                 out: &out,
                 cfg: &cfg.digest,
                 rng_seed: cfg.rng_seed,
-                config_hash: &ch,
                 protein_n_term: cfg.peptidoforms.has_protein_n_term_rule(),
             })?;
         }
@@ -2017,12 +2017,10 @@ fn real_main() -> Result<()> {
             config,
         } => {
             let cfg = load_config(&config)?;
-            let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::peptidoforms::run(stages::peptidoforms::PeptidoformsParams {
                 peptides: &peptides,
                 out: &out,
                 cfg: &cfg.peptidoforms,
-                config_hash: &ch,
             })?;
         }
         Cmd::PredictFrag {
@@ -2034,7 +2032,6 @@ fn real_main() -> Result<()> {
         } => {
             let cfg = load_config(&config)?;
             stages::rt_health::refuse_native_predictors(&cfg, true, "predict-frag")?;
-            let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::predict_frag::run(stages::predict_frag::PredictFragParams {
                 // The standalone stage cannot know that a multi-head calibration follows.
                 rt_placeholder: false,
@@ -2043,7 +2040,6 @@ fn real_main() -> Result<()> {
                 out_fragments: &out_fragments,
                 work_dir: &work_dir,
                 cfg: &cfg.predict_frag,
-                config_hash: &ch,
                 // No run: `im_predictor = auto` predicts nothing here (an explicit
                 // `im2deep` still does).
                 run_has_im: false,
@@ -2057,7 +2053,6 @@ fn real_main() -> Result<()> {
             config,
         } => {
             let cfg = load_config(&config)?;
-            let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::search_seed::run(stages::search_seed::SearchSeedParams {
                 observed_im_q: cfg.rt_im_train.seed_observed_im_q(),
                 precursor_span: None,
@@ -2072,7 +2067,6 @@ fn real_main() -> Result<()> {
                 out: &out,
                 cfg: &cfg.search_seed,
                 bucket_size: cfg.extract.bucket_size,
-                config_hash: &ch,
             })?;
         }
         Cmd::RtImTrain {
