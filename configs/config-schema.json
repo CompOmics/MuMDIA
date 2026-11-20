@@ -2346,7 +2346,7 @@
       "optional": false,
       "default": 2,
       "default_text": "2",
-      "help": "",
+      "help": "Fewest consecutive scan groups over which `presence_min_coelution` fragments must be present (the co-elution run) for a candidate to be accepted; values below 1 read as 1. `min_coelution_run` floors the same run, so the larger of the two applies.",
       "gates": [],
       "source_struct": "ExtractConfig"
     },
@@ -2385,7 +2385,7 @@
       "optional": false,
       "default": 3,
       "default_text": "3",
-      "help": "tier-(b) minimum matched fragment count.",
+      "help": "Fewest distinct matched fragments a candidate needs before its peak is looked at (tier b), and a promoted alternative peak (`promote_top_peaks > 1`) within its own bounds. For the selected peak it floors the same count as `presence_min_fragments`, so the larger of the two applies there.",
       "gates": [],
       "source_struct": "ExtractConfig"
     },
@@ -2398,7 +2398,7 @@
       "optional": false,
       "default": 3,
       "default_text": "3",
-      "help": "minimum distinct fragments for acceptance.",
+      "help": "Fewest distinct matched fragments for acceptance (tier c). It floors the same count as `presence_min_matched`, and the larger of the two applies.",
       "gates": [],
       "source_struct": "ExtractConfig"
     },

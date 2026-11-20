@@ -299,9 +299,12 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
         ),
     );
 
-    // `extract.q1_traces`: the cycle-trace table beside the chromatograms.
-    if let Some(r) = extract::q1_trace_record(&chrom, ch)? {
-        keep(&mut manifest, r);
+    // `extract.q1_traces`: the cycle-trace table beside the chromatograms, when this extract
+    // wrote one (a table an earlier run left in the directory is not this run's).
+    if ext_cfg.q1_traces.on() {
+        if let Some(r) = extract::q1_trace_record(&chrom, ch)? {
+            keep(&mut manifest, r);
+        }
     }
 
     let feats = d("features.parquet");
