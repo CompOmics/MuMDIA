@@ -528,7 +528,7 @@ impl Spectra {
 }
 
 /// `v` cut into consecutive slices of `lens`.
-fn split_mut<'a, T>(mut v: &'a mut [T], lens: impl Iterator<Item = usize>) -> Vec<&'a mut [T]> {
+fn split_mut<T>(mut v: &mut [T], lens: impl Iterator<Item = usize>) -> Vec<&mut [T]> {
     lens.map(|n| {
         let (head, tail) = std::mem::take(&mut v).split_at_mut(n);
         v = tail;
@@ -1295,17 +1295,17 @@ pub fn run(p: PrescreenParams) -> Result<()> {
             let cs: Vec<f64> = (0..ext::N_EXT)
                 .map(|k| q95(&|i| e.components[i][k]))
                 .collect();
-            for i in 0..n {
-                if score[i].is_nan() {
+            for (x, c) in score.iter_mut().zip(&e.components) {
+                if x.is_nan() {
                     continue;
                 }
-                let mut s = score[i] / bs;
+                let mut s = *x / bs;
                 for k in 0..ext::N_EXT {
                     if weights[k] > 0.0 {
-                        s += weights[k] * e.components[i][k] / cs[k];
+                        s += weights[k] * c[k] / cs[k];
                     }
                 }
-                score[i] = s;
+                *x = s;
             }
             scales = Some((bs, cs));
         }
