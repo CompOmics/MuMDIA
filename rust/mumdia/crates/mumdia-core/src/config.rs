@@ -7103,6 +7103,19 @@ impl Config {
                     .into(),
             ));
         }
+        // The multi-head ridge and the base-model re-prediction are deterministic in the
+        // anchors, so every band gets the same model; a fine-tune trained per band would give
+        // each band a different one, at the training cost once per band. Refused at load, not
+        // after the library build and the conversion.
+        if self.rt_im_train.finetune_deeplc && self.groups.window_groups > 1 {
+            return Err(Invalid(
+                "rt_im_train.finetune_deeplc is not supported with groups.window_groups > 1: the \
+                 fine-tune would be trained separately in every group (non-deterministic, and \
+                 the training cost once per group). Fine-tune the library once beforehand and \
+                 search the fine-tuned table, or leave the default multi-head calibration on."
+                    .into(),
+            ));
+        }
         if self.extract.prec_tol_auto && !self.extract.ms1_calibrate.is_on() {
             return Err(Invalid(
                 "extract.prec_tol_auto sets the MS1 tolerance from the residuals of the MS1 \
@@ -10246,6 +10259,22 @@ mod tests {
         ] {
             assert!(Config::from_json(json).is_ok(), "{json}");
         }
+    }
+
+    /// A grouped run cannot fine-tune, and is told so when the configuration loads, not after
+    /// the library build and the conversion.
+    #[test]
+    fn a_grouped_fine_tune_is_refused_at_load() {
+        let msg = Config::from_json(
+            r#"{"rt_im_train":{"finetune_deeplc":true},"groups":{"window_groups":2}}"#,
+        )
+        .expect_err("must be refused")
+        .to_string();
+        assert!(
+            msg.contains("finetune_deeplc") && msg.contains("groups.window_groups"),
+            "{msg}"
+        );
+        assert!(!msg.contains("  ") && !msg.contains('\n'), "{msg:?}");
     }
 
     #[test]

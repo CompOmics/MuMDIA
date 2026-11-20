@@ -466,6 +466,8 @@ fn process_run(
     // `lib_p_base` carries placeholder iRT the multi-head calibration must replace in full
     // (`predict_frag.defer_deeplc_to_multihead`).
     irt_placeholder: bool,
+    // The experiment's base-model re-prediction of an imported library (`chain::BaseIrt`).
+    base_irt: Option<&chain::BaseIrt>,
 ) -> Result<(Vec<String>, Vec<ChromTable>, Option<String>)> {
     let co = convert_run(cfg, mzml, out, top_peaks_ms2, max_spectra, library_input)?;
     let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
@@ -512,6 +514,7 @@ fn process_run(
         &seed,
         shared_rt_lib,
         irt_placeholder,
+        base_irt,
     )
 }
 
@@ -606,22 +609,26 @@ fn chain_after_seed(
     seed: &str,
     shared_rt_lib: Option<&str>,
     irt_placeholder: bool,
+    base_irt: Option<&chain::BaseIrt>,
 ) -> Result<(Vec<String>, Vec<ChromTable>, Option<String>)> {
     let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
     let mh_heads = cfg
         .rt_im_train
         .multihead_heads(has_deeplc, cfg.deeplc_rt_source(library_input, has_deeplc));
-    let adapted = adapt_rt_library(
+    let adapted = chain::adapt_rt_library(chain::AdaptParams {
         cfg,
+        config_hash: ch,
         lib_p_base,
+        lib_f,
+        converted: co,
         seed,
-        out,
+        out_dir: out,
         mh_heads,
         shared_rt_lib,
         irt_placeholder,
-        rayon::current_num_threads(),
-        BootInputs { ch, lib_f, co },
-    )?;
+        threads: rayon::current_num_threads(),
+        base_irt,
+    })?;
     let (competed, chrom) = finish_run(
         cfg,
         ch,
@@ -638,182 +645,6 @@ fn chain_after_seed(
         vec![ChromTable::whole(&chrom)],
         adapted.produced,
     ))
-}
-
-/// What a run's search-anchored refit needs beyond the adaptation's own arguments
-/// (`rt_im_train.multihead_anchors = search`, `rt_bootstrap`): the bootstrap pass searches
-/// the run once on the seed-anchored library.
-#[derive(Clone, Copy)]
-struct BootInputs<'a> {
-    ch: &'a str,
-    lib_f: &'a str,
-    co: &'a convert::ConvertOutputs,
-}
-
-/// What [`adapt_rt_library`] chose for one run.
-struct Adapted {
-    /// The precursor table the rest of the run reads.
-    lib: String,
-    /// The table this run produced, which the runs after it may reuse.
-    produced: Option<String>,
-    /// Whether the adaptation searched the run in this process (the bootstrap pass of
-    /// `rt_bootstrap`: extract, features and compete on the seed-anchored library), so a
-    /// memory window around it measured a search of this run.
-    searched: bool,
-}
-
-/// Choose the precursor table the rest of an ungrouped run reads: a previous run's adapted
-/// library, this run's multi-head calibration or fine-tune of the base library (`threads`
-/// torch threads), or the base library. Under `rt_im_train.multihead_anchors = search`, or
-/// `auto` on 1/K0 spectra or a seed short of anchors, the multi-head calibration is refitted
-/// on the confident targets of a bootstrap search of this run (`rt_bootstrap::refit`).
-#[allow(clippy::too_many_arguments)]
-fn adapt_rt_library(
-    cfg: &Config,
-    lib_p_base: &str,
-    seed: &str,
-    out: &str,
-    mh_heads: usize,
-    shared_rt_lib: Option<&str>,
-    irt_placeholder: bool,
-    threads: usize,
-    boot: BootInputs,
-) -> Result<Adapted> {
-    let d = |name: &str| format!("{out}/{name}");
-    // DeepLC fine-tune. Under `RtLibraryScope::FirstRunOnly` the caller hands every run
-    // after the first the library the first run produced, so the fine-tune -- the most
-    // expensive step in the whole experiment -- is paid once. Run-to-run chromatographic
-    // drift is then absorbed by `rt_im_train`'s per-run calibration below, which is fitted
-    // separately for every run regardless.
-    let mut produced_rt_lib: Option<String> = None;
-    let mut searched = false;
-    // The anchor cut (`rt_im_train::plan_anchors`): relaxed on a seed short of anchors, and
-    // when still short the multi-head calibration is skipped for this run, which then keeps
-    // `lib_p_base` and adapts nothing for the runs after it to reuse.
-    let anchor_plan =
-        if shared_rt_lib.is_none() && (mh_heads > 0 || cfg.rt_im_train.finetune_deeplc) {
-            Some(rt_im_train::plan_anchors(seed, &cfg.rt_im_train)?)
-        } else {
-            None
-        };
-    let anchor_q = anchor_plan.map_or(cfg.rt_im_train.q_train, |a| a.q_train);
-    let mh_heads = match anchor_plan {
-        Some(a) if mh_heads > 0 && !a.sufficient => {
-            if irt_placeholder {
-                anyhow::bail!(
-                    "the library carries placeholder retention times for the multi-head \
-                     calibration to replace, but the seed search of {out} found only {} target \
-                     anchors even at q {}; re-run without predict_frag.defer_deeplc_to_multihead",
-                    a.n_anchors,
-                    a.q_train
-                );
-            }
-            0
-        }
-        _ => mh_heads,
-    };
-    let lib_p = if let Some(shared) = shared_rt_lib {
-        // A previous run already adapted the library and `experiment.rt_library_scope`
-        // says to reuse it. Which mechanism produced it does not matter here: the
-        // fine-tune and multi-head both hand back a precursor table with rewritten
-        // retention times, and this run fits its own LOESS on top either way.
-        shared.to_string()
-    } else if mh_heads > 0 {
-        let python = cfg
-            .predict_frag
-            .deeplc_python
-            .as_deref()
-            .expect("mh_heads is 0 unless an interpreter resolved");
-        let script = crate::sidecar::resolve_script(
-            &cfg.predict_frag.sidecar_script_dir,
-            "deeplc_finetune.py",
-        );
-        // Planned above whenever a multi-head calibration runs on a run with no shared
-        // library, which is this branch.
-        let plan = anchor_plan.expect("the anchor cut is planned for a multi-head calibration");
-        // Under `multihead_anchors = search`, or `auto` on a seed short of anchors, the
-        // seed-anchored fit goes to `rt_bootstrap/` and the refitted library takes the usual
-        // name; otherwise this is the usual name.
-        let has_im = crate::instrument::spectra_has_im(&boot.co.ms2);
-        let search = rt_bootstrap::decide(cfg, mh_heads, &plan, has_im, out);
-        let lib_p_mh = rt_bootstrap::seed_library_path(search, out);
-        crate::sidecar::run_deeplc_multihead(
-            python,
-            &script,
-            lib_p_base,
-            seed,
-            &lib_p_mh,
-            mh_heads,
-            anchor_q,
-            cfg.rt_im_train.window_holdout_frac,
-            threads,
-            cfg.rt_im_train.deeplc_predict_shards,
-            crate::cache::projection_dir(cfg).as_ref(),
-        )?;
-        if irt_placeholder {
-            crate::sidecar::require_every_row_repredicted(&lib_p_mh)?;
-        }
-        let lib_p_mh = if search {
-            rt_bootstrap::refit(&rt_bootstrap::Refit {
-                cfg,
-                config_hash: boot.ch,
-                converted: boot.co,
-                lib_p_base,
-                lib_f: boot.lib_f,
-                seed,
-                out,
-                seed_library: &lib_p_mh,
-                mh_heads,
-                threads,
-                irt_placeholder,
-                seed_anchors: plan.n_anchors,
-            })?
-            .library
-        } else {
-            lib_p_mh
-        };
-        rt_bootstrap::record_auto(cfg, &plan, has_im, search, &lib_p_mh);
-        produced_rt_lib = Some(lib_p_mh.clone());
-        searched = search;
-        lib_p_mh
-    } else if cfg.rt_im_train.finetune_deeplc {
-        let python = cfg
-            .predict_frag
-            .deeplc_python
-            .as_deref()
-            .expect("preflight");
-        let script = crate::sidecar::resolve_script(
-            &cfg.predict_frag.sidecar_script_dir,
-            "deeplc_finetune.py",
-        );
-        let lib_p_ft = d("fragment_library_precursors_ft.parquet");
-        crate::sidecar::run_deeplc_finetune(
-            python,
-            &script,
-            lib_p_base,
-            seed,
-            &lib_p_ft,
-            cfg.rt_im_train.finetune_epochs,
-            cfg.rt_im_train.finetune_patience,
-            anchor_q,
-            cfg.rt_im_train.finetune_batch,
-            // Keep the fine-tune exclusion aligned with rt-im-train's holdout
-            // split (see run.rs); 0.0 (default) changes nothing.
-            cfg.rt_im_train.window_holdout_frac,
-            cfg.rng_seed,
-            threads,
-            cfg.rt_im_train.deeplc_predict_shards,
-        )?;
-        produced_rt_lib = Some(lib_p_ft.clone());
-        lib_p_ft
-    } else {
-        lib_p_base.to_string()
-    };
-    Ok(Adapted {
-        lib: lib_p,
-        produced: produced_rt_lib,
-        searched,
-    })
 }
 
 /// Retention-time windows, extract, the optional retrace, features and compete of one
@@ -1639,31 +1470,23 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     } else {
         "convert"
     });
+    // The one base-model re-prediction of an imported library: made here when `library_irt`
+    // asks for it, else by the first run whose multi-head calibration is skipped for want of
+    // anchors (`chain::adapt_rt_library`), and shared by every run after it.
+    let base_irt = p
+        .lib_precursors
+        .is_some()
+        .then(|| chain::BaseIrt::new(d("fragment_library_precursors_deeplc.parquet")));
     let lib_p_base = if library_irt_repredicted {
-        let python = cfg
-            .predict_frag
-            .deeplc_python
-            .as_deref()
-            .expect("repredicts_library_irt implies deeplc_python");
-        let script = crate::sidecar::resolve_script(
-            &cfg.predict_frag.sidecar_script_dir,
-            "deeplc_finetune.py",
-        );
-        let out = d("fragment_library_precursors_deeplc.parquet");
         info!(
             library = %lib_p_base,
             "run-experiment: re-predicting the library iRT once with the DeepLC base model"
         );
-        crate::sidecar::run_deeplc_repredict(
-            python,
-            &script,
-            &lib_p_base,
-            &out,
-            rayon::current_num_threads(),
-            cfg.rt_im_train.deeplc_predict_shards,
-            crate::cache::projection_dir(cfg).as_ref(),
-        )?;
-        out
+        base_irt
+            .as_ref()
+            .expect("repredicts_library_irt implies an imported library")
+            .get(cfg, &lib_p_base, rayon::current_num_threads())?
+            .to_string()
     } else {
         // Same two reasons as in `run`: no interpreter (warn) or the multi-head calibration
         // taking over the re-prediction on the first run (a plan, logged as such).
@@ -1789,6 +1612,14 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         .multihead_heads(has_deeplc_for_scope, deeplc_rt_source_for_scope);
     let search_anchors = rt_bootstrap::always(cfg, mh_heads_for_scope);
     rt_bootstrap::warn_if_inert(cfg, mh_heads_for_scope, "run-experiment");
+    if cfg.extract.emit_candidate_audit {
+        warn!(
+            "run-experiment: extract.emit_candidate_audit has no effect here: the candidate \
+             audit runs in a single `mumdia run` only, so a grouped run does not pool its band \
+             tables for it (`mumdia pool --groups-dir <run>/groups --psms` does, for a later \
+             `mumdia audit`)"
+        );
+    }
     if share_ft && overlap > 0 && !grouped_runs && search_anchors {
         info!(
             "run-experiment: rt_im_train.multihead_anchors = search; the first run adapts the \
@@ -1924,6 +1755,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 seed,
                 shared,
                 irt_placeholder,
+                base_irt.as_ref(),
             ),
             None => process_run(
                 cfg,
@@ -1939,6 +1771,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 library_irt_repredicted,
                 slices_from,
                 irt_placeholder,
+                base_irt.as_ref(),
             ),
         }
     };
@@ -2061,21 +1894,20 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 }
                 r
             });
-            let adapted = adapt_rt_library(
+            let adapted = chain::adapt_rt_library(chain::AdaptParams {
                 cfg,
-                &lib_p_base,
-                &seed0,
-                &out0,
+                config_hash: &ch,
+                lib_p_base: &lib_p_base,
+                lib_f: &lib_f,
+                converted: &co0,
+                seed: &seed0,
+                out_dir: &out0,
                 mh_heads,
-                None,
+                shared_rt_lib: None,
                 irt_placeholder,
-                adapt_threads,
-                BootInputs {
-                    ch: &ch,
-                    lib_f: &lib_f,
-                    co: &co0,
-                },
-            );
+                threads: adapt_threads,
+                base_irt: base_irt.as_ref(),
+            });
             if adapted.is_err() {
                 cancel.store(true, std::sync::atomic::Ordering::SeqCst);
             }
@@ -2084,7 +1916,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("the overlapped runs' thread panicked")));
             (adapted, fronts)
         });
-        let Adapted {
+        let chain::Adapted {
             lib: lib0,
             produced,
             ..
@@ -2115,21 +1947,20 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         let back = |i: usize, (co, seed): &(convert::ConvertOutputs, String)| {
             let out = d(&names[i]);
             info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain after the overlapped front");
-            let lib_p = adapt_rt_library(
+            let lib_p = chain::adapt_rt_library(chain::AdaptParams {
                 cfg,
-                &lib_p_base,
+                config_hash: &ch,
+                lib_p_base: &lib_p_base,
+                lib_f: &lib_f,
+                converted: co,
                 seed,
-                &out,
+                out_dir: &out,
                 mh_heads,
-                produced.as_deref(),
+                shared_rt_lib: produced.as_deref(),
                 irt_placeholder,
-                rayon::current_num_threads(),
-                BootInputs {
-                    ch: &ch,
-                    lib_f: &lib_f,
-                    co,
-                },
-            )?
+                threads: rayon::current_num_threads(),
+                base_irt: base_irt.as_ref(),
+            })?
             .lib;
             finish_run(
                 cfg,
@@ -2207,21 +2038,20 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             (Some((co0, seed0)), true) => {
                 let out0 = d(&names[0]);
                 let window = crate::sched::PeakWindow::open();
-                let adapted = adapt_rt_library(
+                let adapted = chain::adapt_rt_library(chain::AdaptParams {
                     cfg,
-                    &lib_p_base,
-                    seed0,
-                    &out0,
-                    mh_heads_for_scope,
-                    None,
+                    config_hash: &ch,
+                    lib_p_base: &lib_p_base,
+                    lib_f: &lib_f,
+                    converted: co0,
+                    seed: seed0,
+                    out_dir: &out0,
+                    mh_heads: mh_heads_for_scope,
+                    shared_rt_lib: None,
                     irt_placeholder,
-                    rayon::current_num_threads(),
-                    BootInputs {
-                        ch: &ch,
-                        lib_f: &lib_f,
-                        co: co0,
-                    },
-                )?;
+                    threads: rayon::current_num_threads(),
+                    base_irt: base_irt.as_ref(),
+                })?;
                 first_window = Some(window);
                 if adapted.searched {
                     first_step = "the first run's retention-time adaptation (a search of it)";
@@ -2260,12 +2090,12 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 info!(library = %path, "run-experiment: reusing this adapted library for the remaining runs");
                 shared_ft = Some(path);
             }
-            // Defensive: `share_ft` implies the first run fine-tunes, so this should not
-            // happen. Falling through with `None` means the rest fine-tune themselves --
-            // slower, but never silently wrong.
+            // The first run's multi-head calibration was skipped for want of anchors
+            // (`chain::adapt_rt_library`): the rest adapt their own, slower but never
+            // silently wrong.
             None => warn!(
-                "run-experiment: the first run produced no fine-tuned library; the \
-                 remaining runs will each fine-tune"
+                "run-experiment: the first run produced no adapted library; the remaining \
+                 runs will each adapt their own"
             ),
         }
     }
