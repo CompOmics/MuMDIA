@@ -5,8 +5,8 @@
 //! the features shared between samples (MaxLFQ: peptide-level; directLFQ:
 //! ion/fragment-level), so with a single run there are no cross-sample ratios and
 //! the profile reduces to the per-sample summed intensity. The shared core is
-//! [`lfq_profile`]; `maxlfq`/`directlfq` differ only in the feature granularity
-//! the caller passes.
+//! [`lfq_profile`]; the two methods differ only in the feature granularity the
+//! caller passes.
 //!
 //! The `quant-lfq` command lives here too: [`run_lfq_combine_grouped`] reads the per-run
 //! quant tables, divides each run by its size factor and writes the protein-by-run matrix
@@ -190,18 +190,6 @@ pub fn lfq_profile<R: AsRef<[Option<f64>]>>(mat: &[R], n_samples: usize) -> Vec<
         }
     }
     out
-}
-
-/// MaxLFQ (Cox et al. 2014): peptide-level cross-sample profile.
-pub fn maxlfq<R: AsRef<[Option<f64>]>>(peptides_by_sample: &[R], n_samples: usize) -> Vec<f64> {
-    lfq_profile(peptides_by_sample, n_samples)
-}
-
-/// directLFQ (Ammar et al. 2023) core: the same ratio-alignment applied at the
-/// ion/fragment level rather than the peptide level (the caller passes an
-/// ion-by-sample matrix).
-pub fn directlfq<R: AsRef<[Option<f64>]>>(ions_by_sample: &[R], n_samples: usize) -> Vec<f64> {
-    lfq_profile(ions_by_sample, n_samples)
 }
 
 /// The cross-run precursor matrix `quant-lfq` writes next to the protein matrix at `lfq`.
@@ -451,8 +439,9 @@ pub fn write_size_factors_tsv(
 
 /// Stripped base amino-acid sequence of a peptidoform: drop bracketed or
 /// parenthesized modification blocks and any DECOY_ prefix, keep the residues.
-/// Used to roll precursors up to peptide-level LFQ groups.
-fn base_sequence(peptidoform: &str) -> String {
+/// Used to roll precursors up to peptide-level LFQ groups, and for the stripped sequences of
+/// the TSV report.
+pub(crate) fn base_sequence(peptidoform: &str) -> String {
     let s = peptidoform.strip_prefix("DECOY_").unwrap_or(peptidoform);
     let mut out = String::new();
     let mut depth = 0i32;
@@ -651,7 +640,7 @@ mod tests {
     #[test]
     fn single_sample_is_column_sum() {
         let mat = vec![vec![Some(3.0)], vec![Some(4.0)], vec![None]];
-        assert_eq!(maxlfq(&mat, 1), vec![7.0]);
+        assert_eq!(lfq_profile(&mat, 1), vec![7.0]);
     }
 
     #[test]
@@ -663,7 +652,7 @@ mod tests {
             .iter()
             .map(|f| true_prof.iter().map(|p| Some(f * p)).collect())
             .collect();
-        let q = maxlfq(&mat, 3);
+        let q = lfq_profile(&mat, 3);
         let r = ratios(&q);
         assert!((r[1] - 2.0).abs() < 1e-6, "r1={}", r[1]);
         assert!((r[2] - 4.0).abs() < 1e-6, "r2={}", r[2]);
@@ -680,7 +669,7 @@ mod tests {
             vec![Some(5.0), Some(10.0), Some(20.0)], // pep in all
         ];
         let _ = true_prof;
-        let q = maxlfq(&mat, 3);
+        let q = lfq_profile(&mat, 3);
         let r = ratios(&q);
         assert!((r[1] - 2.0).abs() < 1e-6, "r1={}", r[1]);
         assert!((r[2] - 4.0).abs() < 1e-6, "r2={}", r[2]);
@@ -692,7 +681,7 @@ mod tests {
             vec![Some(10.0), Some(20.0), Some(40.0)],
             vec![Some(5.0), Some(10.0), Some(20.0)],
         ];
-        let q = maxlfq(&mat, 3);
+        let q = lfq_profile(&mat, 3);
         let measured: f64 = 10.0 + 20.0 + 40.0 + 5.0 + 10.0 + 20.0;
         let got: f64 = q.iter().sum();
         assert!(
@@ -728,7 +717,7 @@ mod tests {
             vec![Some(5.0), Some(10.0), None],
             vec![None, None, Some(7.0)],
         ];
-        let q = maxlfq(&mat, 3);
+        let q = lfq_profile(&mat, 3);
         assert!((q[2] - 7.0).abs() < 1e-6, "q2={}", q[2]);
     }
 

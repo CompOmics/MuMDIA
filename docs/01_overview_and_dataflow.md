@@ -560,9 +560,9 @@ recording each output in the manifest with `record_artifact` (`run.rs:85-509`):
 9. Optional `audit::run` (`run.rs:405`, gated on `extract.emit_candidate_audit`)
    reconstructs the per-candidate identification-loss ladder into
    `candidate_audit.parquet`. It is a cheap join over the artifact chain and runs
-   no extraction. Inside `run` its parameters are fixed: `q_threshold = 0.01`,
-   `run_id = out_dir`, and an empty `entrapment_substr` (`run.rs:413-415`); the
-   standalone `audit` command exposes all three as flags.
+   no extraction. Inside `run` it gates on the report's `quant.q_threshold`, with
+   `run_id = out_dir` and an empty `entrapment_substr`; the standalone `audit` command
+   exposes all three as flags.
 
 10. `quant::run` (`run.rs:422`) integrates fragment chromatograms and rolls up to
     protein groups, writing `peptide_quant`, `protein_group_quant`, and

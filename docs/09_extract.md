@@ -644,11 +644,9 @@ what identifies the cap as the cause.
 
 `DID_NOT_SURVIVE_EXTRACTION` (named `NO_PEAK_GROUP` until docs/29 #16) does not mean
 "never assembled `presence_min_fragments` distinct fragments", although this document
-previously said so. `audit.rs` reads a
-per-candidate audit table that `extract` does not write -- `emit_candidate_audit`
-is unwired -- so the reason map is always empty and the `_ => DidNotSurviveExtraction`
-catch-all absorbs presence failures, matched-fraction failures and every
-extraction-gate rejection alike. Read it as "did not survive extract". The
+previously said so. `extract` writes no per-candidate table, so `audit.rs` sees only
+whether a candidate has an extracted row, and that one label covers presence failures,
+matched-fraction failures and every extraction-gate rejection alike. Read it as "did not survive extract". The
 attribution to the peak cap above stands on the replay experiment, not on the
 label.
 
@@ -1585,9 +1583,9 @@ declutter" commit: `extract.scan_window_mode` (and the `ScanWindowMode` enum),
 | `q1_deconvolved` | false | Count only the peaks whose Q1 centroid sits where the matched fragment is expected, within the tolerance the Q1 calibration learns; needs `rt_im_train.q1_calibrate` and spectra_ms2 v3 (section 14) |
 | `im_gate` | `off` | The 1/K0 gate on fragment peaks (`off`, `fragments`, `auto`; section 8). Inert on 3D data. Omitted from the canonical configuration at its default |
 
-Note: `emit_candidate_audit` is a declared knob but the candidate-audit write is
-not present in this `extract.rs`; the audit ladder is produced by the separate
-`mumdia audit` command. Treat the in-stage audit as unwired here.
+Note: `emit_candidate_audit` is not read in `extract.rs`; it gates the separate `audit`
+stage of a single-file `run` (also `mumdia audit`), and extract writes no per-candidate
+table for it.
 
 ### Default-off sensitivity knobs (index)
 
