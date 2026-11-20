@@ -8,24 +8,17 @@
 //! the localised modification's count on the candidate slots; the hypotheses of a peptide are
 //! every such placement, in lexicographic order of their sorted slots.
 
-use mumdia_core::mass::{parse_peptidoform, unimod_mass};
+use mumdia_core::mass::{parse_peptidoform, unimod_mass, ParsedPeptidoform};
 
 /// Modification siblings: same residues, charge, label and modification composition (the
 /// sorted deltas, terminal ones included), so they differ only in localisation. Shared by
 /// the prescreen's localisation policy and this stage.
 pub(crate) fn sibling_key(pf: &str, charge: i32, label: u32) -> Option<String> {
     let p = parse_peptidoform(pf).ok()?;
-    let mut d: Vec<i64> = p
-        .mods
-        .iter()
-        .chain([&p.n_term_mod, &p.c_term_mod])
-        .filter(|&&x| x != 0.0)
-        .map(|&x| (x * 1e4).round() as i64)
-        .collect();
-    d.sort_unstable();
     Some(format!(
-        "{}/{charge}/{label}/{d:?}",
-        String::from_utf8_lossy(&p.residues)
+        "{}/{charge}/{label}/{:?}",
+        String::from_utf8_lossy(&p.residues),
+        deltas(&p)
     ))
 }
 
@@ -33,7 +26,11 @@ pub(crate) fn sibling_key(pf: &str, charge: i32, label: u32) -> Option<String> {
 /// in 1e-4 Da, terminal ones included. Positional isomers share it, and so do a target and
 /// its paired decoy, which is what the picked isomer-group competition keys on.
 pub(crate) fn composition_key(pf: &str) -> Option<Vec<i64>> {
-    let p = parse_peptidoform(pf).ok()?;
+    parse_peptidoform(pf).ok().map(|p| deltas(&p))
+}
+
+/// The sorted modification deltas of `p` in 1e-4 Da, terminal ones included.
+fn deltas(p: &ParsedPeptidoform) -> Vec<i64> {
     let mut d: Vec<i64> = p
         .mods
         .iter()
@@ -42,7 +39,7 @@ pub(crate) fn composition_key(pf: &str) -> Option<Vec<i64>> {
         .map(|&x| (x * 1e4).round() as i64)
         .collect();
     d.sort_unstable();
-    Some(d)
+    d
 }
 
 /// A peptidoform split for localisation of one modification.
@@ -157,12 +154,8 @@ fn residue_brackets(pf: &str) -> Vec<Option<String>> {
         }
         if c == b'[' {
             let Some(off) = pf[i..].find(']') else { break };
-            let text = &pf[i + 1..i + off];
             if let Some(last) = out.last_mut() {
-                *last = Some(match last.take() {
-                    Some(prev) => format!("{prev}+{text}"),
-                    None => text.to_string(),
-                });
+                *last = Some(pf[i + 1..i + off].to_string());
             }
             i += off + 1;
             continue;
@@ -175,11 +168,10 @@ fn residue_brackets(pf: &str) -> Vec<Option<String>> {
     out
 }
 
-/// Split `pf` for the localisation of `name` (a catalogue modification). `None` when the
-/// peptidoform does not parse, does not carry the modification, or a residue or the
-/// N-terminus carries it together with another modification (stacked modifications are not
-/// localised). The modification in the N-terminal group (`[name]-`) is a site on the
-/// N-terminal slot.
+/// Split `pf` for the localisation of `name` (a catalogue modification, written as its name
+/// or as a mass within 1e-3 Da of it). `None` when the peptidoform does not parse (a residue
+/// or the N-terminus with two modifications does not) or does not carry the modification.
+/// The modification in the N-terminal group (`[name]-`) is a site on the N-terminal slot.
 pub(crate) fn split(pf: &str, name: &str) -> Option<Split> {
     let delta = unimod_mass(name)?;
     let p = parse_peptidoform(pf).ok()?;
@@ -191,30 +183,15 @@ pub(crate) fn split(pf: &str, name: &str) -> Option<Split> {
     let mut sites = Vec::new();
     let mut base_mods = p.mods.clone();
     for (i, b) in brackets.iter().enumerate() {
-        let Some(text) = b else { continue };
-        if is_mod(text) {
+        if b.as_deref().is_some_and(is_mod) {
             sites.push(i);
-            base_mods[i] -= delta;
-            if base_mods[i].abs() > 1e-6 {
-                return None;
-            }
             base_mods[i] = 0.0;
-        } else if text.split('+').any(is_mod) {
-            return None;
         }
     }
     let mut n_term = p.n_term_mod;
-    if let Some(text) = n_term_text(pf) {
-        if is_mod(text) {
-            sites.push(p.residues.len());
-            n_term -= delta;
-            if n_term.abs() > 1e-6 {
-                return None;
-            }
-            n_term = 0.0;
-        } else if text.split('+').any(is_mod) {
-            return None;
-        }
+    if n_term_text(pf).is_some_and(is_mod) {
+        sites.push(p.residues.len());
+        n_term = 0.0;
     }
     if sites.is_empty() {
         return None;
@@ -367,6 +344,9 @@ mod tests {
         // a signed mass is recognised as the modification
         let m = split("PEPS[+79.966331]K", "Phospho").unwrap();
         assert_eq!(m.sites, vec![3]);
+        // also with fewer decimals: the tolerance that names it is the one that removes it
+        let m = split("PEPS[+79.9663]K", "Phospho").unwrap();
+        assert_eq!((m.sites, m.base_mods[3]), (vec![3], 0.0));
     }
 
     #[test]

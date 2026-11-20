@@ -1,10 +1,10 @@
 //! Typed configuration (docs/02_config_and_data_model.md).
 //!
 //! One serde structure with per-stage sections, `#[serde(default)]` on every
-//! field, and `deny_unknown_fields` so misconfiguration fails loudly. Every
-//! choice point is an enum backed by a strategy; MVP ships only the strategies
-//! MVP needs, with MVP-conservative defaults: fixed tolerances, one documented
-//! decoy scheme, the `minimal` feature set.
+//! section, and `deny_unknown_fields` so misconfiguration fails loudly. Every
+//! choice point is an enum backed by a strategy. [`Config::validate`] refuses, at
+//! load, every value and combination the file alone shows to be out of range or
+//! contradictory.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -191,8 +191,6 @@ pub enum RescorerKind {
     /// the extraction gate is opened. Same positional-CLI PIN contract as Mokapot;
     /// requires `rescore.python` to point at an interpreter with torch.
     NnTorch,
-    /// External percolator.exe over the PIN file.
-    Percolator,
     /// Spike-in (entrapment) negative rescorer: treat foreign-proteome PSMs
     /// (identified by `entrapment_marker`) as real negatives, train a nonlinear
     /// GBM sidecar (out-of-fold by base peptide) or a native linear fallback,
@@ -352,12 +350,14 @@ impl Default for DecoyConfig {
 /// Vendor-format conversion, read by every subcommand that takes a spectra path
 /// (`raw.rs`; docs/04_convert.md, "Vendor formats").
 ///
-/// The engine itself reads mzML only, deliberately: `mzdata` is pinned to its
-/// pure-Rust `mzml` + `miniz_oxide` features so the build needs no C or .NET
-/// toolchain, and its vendor readers would reintroduce both. A vendor file is
-/// therefore converted to mzML first by an external converter run as a child
-/// process, in the same way the Python sidecars are: ThermoRawFileParser for Thermo
-/// `.raw`, ProteoWizard `msconvert` for everything else and as the Thermo fallback.
+/// The engine reads two vendor formats natively: a timsTOF diaPASEF `.d`, always, and a
+/// Thermo `.raw` under `thermo_native`, only in an engine built with the `thermo` feature.
+/// Otherwise `mzdata` is pinned to its pure-Rust `mzml` + `miniz_oxide` features so the
+/// build needs no vendor SDK, C++ or .NET toolchain, which its vendor readers would
+/// reintroduce. Every other vendor file is therefore converted to mzML first by an
+/// external converter run as a child process, in the same way the Python sidecars are:
+/// ThermoRawFileParser for Thermo `.raw`, ProteoWizard `msconvert` for everything else
+/// and as the Thermo fallback.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ConvertConfig {
@@ -545,8 +545,6 @@ impl Default for ConvertConfig {
     }
 }
 
-// The `rt_im_train` ion-mobility keys at their defaults, which the canonical configuration
-// omits.
 /// An m/z limit pair (`<what>_min`, `<what>_max`, either unset): each one set must be finite
 /// and positive, and with both set the lower must lie below the upper.
 fn check_mz_limits(what: &str, lo: Option<f64>, hi: Option<f64>) -> Result<(), String> {
@@ -570,6 +568,8 @@ fn check_mz_limits(what: &str, lo: Option<f64>, hi: Option<f64>) -> Result<(), S
     Ok(())
 }
 
+// The `rt_im_train` ion-mobility keys at their defaults, which the canonical configuration
+// omits.
 fn is_default_im_min_anchors_per_charge(v: &usize) -> bool {
     *v == RtImTrainConfig::default().im_min_anchors_per_charge
 }
@@ -1914,8 +1914,9 @@ pub struct RtImTrainConfig {
     /// fraction of 0.0100 in every arm (`docs/08_rt_im_train.md` section 4d): AIF +4.8%
     /// peptides, Astral +14.3%, protein groups +2.4% and +7.1%. The mechanism is ordering,
     /// not thresholds -- fewer candidates reach rescore and more of them are real -- and
-    /// the cost is 1.4x to 1.7x wall clock, because the calibration is fitted against each
-    /// run's own anchors and so cannot be shared across an experiment.
+    /// the cost is 1.4x to 1.7x wall clock, because the calibration is fitted against a run's
+    /// own anchors. Under `experiment.rt_library_scope = first_run_only` (the default) the
+    /// first run of an experiment fits it and the others reuse the adapted library.
     pub multihead_calibration: Option<usize>,
     /// Which anchors the multi-head calibration of the run that adapts the library is
     /// fitted on. `seed` is the run's confident seed PSMs at `q_train`. `search` adds a
@@ -1997,7 +1998,8 @@ pub struct RtImTrainConfig {
     /// `fallback_rt_window_s`. Where the predicted retention time loses the elution order
     /// (typically the gradient ends) the anchors' residuals are one-sided and large, and the
     /// window widens on that side only; elsewhere it stays the global window. Default 100
-    /// since 2026-10-08; 0 is off. Mutually exclusive with `adaptive_rt_window`.
+    /// since 2026-10-08; 0 is off. An explicit `adaptive_rt_window` takes its place: the
+    /// local window is then not used.
     pub local_window_anchors: usize,
     /// Write `run_windows.parquet` with Float32 window columns (`rt_pred_cal`, `rt_lo`,
     /// `rt_hi`, `im_pred_cal`, `im_lo`, `im_hi`; schema version 2) instead of Float64. Off
@@ -2009,7 +2011,7 @@ pub struct RtImTrainConfig {
     /// relative 6e-8, far below any window width). Every reader takes both versions.
     #[serde(skip_serializing_if = "is_false")]
     pub run_windows_f32: bool,
-    /// Multiplier on the local one-sided quantiles of `local_window_anchors`.
+    /// Multiplier on the local one-sided quantiles of `local_window_anchors`. Must be > 0.
     pub local_window_multiplier: f64,
     /// Lower clamp (seconds) for any RT half-window (the existing 1 s floor).
     pub rt_window_min_s: f64,
@@ -2023,7 +2025,7 @@ pub struct RtImTrainConfig {
     /// it does not deserve (measured: it inverted the 4.0.0a2/4.1.0 ranking); held-out
     /// sizing measured +0.9% peptides with DeepLC 4.1.0 and -1.5% with 4.0.0a2 on the
     /// AIF benchmark, both at 0.98% decoy, so enable it only with a generalizing RT
-    /// model. 0.0 (default) keeps in-sample sizing. Mutually exclusive with
+    /// model. 0.0 (default) keeps in-sample sizing; at most 0.9. Mutually exclusive with
     /// `adaptive_rt_window`. Benchmark-gated; do not default on.
     pub window_holdout_frac: f64,
     /// Where an imported library's `predicted_irt` comes from. `auto` (the default)
@@ -2336,7 +2338,6 @@ pub struct ExtractConfig {
     /// order with the same values (measured on one band: 29,028,466 rows, 10.4 billion
     /// trace elements, every per-column sum equal). Compare values, not bytes, across
     /// settings.
-    #[serde(default)]
     pub windows_in_flight: Option<usize>,
     /// Refuse an extraction whose hit store is estimated, before anything is probed, to
     /// hold more than this many GiB at once. Unset (the default) is `auto`: the machine's
@@ -2482,24 +2483,33 @@ pub struct ExtractConfig {
     /// Never read from a configuration file.
     #[serde(skip)]
     pub q1_separable: bool,
+    /// Fewest consecutive scan groups over which `presence_min_coelution` fragments must be
+    /// present (the co-elution run) for a candidate to be accepted; values below 1 read as 1.
+    /// `min_coelution_run` floors the same run, so the larger of the two applies.
     pub fixed_scan_window: usize,
     pub frag_tol_ppm: f64,
     pub prec_tol_ppm: f64,
-    /// tier-(b) minimum matched fragment count.
+    /// Fewest distinct matched fragments a candidate needs before its peak is looked at
+    /// (tier b), and a promoted alternative peak (`promote_top_peaks > 1`) within its own
+    /// bounds. For the selected peak it floors the same count as `presence_min_fragments`, so
+    /// the larger of the two applies there.
     pub presence_min_matched: usize,
-    /// minimum distinct fragments for acceptance.
+    /// Fewest distinct matched fragments for acceptance (tier c). It floors the same count as
+    /// `presence_min_matched`, and the larger of the two applies.
     pub presence_min_fragments: usize,
     /// minimum simultaneously-present fragments over the consecutive-scan run.
     pub presence_min_coelution: usize,
-    /// tier-(d) spectral-agreement gate: reject a candidate whose observed fragment
-    /// intensities agree with the predicted pattern below this score.
+    /// tier-(d) spectral-agreement gate: reject a candidate whose score under the active
+    /// `gate_mode` is below this value. Under the default `window_mean` it scores the
+    /// spectrum summed over the apex +-2 scans, less an RT-error term (`gate_rt_weight`);
+    /// under `apex_pearson` it is an intensity correlation at ONE apex scan rather than a
+    /// chromatographic co-elution correlation; under `spectral_entropy` it is not a
+    /// correlation at all.
     ///
-    /// Renamed from `min_frag_corr`, which was accurate for none of the four
-    /// `gate_mode` values: under the default `apex_pearson` it is an intensity
-    /// correlation at ONE apex scan rather than a chromatographic co-elution
-    /// correlation, and under `spectral_entropy` it is not a correlation at all. The
-    /// old name is not accepted (`deny_unknown_fields`), so an old config fails loudly
-    /// with the offending key named rather than silently reverting to a default.
+    /// Renamed from `min_frag_corr`, which was accurate for none of the `gate_mode`
+    /// values. The old name is not accepted (`deny_unknown_fields`), so an old config
+    /// fails loudly with the offending key named rather than silently reverting to a
+    /// default.
     /// Applied symmetrically to targets and decoys, but that alone does not prove
     /// null exchangeability in chimeric DIA; validate every threshold with an
     /// independent entrapment. 0 disables.
@@ -2573,9 +2583,8 @@ pub struct ExtractConfig {
     /// bit, so every table downstream of extract is byte-identical; only the chromatogram
     /// table changes (smaller, with a different content hash). A reader outside the engine,
     /// or an engine binary from before v2, reads only `rt` and `intensity` and stops at their
-    /// absence from a v2 table: set `1` for such a reader, or convert a table with
-    /// `mumdia::chromatograms::rewrite`. The pool splices band tables of one layout only, so
-    /// all bands of a grouped run share it.
+    /// absence from a v2 table: set `1` for such a reader. The pool splices band tables of
+    /// one layout only, so all bands of a grouped run share it.
     ///
     /// Measured before the default changed: on a six-run Astral experiment and a five-run
     /// Orbitrap AIF experiment (imported HYE library, multi-head calibration, `nn_torch`)
@@ -2629,8 +2638,9 @@ pub struct ExtractConfig {
     /// peptide persists across its elution. 0 disables (the `scan_window` floor still
     /// applies). This is the DIA analog of a "seen in >= N PSMs" requirement.
     pub min_coelution_run: usize,
-    /// Rescue a candidate that fails the single-scan fragment-Pearson gate when it
-    /// has adequate matched fragments AND MS1 isotope-pattern support (mono + a
+    /// Rescue a candidate that fails the extraction gate (`gate_min_score`, under any
+    /// `gate_mode`) when it has at least `presence_min_fragments` distinct matched
+    /// fragments AND MS1 isotope-pattern support (mono + a
     /// plausible +1/mono ratio). Off by default: it relaxes acceptance, so enable
     /// it only with target-decoy/entrapment FDR validation. MS1 evidence is now
     /// computed before the gate so this can take effect.
@@ -2699,10 +2709,11 @@ pub struct ExtractConfig {
     /// rank-0 apex, so a near-duplicate of the selected peak is not re-emitted. Only
     /// used when `promote_top_peaks > 1`.
     pub alt_peak_min_separation_s: f64,
-    /// Diagnostic candidate-audit: when true, extraction records, for every probed
-    /// candidate, either the survivor stage-flags or the earliest `RejectionReason`,
-    /// and writes `<out-psms>.audit.parquet` (spec 01 §4 / P0.3). Near-zero cost
-    /// when false (no per-candidate audit allocation). Default false (production).
+    /// Diagnostic candidate audit: `run` writes `candidate_audit.parquet`, the
+    /// per-candidate identification-loss ladder rebuilt from the artifact chain
+    /// (`stages::audit`), and a grouped run keeps its pooled extracted and competed
+    /// tables for it. Extract itself writes no per-candidate table, so every candidate
+    /// it rejects carries one label, `DID_NOT_SURVIVE_EXTRACTION`. Default false.
     pub emit_candidate_audit: bool,
     /// Evidence-count apex selection: choose the apex scan by the NUMBER of distinct
     /// co-eluting predicted fragments present (breadth of evidence), using observed
@@ -2761,7 +2772,7 @@ pub struct ExtractConfig {
     /// the mono, +1 and +2 isotopes, as the `log_mono_ms1` feature does. 0 is off.
     ///
     /// Unset (the default) is off. It was 0.845 on spectra that carry 1/K0 from 2026-10-18 to
-    /// 2026-11-17, a speed default; it is off because on the 2026-11 low-input campaign it cost
+    /// 2026-11-19, a speed default; it is off because on the 2026-11 low-input campaign it cost
     /// identifications at every load: +26% precursors per run at 200 pg and +19% at 1 ng with
     /// it off, +6.1% on 50 ng 5-min Ultra 2 runs, other-species shares unchanged (one NN seed,
     /// docs/35_diapasef.md section 16). The measurements of the old default: on the six
@@ -2996,6 +3007,25 @@ impl ExtractConfig {
         }
     }
 
+    /// Copy the `features` and `retrace` keys extract reads into their mirror fields
+    /// (`ms1_envelope`, `q1_precursor`, `q1_multiscale`, `q1_dec_features`, `q1_separable`,
+    /// and `q1_repick` / `q1_repick_peaks` under `q1_fragments`). The orchestrated chain and
+    /// the standalone `mumdia extract` both reach it through `q1frag::configure_extract`, so
+    /// the two write the same evidence.
+    /// `q1_model` and `q1_dec_tol_steps` come from the run's `cal.json` and stay with the
+    /// callers.
+    pub fn set_search_keys(&mut self, cfg: &Config) {
+        self.ms1_envelope = cfg.features.ms1_envelope;
+        self.q1_precursor = cfg.features.q1_precursor.on();
+        self.q1_multiscale = cfg.features.q1_multiscale.on();
+        self.q1_dec_features = cfg.features.q1_deconvolved.on();
+        self.q1_separable = cfg.features.q1_separable;
+        if self.q1_fragments.on() {
+            self.q1_repick = cfg.retrace.q1_repick.on();
+            self.q1_repick_peaks = cfg.retrace.q1_repick_peaks;
+        }
+    }
+
     /// Whether the MS1 shift depends on m/z and retention time (a fitted surface).
     pub fn ms1_shift_varies(&self) -> bool {
         self.ms1_cal.as_ref().is_some_and(|c| c.surface.is_some())
@@ -3060,32 +3090,9 @@ impl Default for ExtractConfig {
             presence_min_matched: 3,
             presence_min_fragments: 3,
             presence_min_coelution: 2,
-            // Loosening raises recall and candidate volume; external entrapment
-            // validation is required before treating any threshold as FDR-safe.
-            // Relaxed from the historical 0.5 to 0.2 to recover low-abundance
-            // candidates the hard single-scan Pearson gate was dropping
-            // (docs/18_findings_and_decisions.md); still a hard gate, not the
-            // soft/budgeted redesign.
-            // 0.2. Briefly set to 0.6 on the strength of the gate sweep in docs/18,
-            // where `native_tda` peaked at 0.6 (9,503 peptides) while `nn_torch` peaked
-            // at the loosest gate tested. Since `native_tda` is the default classifier,
-            // 0.6 looked like the matching default.
-            //
-            // Measured, and it is not. Same AIF file, current defaults (augmented
-            // library, `apex_evidence_rank = true`, paired CV folds), 2x2 of gate x
-            // rescorer at an unchanged empirical decoy fraction of 0.0097-0.0098:
-            //
-            //     gate 0.2   native_tda 10,847   nn_torch 10,914
-            //     gate 0.6   native_tda 10,369   nn_torch 10,399
-            //
-            // 0.6 costs 4.4% of peptides for `native_tda` and 4.7% for `nn_torch`, and
-            // halves what extract accepts (45,338 -> 21,979). `native_tda`'s inverted-U
-            // flattened from below -- its count rose from 9,503 to 10,847 and the optimum
-            // moved to the loose end -- so the sweep that motivated 0.6 no longer
-            // describes this configuration, and loose is now better for BOTH rescorers.
             gate_min_score: 0.6, // with GateMode::WindowMean (default since 2026-10-08)
             min_matched_fraction: 0.0,
-            apex_top_fragments: 0, // superseded by apex_count_tol; kept for compat
+            apex_top_fragments: 0, // 0 = 3; the signature-intensity apex reads it
             apex_rt_prior_s: 0.0,  // RT prior off by default
             apex_count_tol: 1,     // fragment-count apex with 1-fragment slack
             apex_gaussian_sigma_scans: 0.0, // Gaussian apex smoother off by default (opt-in)
@@ -3135,7 +3142,7 @@ impl Default for ExtractConfig {
             gate_mode: GateMode::WindowMean, // window-summed agreement minus RT term (since 2026-10-08)
             gate_coelution_min: 0.5,         // used only by GateMode::Combined
             gate_rt_weight: 0.2,             // used only by GateMode::WindowMean
-            gate_support_min: None,          // off (0.845 on 1/K0 spectra until 2026-11-17)
+            gate_support_min: None,          // off (0.845 on 1/K0 spectra until 2026-11-19)
             im_gate: ImGate::Off,
         }
     }
@@ -3421,12 +3428,12 @@ impl Default for FeaturesConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CompeteConfig {
-    /// Competition grouping: `precursor` collapses charge/modification siblings
-    /// separately within each target/decoy label; targets and decoys therefore do
-    /// not compete directly. `apex` also groups by rounded apex RT;
-    /// `peptidoform_charge` keeps each peptidoform+charge as its own group
-    /// (precursor-level, as DIA-NN/Spectronaut report), so sibling charges of one
-    /// peptide are not collapsed.
+    /// Competition grouping, always within one target/decoy label, so a target never
+    /// competes against its own decoy. `peptidoform_charge` (the default) makes each
+    /// peptidoform + charge its own group, so sibling charge states and modforms of one
+    /// peptide are separate precursors; `base_peptide` collapses every charge and
+    /// modification sibling of one stripped peptide to a single winner; `apex` groups each
+    /// base peptide by rounded apex RT.
     pub group_by: CompeteGroupBy,
     pub apex_rt_tolerance_s: f64,
     /// How within-group competition resolves (sensitivity program, spec 04 §6 /
@@ -3437,9 +3444,9 @@ pub struct CompeteConfig {
     /// Score margin (in `prelim_score` units) required to remove a loser under
     /// `margin_gated`. A loser closer than this to the winner is kept.
     pub margin: f64,
-    /// Minimum distinct unique-fragment count a loser must have to survive under
-    /// `unique_evidence` (needs the `unique_fragment_count` feature; falls back to
-    /// winner-take-all when the column is absent).
+    /// Minimum unique-fragment evidence a loser must have to survive under
+    /// `unique_evidence`: its `n_matched_fragments` x (1 - `peak_contested_frac`), which is
+    /// the matched-fragment count itself unless `extract.emit_contested_features` is on.
     pub unique_evidence_min_fragments: usize,
     /// Diagnostic: when true, write `<out>.compete_audit.parquet` recording every
     /// removed candidate with its group, winner, scores, and removal reason.
@@ -3470,15 +3477,12 @@ pub enum CompetitionMode {
     /// Legacy: keep only the highest `prelim_score` candidate per group.
     #[default]
     WinnerTakeAll,
-    /// Keep every candidate (no within-group removal); FDR handles ambiguity.
+    /// Keep every candidate (no within-group removal); FDR handles ambiguity. The retired
+    /// `features_only`, which kept the same set, is read as this mode.
+    #[serde(alias = "features_only")]
     None,
-    /// Keep every candidate; conflict/contested features (added upstream) carry the
-    /// interference signal into rescoring. Same retained set as `None`; the name
-    /// documents intent for the experiment matrix.
-    FeaturesOnly,
-    /// Keep a loser when it has enough independent evidence
-    /// (`unique_fragment_count >= unique_evidence_min_fragments`); otherwise remove
-    /// it (winner-take-all fallback).
+    /// Keep a loser when its unique-fragment evidence reaches
+    /// `unique_evidence_min_fragments`; otherwise remove it (winner-take-all fallback).
     UniqueEvidence,
     /// Remove a loser only when `winner_score - loser_score >= margin`; otherwise
     /// keep it. Conservative removal for the low-FDR region.
@@ -3592,8 +3596,8 @@ pub enum QuantQColumn {
     PsmQ,
     /// Filter on `run_psm_q` (per-run PSM FDR). The correct choice for cross-run
     /// quant off an experiment-wide rescore: each run's PSMs are FDR-controlled
-    /// within their own run, so quant keeps the right per-run precursors without
-    /// the external `split_scored.py` peptide-q overwrite.
+    /// within their own run (`run-experiment` splits the scored table by `source` before
+    /// quant), so quant keeps the right per-run precursors.
     RunPsmQ,
 }
 
@@ -4130,6 +4134,14 @@ impl QuantConfig {
     pub fn lfq_reads_normalised(&self) -> bool {
         !self.normalisation.is_off() && self.normalisation_lfq
     }
+
+    /// Whether `peak_window_mode = consensus` is set where it changes no quantity: under a
+    /// fixed window every candidate with an apex integrates over that window, and the
+    /// consensus half-widths reach only the bounds reported for a candidate without one.
+    pub fn consensus_is_inert(&self) -> bool {
+        self.peak_window_mode == PeakWindowMode::Consensus
+            && (self.fixed_scan_halfwidth > 0 || self.fixed_window_s > 0.0)
+    }
 }
 
 /// Fragment ranking for the quant top-N sum. See [`QuantConfig::fragment_selection`].
@@ -4467,8 +4479,8 @@ pub struct RescoreConfig {
     /// kept, so the share of rows kept follows the pool: 36% on a six-run diaPASEF pool, 49%
     /// on a six-run Astral pool at 0.35. The classifier, its q values and the scored table
     /// see only the kept rows; a dropped PSM is not identified. When the model cannot be
-    /// fitted (too few confident targets, a missing or non-finite column) or the pool has
-    /// fewer decoys than `min_train_decoys` (100 at least) every PSM goes to the classifier
+    /// fitted (too few confident targets, a missing or non-finite column) or the cut would
+    /// keep fewer decoys than `min_train_decoys` (100 at least) every PSM goes to the classifier
     /// with a warning, and a pool smaller than `prefilter_min_psms` is not cut. Must be in
     /// [0, 1). The default since 2026-10-17: at
     /// 0.35 within 0.11% of the peptides on diaPASEF, Astral and Orbitrap pools, an
@@ -4514,15 +4526,16 @@ pub struct RescoreConfig {
     /// unbiased when the spike-in library differs in size from the real one.
     pub entrapment_ratio: f64,
     /// When true, any sidecar/classifier failure or misconfiguration (Mokapot or
-    /// entrapment sidecar error, unwired percolator, entrapment mode with no
+    /// entrapment sidecar error, entrapment mode with no
     /// entrapment PSMs) is a hard error instead of a silent fall back to the
     /// native rescorer. Default true so a named scientific workflow cannot
     /// silently execute a different model; set false only for explicit legacy
     /// compatibility.
     pub strict: bool,
     /// How the feature matrix reaches a sidecar rescorer. See [`Handoff`]. Defaults to
-    /// `raw`, which applies to nn_torch only; mokapot and entrapment sidecars always
-    /// receive the tab-separated PIN.
+    /// `raw`, which applies to nn_torch only: mokapot always receives the tab-separated PIN
+    /// (with a warning when another handoff is set), and the entrapment sidecar its own
+    /// parquet table.
     #[serde(default)]
     pub handoff: Handoff,
     /// Restrict the classifier's input to these feature columns, by name. Absent (the
@@ -4536,11 +4549,9 @@ pub struct RescoreConfig {
     ///
     /// Mutually exclusive with [`RescoreConfig::features_file`]. Every name must exist in
     /// the competed table's schema; a missing one is an error, never a silent drop.
-    #[serde(default)]
     pub features: Option<Vec<String>>,
     /// The same restriction, read from a file with one feature name per line (blank lines
     /// and `#` comments ignored), which is how a 100+ name list stays readable.
-    #[serde(default)]
     pub features_file: Option<String>,
     /// Named feature list used when neither `features` nor `features_file` is set. `all`
     /// is every feature the competed table carries. `compact` is the 114-name list of
@@ -4573,7 +4584,6 @@ pub struct RescoreConfig {
     /// Stratified thinning of whatever survived the cap: a fraction in (0, 1], or a row
     /// cap when > 1. Positives and negatives are thinned by the same factor, so the class
     /// balance is unchanged. 0 (the default) keeps every row.
-    #[serde(default)]
     pub train_subsample: f64,
     /// Reuse the previous iteration's weights and optimiser state, running this many
     /// epochs from the second self-training iteration on instead of a full fresh fit.
@@ -4582,12 +4592,10 @@ pub struct RescoreConfig {
     pub train_warm_epochs: usize,
     /// Under `train_neg_select = hybrid`, the share of the negative budget taken from the
     /// margin (highest-scoring decoys); the rest is sampled at random. Default 0.5.
-    #[serde(default = "default_margin_frac")]
     pub train_margin_frac: f64,
     /// Independent self-training passes whose out-of-fold scores are rank-averaged. 1 (the
     /// default) is a single pass. 3 was the one knob positive on every pool of the seeded
     /// sweep (docs/28 section 17), at three times the training cost.
-    #[serde(default = "default_seeds")]
     pub seeds: usize,
     /// Shadow demotion: demote (below every other score) a candidate of either label when at
     /// least this many of its library fragments lie within `shadow_ppm` of a fragment of a
@@ -4636,14 +4644,6 @@ pub struct RescoreConfig {
     /// warning and `classifier = "prelim_score_few_decoys"` in the scored table's report.
     /// A strict gate on a very small or very clean run can leave this few. 0 disables it.
     pub min_train_decoys: usize,
-}
-
-fn default_margin_frac() -> f64 {
-    0.5
-}
-
-fn default_seeds() -> usize {
-    1
 }
 
 /// Named feature list for `RescoreConfig::feature_preset`.
@@ -4767,7 +4767,7 @@ pub enum RtLibraryScope {
 #[serde(rename_all = "snake_case")]
 pub enum Handoff {
     /// Tab-separated PIN. Percolator's format, and what `mokapot.read_pin` requires, so it
-    /// is what a mokapot or entrapment sidecar receives whatever this is set to.
+    /// is what a mokapot sidecar receives whatever this is set to.
     Tsv,
     /// Parquet feature table with f32 features: the default from 2026-09-05 until `Raw`
     /// replaced it on 2026-09-28, with identical scores.
@@ -5114,7 +5114,7 @@ pub enum GroupRtAdaptation {
 ///
 /// A group of isolation windows can only select precursors whose m/z lies in the group's
 /// band, so its seed, calibration, extract, features and compete need only that band of the
-/// library (`Library::load_with_fragment_offset`): the library, the hit accumulator and the
+/// library (`Library::load_for_stage`): the library, the hit accumulator and the
 /// accepted rows are all one band's worth instead of the whole run's, which is what bounds
 /// the memory of a search against a library of 10^8 precursors. Only rescore, quant and
 /// report see everything, after the group artifacts are pooled with library-wide ids. The
@@ -5674,11 +5674,8 @@ pub struct Config {
     pub compete: CompeteConfig,
     pub rescore: RescoreConfig,
     pub quant: QuantConfig,
-    #[serde(default)]
     pub mbr: MbrConfig,
-    #[serde(default)]
     pub experiment: ExperimentConfig,
-    #[serde(default)]
     pub groups: GroupsConfig,
     /// Raw-event trace rebuild for diaPASEF runs ([`RetraceConfig`]). Omitted from the
     /// canonical configuration while every key is at its default.
@@ -6475,14 +6472,6 @@ impl Config {
                     .into(),
             ));
         }
-        // The entrapment estimate is
-        // `(ratio * n_entrap + 1) / max(1, n_real)`, so `ratio` scales the entire
-        // numerator. At 0 it collapses to `1/n_real`: with more than 100 real targets
-        // every row passes at 1% FDR with no null contributing at all. Negative values
-        // make q negative, and both `count_targets_at_q` and `passes_quant_filter` accept
-        // a negative q as passing. This is the failure mode of computing the ratio the
-        // wrong way round (N_entrap/N_real, a small number), which silently reports a
-        // near-zero FDR on the tool whose whole job is to validate the FDR.
         // ── divisors and window widths ──────────────────────────────────────────
         //
         // Every field below is either divided by or used as a bin width, so a zero or a
@@ -6526,6 +6515,14 @@ impl Config {
             }
         }
 
+        // The entrapment estimate is
+        // `(ratio * n_entrap + 1) / max(1, n_real)`, so `ratio` scales the entire
+        // numerator. At 0 it collapses to `1/n_real`: with more than 100 real targets
+        // every row passes at 1% FDR with no null contributing at all. Negative values
+        // make q negative, and both `count_targets_at_q` and `passes_quant_filter` accept
+        // a negative q as passing. This is the failure mode of computing the ratio the
+        // wrong way round (N_entrap/N_real, a small number), which silently reports a
+        // near-zero FDR on the tool whose whole job is to validate the FDR.
         if !self.rescore.entrapment_ratio.is_finite() || self.rescore.entrapment_ratio <= 0.0 {
             return Err(Invalid(
                 "rescore.entrapment_ratio must be finite and > 0. It is \
@@ -6571,6 +6568,20 @@ impl Config {
                 "rescore.train_fdr must be finite and in (0, 1].".into(),
             ));
         }
+        // A `features_file` that turns out empty is still the rescore stage's to refuse: it is
+        // read there, not here.
+        if self.rescore.features.is_some() && self.rescore.features_file.is_some() {
+            return Err(Invalid(
+                "rescore.features and rescore.features_file are mutually exclusive; set one".into(),
+            ));
+        }
+        if self.rescore.features.as_ref().is_some_and(Vec::is_empty) {
+            return Err(Invalid(
+                "rescore.features is an empty list; name at least one feature, or leave it \
+                 unset to use rescore.feature_preset"
+                    .into(),
+            ));
+        }
         if matches!(
             self.rescore.classifier,
             RescorerKind::Mokapot | RescorerKind::NnTorch
@@ -6580,13 +6591,6 @@ impl Config {
                 "rescore.classifier={:?} requires rescore.python",
                 self.rescore.classifier
             )));
-        }
-        if self.rescore.classifier == RescorerKind::Percolator {
-            return Err(Invalid(
-                "rescore.classifier=percolator is not wired; use native_tda, \
-                 mokapot, nn_torch, or entrapment."
-                    .into(),
-            ));
         }
         if self.rescore.classifier == RescorerKind::Entrapment
             && self.rescore.entrapment_marker.is_none()
@@ -6697,6 +6701,14 @@ impl Config {
                  every candidate takes equal weights"
             );
         }
+        if self.quant.consensus_is_inert() {
+            tracing::warn!(
+                "quant.peak_window_mode = consensus sets the half-widths of the walked window, \
+                 but a fixed window is set (fixed_scan_halfwidth or fixed_window_s) and every \
+                 candidate with an apex is integrated over it, so consensus changes no \
+                 quantity; set both to 0 to integrate over the consensus window"
+            );
+        }
         // ── numeric domains (docs/29 #18) ───────────────────────────────────────
         //
         // A value outside its domain used to be accepted and then either excluded every
@@ -6786,13 +6798,46 @@ impl Config {
                 self.rescore.shadow_im_tolerance
             )));
         }
-        if !self.rt_im_train.window_holdout_frac.is_finite()
-            || !(0.0..1.0).contains(&self.rt_im_train.window_holdout_frac)
+        // A zero or negative tolerance, or an empty region, demotes nothing while the run
+        // still reports the test as on.
+        let r = &self.rescore;
+        if r.shadow_min_shared > 0
+            && !(r.shadow_ppm.is_finite()
+                && r.shadow_ppm > 0.0
+                && r.shadow_rt_s.is_finite()
+                && r.shadow_rt_s > 0.0
+                && r.shadow_region >= 1)
         {
             return Err(Invalid(format!(
-                "rt_im_train.window_holdout_frac must be finite and in [0, 1) (got {}); 0 \
+                "rescore.shadow_ppm and rescore.shadow_rt_s must be finite and > 0 and \
+                 rescore.shadow_region at least 1 (got {}, {} and {}); \
+                 rescore.shadow_min_shared = 0 turns the shadow test off",
+                r.shadow_ppm, r.shadow_rt_s, r.shadow_region
+            )));
+        }
+        if !self.rt_im_train.window_holdout_frac.is_finite()
+            || !(0.0..=0.9).contains(&self.rt_im_train.window_holdout_frac)
+        {
+            return Err(Invalid(format!(
+                "rt_im_train.window_holdout_frac must be finite and in [0, 0.9] (got {}); 0 \
                  sizes the window in-sample",
                 self.rt_im_train.window_holdout_frac
+            )));
+        }
+        if self.rt_im_train.window_holdout_frac > 0.0 && self.rt_im_train.adaptive_rt_window {
+            return Err(Invalid(
+                "rt_im_train.window_holdout_frac and rt_im_train.adaptive_rt_window are \
+                 mutually exclusive: the adaptive per-bin percentiles are in-sample and would \
+                 silently undo the held-out sizing; disable one of them"
+                    .into(),
+            ));
+        }
+        if !(self.rt_im_train.local_window_multiplier.is_finite()
+            && self.rt_im_train.local_window_multiplier > 0.0)
+        {
+            return Err(Invalid(format!(
+                "rt_im_train.local_window_multiplier must be a positive number, got {}",
+                self.rt_im_train.local_window_multiplier
             )));
         }
         for (name, value) in [
@@ -6992,7 +7037,9 @@ impl Config {
         }
         if self.search_seed.q1_deconvolved && self.search_seed.count_fragments_once {
             return Err(Invalid(
-                "search_seed.q1_deconvolved counts every matching peak near the candidate's Q1                  centre; it does not combine with search_seed.count_fragments_once (a diaPASEF                  setting)"
+                "search_seed.q1_deconvolved counts every matching peak near the candidate's Q1 \
+                 centre; it does not combine with search_seed.count_fragments_once (a diaPASEF \
+                 setting)"
                     .into(),
             ));
         }
@@ -7103,6 +7150,19 @@ impl Config {
                     .into(),
             ));
         }
+        // The multi-head ridge and the base-model re-prediction are deterministic in the
+        // anchors, so every band gets the same model; a fine-tune trained per band would give
+        // each band a different one, at the training cost once per band. Refused at load, not
+        // after the library build and the conversion.
+        if self.rt_im_train.finetune_deeplc && self.groups.window_groups > 1 {
+            return Err(Invalid(
+                "rt_im_train.finetune_deeplc is not supported with groups.window_groups > 1: the \
+                 fine-tune would be trained separately in every group (non-deterministic, and \
+                 the training cost once per group). Fine-tune the library once beforehand and \
+                 search the fine-tuned table, or leave the default multi-head calibration on."
+                    .into(),
+            ));
+        }
         if self.extract.prec_tol_auto && !self.extract.ms1_calibrate.is_on() {
             return Err(Invalid(
                 "extract.prec_tol_auto sets the MS1 tolerance from the residuals of the MS1 \
@@ -7139,7 +7199,6 @@ impl Config {
                 "extract.gate_coelution_min",
                 self.extract.gate_coelution_min,
             ),
-            ("quant.baseline_quantile", self.quant.baseline_quantile),
             ("mbr.consensus_corr_min", self.mbr.consensus_corr_min),
         ] {
             if !value.is_finite() || !(0.0..=1.0).contains(&value) {
@@ -7156,7 +7215,6 @@ impl Config {
                 "features.bound_peak_fraction",
                 self.features.bound_peak_fraction,
             ),
-            ("rescore.train_fdr", self.rescore.train_fdr),
         ] {
             if !value.is_finite() || value <= 0.0 || value > 1.0 {
                 return Err(Invalid(format!(
@@ -7182,15 +7240,7 @@ impl Config {
             )));
         }
         for (name, value) in [
-            (
-                "search_seed.fragment_tol_ppm",
-                self.search_seed.fragment_tol_ppm,
-            ),
-            ("extract.frag_tol_ppm", self.extract.frag_tol_ppm),
-            ("extract.prec_tol_ppm", self.extract.prec_tol_ppm),
             ("features.prec_tol_ppm", self.features.prec_tol_ppm),
-            ("prescan.tol_da", self.prescan.tol_da),
-            ("prescan.rt_bin_s", self.prescan.rt_bin_s),
             (
                 "extract.claim_cues.mz_close_sigma_ppm",
                 self.extract.claim_cues.mz_close_sigma_ppm,
@@ -7201,7 +7251,6 @@ impl Config {
             ),
             ("extract.peak_claim_margin", self.extract.peak_claim_margin),
             ("mbr.rt_window_s", self.mbr.rt_window_s),
-            ("rescore.entrapment_ratio", self.rescore.entrapment_ratio),
         ] {
             if !value.is_finite() || value <= 0.0 {
                 return Err(Invalid(format!(
@@ -7352,12 +7401,7 @@ impl Config {
                 "extract.alt_peak_min_separation_s",
                 self.extract.alt_peak_min_separation_s,
             ),
-            (
-                "compete.apex_rt_tolerance_s",
-                self.compete.apex_rt_tolerance_s,
-            ),
             ("compete.margin", self.compete.margin),
-            ("quant.fixed_window_s", self.quant.fixed_window_s),
         ] {
             if !value.is_finite() || value < 0.0 {
                 return Err(Invalid(format!(
@@ -7368,7 +7412,6 @@ impl Config {
         }
         for (name, value) in [
             ("mbr.min_anchor_runs", self.mbr.min_anchor_runs),
-            ("rescore.num_iter", self.rescore.num_iter),
             ("quant.top_n_fragments", self.quant.top_n_fragments),
             ("quant.top_n_peptides", self.quant.top_n_peptides),
             (
@@ -7380,7 +7423,6 @@ impl Config {
                 self.extract.demix_max_candidates,
             ),
             ("extract.demix_scan_stride", self.extract.demix_scan_stride),
-            ("extract.retain_top_peaks", self.extract.retain_top_peaks),
             ("extract.promote_top_peaks", self.extract.promote_top_peaks),
             (
                 "rt_im_train.adaptive_rt_bins",
@@ -7391,28 +7433,32 @@ impl Config {
                 return Err(Invalid(format!("{name} must be >= 1")));
             }
         }
-        if self.rescore.folds < 2 {
-            return Err(Invalid(format!(
-                "rescore.folds must be >= 2 for cross-validated scores (got {})",
-                self.rescore.folds
-            )));
-        }
         if self.extract.promote_top_peaks > self.extract.retain_top_peaks {
             return Err(Invalid(format!(
                 "extract.promote_top_peaks ({}) must be <= extract.retain_top_peaks ({})",
                 self.extract.promote_top_peaks, self.extract.retain_top_peaks
             )));
         }
+        // The contested features take the two-pass path, which applies only the co-elution
+        // claims: it would return every claimant's full peak without a word.
+        if self.extract.emit_contested_features
+            && matches!(
+                self.extract.peak_claim,
+                PeakClaim::WinnerPredictedIntensity | PeakClaim::Proportional
+            )
+        {
+            return Err(Invalid(
+                "extract.emit_contested_features applies only none or a coelution_* \
+                 extract.peak_claim; with winner_predicted_intensity or proportional every \
+                 claimant would keep the full peak"
+                    .into(),
+            ));
+        }
         if !self.extract.bucket_size.is_power_of_two() {
             return Err(Invalid(format!(
                 "extract.bucket_size must be a power of two (got {})",
                 self.extract.bucket_size
             )));
-        }
-        if self.rt_im_train.adaptive_rt_window && self.rt_im_train.adaptive_rt_bins == 0 {
-            return Err(Invalid(
-                "rt_im_train.adaptive_rt_bins must be >= 1 when adaptive_rt_window is on".into(),
-            ));
         }
         self.validate_retrace()?;
         self.validate_localise()?;
@@ -7478,9 +7524,9 @@ impl Config {
                 l.peak_valley_ratio
             )));
         }
-        if !(l.prior_strength.is_finite() && l.prior_strength >= 0.0) {
+        if !(l.prior_strength.is_finite() && l.prior_strength > 0.0) {
             return Err(Invalid(format!(
-                "localise.prior_strength must be finite and >= 0 (got {})",
+                "localise.prior_strength must be finite and > 0 (got {})",
                 l.prior_strength
             )));
         }
@@ -8212,6 +8258,23 @@ mod tests {
         assert!(Config::from_json(r#"{"quant":{"fragment_selection":"library"}}"#).is_err());
     }
 
+    /// `peak_window_mode = consensus` sets the walked window's half-widths, so under a fixed
+    /// window (the default) it changes no quantity: accepted, with a warning. Under the
+    /// walked window it is read.
+    #[test]
+    fn consensus_under_a_fixed_window_is_accepted_and_flagged_as_inert() {
+        let c = Config::from_json(r#"{"quant":{"peak_window_mode":"consensus"}}"#).unwrap();
+        assert!(c.quant.consensus_is_inert());
+        let walked = Config::from_json(
+            r#"{"quant":{"peak_window_mode":"consensus","fixed_scan_halfwidth":0,
+                 "window_centre":"apex","fragment_selection":"observed_area",
+                 "baseline_subtract":false,"normalisation":"off"}}"#,
+        )
+        .unwrap();
+        assert!(!walked.quant.consensus_is_inert());
+        assert!(!QuantConfig::default().consensus_is_inert());
+    }
+
     #[test]
     fn shipped_configs_parse() {
         // `Config` is `deny_unknown_fields`, so a documentation key such as `_comment` in a
@@ -8453,6 +8516,18 @@ mod tests {
     }
 
     #[test]
+    fn default_canonical_json_is_pinned() {
+        // The manifest's `config_hash` hashes this text, and a run with no 1/K0 must keep it
+        // byte-identical. A new field serialized at its default, or a default changed by
+        // mistake, moves the hash of every run and fails here. Update the snapshot only with
+        // a default that is meant to change, and say so in the CHANGELOG.
+        assert_eq!(
+            Config::default().canonical_json(),
+            include_str!("default_canonical.json").trim()
+        );
+    }
+
+    #[test]
     fn unknown_key_rejected() {
         let j = r#"{"digest":{"min_len":7,"bogus":1}}"#;
         assert!(Config::from_json(j).is_err());
@@ -8500,6 +8575,12 @@ mod tests {
             r#"{"digest":{"min_len":0}}"#,
             r#"{"peptidoforms":{"charge_min":3,"charge_max":2}}"#,
             r#"{"rt_im_train":{"window_holdout_frac":1.0}}"#,
+            // The bound the stage applies, now checked at load.
+            r#"{"rt_im_train":{"window_holdout_frac":0.95}}"#,
+            r#"{"rt_im_train":{"window_holdout_frac":0.3,"adaptive_rt_window":true}}"#,
+            r#"{"rt_im_train":{"local_window_multiplier":0.0}}"#,
+            r#"{"rescore":{"features":[]}}"#,
+            r#"{"rescore":{"features":["a"],"features_file":"f.txt"}}"#,
             r#"{"rt_im_train":{"p_rt":0.0}}"#,
             r#"{"search_seed":{"min_matched_peaks":0}}"#,
             r#"{"convert":{"parallel_conversions":0}}"#,
@@ -8529,6 +8610,7 @@ mod tests {
         for ok in [
             r#"{"rescore":{"train_neg_ratio":0}}"#,
             r#"{"rt_im_train":{"window_holdout_frac":0.0}}"#,
+            r#"{"rt_im_train":{"window_holdout_frac":0.9}}"#,
             r#"{"rescore":{"train_subsample":0.0}}"#,
             r#"{"rescore":{"train_subsample":2000}}"#,
             r#"{"rescore":{"max_feature_matrix_gib":0}}"#,
@@ -10098,6 +10180,23 @@ mod tests {
         }
     }
 
+    /// A shadow tolerance or region that would demote nothing is refused while the test is
+    /// on, and accepted once `shadow_min_shared = 0` turns it off.
+    #[test]
+    fn a_shadow_test_that_cannot_demote_is_refused() {
+        for bad in [
+            r#""shadow_ppm":0.0"#,
+            r#""shadow_ppm":-5.0"#,
+            r#""shadow_rt_s":-1.0"#,
+            r#""shadow_region":0"#,
+        ] {
+            let on = format!(r#"{{"rescore":{{{bad}}}}}"#);
+            assert!(Config::from_json(&on).is_err(), "{on} must be refused");
+            let off = format!(r#"{{"rescore":{{"shadow_min_shared":0,{bad}}}}}"#);
+            assert!(Config::from_json(&off).is_ok(), "{off} must be accepted");
+        }
+    }
+
     /// `auto` resolves on the one TIMS predicate; explicit values are kept.
     #[test]
     fn the_im_gate_and_family_resolve_on_the_run() {
@@ -10284,6 +10383,22 @@ mod tests {
         ] {
             assert!(Config::from_json(json).is_ok(), "{json}");
         }
+    }
+
+    /// A grouped run cannot fine-tune, and is told so when the configuration loads, not after
+    /// the library build and the conversion.
+    #[test]
+    fn a_grouped_fine_tune_is_refused_at_load() {
+        let msg = Config::from_json(
+            r#"{"rt_im_train":{"finetune_deeplc":true},"groups":{"window_groups":2}}"#,
+        )
+        .expect_err("must be refused")
+        .to_string();
+        assert!(
+            msg.contains("finetune_deeplc") && msg.contains("groups.window_groups"),
+            "{msg}"
+        );
+        assert!(!msg.contains("  ") && !msg.contains('\n'), "{msg:?}");
     }
 
     #[test]

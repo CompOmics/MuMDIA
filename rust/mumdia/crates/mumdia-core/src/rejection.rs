@@ -2,14 +2,14 @@
 //!
 //! Sensitivity program (docs/20_sensitivity_and_quantification_playbook.md,
 //! backlog P0.3). Each variant names the pipeline stage at which a candidate
-//! precursor is lost. A candidate's audit row
-//! records the EARLIEST such stage, so the aggregate answers "where was each
-//! DIA-NN-only precursor first lost?" without conflating later stages.
+//! precursor is lost. The audit (`stages/audit.rs`) tests the stages in pipeline
+//! order and records the first that applies, so the aggregate answers "where was each
+//! missing precursor first lost?" without conflating later stages; `compete` writes
+//! the two `OUTCOMPETED_*` codes to its own audit table.
 //!
-//! The serialized spelling is SCREAMING_SNAKE_CASE and matches the reason strings
-//! in the specification exactly (e.g. `NO_FRAGMENT_TRACES`). Use
-//! [`RejectionReason::code`] for the stable string written to Parquet/JSON (no serde
-//! round-trip cost).
+//! [`RejectionReason::code`] is the stable SCREAMING_SNAKE_CASE string written to
+//! Parquet/JSON and matches the reason strings in the specification exactly (e.g.
+//! `NO_FRAGMENT_TRACES`).
 //!
 //! `DID_NOT_SURVIVE_EXTRACTION` was `NO_PEAK_GROUP` until docs/29 #16. The audit
 //! assigns it to every candidate that has traces in no extracted row, and `extract`
@@ -17,23 +17,14 @@
 //! matched-fraction failures and gate rejections, so the old name claimed a cause the
 //! audit cannot see. The name now says what is known.
 
-use serde::{Deserialize, Serialize};
-
-/// Earliest-loss category for a candidate. Ordered along the pipeline so
-/// [`RejectionReason::stage_order`] can pick the earliest when several apply.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+/// Earliest-loss category for a candidate, in pipeline order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RejectionReason {
     // --- search space (Stage A) ---
-    PeptideNotGenerated,
-    ModificationNotAllowed,
-    ChargeOutOfRange,
-    PrecursorMzOutOfRange,
     NoValidFragments,
     WrongIsolationWindow,
     // --- candidate generation / pruning (Stage B) ---
     RtPruned,
-    CandidateCapReached,
     // --- extraction + peak formation (Stages C, D) ---
     NoFragmentTraces,
     /// Extracted no accepted row, for any extraction-side reason; see the module
@@ -54,19 +45,14 @@ pub enum RejectionReason {
 }
 
 impl RejectionReason {
-    /// Stable string code (matches the specification's reason strings). Used for
-    /// Parquet columns and JSON without a serde round-trip.
+    /// Stable string code (matches the specification's reason strings), written to
+    /// Parquet columns and JSON.
     pub fn code(&self) -> &'static str {
         use RejectionReason::*;
         match self {
-            PeptideNotGenerated => "PEPTIDE_NOT_GENERATED",
-            ModificationNotAllowed => "MODIFICATION_NOT_ALLOWED",
-            ChargeOutOfRange => "CHARGE_OUT_OF_RANGE",
-            PrecursorMzOutOfRange => "PRECURSOR_MZ_OUT_OF_RANGE",
             NoValidFragments => "NO_VALID_FRAGMENTS",
             WrongIsolationWindow => "WRONG_ISOLATION_WINDOW",
             RtPruned => "RT_PRUNED",
-            CandidateCapReached => "CANDIDATE_CAP_REACHED",
             NoFragmentTraces => "NO_FRAGMENT_TRACES",
             DidNotSurviveExtraction => "DID_NOT_SURVIVE_EXTRACTION",
             PeakNotSelected => "PEAK_NOT_SELECTED",
@@ -78,53 +64,11 @@ impl RejectionReason {
             Reported => "REPORTED",
         }
     }
-
-    /// Position on the identification-loss ladder (0 = earliest stage). The
-    /// `Reported` sentinel sorts last. When a candidate could be assigned more than
-    /// one reason across stages, keep the one with the smallest `stage_order`.
-    pub fn stage_order(&self) -> u8 {
-        use RejectionReason::*;
-        match self {
-            PeptideNotGenerated => 0,
-            ModificationNotAllowed => 1,
-            ChargeOutOfRange => 2,
-            PrecursorMzOutOfRange => 3,
-            NoValidFragments => 4,
-            WrongIsolationWindow => 5,
-            RtPruned => 6,
-            CandidateCapReached => 7,
-            NoFragmentTraces => 8,
-            DidNotSurviveExtraction => 9,
-            PeakNotSelected => 10,
-            OutcompetedByTarget => 11,
-            OutcompetedByDecoy => 12,
-            FailedPrecursorFdr => 13,
-            FailedPeptideFdr => 14,
-            RemovedDuringReporting => 15,
-            Reported => 255,
-        }
-    }
-
-    /// True if the candidate was lost (any non-`Reported` reason).
-    pub fn is_rejection(&self) -> bool {
-        !matches!(self, RejectionReason::Reported)
-    }
-
-    /// Keep the earlier of two losses (smaller `stage_order`). `Reported` never
-    /// overrides a real rejection.
-    pub fn earliest(self, other: RejectionReason) -> RejectionReason {
-        if other.stage_order() < self.stage_order() {
-            other
-        } else {
-            self
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::RejectionReason::*;
-    use super::*;
 
     #[test]
     fn codes_match_spec_strings() {
@@ -132,47 +76,5 @@ mod tests {
         assert_eq!(PeakNotSelected.code(), "PEAK_NOT_SELECTED");
         assert_eq!(OutcompetedByDecoy.code(), "OUTCOMPETED_BY_DECOY");
         assert_eq!(Reported.code(), "REPORTED");
-    }
-
-    #[test]
-    fn serde_roundtrip_uses_spec_spelling() {
-        let j = serde_json::to_string(&FailedPrecursorFdr).unwrap();
-        assert_eq!(j, "\"FAILED_PRECURSOR_FDR\"");
-        let back: RejectionReason = serde_json::from_str(&j).unwrap();
-        assert_eq!(back, FailedPrecursorFdr);
-    }
-
-    #[test]
-    fn earliest_keeps_smaller_stage() {
-        // an extraction loss precedes an FDR loss
-        assert_eq!(
-            DidNotSurviveExtraction.earliest(FailedPrecursorFdr),
-            DidNotSurviveExtraction
-        );
-        assert_eq!(
-            FailedPrecursorFdr.earliest(DidNotSurviveExtraction),
-            DidNotSurviveExtraction
-        );
-        // Reported never wins against a real rejection
-        assert_eq!(Reported.earliest(NoFragmentTraces), NoFragmentTraces);
-        assert_eq!(NoFragmentTraces.earliest(Reported), NoFragmentTraces);
-    }
-
-    #[test]
-    fn is_rejection_flags_only_losses() {
-        assert!(DidNotSurviveExtraction.is_rejection());
-        assert!(!Reported.is_rejection());
-    }
-
-    #[test]
-    fn stage_order_is_monotone_ladder() {
-        // ladder ordering across the major stages
-        assert!(PeptideNotGenerated.stage_order() < NoFragmentTraces.stage_order());
-        assert!(NoFragmentTraces.stage_order() < DidNotSurviveExtraction.stage_order());
-        assert!(DidNotSurviveExtraction.stage_order() < PeakNotSelected.stage_order());
-        assert!(PeakNotSelected.stage_order() < OutcompetedByTarget.stage_order());
-        assert!(OutcompetedByTarget.stage_order() < FailedPrecursorFdr.stage_order());
-        assert!(FailedPrecursorFdr.stage_order() < RemovedDuringReporting.stage_order());
-        assert!(RemovedDuringReporting.stage_order() < Reported.stage_order());
     }
 }

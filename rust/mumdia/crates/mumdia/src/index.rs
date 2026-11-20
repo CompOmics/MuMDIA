@@ -16,7 +16,7 @@
 
 use anyhow::Result;
 use arrow::array::{Array, ArrayRef, Float32Array, Float64Array, StringArray, UInt32Array};
-use mumdia_core::constants::{ppm_bounds, PROTON};
+use mumdia_core::constants::ppm_bounds;
 use mumdia_io::table::{require_no_nulls, TableFile};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -121,9 +121,9 @@ pub struct Library {
     /// [`crate::matchers::fragindex::FragIndex`] built from this library.
     pub prec_mz: Arc<[f64]>,
     /// Row of the precursor table that local `candidate_id` 0 corresponds to: 0 for a full
-    /// load, the first selected row for [`Library::load_range_with`]. Every id the library
-    /// hands out and every artifact a stage writes from it is local; a pooling step that
-    /// combines groups adds this back to obtain the library-wide id.
+    /// load, the first row of a band or row span ([`Library::load_for_stage`]). Every id the
+    /// library hands out and every artifact a stage writes from it is local; a pooling step
+    /// that combines groups adds this back to obtain the library-wide id.
     pub global_offset: u32,
 }
 
@@ -1013,170 +1013,19 @@ impl<'a> FragBatch<'a> {
 type StageRows = (Option<(usize, usize)>, Option<usize>);
 
 impl Library {
-    /// Load a library and build the bucketed inverted index.
-    ///
-    /// Prefer [`Library::load_with`] and pass `build_bucketed = false` when the caller
-    /// uses the `fragindex` backend (the default), since that backend never reads the
-    /// bucketed arrays and building them costs a full sort of every library fragment.
-    pub fn load(precursors: &str, fragments: &str, bucket_size: usize) -> Result<Library> {
-        Self::load_with(precursors, fragments, bucket_size, true)
-    }
-
-    /// As [`Library::load`], but skips the bucketed `page_search` index when
-    /// `build_bucketed` is false. `page_search` already early-returns on an empty index,
-    /// so skipping is safe for callers that only use the fragindex matcher.
-    pub fn load_with(
-        precursors: &str,
-        fragments: &str,
-        bucket_size: usize,
-        build_bucketed: bool,
-    ) -> Result<Library> {
-        Self::load_impl(
-            precursors,
-            fragments,
-            bucket_size,
-            build_bucketed,
-            None,
-            None,
-            true,
-        )
-    }
-
-    /// Load only the precursors whose `precursor_mz` lies in `[mz_lo, mz_hi]`, with their
-    /// fragments, as a library of its own: local `candidate_id`s `0..n`, and
-    /// [`Library::global_offset`] recording where the slice starts in the file.
-    ///
-    /// The precursor table is m/z-sorted with row-aligned ids (both are load-time
-    /// invariants), so the range is one row span, found from the row-group statistics and
-    /// one decode of `precursor_mz` over the boundary groups; the rest of the table is never
-    /// read. Fragments are read the same way when their table is sorted by `candidate_id`
-    /// at row-group granularity (what the library writers produce); an older, unsorted table
-    /// still loads correctly through a filtered full scan, with a warning naming the cost.
-    ///
-    /// This is the per-isolation-window-group search: a group of windows can only select
-    /// precursors in its m/z band, so a run searched group by group holds one band's library
-    /// at a time. An empty range is an error, since no stage can run on it.
-    pub fn load_range_with(
-        precursors: &str,
-        fragments: &str,
-        mz_lo: f64,
-        mz_hi: f64,
-        bucket_size: usize,
-        build_bucketed: bool,
-    ) -> Result<Library> {
-        if !(mz_lo.is_finite() && mz_hi.is_finite()) || mz_lo > mz_hi {
-            anyhow::bail!("precursor m/z range [{mz_lo}, {mz_hi}] is empty or not finite");
-        }
-        let (first_row, n_rows) = Self::precursor_row_span(precursors, mz_lo, mz_hi)?;
-        if n_rows == 0 {
-            anyhow::bail!(
-                "no precursor of {precursors} has precursor_mz in [{mz_lo}, {mz_hi}]; the \
-                 isolation-window group selects nothing from this library"
-            );
-        }
-        Self::load_impl(
-            precursors,
-            fragments,
-            bucket_size,
-            build_bucketed,
-            Some((first_row, n_rows)),
-            Some(first_row),
-            true,
-        )
-    }
-
-    /// Load a band that was written out as a precursor table of its own (local ids `0..n`,
-    /// see `groups::write_band_slice`) together with its fragments from the library-wide
-    /// fragment table, whose rows for this band carry the ids from `fragment_offset` to
-    /// `fragment_offset + n`. This is what every stage of an isolation-window group loads:
-    /// the band file is what the DeepLC sidecars rewrite, and the fragment table is shared
-    /// and read by id range (selectively when it is sorted by candidate, else through a
-    /// filtered scan).
-    pub fn load_with_fragment_offset(
-        precursors: &str,
-        fragments: &str,
-        fragment_offset: u32,
-        bucket_size: usize,
-        build_bucketed: bool,
-    ) -> Result<Library> {
-        Self::load_impl(
-            precursors,
-            fragments,
-            bucket_size,
-            build_bucketed,
-            None,
-            Some(fragment_offset as usize),
-            true,
-        )
-    }
-
-    /// The seed's library: the precursor columns and the fragment m/z, with NO fragment
-    /// payload (`frag_int`, `frag_name_id`, `frag_name_dict` stay empty, so
-    /// [`Library::fragment_payload_released`] is true and [`Library::cand_frags`] refuses to
-    /// hand out intensities). `fragment_offset` is that of
-    /// [`Library::load_with_fragment_offset`] for a band file, `None` for a whole library.
-    ///
-    /// The seed never reads a predicted intensity or a fragment name: its hyperscore is a
-    /// match count plus observed intensity, and its mass recalibration walks `frag_mz`. So
-    /// holding the two columns until the index was built -- where the fragindex path then
-    /// released them -- cost 6 bytes per fragment at the seed's build peak, plus 6 more in
-    /// the index ([`FragIndex::build_mz_only`]).
-    ///
-    /// Validation is the full load's, by construction: the two payload columns are still
-    /// decoded batch by batch through the same pass and checked with the same checks
-    /// (presence and type, NULLs, non-finite intensities, the u16 name limit), and each
-    /// batch is then discarded instead of stored. A library that extract's full load would
-    /// refuse is refused here, with the same message, before any DeepLC step runs on the
-    /// seed's output.
-    ///
-    /// [`FragIndex::build_mz_only`]: crate::matchers::fragindex::FragIndex::build_mz_only
-    pub fn load_mz_only(
-        precursors: &str,
-        fragments: &str,
-        fragment_offset: Option<u32>,
-    ) -> Result<Library> {
-        Self::load_impl(
-            precursors,
-            fragments,
-            1,
-            false,
-            None,
-            fragment_offset.map(|o| o as usize),
-            false,
-        )
-    }
-
-    /// Load the precursor rows `[first_row, first_row + n_rows)` of the whole library, with
-    /// their fragments, as a library of its own: local ids `0..n_rows` and
-    /// [`Library::global_offset`] `first_row`. The same library, value for value, as
-    /// [`Library::load_with_fragment_offset`] over a band file that
-    /// `groups::write_band_slice` wrote from those rows, without the file: a grouped run
-    /// loads a band this way wherever nothing rewrites the band's precursor table.
-    pub fn load_row_span_with(
-        precursors: &str,
-        fragments: &str,
-        first_row: usize,
-        n_rows: usize,
-        bucket_size: usize,
-        build_bucketed: bool,
-    ) -> Result<Library> {
-        if n_rows == 0 {
-            anyhow::bail!("an empty row span of {precursors} is not a library");
-        }
-        Self::load_impl(
-            precursors,
-            fragments,
-            bucket_size,
-            build_bucketed,
-            Some((first_row, n_rows)),
-            Some(first_row),
-            true,
-        )
-    }
-
     /// The load a stage asks for: the whole table, a band file (`fragment_offset`), or a
     /// row span of the whole table (`precursor_span`, with `fragment_offset` either absent
     /// or equal to the span's first row).
+    ///
+    /// A band file is a precursor table of its own (local ids `0..n`, see
+    /// `groups::write_band_slice`), whose fragments are the rows of the library-wide
+    /// fragment table with ids `fragment_offset..fragment_offset + n`. A row span
+    /// `(first_row, n_rows)` is the same library, value for value, without the file: a
+    /// grouped run loads a band this way wherever nothing rewrites the band's precursor
+    /// table. Either way the library has local ids `0..n` and [`Library::global_offset`] at
+    /// its first library row, and the fragment table is read by id range: selectively when
+    /// it is sorted by `candidate_id` at row-group granularity (what the library writers
+    /// produce), else through a filtered scan, with a warning naming the cost.
     pub fn load_for_stage(
         precursors: &str,
         fragments: &str,
@@ -1197,8 +1046,25 @@ impl Library {
         )
     }
 
-    /// [`Library::load_mz_only`] for any load [`Library::load_for_stage`] accepts, so a
-    /// seed can search a band by row span without its fragment payload.
+    /// The seed's library, for any load [`Library::load_for_stage`] accepts: the precursor
+    /// columns and the fragment m/z, with NO fragment payload (`frag_int`, `frag_name_id`,
+    /// `frag_name_dict` stay empty, so [`Library::fragment_payload_released`] is true and
+    /// [`Library::cand_frags`] refuses to hand out intensities).
+    ///
+    /// The seed never reads a predicted intensity or a fragment name: its hyperscore is a
+    /// match count plus observed intensity, and its mass recalibration walks `frag_mz`. So
+    /// holding the two columns until the index was built -- where the fragindex path then
+    /// released them -- cost 6 bytes per fragment at the seed's build peak, plus 6 more in
+    /// the index ([`FragIndex::build_mz_only`]).
+    ///
+    /// Validation is the full load's, by construction: the two payload columns are still
+    /// decoded batch by batch through the same pass and checked with the same checks
+    /// (presence and type, NULLs, non-finite intensities, the u16 name limit), and each
+    /// batch is then discarded instead of stored. A library that extract's full load would
+    /// refuse is refused here, with the same message, before any DeepLC step runs on the
+    /// seed's output.
+    ///
+    /// [`FragIndex::build_mz_only`]: crate::matchers::fragindex::FragIndex::build_mz_only
     pub fn load_mz_only_for_stage(
         precursors: &str,
         fragments: &str,
@@ -1211,7 +1077,7 @@ impl Library {
 
     /// The `(span, frag_offset)` of [`Library::load_impl`] for a stage's load: the whole
     /// table, a band file, or a row span of the whole table, whose first row is also its
-    /// fragment offset (see [`Library::load_row_span_with`]).
+    /// fragment offset.
     fn stage_rows(
         precursors: &str,
         fragment_offset: Option<u32>,
@@ -1636,8 +1502,8 @@ impl Library {
     pub fn cand_frags(&self, cid: u32) -> (&[f32], &[f32], &[u16]) {
         assert!(
             !self.fragment_payload_released(),
-            "the library's fragment payload was released (Library::release_fragment_payload); \
-             only cand_frag_mz is available after that"
+            "the library was loaded without its fragment payload \
+             (Library::load_mz_only_for_stage); only cand_frag_mz is available"
         );
         let r = self.frag_range(cid);
         (
@@ -1647,33 +1513,16 @@ impl Library {
         )
     }
 
-    /// Per-candidate fragment m/z alone. The only fragment column that survives
-    /// [`Library::release_fragment_payload`], so this is what a stage that has already built
-    /// its index must use.
+    /// Per-candidate fragment m/z alone: the only fragment column of a library loaded
+    /// without its payload ([`Library::load_mz_only_for_stage`]).
     pub fn cand_frag_mz(&self, cid: u32) -> &[f32] {
         &self.frag_mz[self.frag_range(cid)]
     }
 
-    /// Free the fragment columns that only an index build reads: `frag_int`,
-    /// `frag_name_id` and the name dictionary. `frag_mz` is kept, because the seed's mass
-    /// recalibration still matches every library fragment against the scan.
-    ///
-    /// Predicted intensity and fragment name are copied into the index (or, for the
-    /// bucketed arrays, into `idx_int`) at build time and never read from the library
-    /// afterwards by a stage that has an index, so holding them is 6 bytes per fragment of
-    /// dead weight for the whole search -- about 7 GB on a 1.2G-fragment library, and two
-    /// of the large mappings the process is rationed on. Call it only after the index the
-    /// stage will actually probe exists; [`Library::cand_frags`] panics afterwards rather
-    /// than returning a short or stale slice.
-    pub fn release_fragment_payload(&mut self) {
-        self.frag_int = Vec::new();
-        self.frag_name_id = Vec::new();
-        self.frag_name_dict = Vec::new();
-    }
-
-    /// Whether [`Library::release_fragment_payload`] has run. Derived rather than stored:
-    /// the three fragment arrays are parallel, so a `frag_int` shorter than `frag_mz` can
-    /// only mean the payload was dropped.
+    /// Whether the library was loaded without its fragment payload
+    /// ([`Library::load_mz_only_for_stage`]). Derived rather than stored: the three fragment
+    /// arrays are parallel, so a `frag_int` shorter than `frag_mz` can only mean the payload
+    /// was not kept.
     pub fn fragment_payload_released(&self) -> bool {
         self.frag_int.len() != self.frag_mz.len()
     }
@@ -1719,11 +1568,12 @@ impl Library {
         let (lo, hi) = ppm_bounds(q, tol_ppm);
         let (lo32, hi32) = (lo as f32, hi as f32);
         let nb = self.bucket_min.len();
-        // First bucket whose min could hold an entry >= lo: the bucket before
-        // the first min > lo.
+        // First bucket that could hold an entry >= lo: the bucket before the first min
+        // >= lo. A run of equal m/z can end one bucket and start the next, so a bucket
+        // whose min equals lo can be preceded by buckets holding lo too.
         let first = self
             .bucket_min
-            .partition_point(|&m| m <= lo32)
+            .partition_point(|&m| m < lo32)
             .saturating_sub(1);
         // Last bucket whose min <= hi.
         let last = self.bucket_min.partition_point(|&m| m <= hi32);
@@ -1744,13 +1594,6 @@ impl Library {
             }
         }
     }
-}
-
-/// Deconvolve an observed z-charged peak m/z to neutral m/z
-/// (docs/06_predict_frag_index_matchers.md). Done in f64.
-#[inline]
-pub fn deconvolve(peak_mz: f64, z: i32) -> f64 {
-    peak_mz * z as f64 - (z as f64 - 1.0) * PROTON
 }
 
 #[cfg(test)]
@@ -1907,6 +1750,13 @@ mod tests {
         (p, f)
     }
 
+    /// The precursors with `precursor_mz` in `[lo, hi]` and their fragments, loaded as a
+    /// row span the way an m/z band of a grouped run is ([`Library::precursor_row_span`]).
+    fn load_range(p: &str, f: &str, lo: f64, hi: f64) -> Result<Library> {
+        let span = Library::precursor_row_span(p, lo, hi)?;
+        Library::load_for_stage(p, f, None, Some(span), 8, false)
+    }
+
     fn frag_slice(lib: &Library, c: usize) -> (Vec<f32>, Vec<f32>, Vec<String>) {
         let r = lib.frag_range(c as u32);
         (
@@ -1924,10 +1774,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mumdia_index_range_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (p, f) = build_six_lib(&dir, "sorted", &[0, 1, 2, 3, 4, 5]);
-        let full = Library::load_with(&p, &f, 8, false).unwrap();
+        let full = Library::load_for_stage(&p, &f, None, None, 8, false).unwrap();
         assert_eq!(full.global_offset, 0);
         // [440, 530] covers 450, 500, 520: file rows 1..4, crossing two row groups.
-        let part = Library::load_range_with(&p, &f, 440.0, 530.0, 8, false).unwrap();
+        let part = load_range(&p, &f, 440.0, 530.0).unwrap();
         assert_eq!(part.n_candidates(), 3);
         assert_eq!(part.global_offset, 1);
         for c in 0..3 {
@@ -1942,11 +1792,11 @@ mod tests {
         assert_eq!(part.frag_mz.len(), 6);
         assert_eq!(part.candidate_range(499.0, 501.0), (1, 2));
         // The two halves of the library cover it exactly once.
-        let lo = Library::load_range_with(&p, &f, 0.0, 470.0, 8, false).unwrap();
-        let hi = Library::load_range_with(&p, &f, 470.0, 1000.0, 8, false).unwrap();
+        let lo = load_range(&p, &f, 0.0, 470.0).unwrap();
+        let hi = load_range(&p, &f, 470.0, 1000.0).unwrap();
         assert_eq!((lo.n_candidates(), lo.global_offset), (2, 0));
         assert_eq!((hi.n_candidates(), hi.global_offset), (4, 2));
-        assert!(Library::load_range_with(&p, &f, 700.0, 800.0, 8, false).is_err());
+        assert!(load_range(&p, &f, 700.0, 800.0).is_err());
     }
 
     #[test]
@@ -1954,7 +1804,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mumdia_index_band_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (p, f) = build_six_lib(&dir, "band", &[0, 1, 2, 3, 4, 5]);
-        let full = Library::load_with(&p, &f, 8, false).unwrap();
+        let full = Library::load_for_stage(&p, &f, None, None, 8, false).unwrap();
         // The band of rows 1..4 written as its own table, ids 0..3.
         let band = dir.join("band_prec.parquet").to_str().unwrap().to_string();
         let n = crate::groups::write_band_slice(&p, 1, 3, &band).unwrap();
@@ -1964,7 +1814,7 @@ mod tests {
             .u32("candidate_id")
             .unwrap();
         assert_eq!(ids, vec![0, 1, 2]);
-        let lib = Library::load_with_fragment_offset(&band, &f, 1, 8, false).unwrap();
+        let lib = Library::load_for_stage(&band, &f, Some(1), None, 8, false).unwrap();
         assert_eq!(lib.n_candidates(), 3);
         assert_eq!(lib.global_offset, 1);
         for c in 0..3 {
@@ -1972,7 +1822,7 @@ mod tests {
             assert_eq!(frag_slice(&lib, c), frag_slice(&full, c + 1));
         }
         // Same content as loading the band by m/z from the whole file.
-        let by_mz = Library::load_range_with(&p, &f, 440.0, 530.0, 8, false).unwrap();
+        let by_mz = load_range(&p, &f, 440.0, 530.0).unwrap();
         for c in 0..3 {
             assert_eq!(frag_slice(&lib, c), frag_slice(&by_mz, c));
             assert_eq!(lib.prec_mz[c], by_mz.prec_mz[c]);
@@ -2034,10 +1884,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mumdia_index_band0_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (p, f) = build_six_lib(&dir, "band0", &[0, 1, 2, 3, 4, 5]);
-        let full = Library::load_with(&p, &f, 8, false).unwrap();
+        let full = Library::load_for_stage(&p, &f, None, None, 8, false).unwrap();
         let band = dir.join("band0_prec.parquet").to_str().unwrap().to_string();
         assert_eq!(crate::groups::write_band_slice(&p, 0, 2, &band).unwrap(), 2);
-        let lib = Library::load_with_fragment_offset(&band, &f, 0, 8, false).unwrap();
+        let lib = Library::load_for_stage(&band, &f, Some(0), None, 8, false).unwrap();
         assert_eq!(lib.n_candidates(), 2);
         assert_eq!(lib.global_offset, 0);
         for c in 0..2 {
@@ -2173,7 +2023,7 @@ mod tests {
                     .unwrap()
                     .to_string();
                 write_named_fragments(&f, &cid, &names, enc, rg);
-                let full = Library::load_with(&p, &f, 8, false).unwrap();
+                let full = Library::load_for_stage(&p, &f, None, None, 8, false).unwrap();
                 let (dict, ids) = reference(0, 6);
                 assert_eq!(
                     full.frag_name_dict, dict,
@@ -2181,7 +2031,7 @@ mod tests {
                 );
                 assert_eq!(full.frag_name_id, ids, "{enc}/{rg}: full-load ids");
                 // [440, 530] is candidates 1..=3.
-                let part = Library::load_range_with(&p, &f, 440.0, 530.0, 8, false).unwrap();
+                let part = load_range(&p, &f, 440.0, 530.0).unwrap();
                 let (pdict, pids) = reference(1, 4);
                 assert_eq!(part.frag_name_dict, pdict, "{enc}/{rg}: range dictionary");
                 assert_eq!(part.frag_name_id, pids, "{enc}/{rg}: range ids");
@@ -2213,8 +2063,8 @@ mod tests {
             std::env::temp_dir().join(format!("mumdia_index_unsorted_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (p, f) = build_six_lib(&dir, "shuffled", &[3, 0, 5, 1, 4, 2]);
-        let full = Library::load_with(&p, &f, 8, false).unwrap();
-        let part = Library::load_range_with(&p, &f, 440.0, 530.0, 8, false).unwrap();
+        let full = Library::load_for_stage(&p, &f, None, None, 8, false).unwrap();
+        let part = load_range(&p, &f, 440.0, 530.0).unwrap();
         assert_eq!(part.n_candidates(), 3);
         for c in 0..3 {
             assert_eq!(frag_slice(&part, c), frag_slice(&full, c + 1));
@@ -2274,7 +2124,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mumdia_index_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (p, f) = build_tiny_lib(&dir);
-        let lib = Library::load(&p, &f, 8).unwrap();
+        let lib = Library::load_for_stage(&p, &f, None, None, 8, true).unwrap();
         assert_eq!(lib.n_candidates(), 2);
 
         // window covering only candidate 0 (precursor 400)
@@ -2297,6 +2147,73 @@ mod tests {
         let mut hits3 = Vec::new();
         lib.page_search(250.5, 20.0, lo1, hi1, |cid, _, _| hits3.push(cid));
         assert_eq!(hits3, vec![1]);
+    }
+
+    /// The bucketed build sorts every posting by m/z and cuts the result into
+    /// `bucket_size` chunks, so a run of equal m/z (a shared ion such as y1) can cross
+    /// bucket edges. A probe whose f32 lower bound equals that m/z must read the whole run,
+    /// not only the postings from the last bucket whose minimum is at or below the bound.
+    #[test]
+    fn page_search_reads_a_run_of_equal_mz_across_bucket_edges() {
+        let dir = unique_dir("page_search_runs");
+        // One fragment per candidate. In buckets of two, the first library sorts to
+        // [100, 147 | 147, 160 | 200, 210] (the run crosses one edge), the second to
+        // [100, 147 | 147, 147 | 147, 160] (the run spans three buckets).
+        for (tag, mz) in [
+            ("edge", [100.0, 147.0, 147.0, 160.0, 200.0, 210.0]),
+            ("span", [100.0, 147.0, 147.0, 147.0, 147.0, 160.0]),
+        ] {
+            let sub = dir.join(tag);
+            std::fs::create_dir_all(&sub).unwrap();
+            let p = sub.join("prec.parquet").to_str().unwrap().to_string();
+            let f = sub.join("frag.parquet").to_str().unwrap().to_string();
+            let n = mz.len();
+            let ids: Vec<u32> = (0..n as u32).collect();
+            write_table(
+                &p,
+                vec![
+                    Col::U32("candidate_id".into(), ids.clone()),
+                    Col::U32("peptidoform_id".into(), ids.clone()),
+                    Col::U32("base_peptide_id".into(), ids.clone()),
+                    Col::Str(
+                        "peptidoform".into(),
+                        (0..n).map(|i| format!("PEPTIDE{i}K")).collect(),
+                    ),
+                    Col::I32("charge".into(), vec![2; n]),
+                    Col::F64(
+                        "precursor_mz".into(),
+                        (0..n).map(|i| 400.0 + i as f64).collect(),
+                    ),
+                    Col::F32("predicted_irt".into(), vec![10.0; n]),
+                    Col::Str(
+                        "label".into(),
+                        (0..n)
+                            .map(|i| if i % 2 == 0 { "target" } else { "decoy" }.to_string())
+                            .collect(),
+                    ),
+                    Col::Str("protein".into(), (0..n).map(|i| format!("P{i}")).collect()),
+                ],
+            )
+            .unwrap();
+            write_table(
+                &f,
+                vec![
+                    Col::U32("candidate_id".into(), ids),
+                    Col::F64("mz".into(), mz.to_vec()),
+                    Col::F32("predicted_intensity".into(), vec![1.0; n]),
+                    Col::Str("name".into(), vec!["y1".to_string(); n]),
+                ],
+            )
+            .unwrap();
+            let lib = Library::load_for_stage(&p, &f, None, None, 2, true).unwrap();
+            // At zero tolerance the probe's lower bound is the run's m/z itself.
+            let mut hits = Vec::new();
+            lib.page_search(147.0, 0.0, 0, n as u32, |cid, _, _| hits.push(cid));
+            hits.sort_unstable();
+            let want: Vec<u32> = (0..n as u32).filter(|&c| mz[c as usize] == 147.0).collect();
+            assert_eq!(hits, want, "{tag}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Write a library whose numeric columns can be poisoned, into a caller-unique
@@ -2684,7 +2601,7 @@ mod tests {
         let dir = unique_dir("nan_pmz");
         let (p, f) = build_lib_values(&dir, vec![400.0, f64::NAN], vec![200.1, 250.5]);
         // `unwrap_err` would require Debug on Library, which is a large SoA type.
-        let err = match Library::load(&p, &f, 8) {
+        let err = match Library::load_for_stage(&p, &f, None, None, 8, true) {
             Ok(_) => panic!("a non-finite library value must be rejected at load"),
             Err(e) => e.to_string(),
         };
@@ -2706,7 +2623,7 @@ mod tests {
         let dir = unique_dir("inf_frag");
         let (p, f) = build_lib_values(&dir, vec![400.0, 500.0], vec![200.1, f64::INFINITY]);
         // `unwrap_err` would require Debug on Library, which is a large SoA type.
-        let err = match Library::load(&p, &f, 8) {
+        let err = match Library::load_for_stage(&p, &f, None, None, 8, true) {
             Ok(_) => panic!("a non-finite library value must be rejected at load"),
             Err(e) => e.to_string(),
         };
@@ -2720,7 +2637,7 @@ mod tests {
         // Guard against the finiteness pass rejecting a valid library.
         let dir = unique_dir("ok");
         let (p, f) = build_lib_values(&dir, vec![400.0, 500.0], vec![200.1, 250.5]);
-        let lib = Library::load(&p, &f, 8).unwrap();
+        let lib = Library::load_for_stage(&p, &f, None, None, 8, true).unwrap();
         assert_eq!(lib.n_candidates(), 2);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2767,7 +2684,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let err = match Library::load(&p, &f, 8) {
+        let err = match Library::load_for_stage(&p, &f, None, None, 8, true) {
             Ok(_) => panic!("charge 0 must be rejected at load"),
             Err(e) => e.to_string(),
         };
@@ -2876,11 +2793,11 @@ mod tests {
     fn the_label_column_becomes_the_boolean_it_always_meant() {
         let dir = unique_dir("label_bool");
         let (p, f) = library_ids_labels(&dir, [0, 1], ["target", "decoy"]);
-        let lib = Library::load_with(&p, &f, 8, false).unwrap();
+        let lib = Library::load_for_stage(&p, &f, None, None, 8, false).unwrap();
         assert_eq!(lib.is_decoy.clone(), vec![false, true]);
         // Reversed, so a constant-false or index-shifted read cannot pass both cases.
         let (p2, f2) = library_ids_labels(&unique_dir("label_bool2"), [0, 1], ["decoy", "target"]);
-        let lib2 = Library::load_with(&p2, &f2, 8, false).unwrap();
+        let lib2 = Library::load_for_stage(&p2, &f2, None, None, 8, false).unwrap();
         assert_eq!(lib2.is_decoy.clone(), vec![true, false]);
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(unique_dir("label_bool2")).ok();
@@ -2890,7 +2807,7 @@ mod tests {
     fn an_unknown_label_is_still_refused_by_name() {
         let dir = unique_dir("label_bad");
         let (p, f) = library_ids_labels(&dir, [0, 1], ["target", "REVERSE"]);
-        let err = match Library::load_with(&p, &f, 8, false) {
+        let err = match Library::load_for_stage(&p, &f, None, None, 8, false) {
             Ok(_) => panic!("an unknown label must be rejected at load"),
             Err(e) => e.to_string(),
         };
@@ -2906,7 +2823,7 @@ mod tests {
     fn a_non_contiguous_candidate_id_is_rejected_with_the_row() {
         let dir = unique_dir("cid_gap");
         let (p, f) = library_ids_labels(&dir, [0, 2], ["target", "decoy"]);
-        let err = match Library::load_with(&p, &f, 8, false) {
+        let err = match Library::load_for_stage(&p, &f, None, None, 8, false) {
             Ok(_) => panic!("a non-contiguous candidate_id must be rejected at load"),
             Err(e) => e.to_string(),
         };
@@ -2926,7 +2843,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (p, f) = build_six_lib(&dir, "cidspan", &[0, 1, 2, 3, 4, 5]);
         // Rows 1..4 carry file ids 1, 2, 3; the load accepts them against offset 1.
-        let part = Library::load_range_with(&p, &f, 440.0, 530.0, 8, false).unwrap();
+        let part = load_range(&p, &f, 440.0, 530.0).unwrap();
         assert_eq!(part.n_candidates(), 3);
         // Local ids are positions, so what pins the span is that local 0..3 hold file rows
         // 1..4: their peptidoform ids are 11, 12, 13, and the offset records row 1.
@@ -2942,7 +2859,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mumdia_index_precmz_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (p, f) = build_six_lib(&dir, "precmz", &[0, 1, 2, 3, 4, 5]);
-        let lib = Library::load_with(&p, &f, 8, false).unwrap();
+        let lib = Library::load_for_stage(&p, &f, None, None, 8, false).unwrap();
         assert_eq!(lib.prec_mz.len(), lib.n_candidates());
         for c in 0..lib.n_candidates() {
             assert_eq!(lib.prec_mz[c], lib.cand(c as u32).precursor_mz);
@@ -2952,50 +2869,46 @@ mod tests {
             vec![400.0, 450.0, 500.0, 520.0, 600.0, 650.0]
         );
         // The same holds for a band, whose `prec_mz` is the band's slice of the column.
-        let part = Library::load_range_with(&p, &f, 440.0, 530.0, 8, false).unwrap();
+        let part = load_range(&p, &f, 440.0, 530.0).unwrap();
         assert_eq!(part.prec_mz.to_vec(), vec![450.0, 500.0, 520.0]);
         for c in 0..part.n_candidates() {
             assert_eq!(part.prec_mz[c], part.cand(c as u32).precursor_mz);
         }
     }
 
-    /// Releasing the fragment payload frees `frag_int`/`frag_name_id` and keeps `frag_mz`
-    /// byte for byte, because the seed's mass recalibration still walks every library
-    /// fragment m/z after its index exists.
+    /// The m/z-only load keeps `frag_mz` byte for byte and none of the rest of the fragment
+    /// payload, because the seed's mass recalibration still walks every library fragment
+    /// m/z.
     #[test]
-    fn releasing_the_fragment_payload_keeps_every_fragment_mz() {
+    fn the_mz_only_load_keeps_every_fragment_mz() {
         let dir = std::env::temp_dir().join(format!("mumdia_index_release_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (p, f) = build_six_lib(&dir, "release", &[0, 1, 2, 3, 4, 5]);
-        let mut lib = Library::load_with(&p, &f, 8, false).unwrap();
+        let lib = Library::load_for_stage(&p, &f, None, None, 8, false).unwrap();
         assert!(!lib.fragment_payload_released());
-        let before: Vec<Vec<f32>> = (0..lib.n_candidates())
-            .map(|c| lib.cand_frag_mz(c as u32).to_vec())
-            .collect();
-        // Before the release the two accessors agree, which is what makes the swap safe.
+        // On a full load the two accessors agree, which is what makes the m/z-only one a
+        // drop-in for a stage that reads no payload.
         for c in 0..lib.n_candidates() {
             assert_eq!(lib.cand_frags(c as u32).0, lib.cand_frag_mz(c as u32));
         }
-        lib.release_fragment_payload();
-        assert!(lib.fragment_payload_released());
-        assert!(lib.frag_int.is_empty() && lib.frag_name_id.is_empty());
-        let after: Vec<Vec<f32>> = (0..lib.n_candidates())
-            .map(|c| lib.cand_frag_mz(c as u32).to_vec())
-            .collect();
-        assert_eq!(before, after);
+        let mz_only = Library::load_mz_only_for_stage(&p, &f, None, None).unwrap();
+        assert!(mz_only.fragment_payload_released());
+        assert!(mz_only.frag_int.is_empty() && mz_only.frag_name_id.is_empty());
+        for c in 0..lib.n_candidates() {
+            assert_eq!(mz_only.cand_frag_mz(c as u32), lib.cand_frag_mz(c as u32));
+        }
     }
 
-    /// The released payload must fail loudly rather than hand back a short or stale slice:
-    /// `cand_frags` is what extract reads predicted intensities through.
+    /// A library without its payload must fail loudly rather than hand back a short or stale
+    /// slice: `cand_frags` is what extract reads predicted intensities through.
     #[test]
-    #[should_panic(expected = "fragment payload was released")]
-    fn cand_frags_after_a_release_panics_instead_of_lying() {
+    #[should_panic(expected = "loaded without its fragment payload")]
+    fn cand_frags_without_the_payload_panics_instead_of_lying() {
         let dir =
             std::env::temp_dir().join(format!("mumdia_index_relpanic_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (p, f) = build_six_lib(&dir, "relpanic", &[0, 1, 2, 3, 4, 5]);
-        let mut lib = Library::load_with(&p, &f, 8, false).unwrap();
-        lib.release_fragment_payload();
+        let lib = Library::load_mz_only_for_stage(&p, &f, None, None).unwrap();
         let _ = lib.cand_frags(0);
     }
 
@@ -3007,7 +2920,8 @@ mod tests {
         // every such candidate into one group, and refusing the library served nobody.
         let dir = unique_dir("empty_protein");
         let (p, f) = library_with(&dir, ["PEPTIDEK", "SAMPLER"], ["P1", ""]);
-        let lib = Library::load(&p, &f, 8).expect("an empty protein is not a load error");
+        let lib = Library::load_for_stage(&p, &f, None, None, 8, true)
+            .expect("an empty protein is not a load error");
         assert_eq!(lib.protein(0), "P1");
         assert_eq!(lib.protein(1), "UNASSIGNED");
         std::fs::remove_dir_all(&dir).ok();
@@ -3074,7 +2988,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let lib = Library::load_with(&p, &f, 8, false).unwrap();
+        let lib = Library::load_for_stage(&p, &f, None, None, 8, false).unwrap();
         assert_eq!(lib.n_candidates(), 6);
         let mut start = 0usize;
         for c in 0..6u32 {
@@ -3118,7 +3032,7 @@ mod tests {
         // explicitly empty string.
         let dir = unique_dir("empty_peptidoform");
         let (p, f) = library_with(&dir, ["PEPTIDEK", ""], ["P1", "P2"]);
-        let err = match Library::load(&p, &f, 8) {
+        let err = match Library::load_for_stage(&p, &f, None, None, 8, true) {
             Ok(_) => panic!("an empty peptidoform must be rejected at load"),
             Err(e) => e.to_string(),
         };
@@ -3145,20 +3059,20 @@ mod tests {
                 write_parts_fragments(&f, 6, order, rg);
                 let pairs: Vec<(Library, Library)> = vec![
                     (
-                        Library::load_with(&p, &f, 8, false).unwrap(),
-                        Library::load_mz_only(&p, &f, None).unwrap(),
+                        Library::load_for_stage(&p, &f, None, None, 8, false).unwrap(),
+                        Library::load_mz_only_for_stage(&p, &f, None, None).unwrap(),
                     ),
                     (
                         {
                             let band = dir.join("mzonly_band.parquet");
                             let band = band.to_str().unwrap().to_string();
                             crate::groups::write_band_slice(&p, 2, 3, &band).unwrap();
-                            Library::load_with_fragment_offset(&band, &f, 2, 8, false).unwrap()
+                            Library::load_for_stage(&band, &f, Some(2), None, 8, false).unwrap()
                         },
                         {
                             let band = dir.join("mzonly_band.parquet");
                             let band = band.to_str().unwrap().to_string();
-                            Library::load_mz_only(&band, &f, Some(2)).unwrap()
+                            Library::load_mz_only_for_stage(&band, &f, Some(2), None).unwrap()
                         },
                     ),
                 ];
@@ -3274,12 +3188,12 @@ mod tests {
             f
         };
         let full = |f: &str| {
-            Library::load_with(&p, f, 8, false)
+            Library::load_for_stage(&p, f, None, None, 8, false)
                 .err()
                 .map(|e| format!("{e:#}"))
         };
         let mz = |f: &str| {
-            Library::load_mz_only(&p, f, None)
+            Library::load_mz_only_for_stage(&p, f, None, None)
                 .err()
                 .map(|e| format!("{e:#}"))
         };
@@ -3447,7 +3361,7 @@ mod null_fixture_tests {
         let p = precursors(&dir);
         for col in ["candidate_id", "mz", "predicted_intensity", "name"] {
             let f = fragments_with_null(&dir, col);
-            let err = match Library::load(&p, &f, 8) {
+            let err = match Library::load_for_stage(&p, &f, None, None, 8, true) {
                 Ok(_) => panic!("a NULL {col} must not load"),
                 Err(e) => format!("{e:#}"),
             };

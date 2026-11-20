@@ -709,7 +709,7 @@ fn peak_snr(a_peak: f64, axis_full: &[f64], r_full: &[f64], lo: f64, hi: f64) ->
     let mut out = out;
     let med = super::median_select(&mut out);
     let mad = median(out.iter().map(|v| (v - med).abs()).collect());
-    let noise = 1.4826 * mad;
+    let noise = crate::calibrate::MAD_TO_SIGMA * mad;
     let denom = if noise > EPS { noise } else { 1.0 };
     // Bounded: a near-flat out-of-peak baseline gives noise ~ 1e-9 and otherwise
     // sends S/N to ~1e15. A ratio above 1000 already means "essentially noiseless".

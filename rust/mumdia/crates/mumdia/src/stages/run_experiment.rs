@@ -29,6 +29,7 @@ use rayon::prelude::*;
 use serde_json::json;
 use tracing::{info, warn};
 
+use crate::quant_lfq;
 use crate::stages::quant::ChromTable;
 use crate::stages::*;
 
@@ -63,7 +64,6 @@ pub struct RunExperimentParams<'a> {
 }
 
 fn preflight(p: &RunExperimentParams) -> Result<()> {
-    use mumdia_core::config::RescorerKind;
     if p.mzmls.len() < 2 {
         anyhow::bail!(
             "run-experiment needs >= 2 --mzml files (got {})",
@@ -85,7 +85,9 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
             }
         }
         (None, None) => match p.fasta {
-            Some(f) if std::path::Path::new(f).exists() => {}
+            Some(f) if std::path::Path::new(f).exists() => {
+                crate::stages::run::refuse_decoy_free_digest(p.config)?
+            }
             Some(f) => anyhow::bail!("--fasta not found: {f}"),
             None => {
                 anyhow::bail!("provide either --fasta or both --lib-precursors and --lib-fragments")
@@ -99,41 +101,9 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
     {
         warn!("{w}");
     }
-    if cfg.rt_im_train.finetune_deeplc && cfg.predict_frag.deeplc_python.is_none() {
-        anyhow::bail!("rt_im_train.finetune_deeplc requires predict_frag.deeplc_python");
-    }
-    // Explicit count: hard requirement. Automatic default: degrade with a warning, so a
-    // native Python-free experiment stays runnable (`run.rs` says the same).
-    if cfg.rt_im_train.multihead_calibration.is_some_and(|n| n > 0)
-        && cfg.predict_frag.deeplc_python.is_none()
-    {
-        anyhow::bail!(
-            "rt_im_train.multihead_calibration requires predict_frag.deeplc_python (DeepLC \
-             >= 4.5.0): it calibrates the base model against each run's confident seed PSMs"
-        );
-    }
-    if cfg.rt_im_train.multihead_calibration.is_none()
-        && !cfg.rt_im_train.finetune_deeplc
-        && cfg.predict_frag.deeplc_python.is_none()
-    {
-        warn!(
-            "no DeepLC interpreter resolved, so retention-time multi-head calibration is \
-             not running; it is the default and was worth 4.8% of peptides on AIF and \
-             14.3% on Astral. Set predict_frag.deeplc_python (\"auto\" discovers one)."
-        );
-    }
-    if p.lib_precursors.is_some()
-        && matches!(
-            cfg.rt_im_train.library_irt,
-            mumdia_core::config::LibraryIrt::Deeplc
-        )
-        && cfg.predict_frag.deeplc_python.is_none()
-    {
-        anyhow::bail!(
-            "rt_im_train.library_irt = deeplc requires predict_frag.deeplc_python; set \
-             library_irt = library to keep the imported iRT"
-        );
-    }
+    // `python::resolve` ran first and refused every role this configuration requires
+    // without a usable interpreter (`Role::required_by`).
+    crate::stages::run::warn_without_deeplc(cfg);
     // Check the interpreters EXIST, not merely that the fields are set. The rescore runs
     // after every per-run chain, so on an 83-file batch a mistyped `rescore.python` used to
     // discard days of compute at the final stage. A wrong path is also the most likely error
@@ -147,7 +117,7 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
         ("mbr.python", cfg.mbr.python.as_deref()),
     ] {
         if let Some(exe) = path {
-            if !std::path::Path::new(exe).exists() {
+            if crate::python::interpreter_missing(exe) {
                 anyhow::bail!(
                     concat!(
                         "{} points at an interpreter that does not exist: {}. A config ",
@@ -160,22 +130,6 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
                 );
             }
         }
-    }
-    if matches!(
-        cfg.rescore.classifier,
-        RescorerKind::Mokapot | RescorerKind::NnTorch
-    ) && cfg.rescore.python.is_none()
-    {
-        anyhow::bail!(
-            "rescore.classifier={:?} requires rescore.python",
-            cfg.rescore.classifier
-        );
-    }
-    if cfg.mbr.strategy.transfers() && cfg.mbr.python.is_none() {
-        anyhow::bail!(
-            "mbr.strategy = {:?} (the rescuable-tier transfer) requires mbr.python",
-            cfg.mbr.strategy
-        );
     }
     refuse_unchecked_cross_run_step(cfg)?;
     Ok(())
@@ -331,7 +285,6 @@ fn search_second_pass(
         let co = convert::ConvertOutputs::existing(&format!("{}/spectra", run_dirs[i]))?;
         let seed = seed_run(
             cfg2,
-            ch,
             &library.precursors,
             &library.fragments,
             &co,
@@ -466,6 +419,8 @@ fn process_run(
     // `lib_p_base` carries placeholder iRT the multi-head calibration must replace in full
     // (`predict_frag.defer_deeplc_to_multihead`).
     irt_placeholder: bool,
+    // The experiment's base-model re-prediction of an imported library (`chain::BaseIrt`).
+    base_irt: Option<&chain::BaseIrt>,
 ) -> Result<(Vec<String>, Vec<ChromTable>, Option<String>)> {
     let co = convert_run(cfg, mzml, out, top_peaks_ms2, max_spectra, library_input)?;
     let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
@@ -500,7 +455,7 @@ fn process_run(
             Some(format!("{out}/groups")),
         ));
     }
-    let seed = seed_run(cfg, ch, lib_p_base, lib_f, &co, out, None)?;
+    let seed = seed_run(cfg, lib_p_base, lib_f, &co, out, None)?;
     chain_after_seed(
         cfg,
         ch,
@@ -512,6 +467,7 @@ fn process_run(
         &seed,
         shared_rt_lib,
         irt_placeholder,
+        base_irt,
     )
 }
 
@@ -528,17 +484,8 @@ fn convert_run(
 ) -> Result<convert::ConvertOutputs> {
     let d = |name: &str| format!("{out}/{name}");
     std::fs::create_dir_all(out).ok();
-    // Fold the conversion caps into the convert artifacts' provenance key, exactly as
-    // both the standalone `convert` subcommand and single-run `run` do. The caps change
-    // the spectra output but are not part of the config, so the bare config hash made
-    // two experiments with different caps record identical convert provenance.
-    let convert_hash = mumdia_io::hash::blake3_str(&format!(
-        "{}\u{1f}max_spectra={}\u{1f}top_peaks_ms2={}\u{1f}top_peaks_ms1={}",
-        cfg.canonical_json(),
-        max_spectra,
-        top_peaks_ms2,
-        0
-    ));
+    let convert_hash =
+        convert::provenance_hash(&cfg.canonical_json(), max_spectra, top_peaks_ms2, 0);
     let co = convert::run(convert::ConvertParams {
         mzml,
         out_dir: &d("spectra"),
@@ -564,7 +511,6 @@ fn convert_run(
 /// Returns the seed path.
 fn seed_run(
     cfg: &Config,
-    ch: &str,
     lib_p_base: &str,
     lib_f: &str,
     co: &convert::ConvertOutputs,
@@ -586,7 +532,6 @@ fn seed_run(
         out: &seed,
         cfg: &cfg.search_seed,
         bucket_size: cfg.extract.bucket_size,
-        config_hash: ch,
     })?;
     Ok(seed)
 }
@@ -606,22 +551,26 @@ fn chain_after_seed(
     seed: &str,
     shared_rt_lib: Option<&str>,
     irt_placeholder: bool,
+    base_irt: Option<&chain::BaseIrt>,
 ) -> Result<(Vec<String>, Vec<ChromTable>, Option<String>)> {
     let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
     let mh_heads = cfg
         .rt_im_train
         .multihead_heads(has_deeplc, cfg.deeplc_rt_source(library_input, has_deeplc));
-    let adapted = adapt_rt_library(
+    let adapted = chain::adapt_rt_library(chain::AdaptParams {
         cfg,
+        config_hash: ch,
         lib_p_base,
+        lib_f,
+        converted: co,
         seed,
-        out,
+        out_dir: out,
         mh_heads,
         shared_rt_lib,
         irt_placeholder,
-        rayon::current_num_threads(),
-        BootInputs { ch, lib_f, co },
-    )?;
+        threads: rayon::current_num_threads(),
+        base_irt,
+    })?;
     let (competed, chrom) = finish_run(
         cfg,
         ch,
@@ -638,182 +587,6 @@ fn chain_after_seed(
         vec![ChromTable::whole(&chrom)],
         adapted.produced,
     ))
-}
-
-/// What a run's search-anchored refit needs beyond the adaptation's own arguments
-/// (`rt_im_train.multihead_anchors = search`, `rt_bootstrap`): the bootstrap pass searches
-/// the run once on the seed-anchored library.
-#[derive(Clone, Copy)]
-struct BootInputs<'a> {
-    ch: &'a str,
-    lib_f: &'a str,
-    co: &'a convert::ConvertOutputs,
-}
-
-/// What [`adapt_rt_library`] chose for one run.
-struct Adapted {
-    /// The precursor table the rest of the run reads.
-    lib: String,
-    /// The table this run produced, which the runs after it may reuse.
-    produced: Option<String>,
-    /// Whether the adaptation searched the run in this process (the bootstrap pass of
-    /// `rt_bootstrap`: extract, features and compete on the seed-anchored library), so a
-    /// memory window around it measured a search of this run.
-    searched: bool,
-}
-
-/// Choose the precursor table the rest of an ungrouped run reads: a previous run's adapted
-/// library, this run's multi-head calibration or fine-tune of the base library (`threads`
-/// torch threads), or the base library. Under `rt_im_train.multihead_anchors = search`, or
-/// `auto` on 1/K0 spectra or a seed short of anchors, the multi-head calibration is refitted
-/// on the confident targets of a bootstrap search of this run (`rt_bootstrap::refit`).
-#[allow(clippy::too_many_arguments)]
-fn adapt_rt_library(
-    cfg: &Config,
-    lib_p_base: &str,
-    seed: &str,
-    out: &str,
-    mh_heads: usize,
-    shared_rt_lib: Option<&str>,
-    irt_placeholder: bool,
-    threads: usize,
-    boot: BootInputs,
-) -> Result<Adapted> {
-    let d = |name: &str| format!("{out}/{name}");
-    // DeepLC fine-tune. Under `RtLibraryScope::FirstRunOnly` the caller hands every run
-    // after the first the library the first run produced, so the fine-tune -- the most
-    // expensive step in the whole experiment -- is paid once. Run-to-run chromatographic
-    // drift is then absorbed by `rt_im_train`'s per-run calibration below, which is fitted
-    // separately for every run regardless.
-    let mut produced_rt_lib: Option<String> = None;
-    let mut searched = false;
-    // The anchor cut (`rt_im_train::plan_anchors`): relaxed on a seed short of anchors, and
-    // when still short the multi-head calibration is skipped for this run, which then keeps
-    // `lib_p_base` and adapts nothing for the runs after it to reuse.
-    let anchor_plan =
-        if shared_rt_lib.is_none() && (mh_heads > 0 || cfg.rt_im_train.finetune_deeplc) {
-            Some(rt_im_train::plan_anchors(seed, &cfg.rt_im_train)?)
-        } else {
-            None
-        };
-    let anchor_q = anchor_plan.map_or(cfg.rt_im_train.q_train, |a| a.q_train);
-    let mh_heads = match anchor_plan {
-        Some(a) if mh_heads > 0 && !a.sufficient => {
-            if irt_placeholder {
-                anyhow::bail!(
-                    "the library carries placeholder retention times for the multi-head \
-                     calibration to replace, but the seed search of {out} found only {} target \
-                     anchors even at q {}; re-run without predict_frag.defer_deeplc_to_multihead",
-                    a.n_anchors,
-                    a.q_train
-                );
-            }
-            0
-        }
-        _ => mh_heads,
-    };
-    let lib_p = if let Some(shared) = shared_rt_lib {
-        // A previous run already adapted the library and `experiment.rt_library_scope`
-        // says to reuse it. Which mechanism produced it does not matter here: the
-        // fine-tune and multi-head both hand back a precursor table with rewritten
-        // retention times, and this run fits its own LOESS on top either way.
-        shared.to_string()
-    } else if mh_heads > 0 {
-        let python = cfg
-            .predict_frag
-            .deeplc_python
-            .as_deref()
-            .expect("mh_heads is 0 unless an interpreter resolved");
-        let script = crate::sidecar::resolve_script(
-            &cfg.predict_frag.sidecar_script_dir,
-            "deeplc_finetune.py",
-        );
-        // Planned above whenever a multi-head calibration runs on a run with no shared
-        // library, which is this branch.
-        let plan = anchor_plan.expect("the anchor cut is planned for a multi-head calibration");
-        // Under `multihead_anchors = search`, or `auto` on a seed short of anchors, the
-        // seed-anchored fit goes to `rt_bootstrap/` and the refitted library takes the usual
-        // name; otherwise this is the usual name.
-        let has_im = crate::instrument::spectra_has_im(&boot.co.ms2);
-        let search = rt_bootstrap::decide(cfg, mh_heads, &plan, has_im, out);
-        let lib_p_mh = rt_bootstrap::seed_library_path(search, out);
-        crate::sidecar::run_deeplc_multihead(
-            python,
-            &script,
-            lib_p_base,
-            seed,
-            &lib_p_mh,
-            mh_heads,
-            anchor_q,
-            cfg.rt_im_train.window_holdout_frac,
-            threads,
-            cfg.rt_im_train.deeplc_predict_shards,
-            crate::cache::projection_dir(cfg).as_ref(),
-        )?;
-        if irt_placeholder {
-            crate::sidecar::require_every_row_repredicted(&lib_p_mh)?;
-        }
-        let lib_p_mh = if search {
-            rt_bootstrap::refit(&rt_bootstrap::Refit {
-                cfg,
-                config_hash: boot.ch,
-                converted: boot.co,
-                lib_p_base,
-                lib_f: boot.lib_f,
-                seed,
-                out,
-                seed_library: &lib_p_mh,
-                mh_heads,
-                threads,
-                irt_placeholder,
-                seed_anchors: plan.n_anchors,
-            })?
-            .library
-        } else {
-            lib_p_mh
-        };
-        rt_bootstrap::record_auto(cfg, &plan, has_im, search, &lib_p_mh);
-        produced_rt_lib = Some(lib_p_mh.clone());
-        searched = search;
-        lib_p_mh
-    } else if cfg.rt_im_train.finetune_deeplc {
-        let python = cfg
-            .predict_frag
-            .deeplc_python
-            .as_deref()
-            .expect("preflight");
-        let script = crate::sidecar::resolve_script(
-            &cfg.predict_frag.sidecar_script_dir,
-            "deeplc_finetune.py",
-        );
-        let lib_p_ft = d("fragment_library_precursors_ft.parquet");
-        crate::sidecar::run_deeplc_finetune(
-            python,
-            &script,
-            lib_p_base,
-            seed,
-            &lib_p_ft,
-            cfg.rt_im_train.finetune_epochs,
-            cfg.rt_im_train.finetune_patience,
-            anchor_q,
-            cfg.rt_im_train.finetune_batch,
-            // Keep the fine-tune exclusion aligned with rt-im-train's holdout
-            // split (see run.rs); 0.0 (default) changes nothing.
-            cfg.rt_im_train.window_holdout_frac,
-            cfg.rng_seed,
-            threads,
-            cfg.rt_im_train.deeplc_predict_shards,
-        )?;
-        produced_rt_lib = Some(lib_p_ft.clone());
-        lib_p_ft
-    } else {
-        lib_p_base.to_string()
-    };
-    Ok(Adapted {
-        lib: lib_p,
-        produced: produced_rt_lib,
-        searched,
-    })
 }
 
 /// Retention-time windows, extract, the optional retrace, features and compete of one
@@ -1587,10 +1360,17 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
 
     // A FASTA build may leave DeepLC to the multi-head calibration of each run, which
     // re-predicts every row before anything reads the iRT
-    // (`predict_frag.defer_deeplc_to_multihead`).
-    let irt_placeholder = cfg.defers_library_deeplc(
+    // (`predict_frag.defer_deeplc_to_multihead`), unless the library cache holds the library
+    // with its predictions (`library_build::defers_deeplc`).
+    let run_has_im = p.mzmls.iter().any(|m| crate::instrument::input_has_im(m));
+    let irt_placeholder = library_build::defers_deeplc(
+        cfg,
         p.lib_precursors.is_some(),
-        cfg.predict_frag.deeplc_python.is_some(),
+        p.fasta,
+        run_has_im,
+        (&prov.mumdia_version, &prov.git_sha),
+        true,
+        "run-experiment",
     );
 
     // --- shared library (imported or digested once) ---
@@ -1612,7 +1392,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                     fasta,
                     out_dir: p.out_dir,
                     rt_placeholder: irt_placeholder,
-                    run_has_im: p.mzmls.iter().any(|m| crate::instrument::input_has_im(m)),
+                    run_has_im,
                     engine: (&prov.mumdia_version, &prov.git_sha),
                     use_cache: true,
                     caller: "run-experiment",
@@ -1639,31 +1419,23 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     } else {
         "convert"
     });
+    // The one base-model re-prediction of an imported library: made here when `library_irt`
+    // asks for it, else by the first run whose multi-head calibration is skipped for want of
+    // anchors (`chain::adapt_rt_library`), and shared by every run after it.
+    let base_irt = p
+        .lib_precursors
+        .is_some()
+        .then(|| chain::BaseIrt::new(d("fragment_library_precursors_deeplc.parquet")));
     let lib_p_base = if library_irt_repredicted {
-        let python = cfg
-            .predict_frag
-            .deeplc_python
-            .as_deref()
-            .expect("repredicts_library_irt implies deeplc_python");
-        let script = crate::sidecar::resolve_script(
-            &cfg.predict_frag.sidecar_script_dir,
-            "deeplc_finetune.py",
-        );
-        let out = d("fragment_library_precursors_deeplc.parquet");
         info!(
             library = %lib_p_base,
             "run-experiment: re-predicting the library iRT once with the DeepLC base model"
         );
-        crate::sidecar::run_deeplc_repredict(
-            python,
-            &script,
-            &lib_p_base,
-            &out,
-            rayon::current_num_threads(),
-            cfg.rt_im_train.deeplc_predict_shards,
-            crate::cache::projection_dir(cfg).as_ref(),
-        )?;
-        out
+        base_irt
+            .as_ref()
+            .expect("repredicts_library_irt implies an imported library")
+            .get(cfg, &lib_p_base, rayon::current_num_threads())?
+            .to_string()
     } else {
         // Same two reasons as in `run`: no interpreter (warn) or the multi-head calibration
         // taking over the re-prediction on the first run (a plan, logged as such).
@@ -1789,6 +1561,14 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         .multihead_heads(has_deeplc_for_scope, deeplc_rt_source_for_scope);
     let search_anchors = rt_bootstrap::always(cfg, mh_heads_for_scope);
     rt_bootstrap::warn_if_inert(cfg, mh_heads_for_scope, "run-experiment");
+    if cfg.extract.emit_candidate_audit {
+        warn!(
+            "run-experiment: extract.emit_candidate_audit has no effect here: the candidate \
+             audit runs in a single `mumdia run` only, so a grouped run does not pool its band \
+             tables for it (`mumdia pool --groups-dir <run>/groups --psms` does, for a later \
+             `mumdia audit`)"
+        );
+    }
     if share_ft && overlap > 0 && !grouped_runs && search_anchors {
         info!(
             "run-experiment: rt_im_train.multihead_anchors = search; the first run adapts the \
@@ -1876,7 +1656,6 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: seed");
             seed_run(
                 cfg,
-                &ch,
                 &lib_p_base,
                 &lib_f,
                 &conv[i],
@@ -1924,6 +1703,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 seed,
                 shared,
                 irt_placeholder,
+                base_irt.as_ref(),
             ),
             None => process_run(
                 cfg,
@@ -1939,6 +1719,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 library_irt_repredicted,
                 slices_from,
                 irt_placeholder,
+                base_irt.as_ref(),
             ),
         }
     };
@@ -1980,7 +1761,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             p.max_spectra,
             library_input,
         )?;
-        let seed0 = seed_run(cfg, &ch, &lib_p_base, &lib_f, &co0, &out0, None)?;
+        let seed0 = seed_run(cfg, &lib_p_base, &lib_f, &co0, &out0, None)?;
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(front_threads)
             .build()
@@ -2038,7 +1819,6 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                         info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: seed, overlapped");
                         seeds.push(seed_run(
                             cfg,
-                            &ch,
                             &lib_p_base,
                             &lib_f,
                             co,
@@ -2061,21 +1841,20 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 }
                 r
             });
-            let adapted = adapt_rt_library(
+            let adapted = chain::adapt_rt_library(chain::AdaptParams {
                 cfg,
-                &lib_p_base,
-                &seed0,
-                &out0,
+                config_hash: &ch,
+                lib_p_base: &lib_p_base,
+                lib_f: &lib_f,
+                converted: &co0,
+                seed: &seed0,
+                out_dir: &out0,
                 mh_heads,
-                None,
+                shared_rt_lib: None,
                 irt_placeholder,
-                adapt_threads,
-                BootInputs {
-                    ch: &ch,
-                    lib_f: &lib_f,
-                    co: &co0,
-                },
-            );
+                threads: adapt_threads,
+                base_irt: base_irt.as_ref(),
+            });
             if adapted.is_err() {
                 cancel.store(true, std::sync::atomic::Ordering::SeqCst);
             }
@@ -2084,7 +1863,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("the overlapped runs' thread panicked")));
             (adapted, fronts)
         });
-        let Adapted {
+        let chain::Adapted {
             lib: lib0,
             produced,
             ..
@@ -2115,21 +1894,20 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         let back = |i: usize, (co, seed): &(convert::ConvertOutputs, String)| {
             let out = d(&names[i]);
             info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain after the overlapped front");
-            let lib_p = adapt_rt_library(
+            let lib_p = chain::adapt_rt_library(chain::AdaptParams {
                 cfg,
-                &lib_p_base,
+                config_hash: &ch,
+                lib_p_base: &lib_p_base,
+                lib_f: &lib_f,
+                converted: co,
                 seed,
-                &out,
+                out_dir: &out,
                 mh_heads,
-                produced.as_deref(),
+                shared_rt_lib: produced.as_deref(),
                 irt_placeholder,
-                rayon::current_num_threads(),
-                BootInputs {
-                    ch: &ch,
-                    lib_f: &lib_f,
-                    co,
-                },
-            )?
+                threads: rayon::current_num_threads(),
+                base_irt: base_irt.as_ref(),
+            })?
             .lib;
             finish_run(
                 cfg,
@@ -2207,21 +1985,20 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             (Some((co0, seed0)), true) => {
                 let out0 = d(&names[0]);
                 let window = crate::sched::PeakWindow::open();
-                let adapted = adapt_rt_library(
+                let adapted = chain::adapt_rt_library(chain::AdaptParams {
                     cfg,
-                    &lib_p_base,
-                    seed0,
-                    &out0,
-                    mh_heads_for_scope,
-                    None,
+                    config_hash: &ch,
+                    lib_p_base: &lib_p_base,
+                    lib_f: &lib_f,
+                    converted: co0,
+                    seed: seed0,
+                    out_dir: &out0,
+                    mh_heads: mh_heads_for_scope,
+                    shared_rt_lib: None,
                     irt_placeholder,
-                    rayon::current_num_threads(),
-                    BootInputs {
-                        ch: &ch,
-                        lib_f: &lib_f,
-                        co: co0,
-                    },
-                )?;
+                    threads: rayon::current_num_threads(),
+                    base_irt: base_irt.as_ref(),
+                })?;
                 first_window = Some(window);
                 if adapted.searched {
                     first_step = "the first run's retention-time adaptation (a search of it)";
@@ -2260,12 +2037,12 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 info!(library = %path, "run-experiment: reusing this adapted library for the remaining runs");
                 shared_ft = Some(path);
             }
-            // Defensive: `share_ft` implies the first run fine-tunes, so this should not
-            // happen. Falling through with `None` means the rest fine-tune themselves --
-            // slower, but never silently wrong.
+            // The first run's multi-head calibration was skipped for want of anchors
+            // (`chain::adapt_rt_library`): the rest adapt their own, slower but never
+            // silently wrong.
             None => warn!(
-                "run-experiment: the first run produced no fine-tuned library; the \
-                 remaining runs will each fine-tune"
+                "run-experiment: the first run produced no adapted library; the remaining \
+                 runs will each adapt their own"
             ),
         }
     }
@@ -2803,12 +2580,12 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     let cross_run = if qcfg.needs_cross_run_fit() {
         let frag_tables = quant_plan.map_pooled(&run_idx, |&i| {
             let ft = d(&format!("{}/fragment_quant.parquet", names[i]));
-            let tmp = |n: &str| d(&format!("{}/{n}.pass1.parquet", names[i]));
+            // The export alone: the pass's peptide and protein tables are never read.
             let written = quant::run_hashed(quant::QuantParams {
                 psms_scored: &split_paths[i],
                 chromatograms: &chroms[i],
-                out_peptide: &tmp("peptide_quant"),
-                out_protein: &tmp("protein_group_quant"),
+                out_peptide: None,
+                out_protein: None,
                 out_fragment: Some(&ft),
                 out_peak_bounds: None,
                 out_quant_fragments: None,
@@ -2819,12 +2596,6 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 first_pass_ids: None,
                 q1: q1_of(i),
             })?;
-            for n in ["peptide_quant", "protein_group_quant"] {
-                for path in [tmp(n), format!("{}.report.json", tmp(n))] {
-                    std::fs::remove_file(&path)
-                        .with_context(|| format!("removing the first-pass table {path}"))?;
-                }
-            }
             Ok((ft, written.fragment.expect("out_fragment was set")))
         })?;
         let paths: Vec<String> = frag_tables.iter().map(|(p, _)| p.clone()).collect();
@@ -2837,12 +2608,11 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             };
             let tables_b = quant_plan.map_pooled(&run_idx, |&i| {
                 let ft = d(&format!("{}/fragment_quant_background.parquet", names[i]));
-                let tmp = |n: &str| d(&format!("{}/{n}.pass1b.parquet", names[i]));
                 let written = quant::run_hashed(quant::QuantParams {
                     psms_scored: &split_paths[i],
                     chromatograms: &chroms[i],
-                    out_peptide: &tmp("peptide_quant"),
-                    out_protein: &tmp("protein_group_quant"),
+                    out_peptide: None,
+                    out_protein: None,
                     out_fragment: Some(&ft),
                     out_peak_bounds: None,
                     out_quant_fragments: None,
@@ -2853,12 +2623,6 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                     first_pass_ids: None,
                     q1: q1_of(i),
                 })?;
-                for n in ["peptide_quant", "protein_group_quant"] {
-                    for path in [tmp(n), format!("{}.report.json", tmp(n))] {
-                        std::fs::remove_file(&path)
-                            .with_context(|| format!("removing the export-pass table {path}"))?;
-                    }
-                }
                 Ok((ft, written.fragment.expect("out_fragment was set")))
             })?;
             let paths_b: Vec<String> = tables_b.iter().map(|(p, _)| p.clone()).collect();
@@ -2920,8 +2684,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         let written = quant::run_hashed(quant::QuantParams {
             psms_scored: &split_paths[i],
             chromatograms: &chroms[i],
-            out_peptide: &pq,
-            out_protein: &gq,
+            out_peptide: Some(&pq),
+            out_protein: Some(&gq),
             out_fragment: None,
             out_peak_bounds: None,
             out_quant_fragments: qf.as_deref(),
@@ -2977,7 +2741,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         _ => mumdia_core::config::NormalizeMethod::MedianRatio,
     };
     let (n_lfq, size_factors) = match (&normalised, lfq_reads_normalised) {
-        (Some((tables, _, _)), true) => quant::run_lfq_combine_grouped(
+        (Some((tables, _, _)), true) => quant_lfq::run_lfq_combine_grouped(
             tables,
             false,
             lfq_method,
@@ -2985,7 +2749,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             "quantity_normalised",
             &lfq,
         )?,
-        _ => quant::run_lfq_combine_grouped(
+        _ => quant_lfq::run_lfq_combine_grouped(
             &peptide_quants,
             false,
             lfq_method,
@@ -2996,8 +2760,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     };
     // The factors, at the experiment root under every scope, so a viewer reads them rather
     // than deriving them back from the tables.
-    let size_factors_tsv = d(quant::LFQ_SIZE_FACTORS_TSV);
-    quant::write_size_factors_tsv(&size_factors_tsv, &names, &conditions, &size_factors)?;
+    let size_factors_tsv = d(quant_lfq::LFQ_SIZE_FACTORS_TSV);
+    quant_lfq::write_size_factors_tsv(&size_factors_tsv, &names, &conditions, &size_factors)?;
     info!(
         scope = scope.as_str(),
         factors = ?size_factors.iter().map(|f| f.factor).collect::<Vec<_>>(),
@@ -3024,7 +2788,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         out_sites: &sites_tsv,
     });
     // The cross-run precursor matrix `quant-lfq` writes next to the protein matrix.
-    let prec_lfq = quant::precursor_lfq_sibling(&lfq);
+    let prec_lfq = quant_lfq::precursor_lfq_sibling(&lfq);
     // The protein annotations, at the experiment root for `mumdia report --experiment-dir`,
     // with the producer the manifest records them under. Without any the TSVs' three
     // annotation columns are empty, which is said again here and recorded in the manifest
@@ -3409,17 +3173,24 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         ));
         artifacts.push((
             format!("peptide_quant[{name}]"),
-            artifact::peptide_quant(first_pass_ids.is_some()),
+            // The schema quant wrote: v4 under `quant.q1_fragments` (the `q1_quant` column).
+            artifact::peptide_quant_q1(first_pass_ids.is_some(), qcfg.q1_fragments),
             peptide_quants[i].clone(),
             "quant",
-            Some(quant_written[i].peptide.content_hash.clone()),
+            quant_written[i]
+                .peptide
+                .as_ref()
+                .map(|w| w.content_hash.clone()),
         ));
         artifacts.push((
             format!("protein_group_quant[{name}]"),
             artifact::PROTEIN_GROUP_QUANT,
             protein_quants[i].clone(),
             "quant",
-            Some(quant_written[i].protein.content_hash.clone()),
+            quant_written[i]
+                .protein
+                .as_ref()
+                .map(|w| w.content_hash.clone()),
         ));
         // `quant.fragment_detail` only, so every other manifest keeps its entries.
         if let (Some(path), Some(w)) =

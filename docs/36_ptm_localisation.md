@@ -33,7 +33,8 @@ consulted.
    default `["Phospho"]`) are grouped by (source, base peptide, modification composition,
    label). The composition key is the sorted list of mass deltas, terminal ones included
    (`hypotheses::composition_key`); the prescreen's sibling key, which adds charge and label,
-   lives in the same module (`hypotheses::sibling_key`).
+   lives in the same module (`hypotheses::sibling_key`). A modification written as a mass
+   within 1e-3 Da of its catalogue mass counts as the modification.
 2. **Peaks.** Within a group and charge, the accepted rows (`run_psm_q <= localise.q_max`,
    default 0.01) are sorted by apex retention time and cut into chromatographic peaks
    (`peaks::cut`, `localise.peak_rule`). Under `elution_bounds` two rows next to each other in
@@ -66,7 +67,10 @@ consulted.
    position is not: a modification there and one on the N-terminus give the same b and y
    ladder, so that decoy could never lose. A peptide with more than `localise.max_hypotheses`
    (200) placements is not localised. A peptide with a single real placement is
-   `unambiguous`: its site is fixed by the sequence.
+   `unambiguous`: its site is fixed by the sequence. The representative's own sites are always
+   candidates: where the rules leave one out (an imported library searched under narrower
+   rules), it is added with a warning, so that a peak is never called on a residue its
+   identification did not have.
 4. **Ions.** For every hypothesis, the b1 to b(n-1) and y1 to y(n-1) ions at fragment charge 1,
    and 2 for precursors of charge 3 or more (`ions::build`). One ion is one distinct m/z over all
    hypotheses (1e-4 Th), with the set of hypotheses that predict it. An ion every hypothesis
@@ -187,7 +191,8 @@ site probability per consensus peak (`experiment`):
    evidence: the right temperature lies between the run temperature (independent runs) and the
    run temperature times the number of runs summed (runs that repeat the same evidence), and
    the prior is centred on their geometric mean, the run temperature times the square root of
-   the mean number of runs summed, from where the decoy residue moves it;
+   the mean number of runs summed, from where the decoy residue moves it (the grid of
+   temperatures reaches eight times a prior above 1, so the fit can flatten past it);
 4. the calls and both false localisation rates are computed over the consensus peaks, as over the
    peaks of a run.
 
@@ -292,6 +297,7 @@ mumdia localise --psms-scored exp/HYE_A01/scored.parquet --source 0 \
 # runs, then the combination); in place, recorded in the manifest for
 # `mumdia report --experiment-dir exp`, or elsewhere with --out-dir
 mumdia localise --experiment-dir exp --config search.json
+# --sources needs --out-dir: a subset is never written into the experiment
 mumdia localise --experiment-dir exp --out-dir trial --sources 0,1,2 --config search.json
 ```
 

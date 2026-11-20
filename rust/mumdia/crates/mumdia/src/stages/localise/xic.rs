@@ -71,15 +71,7 @@ impl ScanIndex {
     ) -> Vec<usize> {
         let reach = apex_scans + 1;
         let mut pool: Vec<usize> = Vec::new();
-        for slot in &self.slots {
-            if prec_mz < slot.lower_mz || prec_mz > slot.upper_mz {
-                continue;
-            }
-            if let (Some(im), Some(a), Some(b)) = (apex_im, slot.im_lower, slot.im_upper) {
-                if im < a - SLOT_IM_SLACK || im > b + SLOT_IM_SLACK {
-                    continue;
-                }
-            }
+        for slot in self.holding(prec_mz, apex_im) {
             let idx = &slot.scans;
             let at = idx.partition_point(|&i| scans[i].rt_seconds < apex_rt);
             let from = at.saturating_sub(reach);
@@ -89,14 +81,7 @@ impl ScanIndex {
         if pool.is_empty() {
             return pool;
         }
-        // Retention time, then scan position, so slots sharing a frame order deterministically.
-        pool.sort_by(|&a, &b| {
-            scans[a]
-                .rt_seconds
-                .total_cmp(&scans[b].rt_seconds)
-                .then(a.cmp(&b))
-        });
-        pool.dedup();
+        by_rt(scans, &mut pool);
         let mut k0 = 0;
         let mut best = f64::INFINITY;
         for (k, &i) in pool.iter().enumerate() {
@@ -123,15 +108,7 @@ impl ScanIndex {
         rt_hi: f64,
     ) -> Vec<usize> {
         let mut pool: Vec<usize> = Vec::new();
-        for slot in &self.slots {
-            if prec_mz < slot.lower_mz || prec_mz > slot.upper_mz {
-                continue;
-            }
-            if let (Some(im), Some(a), Some(b)) = (apex_im, slot.im_lower, slot.im_upper) {
-                if im < a - SLOT_IM_SLACK || im > b + SLOT_IM_SLACK {
-                    continue;
-                }
-            }
+        for slot in self.holding(prec_mz, apex_im) {
             let idx = &slot.scans;
             let from = idx
                 .partition_point(|&i| scans[i].rt_seconds < rt_lo)
@@ -141,14 +118,59 @@ impl ScanIndex {
                 pool.extend_from_slice(&idx[from..to]);
             }
         }
-        pool.sort_by(|&a, &b| {
-            scans[a]
-                .rt_seconds
-                .total_cmp(&scans[b].rt_seconds)
-                .then(a.cmp(&b))
-        });
-        pool.dedup();
+        by_rt(scans, &mut pool);
         pool
+    }
+
+    /// The slots whose m/z range holds `prec_mz` and, where both are known, whose 1/K0 range
+    /// (widened by [`SLOT_IM_SLACK`]) holds `apex_im`.
+    fn holding(&self, prec_mz: f64, apex_im: Option<f64>) -> impl Iterator<Item = &Slot> {
+        self.slots.iter().filter(move |slot| {
+            !(prec_mz < slot.lower_mz || prec_mz > slot.upper_mz)
+                && match (apex_im, slot.im_lower, slot.im_upper) {
+                    (Some(im), Some(a), Some(b)) => {
+                        !(im < a - SLOT_IM_SLACK || im > b + SLOT_IM_SLACK)
+                    }
+                    _ => true,
+                }
+        })
+    }
+}
+
+/// Sort scan indices by retention time, then scan position, so slots sharing a frame order
+/// deterministically, and drop repeats.
+fn by_rt(scans: &[Ms2Scan], pool: &mut Vec<usize>) {
+    pool.sort_by(|&a, &b| {
+        scans[a]
+            .rt_seconds
+            .total_cmp(&scans[b].rt_seconds)
+            .then(a.cmp(&b))
+    });
+    pool.dedup();
+}
+
+/// The m/z bounds `tol_ppm` around `mz` after the mass offset. Not `ppm_bounds`, whose
+/// arithmetic rounds differently at the edge.
+fn mz_bounds(mz: f64, mass: &MassOffset, tol_ppm: f64) -> (f64, f64) {
+    let target = mz * mass.factor_at(mz);
+    (
+        target * (1.0 - tol_ppm * 1e-6),
+        target * (1.0 + tol_ppm * 1e-6),
+    )
+}
+
+/// The indices of the peaks of `s` inside the m/z bounds `(lo, hi)`.
+fn peaks_within(s: &Ms2Scan, (lo, hi): (f64, f64)) -> impl Iterator<Item = usize> + '_ {
+    let from = s.peaks.partition_point(|p| (p.mz as f64) < lo);
+    (from..s.peaks.len()).take_while(move |&j| (s.peaks[j].mz as f64) <= hi)
+}
+
+/// Whether peak `j` of `s` lies inside the 1/K0 band `im` (centre, half-width): always without
+/// a band or without per-peak 1/K0.
+fn in_band(s: &Ms2Scan, j: usize, im: Option<(f64, f64)>) -> bool {
+    match (im, s.im.as_deref()) {
+        (Some((c, half)), Some(pim)) => ((pim[j] as f64) - c).abs() <= half,
+        _ => true,
     }
 }
 
@@ -162,25 +184,10 @@ pub(crate) fn intensity(
     tol_ppm: f64,
     im: Option<(f64, f64)>,
 ) -> f64 {
-    let target = mz * mass.factor_at(mz);
-    let (lo, hi) = (
-        target * (1.0 - tol_ppm * 1e-6),
-        target * (1.0 + tol_ppm * 1e-6),
-    );
     let s = &scans[i];
-    let mut best = 0.0f64;
-    let mut j = s.peaks.partition_point(|p| (p.mz as f64) < lo);
-    while j < s.peaks.len() && (s.peaks[j].mz as f64) <= hi {
-        let inside = match (im, s.im.as_deref()) {
-            (Some((c, half)), Some(pim)) => ((pim[j] as f64) - c).abs() <= half,
-            _ => true,
-        };
-        if inside {
-            best = best.max(f64::from(s.peaks[j].intensity));
-        }
-        j += 1;
-    }
-    best
+    peaks_within(s, mz_bounds(mz, mass, tol_ppm))
+        .filter(|&j| in_band(s, j, im))
+        .fold(0.0f64, |best, j| best.max(f64::from(s.peaks[j].intensity)))
 }
 
 /// Whether the profile `trace` (one value per scan, in retention-time order, at `rts`) falls
@@ -243,29 +250,11 @@ pub(crate) fn present(
     tol_ppm: f64,
     im: Option<(f64, f64)>,
 ) -> bool {
-    let target = mz * mass.factor_at(mz);
-    let (lo, hi) = (
-        target * (1.0 - tol_ppm * 1e-6),
-        target * (1.0 + tol_ppm * 1e-6),
-    );
-    for &i in sel {
+    let bounds = mz_bounds(mz, mass, tol_ppm);
+    sel.iter().any(|&i| {
         let s = &scans[i];
-        let mut j = s.peaks.partition_point(|p| (p.mz as f64) < lo);
-        while j < s.peaks.len() && (s.peaks[j].mz as f64) <= hi {
-            if s.peaks[j].intensity > 0.0 {
-                match (im, s.im.as_deref()) {
-                    (Some((c, half)), Some(pim)) => {
-                        if ((pim[j] as f64) - c).abs() <= half {
-                            return true;
-                        }
-                    }
-                    _ => return true,
-                }
-            }
-            j += 1;
-        }
-    }
-    false
+        peaks_within(s, bounds).any(|j| s.peaks[j].intensity > 0.0 && in_band(s, j, im))
+    })
 }
 
 /// The intensity-weighted median 1/K0 of the peaks matching `mzs` in `scans[sel]`, for a
@@ -279,21 +268,15 @@ pub(crate) fn apex_im_of(
 ) -> Option<f64> {
     let mut pts: Vec<(f64, f64)> = Vec::new();
     for &mz in mzs {
-        let target = mz * mass.factor_at(mz);
-        let (lo, hi) = (
-            target * (1.0 - tol_ppm * 1e-6),
-            target * (1.0 + tol_ppm * 1e-6),
-        );
+        let bounds = mz_bounds(mz, mass, tol_ppm);
         for &i in sel {
             let s = &scans[i];
             let pim = s.im.as_deref()?;
-            let mut j = s.peaks.partition_point(|p| (p.mz as f64) < lo);
-            while j < s.peaks.len() && (s.peaks[j].mz as f64) <= hi {
-                if s.peaks[j].intensity > 0.0 && pim[j] > 0.0 {
-                    pts.push((pim[j] as f64, s.peaks[j].intensity as f64));
-                }
-                j += 1;
-            }
+            pts.extend(
+                peaks_within(s, bounds)
+                    .filter(|&j| s.peaks[j].intensity > 0.0 && pim[j] > 0.0)
+                    .map(|j| (pim[j] as f64, s.peaks[j].intensity as f64)),
+            );
         }
     }
     if pts.is_empty() {
@@ -332,5 +315,65 @@ mod tests {
         assert!(!has_valley(&two, &rts, 2.0, 3.0, 0.5));
         assert!(!has_valley(&[0.0; 11], &rts, 2.0, 8.0, 0.5));
         assert!(!has_valley(&two, &rts, 2.0, 8.0, 0.0));
+    }
+
+    /// diaPASEF: two slots over the same m/z range and different 1/K0 ranges, each scan
+    /// carrying the ion at its own 1/K0. A known apex 1/K0 reads its own slot's scans, the
+    /// band keeps the other slot's peak out, and without a known 1/K0 the evidence's own
+    /// median is the in-band one.
+    #[test]
+    fn the_apex_1k0_selects_the_slot_and_the_band() {
+        use mumdia_core::types::{IsolationWindow, Peak};
+        let ion = 650.0;
+        let scan = |k: u32, rt: f64, im_range: (f32, f32), at: f32| Ms2Scan {
+            scan_index: k,
+            rt_seconds: rt,
+            window: IsolationWindow {
+                target_mz: 700.0,
+                lower_mz: 675.0,
+                upper_mz: 725.0,
+                im_lower: Some(im_range.0),
+                im_upper: Some(im_range.1),
+            },
+            peaks: vec![Peak {
+                mz: ion as f32,
+                intensity: 100.0,
+            }],
+            im: Some(vec![at]),
+        };
+        // slot A (0.80-0.90) holds the precursor's 1/K0 0.85; slot B (1.00-1.10) another ion
+        let scans: Vec<Ms2Scan> = (0..10u32)
+            .map(|k| {
+                let rt = f64::from(k / 2);
+                if k % 2 == 0 {
+                    scan(k, rt, (0.80, 0.90), 0.85)
+                } else {
+                    scan(k, rt, (1.00, 1.10), 1.05)
+                }
+            })
+            .collect();
+        let index = ScanIndex::new(&scans);
+        let mass = MassOffset {
+            scalar_ppm: 0.0,
+            grid_mz: Vec::new(),
+            grid_ppm: Vec::new(),
+        };
+        let sel = index.apex_scans(&scans, 700.0, 2.0, Some(0.85), 1);
+        assert_eq!(sel, vec![2, 4, 6]);
+        // without a 1/K0 both slots are read
+        let all = index.apex_scans(&scans, 700.0, 2.0, None, 1);
+        assert_eq!(all, vec![3, 4, 5]);
+        let band = Some((0.85, 0.05));
+        assert!(present(&scans, &sel, ion, &mass, 20.0, band));
+        assert!(!present(&scans, &[1, 3], ion, &mass, 20.0, band));
+        assert!(present(&scans, &[1, 3], ion, &mass, 20.0, None));
+        assert_eq!(intensity(&scans, 3, ion, &mass, 20.0, band), 0.0);
+        assert_eq!(intensity(&scans, 4, ion, &mass, 20.0, band), 100.0);
+        assert_eq!(
+            apex_im_of(&scans, &sel, &[ion], &mass, 20.0),
+            Some(f64::from(0.85f32))
+        );
+        let w = index.window_scans(&scans, 700.0, Some(1.05), 1.0, 2.0);
+        assert!(w.iter().all(|&i| i % 2 == 1), "{w:?}");
     }
 }

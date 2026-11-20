@@ -257,7 +257,7 @@ pub(crate) struct RunAnalysis {
 /// Run the stage on one run. See the module documentation.
 pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
     let t0 = Instant::now();
-    let mut a = analyse(&p)?;
+    let mut a = analyse(&p, &mut None)?;
     let temp = match p.cfg.fixed_temperature() {
         Some(t) => Temperature::fixed(t),
         None => calibrate::fit_runs(&[&a], 1.0),
@@ -266,9 +266,13 @@ pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
     write(&a, &p, &temp, t0.elapsed().as_millis())
 }
 
+/// The proteins of a FASTA by accession, and the path they were read from: read once for
+/// the runs of an experiment.
+type Proteins = Option<(String, std::collections::HashMap<String, String>)>;
+
 /// Read one run's scored rows and spectra up to the log-likelihood of every placement of
 /// every peak that needs evidence.
-fn analyse(p: &LocaliseParams) -> Result<RunAnalysis> {
+fn analyse(p: &LocaliseParams, proteins: &mut Proteins) -> Result<RunAnalysis> {
     let t0 = Instant::now();
     let cfg = p.cfg;
     let t = TableFile::open(p.scored).with_context(|| format!("localise: opening {}", p.scored))?;
@@ -422,11 +426,14 @@ fn analyse(p: &LocaliseParams) -> Result<RunAnalysis> {
         .collect();
     if let Some(fasta) = p.fasta {
         if rules.iter().any(|m| m.n_term == NTerm::ProteinStart) {
-            let proteins: std::collections::HashMap<String, String> =
-                crate::stages::digest::read_fasta(fasta)
+            if proteins.as_ref().is_none_or(|(path, _)| path != fasta) {
+                let map = crate::stages::digest::read_fasta(fasta)
                     .with_context(|| format!("localise: reading {fasta}"))?
                     .into_iter()
                     .collect();
+                *proteins = Some((fasta.to_string(), map));
+            }
+            let proteins = &proteins.as_ref().expect("read above").1;
             for r in rows
                 .iter()
                 .filter(|r| !r.decoy && rules[r.modi].n_term == NTerm::ProteinStart)
@@ -537,7 +544,7 @@ fn analyse(p: &LocaliseParams) -> Result<RunAnalysis> {
         && by_gc.values().any(|m| m.len() > 1);
     let mut spectra: Option<Spectra> = None;
     if needs_valley {
-        spectra = Some(Spectra::load(p)?);
+        spectra = Some(Spectra::load(p, &rows)?);
     }
 
     // --- peaks ---
@@ -569,17 +576,32 @@ fn analyse(p: &LocaliseParams) -> Result<RunAnalysis> {
     }
 
     // --- hypotheses per peak ---
+    // The identified placement is always one: configured rules narrower than the library's
+    // (an imported library, another configuration) would otherwise move its site.
+    let mut off_rule = vec![0usize; cfg.mods.len()];
     let mut results: Vec<PeakResult> = peaks
         .iter()
         .map(|pk| {
             let r = &rows[pk.rep];
             let dec = decoy_residue[r.modi];
-            let positions = hypotheses::candidate_positions(
+            let mut positions = hypotheses::candidate_positions(
                 &r.split,
                 &rules[r.modi].residues,
                 dec,
                 n_term_ok(r),
             );
+            let own: Vec<usize> = r
+                .split
+                .sites
+                .iter()
+                .copied()
+                .filter(|i| !positions.contains(i))
+                .collect();
+            if !own.is_empty() {
+                off_rule[r.modi] += 1;
+                positions.extend(own);
+                positions.sort_unstable();
+            }
             let k = r.split.sites.len();
             let n_decoy_positions = positions
                 .iter()
@@ -611,6 +633,14 @@ fn analyse(p: &LocaliseParams) -> Result<RunAnalysis> {
             }
         })
         .collect();
+    for (name, &n) in cfg.mods.iter().zip(&off_rule).filter(|x| *x.1 > 0) {
+        warn!(
+            modification = %name,
+            peaks = n,
+            "localise: identified sites outside the configured rules of this modification \
+             are added to their peaks' candidate slots"
+        );
+    }
     // Peaks whose placement is fixed by the sequence need no evidence.
     for (pi, res) in results.iter_mut().enumerate() {
         if res.status.is_empty() && res.n_real <= 1 {
@@ -642,7 +672,7 @@ fn analyse(p: &LocaliseParams) -> Result<RunAnalysis> {
     let mut tol_used = p.fallback_tol_ppm;
     if !need.is_empty() {
         if spectra.is_none() {
-            spectra = Some(Spectra::load(p)?);
+            spectra = Some(Spectra::load(p, &rows)?);
         }
         let sp = spectra.as_ref().expect("loaded above");
         tol_used = sp.tol;
@@ -730,18 +760,7 @@ fn analyse(p: &LocaliseParams) -> Result<RunAnalysis> {
 
     // The target peaks with a real choice, and their candidate-to-decoy position ratio.
     let flr_rows = choice_peaks(&rows, &peaks, &results);
-    let (real_pos, decoy_pos) = flr_rows.iter().fold((0usize, 0usize), |acc, &pi| {
-        let res = &results[pi];
-        (
-            acc.0 + res.positions.len() - res.n_decoy_positions,
-            acc.1 + res.n_decoy_positions,
-        )
-    });
-    let ratio = if decoy_pos > 0 {
-        real_pos as f64 / decoy_pos as f64
-    } else {
-        f64::NAN
-    };
+    let ratio = position_ratio(flr_rows.iter().map(|&pi| results[pi].position_counts()));
     Ok(RunAnalysis {
         source: wanted_source,
         rows,
@@ -793,7 +812,7 @@ struct Spectra {
 }
 
 impl Spectra {
-    fn load(p: &LocaliseParams) -> Result<Spectra> {
+    fn load(p: &LocaliseParams, rows: &[Row]) -> Result<Spectra> {
         let scans = crate::spectra::load_ms2(p.spectra_ms2)
             .with_context(|| format!("localise: loading {}", p.spectra_ms2))?;
         let has_im = scans.iter().any(|s| s.im.is_some());
@@ -813,7 +832,10 @@ impl Spectra {
                 } else {
                     vec![None; e.nrows]
                 };
+                let wanted: BTreeSet<(u32, i32)> =
+                    rows.iter().map(|r| (r.candidate_id, r.peak_rank)).collect();
                 (0..e.nrows)
+                    .filter(|&i| wanted.contains(&(cid[i], rank[i])))
                     .filter_map(|i| {
                         im[i]
                             .filter(|v| v.is_finite())
@@ -923,30 +945,17 @@ fn finish(a: &mut RunAnalysis, cfg: &LocaliseConfig, temperature: f64) {
         let res = &mut a.results[pi];
         let c = model::call(&res.ll, &res.hyps, n_slots, temperature);
         res.delta_loglik = Some(model::delta_loglik(&res.ll, c.best));
-        res.status = if res.on_decoy[c.best] {
-            status::DECOY_RESIDUE
-        } else if c.min_site_prob >= cfg.threshold {
-            status::LOCALISED
-        } else {
-            status::AMBIGUOUS
-        };
+        res.status = call_status(res.on_decoy[c.best], c.min_site_prob, cfg.threshold);
         res.best = Some(c.best);
         res.min_site_prob = Some(c.min_site_prob);
         res.post = c.post;
         res.site_prob = c.site_prob;
     }
     a.flr_rows = choice_peaks(&a.rows, &a.peaks, &a.results);
-    let flr = flr_curve(
-        &a.flr_rows
+    let flr = flr_of(
+        a.flr_rows
             .iter()
-            .map(|&pi| {
-                let res = &a.results[pi];
-                (
-                    res.min_site_prob.unwrap_or(0.0),
-                    res.status == status::DECOY_RESIDUE,
-                )
-            })
-            .collect::<Vec<_>>(),
+            .map(|&pi| (a.results[pi].min_site_prob, a.results[pi].status)),
         a.ratio,
     );
     for (k, &pi) in a.flr_rows.iter().enumerate() {
@@ -1179,22 +1188,13 @@ fn write(
         .iter()
         .filter(|&&pi| results[pi].status == status::LOCALISED)
         .count() as u64;
-    // The rates at the threshold: those of the lowest probability still at or above it,
-    // which are the largest, the curves being monotone.
-    let at_threshold = a
-        .flr_rows
-        .iter()
-        .filter(|&&pi| results[pi].min_site_prob.unwrap_or(0.0) >= cfg.threshold)
-        .map(|&pi| (results[pi].flr_model.unwrap_or(0.0), results[pi].flr_decoy))
-        .reduce(|x, y| {
-            (
-                x.0.max(y.0),
-                match (x.1, y.1) {
-                    (Some(u), Some(v)) => Some(u.max(v)),
-                    (u, v) => u.or(v),
-                },
-            )
-        });
+    let at_threshold = rates_at(
+        cfg.threshold,
+        a.flr_rows.iter().map(|&pi| {
+            let r = &results[pi];
+            (r.min_site_prob, r.flr_model, r.flr_decoy)
+        }),
+    );
     let mut stats = BTreeMap::new();
     stats.insert("rows".into(), json!(m));
     stats.insert("peaks".into(), json!(peaks.len()));
@@ -1226,11 +1226,7 @@ fn write(
     stats.insert("target_peaks_with_a_choice".into(), json!(ambiguous));
     stats.insert(
         "localisation_rate".into(),
-        json!(if ambiguous > 0 {
-            localised_amb as f64 / ambiguous as f64
-        } else {
-            f64::NAN
-        }),
+        json!(share(localised_amb, ambiguous)),
     );
     stats.insert(
         "site_flr_model_at_threshold".into(),
@@ -1353,6 +1349,80 @@ fn site_string(s: &Split, positions: &[usize], sp: &[f64]) -> String {
         .map(|&i| format!("{}:{:.4}", s.slot_label(i), sp[i]))
         .collect::<Vec<_>>()
         .join(";")
+}
+
+impl PeakResult {
+    /// Its real and decoy-residue candidate positions.
+    fn position_counts(&self) -> (usize, usize) {
+        (
+            self.positions.len() - self.n_decoy_positions,
+            self.n_decoy_positions,
+        )
+    }
+}
+
+/// The candidate-to-decoy residue position ratio over `(real, decoy)` position counts; NaN
+/// without a decoy-residue position.
+fn position_ratio(counts: impl Iterator<Item = (usize, usize)>) -> f64 {
+    let (real, decoy) = counts.fold((0usize, 0usize), |a, c| (a.0 + c.0, a.1 + c.1));
+    if decoy > 0 {
+        real as f64 / decoy as f64
+    } else {
+        f64::NAN
+    }
+}
+
+/// The status of a call: its best placement on the decoy residue, localised at `threshold`,
+/// or ambiguous.
+fn call_status(best_on_decoy: bool, min_site_prob: f64, threshold: f64) -> &'static str {
+    if best_on_decoy {
+        status::DECOY_RESIDUE
+    } else if min_site_prob >= threshold {
+        status::LOCALISED
+    } else {
+        status::AMBIGUOUS
+    }
+}
+
+/// [`flr_curve`] over called peaks `(min_site_prob, status)`.
+fn flr_of<'a>(
+    peaks: impl Iterator<Item = (Option<f64>, &'a str)>,
+    ratio: f64,
+) -> Vec<(f64, Option<f64>)> {
+    let peaks: Vec<(f64, bool)> = peaks
+        .map(|(p, s)| (p.unwrap_or(0.0), s == status::DECOY_RESIDUE))
+        .collect();
+    flr_curve(&peaks, ratio)
+}
+
+/// The false localisation rates at `threshold` over peaks `(min_site_prob, flr_model,
+/// flr_decoy)`: those of the lowest probability still at or above it, which are the largest,
+/// the curves being monotone.
+fn rates_at(
+    threshold: f64,
+    peaks: impl Iterator<Item = (Option<f64>, Option<f64>, Option<f64>)>,
+) -> Option<(f64, Option<f64>)> {
+    peaks
+        .filter(|p| p.0.unwrap_or(0.0) >= threshold)
+        .map(|p| (p.1.unwrap_or(0.0), p.2))
+        .reduce(|x, y| {
+            (
+                x.0.max(y.0),
+                match (x.1, y.1) {
+                    (Some(u), Some(v)) => Some(u.max(v)),
+                    (u, v) => u.or(v),
+                },
+            )
+        })
+}
+
+/// `n / of`; NaN when `of` is 0.
+fn share(n: u64, of: u64) -> f64 {
+    if of > 0 {
+        n as f64 / of as f64
+    } else {
+        f64::NAN
+    }
 }
 
 /// The false localisation rates at each peak's own minimum site probability, for peaks

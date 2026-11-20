@@ -51,7 +51,7 @@ is the source of truth if it has moved.
 | An `nn_torch` rescore takes far longer than its measured per-PSM rate predicts | The feature matrix marginally exceeded `MUMDIA_NN_STREAM_GB` (default 4) and fell to the disk-backed streaming memmap | Compute `n_psms x n_features x 4 bytes` up front and raise `MUMDIA_NN_STREAM_GB` if RAM allows (`nn_rescore_worker.py:299`) |
 | An `nn_torch` rescore on a desktop is many times slower than the same pool on a server, and the single-run case is not | The worker ran one OpenMP thread per logical CPU. On a hybrid CPU (Intel P + E cores) every parallel op waits for its slowest thread, and the penalty grows with the pool: an i9-13900KS took 118 min at 30 threads for the six-run Astral pool, 74 min at 8, and 11.4 min once subnormals are flushed as well | Since 2026-09-16 the worker caps torch threads at the performance-core count (Windows) or 16; check the `torch cpu threads=` line in the log, and set `MUMDIA_NN_THREAD_CAP` where detection is unavailable (Linux desktops) |
 | `peptides.tsv` / `precursors.tsv` / `proteins.tsv` only at the root of a `run-experiment` output tree, none per run | The experiment-wide report is the only valid TSV unit under a pooled rescore: the grouped q columns are assigned to each group's experiment-wide winner | Read the root files (one quantity column per run, `n_runs`); for per-run counts use the split `scored.parquet` on `run_psm_q`; `mumdia report --experiment-dir` rewrites them at another threshold |
-| Per-run counts on `peptide_q_value` / `precursor_q` / `pg_q_value` are roughly `1/n_runs` of expectation after an experiment-wide rescore | Those grouped q columns are assigned only to each group's single winning row (`rescore.rs:721-728`) and the grouping spans the whole experiment | Use `run_psm_q` as the per-file unit after an experiment-wide rescore |
+| Per-run counts on `peptide_q_value` / `precursor_q` / `pg_q_value` are roughly `1/n_runs` of expectation after an experiment-wide rescore | Those grouped q columns are assigned only to each group's single winning row (`grouped_q`) and the grouping spans the whole experiment | Use `run_psm_q` as the per-file unit after an experiment-wide rescore |
 | Per-run quant gated on a different column than `quant.q_filter` names | `run-experiment` overrides `q_filter` and gates on the pooled `q_value` (`run_experiment.rs:490-498`) | Expected; the override is now logged as a warning. Run `quant` standalone to choose the column |
 | Pooling more runs into one rescore did not tighten q | `q = (decoys + 1) / max(1, targets)` (`fdr.rs:38`) is scale-invariant under replicating the population; the `+1` makes a larger pool marginally looser | Do not attribute per-run count changes to pool size; sub-batch to fit RAM instead |
 | `run` / `run-experiment` stop at once with `the output directory is not writable: cannot write a file in ...` (or `cannot create the directory ...`, `cannot rename a file there`) | The results folder takes no write, or takes a write but refuses the rename the engine's artifacts and caches publish with (a cloud-synced folder, a network share, a folder of another account); since 2026-10-31 this is checked before any stage instead of failing minutes in | Choose an `--out-dir` you can write to on a local disk; `mumdia doctor --out-dir DIR` checks one without creating it (docs/14, "Where MuMDIA writes") |
@@ -103,12 +103,12 @@ in the Docker configs.
 is the only stage that can fall back to `native_tda` when its sidecar fails. With
 `rescore.strict = false` (not the default), a failed or misconfigured
 mokapot/nn_torch sidecar is logged
-as a warning and the run continues on native scores (`rescore.rs:172-180` for
-mokapot, `rescore.rs:199-207` for nn_torch). This means a worker that never
+as a warning and the run continues on native scores (`strict_or_warn` in
+`rescore::run_hashed`). This means a worker that never
 resolved (see the path trap above) or crashed produces a completed run whose
 scores are silently native, not the classifier the config named. Set
 `rescore.strict = true` so any sidecar failure is a hard error
-(`rescore.rs:173`, `rescore.rs:200`); this is the production default. Confirm
+(`strict_or_warn`); this is the production default. Confirm
 `params.classifier` and `model_identity` in
 `psms_scored.parquet.report.json` match what was intended.
 
@@ -538,8 +538,8 @@ or choose the streaming path deliberately.
 measured 0.834 ms/PSM and scales linearly, so a pooled rescore is bounded by RAM
 and storage rather than by statistics. `rescore --competed` accepts several
 competed tables, stamps `source` with the index of the input table each PSM came
-from (`rescore.rs:65-70`, `rescore.rs:108`), and computes a per-source
-`run_psm_q` alongside the pooled `q_value` (`rescore.rs:403-408`). Pooling
+from (the input merge of `rescore::run_hashed`), and computes a per-source
+`run_psm_q` alongside the pooled `q_value` (`per_source_q`). Pooling
 therefore never costs per-run FDR, and splitting a large experiment into batches
 that fit memory does not change what any single run's q means. Batch to fit RAM,
 not to chase a q target.
@@ -553,7 +553,7 @@ against them. Their absence is expected, not a failed run.
 
 **Grouped q columns are per-winner and experiment-wide.** `peptide_q_value`,
 `precursor_q` and `pg_q_value` are assigned only to each group's single winning
-row; every losing sibling keeps 1.0 (`rescore.rs:721-728`). That is correct for
+row; every losing sibling keeps 1.0 (`grouped_q`). That is correct for
 an experiment-wide count, but the grouping spans the whole experiment, so
 counting one run's rows on those columns yields roughly `1/n_runs` of the
 expected number and is meaningless as a per-file figure. The correct per-file

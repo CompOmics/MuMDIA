@@ -49,7 +49,7 @@ fn rank_key(x: f64) -> f64 {
 /// same permutation, and no two records compare equal, so the unstable parallel sort is
 /// deterministic.
 pub fn target_decoy_q(scores: &[(f64, bool)]) -> Vec<f64> {
-    target_decoy_q_core(scores.len(), |i| scores[i])
+    target_decoy_q_by(scores.len(), |i| scores[i])
 }
 
 /// [`target_decoy_q`] from two parallel slices instead of a slice of pairs.
@@ -69,7 +69,7 @@ pub fn target_decoy_q(scores: &[(f64, bool)]) -> Vec<f64> {
 /// whose staging buffer is 186 MB at 11.6M rows and 4.1 GB at the 258.75M-row
 /// immunopeptidomics pool. Two remain on it (`stages/search_seed.rs`, `stages/seed_pool.rs`).
 /// That is a saving left on the table, NOT a divergence hazard: every entry point is a
-/// one-line wrapper over `target_decoy_q_core` below and there is no second copy of the
+/// one-line wrapper over `q_core` below and there is no second copy of the
 /// estimator to drift.
 pub fn target_decoy_q_split(scores: &[f64], is_decoy: &[bool]) -> Vec<f64> {
     assert_eq!(
@@ -79,7 +79,7 @@ pub fn target_decoy_q_split(scores: &[f64], is_decoy: &[bool]) -> Vec<f64> {
         scores.len(),
         is_decoy.len()
     );
-    target_decoy_q_core(scores.len(), |i| (scores[i], is_decoy[i]))
+    target_decoy_q_by(scores.len(), |i| (scores[i], is_decoy[i]))
 }
 
 /// [`target_decoy_q`] over `n` rows whose `(score, is_decoy)` pair `row(i)` returns.
@@ -88,12 +88,19 @@ pub fn target_decoy_q_split(scores: &[f64], is_decoy: &[bool]) -> Vec<f64> {
 /// else (rescore's picked groups), which would otherwise copy them into an `n * 16` byte
 /// pair buffer only to have it walked once into the kernel's own records.
 pub fn target_decoy_q_by(n: usize, row: impl Fn(usize) -> (f64, bool)) -> Vec<f64> {
-    target_decoy_q_core(n, row)
+    q_core(n, 1.0, |i| {
+        let (s, d) = row(i);
+        (s, d, !d)
+    })
 }
 
-/// Shared body of the forms above: everything below depends on the input only through
-/// `(score, is_decoy)` per row.
-fn target_decoy_q_core(n: usize, row: impl Fn(usize) -> (f64, bool)) -> Vec<f64> {
+/// The one walk behind every q kernel here: everything below depends on the input only
+/// through `(score, is_null, is_counted)` per row. FDR(t) = (`ratio` * n_null(>=t) + 1) /
+/// max(1, n_counted(>=t)), where a null row is never counted. Target-decoy is the case
+/// `null = is_decoy`, `counted = !is_decoy`, `ratio = 1`, and `1.0 * x` is exact, so it
+/// returns what its own copy of the walk did, bit for bit
+/// (`q_is_bit_identical_to_the_previous_kernel`).
+fn q_core(n: usize, ratio: f64, row: impl Fn(usize) -> (f64, bool, bool)) -> Vec<f64> {
     if n == 0 {
         return Vec::new();
     }
@@ -102,55 +109,58 @@ fn target_decoy_q_core(n: usize, row: impl Fn(usize) -> (f64, bool)) -> Vec<f64>
     // than a silent truncation that would scatter q onto the wrong rows.
     assert!(
         n <= u32::MAX as usize,
-        "target_decoy_q: {n} rows exceeds the u32 row index"
+        "q kernel: {n} rows exceeds the u32 row index"
     );
-    let mut ranked: Vec<(f64, u32, bool)> = (0..n)
+    // Keyed on `rank_key` so a non-finite score cannot hang the tied-block walk below.
+    // Sorting `(key desc, row asc)` orders ties by row index, as the stable sort over an
+    // ascending index vector did, and no two records compare equal, so the unstable
+    // parallel sort is deterministic.
+    let mut ranked: Vec<(f64, u32, bool, bool)> = (0..n)
         .map(|i| {
-            let (s, d) = row(i);
-            (rank_key(s), i as u32, d)
+            let (s, null, counted) = row(i);
+            (rank_key(s), i as u32, null, counted)
         })
         .collect();
     ranked.par_sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    // An integer count over the same multiset, so reading it off the sorted records rather
-    // than the input is the same number.
-    let total_d = ranked.iter().filter(|r| r.2).count();
-    let total_t = n - total_d;
-    // Walk in score order, processing tied-score blocks together so every PSM in
-    // a block gets the same FDR (its within-tie order is arbitrary and must not
-    // change the q). Numerator uses `n_decoys + 1` (the standard conservative
-    // target-decoy estimate); the bare `n_decoys / n_targets` is optimistic in
-    // the low-count regime.
+    // Integer counts over the whole population. A row that claims both is null, which is
+    // the precedence the forward walk had.
+    let total_null = ranked.iter().filter(|r| r.2).count();
+    let total_counted = ranked.iter().filter(|r| !r.2 && r.3).count();
+    // Process tied-score blocks together so every row in a block gets the same FDR
+    // regardless of its arbitrary within-tie order (determinism,
+    // docs/14_build_test_deploy_gotchas.md). Numerator uses `n_null + 1` (the standard
+    // conservative estimate); the bare ratio is optimistic in the low-count regime.
     //
     // Walked from the WORST-scoring end so the monotonization (q non-increasing with
-    // score) happens in the same pass: the counts at or above a block are the totals
-    // minus what is strictly below it, which is exactly what the forward walk
-    // accumulated, and `qmin` over the blocks already visited is exactly what the
-    // separate backward pass over `fdr_at` used to compute.
+    // score) happens in the same pass: the counts at or above a block are the totals minus
+    // what is strictly below it, which is exactly what the forward walk accumulated, and
+    // `qmin` over the blocks already visited is exactly what the separate backward pass
+    // over `fdr_at` used to compute.
     let mut q = vec![1.0f64; n];
-    let (mut below_d, mut below_t) = (0usize, 0usize);
+    let (mut below_null, mut below_counted) = (0usize, 0usize);
     let mut qmin = 1.0f64;
     let mut end = n;
     while end > 0 {
         let s = ranked[end - 1].0;
         let mut start = end;
-        let (mut block_d, mut block_t) = (0usize, 0usize);
+        let (mut block_null, mut block_counted) = (0usize, 0usize);
         while start > 0 && ranked[start - 1].0 == s {
             start -= 1;
             if ranked[start].2 {
-                block_d += 1;
-            } else {
-                block_t += 1;
+                block_null += 1;
+            } else if ranked[start].3 {
+                block_counted += 1;
             }
         }
-        let td = total_d - below_d;
-        let tt = total_t - below_t;
-        let f = (td as f64 + 1.0) / (tt.max(1) as f64);
+        let nn = total_null - below_null;
+        let nc = total_counted - below_counted;
+        let f = (ratio * nn as f64 + 1.0) / (nc.max(1) as f64);
         qmin = qmin.min(f);
         for r in &ranked[start..end] {
             q[r.1 as usize] = qmin;
         }
-        below_d += block_d;
-        below_t += block_t;
+        below_null += block_null;
+        below_counted += block_counted;
         end = start;
     }
     q
@@ -178,69 +188,17 @@ fn target_decoy_q_core(n: usize, row: impl Fn(usize) -> (f64, bool)) -> Vec<f64>
 /// cache-resident record, which matters because this kernel runs five or more times per
 /// entrapment rescore (pooled PSM q, once per source for `run_psm_q`, and three times
 /// through `grouped_q`) over the whole scored table. Off the default path entirely: only
-/// `QMode::Entrapment` reaches it. Leaving the two copies of one kernel divergent is how
-/// the next reader picks the wrong one.
+/// `QMode::Entrapment` reaches it. It is the same walk as [`target_decoy_q`]
+/// (`q_core`), so the two cannot drift apart.
 pub fn entrapment_q(
     scores: &[f64],
     is_entrapment: &[bool],
     is_real: &[bool],
     ratio: f64,
 ) -> Vec<f64> {
-    let n = scores.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    assert!(
-        n <= u32::MAX as usize,
-        "entrapment_q: {n} rows exceeds the u32 row index"
-    );
-    // Keyed on `rank_key` so a non-finite score cannot hang the tied-block walk below.
-    // The previous stable `sort_by` over an ascending index vector ordered ties by row
-    // index; sorting `(key desc, row asc)` is the same permutation, and no two records
-    // compare equal, so the unstable parallel sort is deterministic.
-    let mut ranked: Vec<(f64, u32, bool, bool)> = (0..n)
-        .map(|i| (rank_key(scores[i]), i as u32, is_entrapment[i], is_real[i]))
-        .collect();
-    ranked.par_sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    // Integer counts over the whole population. `is_entrapment` wins where a row claims
-    // both, which is the precedence the forward walk had.
-    let total_e = ranked.iter().filter(|r| r.2).count();
-    let total_r = ranked.iter().filter(|r| !r.2 && r.3).count();
-    // Process tied-score blocks together so every row in a block gets the same FDP
-    // regardless of its arbitrary within-tie order (determinism,
-    // docs/14_build_test_deploy_gotchas.md). Walked from the WORST-scoring end so the
-    // monotonization happens in the same pass: the counts at or above a block are the
-    // totals minus what is strictly below it, which is exactly what the forward walk
-    // accumulated, and `qmin` over the blocks already visited is what the separate
-    // backward pass over `fdr_at` used to compute.
-    let mut q = vec![1.0f64; n];
-    let (mut below_e, mut below_r) = (0usize, 0usize);
-    let mut qmin = 1.0f64;
-    let mut end = n;
-    while end > 0 {
-        let s = ranked[end - 1].0;
-        let mut start = end;
-        let (mut block_e, mut block_r) = (0usize, 0usize);
-        while start > 0 && ranked[start - 1].0 == s {
-            start -= 1;
-            if ranked[start].2 {
-                block_e += 1;
-            } else if ranked[start].3 {
-                block_r += 1;
-            }
-        }
-        let ne = total_e - below_e;
-        let nr = total_r - below_r;
-        let f = (ratio * ne as f64 + 1.0) / (nr.max(1) as f64);
-        qmin = qmin.min(f);
-        for r in &ranked[start..end] {
-            q[r.1 as usize] = qmin;
-        }
-        below_e += block_e;
-        below_r += block_r;
-        end = start;
-    }
-    q
+    q_core(scores.len(), ratio, |i| {
+        (scores[i], is_entrapment[i], is_real[i])
+    })
 }
 
 /// Number of targets at or below the given q threshold.

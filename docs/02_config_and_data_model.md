@@ -33,7 +33,7 @@ The crate is declared in `lib.rs:6-13` (`config`, `constants`, `error`,
 | Path | Role |
 |---|---|
 | `rust/mumdia/crates/mumdia-core/src/config.rs` | All config structs + every strategy enum; `Config::from_json`, `validate`, `apply_profile`, `canonical_json` (1585 lines) |
-| `rust/mumdia/crates/mumdia-core/src/constants.rs` | Physical constants (`PROTON`, `WATER`, `AMMONIA`, `ISOTOPE_SPACING`), `residue_mass`, `mass_to_mz`, ppm predicates |
+| `rust/mumdia/crates/mumdia-core/src/constants.rs` | Physical constants (`PROTON`, `WATER`, `ISOTOPE_SPACING`), `residue_mass`, `mass_to_mz`, ppm predicates |
 | `rust/mumdia/crates/mumdia-core/src/mass.rs` | `unimod_mass`, `IonType`, `Fragment`, `ParsedPeptidoform`, `parse_peptidoform`, b/y fragment generation |
 | `rust/mumdia/crates/mumdia-core/src/schema.rs` | Frozen `(name, version)` ids for every artifact; `PSMS_SCORED` and `PSMS_COMPETED` are v4, `FEATURES`/`PSMS_EXTRACTED`/`PEPTIDE_QUANT`/`PROTEIN_GROUP_QUANT` are v2, all others v1 |
 | `rust/mumdia/crates/mumdia-core/src/manifest.rs` | `Manifest` + `ArtifactRecord` (provenance) |
@@ -113,7 +113,7 @@ id into the Parquet file itself).
 selected peak; v4 added `selected_peak_rank` for top-K peak promotion. The
 `psms_extracted` and `psms_competed` bumps carry `peak_rank` through the same
 chain. The scored column layout is written by the rescore stage
-(`rescore.rs:508-540`) and is the schema a downstream reader must expect:
+(`scored_schema`) and is the schema a downstream reader must expect:
 
 | Column | Type | Meaning |
 |---|---|---|
@@ -130,11 +130,11 @@ chain. The scored column layout is written by the rescore stage
 | `peptide_q_value` | F64 | peptide-level q (global per base peptide) |
 | `protein_group` | Str | protein-group key |
 | `pg_q_value` | F64 | protein-group q |
-| `global_q_value` | F64 | byte-identical clone of `q_value` (rescore.rs:406), kept for backward compatibility |
+| `global_q_value` | F64 | byte-identical clone of `q_value` (`write_scored`), kept for backward compatibility |
 | `prelim_score` | F64 | pre-rescore feature-stage score |
-| `source` | U32 | index of the `--competed` table the PSM came from, stamped during input concat (rescore.rs:65-70, 108); 0 throughout a single-run rescore |
-| `run_psm_q` | F64 | per-run PSM FDR: an independent target-decoy analysis within each `source` (rescore.rs:411-437) |
-| `experiment_psm_q` | F64 | pooled PSM FDR (clone of `q_value`, rescore.rs:407) |
+| `source` | U32 | index of the `--competed` table the PSM came from, stamped during input concat (`rescore::run_hashed`); 0 throughout a single-run rescore |
+| `run_psm_q` | F64 | per-run PSM FDR: an independent target-decoy analysis within each `source` (`per_source_q`) |
+| `experiment_psm_q` | F64 | pooled PSM FDR (clone of `q_value`, `write_scored`) |
 | `precursor_q` | F64 | per (peptidoform+charge) FDR over the rows that survived compete |
 | `selected_peak_rank` | I32 | which enumerated chromatographic peak won: 0 = the up-front apex, >0 = a promoted alternate (`extract.promote_top_peaks`) |
 
@@ -213,8 +213,7 @@ poor setting is detectable. Defaults always pass.
    (`config.rs:1371-1378`).
 8. Mokapot or NnTorch without `rescore.python` -> `Invalid`
    (`config.rs:1379-1388`).
-9. `classifier = percolator` -> `Invalid`: the adapter is not wired
-   (`config.rs:1389-1395`).
+9. `classifier = percolator` does not parse: `RescorerKind` has no such variant.
 10. Entrapment without `rescore.entrapment_marker` -> `Invalid`
     (`config.rs:1396-1404`).
 
@@ -279,8 +278,7 @@ difference; a maintainer must not treat them as interchangeable.
 
 - `ppm_diff(observed, theoretical)` (`constants.rs:66-68`):
   `1e6 * (observed - theoretical) / theoretical`. **Signed**, normalized by the
-  **theoretical** mass. Used for reporting a mass error and for
-  `ppm_match(obs, theo, tol) = |ppm_diff| <= tol` (`constants.rs:72-74`).
+  **theoretical** mass. Used for reporting a mass error.
 - `ppm_bounds(mz, tol)` (`constants.rs:78-81`): returns `(mz - d, mz + d)` with
   `d = mz * tol * 1e-6`. **Symmetric window centered on the query** `mz`,
   normalized by the query itself.
@@ -334,7 +332,7 @@ data model has one `mods[i]` slot per residue plus separate terminal deltas
 | `residue_mass` | constants.rs:26-51 | 20-AA monoisotopic table; `None` for ambiguous |
 | `is_standard_residue` | constants.rs:54-56 | `residue_mass(aa).is_some()` boolean form |
 | `mass_to_mz` | constants.rs:59-62 | Neutral mass -> m/z |
-| `ppm_diff` / `ppm_match` | constants.rs:66-74 | Theoretical-relative signed ppm + tolerance test |
+| `ppm_diff` | constants.rs:66-68 | Theoretical-relative signed ppm |
 | `ppm_bounds` | constants.rs:78-81 | Query-centered symmetric m/z window |
 | `within_ppm` | constants.rs:92-96 | Min-relative canonical index predicate |
 | `parse_peptidoform` | mass.rs:187-249 | ProForma-lite parser |
@@ -345,7 +343,7 @@ data model has one `mods[i]` slot per residue plus separate terminal deltas
 | `unimod_mass` | mass.rs:13-32 | 11-name UniMod subset |
 | `Manifest` / `ArtifactRecord` | manifest.rs:9-51 | Run provenance; `new`/`record`/`get` (manifest.rs:33-51) |
 | `record_artifact` | mumdia-io/src/lib.rs:20-39 | Build `ArtifactRecord`, hash file |
-| `RejectionReason` | rejection.rs:19-113 | Ordered identification-loss ladder |
+| `RejectionReason` | rejection.rs:20-67 | Identification-loss ladder, in pipeline order; `code()` |
 | `Label` | types.rs:33-51 | Target/Decoy; `.pin()` = +1/-1, `.is_decoy()` |
 
 ### Core data types (`types.rs`)
@@ -378,36 +376,27 @@ docs/18_findings_and_decisions.md).
 
 ### Candidate-audit reason ladder (`rejection.rs`)
 
-`RejectionReason` is the ordered identification-loss ladder written to the
-candidate-audit table (`emit_candidate_audit` / `mumdia audit`). Each candidate's
-row records the EARLIEST stage at which it was lost, so the aggregate answers
-"where was each DIA-NN-only precursor first lost?" without conflating later
-stages. The serialized spelling is `SCREAMING_SNAKE_CASE` and equals
-`code()`; `code()` (rejection.rs:50-71) is the stable string written to
-Parquet/JSON without a serde round-trip. `stage_order()` (rejection.rs:76-97) is
-the ladder position (0 = earliest); `earliest(a, b)` (rejection.rs:106-112) keeps
-the smaller `stage_order` and `Reported` never overrides a real rejection;
-`is_rejection()` (rejection.rs:100-102) is true for any non-`Reported` variant.
+`RejectionReason` is the identification-loss ladder written to the candidate-audit
+table (`emit_candidate_audit` / `mumdia audit`). The audit (`stages/audit.rs`) tests the
+stages in pipeline order and records the first at which a candidate was lost, so the
+aggregate answers "where was each missing precursor first lost?" without conflating later
+stages; `compete` writes the two `OUTCOMPETED_*` codes to its own audit table. `code()`
+(rejection.rs:50-66) is the stable `SCREAMING_SNAKE_CASE` string written to Parquet/JSON.
 
-| `stage_order` | Variant / `code()` | Stage lost at |
-|---|---|---|
-| 0 | `PeptideNotGenerated` / `PEPTIDE_NOT_GENERATED` | search space (A) |
-| 1 | `ModificationNotAllowed` / `MODIFICATION_NOT_ALLOWED` | search space (A) |
-| 2 | `ChargeOutOfRange` / `CHARGE_OUT_OF_RANGE` | search space (A) |
-| 3 | `PrecursorMzOutOfRange` / `PRECURSOR_MZ_OUT_OF_RANGE` | search space (A) |
-| 4 | `NoValidFragments` / `NO_VALID_FRAGMENTS` | search space (A) |
-| 5 | `WrongIsolationWindow` / `WRONG_ISOLATION_WINDOW` | search space (A) |
-| 6 | `RtPruned` / `RT_PRUNED` | candidate generation (B) |
-| 7 | `CandidateCapReached` / `CANDIDATE_CAP_REACHED` | candidate generation (B) |
-| 8 | `NoFragmentTraces` / `NO_FRAGMENT_TRACES` | extraction (C, D) |
-| 9 | `DidNotSurviveExtraction` / `DID_NOT_SURVIVE_EXTRACTION` (was `NoPeakGroup` / `NO_PEAK_GROUP` before docs/29 #16) | extraction (C, D) |
-| 10 | `PeakNotSelected` / `PEAK_NOT_SELECTED` | peak/peptide ranking (E) |
-| 11 | `OutcompetedByTarget` / `OUTCOMPETED_BY_TARGET` | competition (G) |
-| 12 | `OutcompetedByDecoy` / `OUTCOMPETED_BY_DECOY` | competition (G) |
-| 13 | `FailedPrecursorFdr` / `FAILED_PRECURSOR_FDR` | FDR + reporting (H) |
-| 14 | `FailedPeptideFdr` / `FAILED_PEPTIDE_FDR` | FDR + reporting (H) |
-| 15 | `RemovedDuringReporting` / `REMOVED_DURING_REPORTING` | FDR + reporting (H) |
-| 255 | `Reported` / `REPORTED` | sentinel: reached the final report (not a loss) |
+| Variant / `code()` | Stage lost at |
+|---|---|
+| `NoValidFragments` / `NO_VALID_FRAGMENTS` | search space (A) |
+| `WrongIsolationWindow` / `WRONG_ISOLATION_WINDOW` | search space (A) |
+| `RtPruned` / `RT_PRUNED` | candidate generation (B) |
+| `NoFragmentTraces` / `NO_FRAGMENT_TRACES` | extraction (C, D) |
+| `DidNotSurviveExtraction` / `DID_NOT_SURVIVE_EXTRACTION` (was `NoPeakGroup` / `NO_PEAK_GROUP` before docs/29 #16) | extraction (C, D) |
+| `PeakNotSelected` / `PEAK_NOT_SELECTED` | peak/peptide ranking (E) |
+| `OutcompetedByTarget` / `OUTCOMPETED_BY_TARGET` | competition (G) |
+| `OutcompetedByDecoy` / `OUTCOMPETED_BY_DECOY` | competition (G) |
+| `FailedPrecursorFdr` / `FAILED_PRECURSOR_FDR` | FDR + reporting (H) |
+| `FailedPeptideFdr` / `FAILED_PEPTIDE_FDR` | FDR + reporting (H) |
+| `RemovedDuringReporting` / `REMOVED_DURING_REPORTING` | FDR + reporting (H) |
+| `Reported` / `REPORTED` | sentinel: reached the final report (not a loss) |
 
 ## Configuration
 
@@ -419,19 +408,19 @@ listed with its default and effect. Fields marked **default-off**, **inert**, or
 
 | Enum | file:line | Variants (default in bold) | Notes |
 |---|---|---|---|
-| `DecoyStrategy` | config.rs:17-28 | **`reverse`**, `scramble`, `diann_shift`, `none` | `diann_shift` rejected by validate; `none` produces no decoys (invalid FDR) |
+| `DecoyStrategy` | config.rs:17-28 | **`reverse`**, `scramble`, `diann_shift`, `none` | `diann_shift` rejected by validate; `none` produces no decoys (invalid FDR), and a FASTA `run` / `run-experiment` refuses it before the digest |
 | `MatcherKind` | config.rs:38-42 | `bucketed`, **`fragindex`** | fragment-matcher backend for search-seed + extract |
 | `Enzyme` | config.rs | **`trypsin_p`**, `trypsin`, `lys_c`, `lys_n`, `arg_c`, `asp_n`, `glu_c`, `chymotrypsin`, `non_specific`, `custom` | cleavage preset or a custom rule (docs/05, "Cleavage rules") |
 | `CalibrationMethod` | config.rs:56-61 | **`loess`**, `linear`, `none` | `none` rejected by validate (falls through to linear) |
 | `FeatureSet` | config.rs:65-75 | **`minimal`** (14), `rich` (44), `extended` (387) | superset battery in `stages/features/`; the `feature_sets_sized` test (`features.rs:1724-1738`) asserts 14, 14+30, and `14 + 30 + extended_names().len() + 6`, which currently resolves to 387 (337 deduplicated family names) |
 | `RtPredictorKind` | config.rs:79-86 | **`native`**, `deeplc` | DeepLC is a Python sidecar |
 | `FragPredictorKind` | config.rs:90-96 | **`native`**, `ms2pip` | MS2PIP is a Python sidecar |
-| `RescorerKind` | config.rs:100-123 | **`native_tda`**, `mokapot`, `nn_torch`, `percolator`, `entrapment` | see RescoreConfig |
+| `RescorerKind` | config.rs:100-123 | **`native_tda`**, `mokapot`, `nn_torch`, `entrapment` | see RescoreConfig |
 | `PeakClaim` | config.rs:132-182 | **`none`**, `winner_predicted_intensity`, `proportional`, `coelution_winner`, `coelution_proportional`, `coelution_winner_margin`, `coelution_multi_cue`, `coelution_demix`, `coelution_shadow` | shared-peak apportionment; the last three are the fragment-competition framework (see below) |
 | `ClaimCues` (struct, not an enum) | config.rs:192-248 | `mz_close`, `rt_prior`, `ms1_support`, `reassign`, `apportion_em_iters` + their sigmas | composable per-claimant weight cues for `coelution_multi_cue`; every cue defaults off (weight 1.0) |
 | `GateMode` | config.rs:735-758 | **`apex_pearson`**, `peak_spectral`, `spectral_entropy`, `coelution`, `combined` | which spectral score `gate_min_score` thresholds |
 | `UnknownModPolicy` | config.rs:353-357 | **`error`**, `skip` | unknown-mod behavior |
-| `CompetitionMode` | config.rs:873-890 | **`winner_take_all`**, `none`, `features_only`, `unique_evidence`, `margin_gated` | within-group resolution |
+| `CompetitionMode` | config.rs:873-890 | **`winner_take_all`**, `none`, `unique_evidence`, `margin_gated` | within-group resolution |
 | `CompeteGroupBy` | config.rs:894-901 | `base_peptide`, `apex`, **`peptidoform_charge`** | competition grouping key; `peptidoform_charge` (precursor-level) is the default since 2026-09-06, `base_peptide` was renamed from `precursor`, which named stripped-peptide grouping inaccurately (see below) |
 | `RollupMethod` | config.rs:905-911 | **`top_n_sum`**, `sum` | protein rollup |
 | `PeakWindowMode` | config.rs:916-928 | **`per_candidate`**, `consensus` | quant integration window |
@@ -460,8 +449,8 @@ Python sidecar over the PIN. `NnTorch` (107-113): PyTorch semi-supervised MLP
 sidecar (`nn_rescore_worker.py`), a nonlinear Percolator/mokapot-style rescorer
 with CV folds + iterative positive re-selection; on the E.coli benchmark it beats
 linear mokapot on the same PIN and gains further when the extraction gate is
-opened; requires `rescore.python` to point at a torch interpreter. `Percolator`
-(114-115): external `percolator.exe` over the PIN. `Entrapment` (116-122): treats
+opened; requires `rescore.python` to point at a torch interpreter. `Entrapment`
+(116-122): treats
 foreign-proteome PSMs (marked by `entrapment_marker`) as real negatives, trains a
 nonlinear GBM sidecar (out-of-fold by base peptide) or a native linear fallback,
 and reports entrapment-calibrated q-values; the chimeric false matches that
@@ -518,11 +507,10 @@ peak-integrated Pearson >= `gate_min_score` AND co-elution >= `gate_coelution_mi
 
 **`CompetitionMode`** (873-890). `WinnerTakeAll` (default, legacy): keep only the
 top `prelim_score` per group. `None`: keep every candidate (FDR handles
-ambiguity). `FeaturesOnly`: same retained set as `None`, with conflict/contested
-features carrying the interference signal into rescoring (the name documents
-intent for the experiment matrix). `UniqueEvidence`: keep a loser only when
-`unique_fragment_count >= unique_evidence_min_fragments`, else winner-take-all
-fallback (also falls back to WTA when the feature column is absent).
+ambiguity); the retired `features_only`, which kept the same set, is read as `none`.
+`UniqueEvidence`: keep a loser only when its unique-fragment evidence,
+`n_matched_fragments * (1 - peak_contested_frac)`, reaches
+`unique_evidence_min_fragments`, else winner-take-all.
 `MarginGated`: remove a loser only when `winner_score - loser_score >= margin`,
 else keep it (conservative removal for the low-FDR region). Target/decoy labels
 stay in the competition key in every mode, so a target never competes against its
@@ -788,15 +776,15 @@ selection dominate.
 | `promote_top_peaks` | 1 | K peak groups PROMOTED to real feature/rescore rows, each carrying `peak_rank` (selected apex stays rank 0). Must be `<= retain_top_peaks`. **Behaviour-changing and entrapment-gated**: it changes the extracted row population, so compete/rescore must collapse per candidate or the decoy null is K-inflated |
 | `alt_peak_min_area_frac` | 0.10 | min integrated area of a promoted alternate as a fraction of the rank-0 peak; only used when `promote_top_peaks > 1` |
 | `alt_peak_min_separation_s` | 5.0 | min apex-RT separation of a promoted alternate from the rank-0 apex; only used when `promote_top_peaks > 1` |
-| `emit_candidate_audit` | `false` | **default-off**; in `run` gates the separate `audit` stage that writes `candidate_audit.parquet` (`run.rs:428-429`); no stage writes `<psms>.audit.parquet`, although `audit` will read it if present (`audit.rs:52`), so the field's own doc comment overstates what extraction does; no-op for standalone `mumdia extract` (P0.3) |
+| `emit_candidate_audit` | `false` | **default-off**; in `run` gates the separate `audit` stage that writes `candidate_audit.parquet`; no stage writes `<psms>.audit.parquet`, although `audit` will read it if present (`load_extract_reasons`); no-op for standalone `mumdia extract` (P0.3) |
 | `apex_evidence_rank` | `true` | evidence-count apex. On by default: the legacy signature-intensity score is 0.0 at every qualifying scan when none of the top-K predicted fragments is observed, which silently selects the lowest-RT qualifying scan |
 | `emit_gate_diagnostics` | `false` | **default-off** four gate-score columns |
-| `gate_mode` | `apex_pearson` | which spectral score `gate_min_score` thresholds |
+| `gate_mode` | `window_mean` | which spectral score `gate_min_score` thresholds |
 | `gate_coelution_min` | 0.5 | second threshold for `gate_mode = combined` |
 
-The gate default was relaxed from a historical 0.5 to 0.2, briefly set to 0.6
-and measured back to 0.2 (docs/18)
-(config.rs:692-697). Every default-off knob is explicitly documented as
+Under `apex_pearson` the gate default was relaxed from a historical 0.5 to 0.2,
+briefly set to 0.6 and measured back to 0.2 (docs/18); since 2026-10-08 the default
+is `window_mean` at 0.6, a different score. Every default-off knob is explicitly documented as
 requiring entrapment/target-decoy FDR validation before use.
 
 ### `FeaturesConfig` (config.rs:760-823)
@@ -858,9 +846,9 @@ requiring entrapment/target-decoy FDR validation before use.
 | `entrapment_ratio` | 1.0 | N_real_lib / N_entrap_lib scaling |
 | `strict` | `true` | fail on a rescorer sidecar failure or unsupported classifier; set false only for explicit compatibility fallback |
 | `handoff` | `raw` | how the feature matrix reaches a sidecar rescorer (`Handoff`): a row-major f32 `.npy` matrix, byte-identical in scores to `parquet`; mokapot/entrapment fall back to TSV automatically (docs/28 section 11, docs/13) |
-| `features` / `features_file` | `None` | explicit feature projection by name (inline list or one-name-per-line file); strict: a missing name is an error |
+| `features` / `features_file` | `None` | explicit feature projection by name (inline list or one-name-per-line file); strict: a missing name is an error. Mutually exclusive, and an empty inline list is refused at load |
 | `feature_preset` | `all` | named list used when no explicit list is set: `all` every column, `compact` the embedded 114-feature list of docs/28 section 12 (3.4x smaller rescore matrix; the option for pooled rescoring on small machines, -1.2% on the held-out HYE B01 pool). Preset names the table lacks are skipped with a log line |
-| `train_neg_ratio` | 3.0 | cap on decoys per positive in each training fold (0 = every decoy) |
+| `train_neg_ratio` | 2.0 | cap on decoys per positive in each training fold (0 = every decoy) |
 | `train_neg_select` | `hybrid` | which decoys survive the cap: `random`, `margin` (highest-scoring), `hybrid` (`train_margin_frac` from the margin, rest random) |
 | `train_margin_frac` | 0.5 | margin share under `hybrid` |
 | `train_subsample` | 0.0 | random fraction of training rows kept after the cap (0 = all) |
@@ -930,7 +918,7 @@ stale.
 ## Invariants, determinism, gotchas
 
 - **Single source of masses.** No crate outside `mumdia-core` defines a residue
-  mass, `PROTON`, `WATER`, `AMMONIA`, or `ISOTOPE_SPACING`
+  mass, `PROTON`, `WATER`, or `ISOTOPE_SPACING`
   (`constants.rs:10-22`). `ISOTOPE_SPACING = 1.003354835` is the 13C-12C mass
   difference used for MS1 envelope spacing. `PROTON = 1.007276466812` is the
   physically correct proton mass, deliberately not DIA-NN's H-atom value
@@ -938,13 +926,15 @@ stale.
   CODATA/AME; nothing is copied from another engine (clean-room boundary).
 - **Three ppm predicates are not interchangeable.** `within_ppm` (min-relative)
   is the only one the fragment index may use; `ppm_bounds` (query-centered) and
-  `ppm_diff`/`ppm_match` (theoretical-relative) disagree at the tolerance edge.
+  `ppm_diff` (theoretical-relative) disagree at the tolerance edge.
   Substituting one for another shifts which fragments match at the boundary.
 - **Validation is targeted and fail-loud for known invalid states.** Invalid
   decoy/calibration settings, impossible rescorer coverage, missing required
   sidecar settings, and invalid numeric bounds are rejected. It is not a general
   scientific validator. `DecoyStrategy::None` is still accepted but produces no
   decoys and therefore no valid target-decoy FDR; treat it as diagnostic-only.
+  `digest` and `build-library` write such a target-only library, and a FASTA `run`
+  or `run-experiment` refuses it before the digest.
 - **`deny_unknown_fields` everywhere.** A misspelled key fails the whole load, so
   a config file cannot silently ignore a setting the author intended.
 - **An enum variant name is not a specification of what it keys.**

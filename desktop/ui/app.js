@@ -145,6 +145,13 @@ const state = {
   ztscan: {
     probes: {}, hwTyped: false, off: null, analysisTouched: false, analysisChoice: null, lib: null,
   },
+  // The vendor check of each selected spectra file (`vendor_of`), by path, kept once it
+  // answered: the list shows it, and the band plan and the search problems need to know
+  // which inputs are diaPASEF (`diapasefInputs`).
+  vendors: {},
+  // Whether the last band plan was asked for diaPASEF input, so the list re-plans when the
+  // answer changes.
+  spaceDiapasef: false,
 };
 
 function readStored(key, fallback) {
@@ -2892,12 +2899,7 @@ async function renderMzmlList() {
 
     // Say which files need something that is not installed, per file, here rather
     // than as one aggregate blocker after Start.
-    let v = null;
-    try {
-      v = await invoke("vendor_of", { path: f });
-    } catch {
-      /* Detection is advisory; preflight is the authority. */
-    }
+    const v = await vendorOf(f, true);
     if (v && v.label === DIAPASEF_LABEL) anyDiapasef = true;
     if (v && v.needs !== "Nothing") {
       const ok =
@@ -2918,6 +2920,7 @@ async function renderMzmlList() {
       state.picks.mzml.splice(i, 1);
       delete state.picks.conditions[f];
       delete state.conditionTyped[f];
+      delete state.vendors[f];
       renderMzmlList();
       updateRawNote();
     });
@@ -2932,6 +2935,8 @@ async function renderMzmlList() {
     $("lib-for").value = anyDiapasef ? "diapasef" : "other";
     refreshLibForNote();
   }
+  // diaPASEF input is planned in one piece, so the band plan follows the selection.
+  if (anyDiapasef !== state.spaceDiapasef) scheduleSpace();
   // Which of them the engine would refuse for want of a Q1 half-width; asked once per file.
   refreshZtscanNote();
 }
@@ -3216,6 +3221,30 @@ function ztscanOverrides() {
 
 // What `vendor_of` calls a .d the engine reads natively, with its ion mobility.
 const DIAPASEF_LABEL = "Bruker timsTOF diaPASEF .d";
+
+// The vendor check of one spectra file, kept in `state.vendors` for the checks that cannot
+// wait for it (`diapasefInputs`). `fresh` asks again: the list does on every render and
+// Start does before it plans, as a `.d` still being copied reads as a plain Bruker `.d`
+// until its `analysis.tdf_bin` is there. A check that could not answer keeps the last
+// answer; detection is advisory, and the engine's preflight is the authority.
+async function vendorOf(f, fresh = false) {
+  if (!fresh && state.vendors[f]) return state.vendors[f];
+  let v = null;
+  try {
+    v = await invoke("vendor_of", { path: f });
+  } catch {
+    /* Advisory, as above. */
+  }
+  if (v) state.vendors[f] = v;
+  return v || state.vendors[f] || null;
+}
+
+// The selected inputs the engine reads as diaPASEF (`raw::Vendor::BrukerTdf`), by the
+// vendor checks made so far. The engine refuses bands on them (docs/35_diapasef.md), so the
+// band plan searches them in one piece and a custom band count is a search problem.
+function diapasefInputs() {
+  return state.picks.mzml.filter((f) => state.vendors[f]?.label === DIAPASEF_LABEL);
+}
 
 // What the "Library for" choice changes, under the library source chosen above it.
 function refreshLibForNote() {
@@ -4078,7 +4107,9 @@ function prescreenKeep() {
     : 1;
 }
 
-function spaceRequest(libPrecursors) {
+// `diapasef` says whether to plan for diaPASEF input: by default whether any selected file
+// is diaPASEF; a batch searched separately plans its other files without it.
+function spaceRequest(libPrecursors, diapasef = diapasefInputs().length > 0) {
   const d = libraryParams("");
   const threads = parseInt($("threads").value, 10);
   const library = libPrecursors || (state.mode === "library" ? state.picks.lib_precursors : "");
@@ -4099,6 +4130,7 @@ function spaceRequest(libPrecursors) {
     max_variable_mods: maxVariableMods(),
     keep_fraction: prescreenKeep(),
     threads: Number.isFinite(threads) && threads > 0 ? threads : null,
+    diapasef,
   };
 }
 
@@ -4109,9 +4141,11 @@ function scheduleSpace() {
 
 async function refreshSpace() {
   const seq = ++state.spaceSeq;
+  const req = spaceRequest();
+  state.spaceDiapasef = req.diapasef;
   let s = null;
   try {
-    s = await invoke("search_space", { req: spaceRequest() });
+    s = await invoke("search_space", { req });
   } catch (e) {
     s = { reason: `Could not size the search: ${e}`, plan: null, machine: null };
   }
@@ -4172,6 +4206,9 @@ function renderSpace() {
       const per = 4 + (plan.unbanded_gb - 4) / c.bands;
       line += ` About ${(per * c.parallel).toFixed(0)} GB in flight against a budget of ${plan.budget_gb.toFixed(0)} GB.`;
     }
+    if (c.bands > 1 && diapasefInputs().length) {
+      line += " diaPASEF spectra cannot be split into bands: choose Automatic or Off.";
+    }
     parts.push(line);
   }
   const m = s?.machine;
@@ -4182,19 +4219,43 @@ function renderSpace() {
 }
 
 // The band count this search uses. Automatic sizes the inputs being started now, so a
-// stale plan from before the last change cannot decide it.
-async function resolveBands(libPrecursors) {
+// stale plan from before the last change cannot decide it. On diaPASEF input Automatic is
+// one band (the plan says why, `sizing::in_one_piece`), written out so that a preset with
+// bands of its own cannot split the search either: the engine refuses bands there.
+// `diapasef` overrides whether to plan for diaPASEF input (`separateRestBands`), and such a
+// plan is not shown: the note keeps describing the selection.
+async function resolveBands(libPrecursors, diapasef = undefined) {
   const mode = $("bands").value;
   if (mode === "off") return { bands: 1, parallel: 1, explicit: true };
   if (mode === "custom") return { ...customBands(), explicit: true };
+  const shown = diapasef === undefined;
+  const req = shown ? spaceRequest(libPrecursors) : spaceRequest(libPrecursors, diapasef);
+  const onePiece = { bands: 1, parallel: 1, explicit: true };
   try {
-    const s = await invoke("search_space", { req: spaceRequest(libPrecursors) });
-    state.space = s;
-    renderSpace();
+    const s = await invoke("search_space", { req });
+    if (shown) {
+      state.space = s;
+      state.spaceDiapasef = req.diapasef;
+      renderSpace();
+    }
+    if (req.diapasef) return onePiece;
     return { bands: s.plan.bands, parallel: s.plan.parallel, explicit: false };
   } catch {
-    return { bands: 1, parallel: 1, explicit: false };
+    return req.diapasef ? onePiece : { bands: 1, parallel: 1, explicit: false };
   }
+}
+
+// The bands of the files that are not diaPASEF in a batch searched separately, when they
+// differ from the selection's. Each file of a batch is its own run, and the engine refuses
+// bands only on a run whose input carries 1/K0, so the other files keep Automatic's plan
+// instead of the one band a diaPASEF file needs. Null when every file takes the same bands:
+// Off or Custom, or a selection that is all diaPASEF or has none. (A pooled experiment is
+// one run, which the engine refuses bands for as soon as one input carries 1/K0.)
+async function separateRestBands(libPrecursors) {
+  if ($("bands").value !== "auto") return null;
+  const diapasef = diapasefInputs().length;
+  if (!diapasef || diapasef === state.picks.mzml.length) return null;
+  return resolveBands(libPrecursors, false);
 }
 
 // What the viewer reads beyond the defaults. `quant.fragment_detail` writes, beside each
@@ -4257,6 +4318,23 @@ function searchProblems() {
     out.push(
       "The prescreen after retention-time calibration cannot be combined with bands yet. " +
         "Set Bands to Off, or choose the prescreen before prediction."
+    );
+  }
+  const diapasef = diapasefInputs();
+  // The engine refuses all three prescreen modes on diaPASEF input (`refuse_unsupported_on_4d`):
+  // they group the spectra by m/z window only.
+  if (diapasef.length && pre !== "off") {
+    out.push(
+      "The prescreen cannot be used on diaPASEF spectra yet: it groups the spectra by m/z " +
+        "window only and does not use their ion mobility. Set Prescreen to Off for these " +
+        `files: ${diapasef.map(baseName).join(", ")}.`
+    );
+  }
+  if (diapasef.length && $("bands").value === "custom" && customBands().bands > 1) {
+    out.push(
+      "diaPASEF spectra cannot be split into bands yet: when the engine combines the bands, " +
+        "it loses their ion-mobility (1/K0) calibration, so it searches them in one piece. " +
+        `Set Bands to Automatic or Off for these files: ${diapasef.map(baseName).join(", ")}.`
     );
   }
   const zt = ztscanFiles();
@@ -4700,7 +4778,9 @@ async function importDiannLibrary() {
 // two at once would compete for the same cores and memory while making the progress
 // display meaningless. The engine's own `experiment.parallel_runs` exists for the
 // pooled case where it can be reasoned about.
-async function runBatch(p, built, threads, config) {
+// `configOf(file)` is that file's configuration: the shared one, except where diaPASEF and
+// other files of the batch take different bands (`separateRestBands`).
+async function runBatch(p, built, threads, config, configOf = () => config) {
   const files = p.mzml.slice();
   state.batch = { total: files.length, done: 0, failed: 0, results: [] };
 
@@ -4720,7 +4800,7 @@ async function runBatch(p, built, threads, config) {
       fasta: state.mode === "fasta" && !built ? p.fasta || null : null,
       lib_precursors: built ? built[0] : state.mode === "library" ? p.lib_precursors || null : null,
       lib_fragments: built ? built[1] : state.mode === "library" ? p.lib_fragments || null : null,
-      config,
+      config: configOf(file),
       threads: Number.isFinite(threads) && threads > 0 ? threads : null,
     };
 
@@ -5193,6 +5273,10 @@ async function startSearch() {
     return;
   }
 
+  // Which inputs are diaPASEF decides the bands: every file is checked again here, before
+  // the problems are read and the bands resolved, so neither a check the list has not
+  // finished nor an answer from before a copy completed decides them.
+  await Promise.all(p.mzml.map((f) => vendorOf(f, true)));
   const problems = searchProblems();
   if (problems.length) {
     banner($("start-error"), problems.join("\n\n"));
@@ -5277,6 +5361,7 @@ async function startSearch() {
   const libraryIrt =
     state.mode === "library" ? await libraryIrtOf(p.lib_precursors) : null;
   const overrides = runOverrides({ bands, built, libraryIrt });
+  const base = config;
   if (Object.keys(overrides).length) {
     try {
       config = await invoke("derive_config", { base: config, overrides });
@@ -5292,7 +5377,24 @@ async function startSearch() {
   // cost is that closing the window ends the queue, which the per-file output folders
   // make recoverable.
   if (p.mzml.length > 1 && currentRunMode() === "separate") {
-    return runBatch(p, built, threads, config);
+    // A batch that mixes diaPASEF files with others: the diaPASEF files take the one band
+    // above, the others Automatic's plan for them, from a configuration of their own.
+    const rest = await separateRestBands(built ? built[0] : null);
+    if (!rest) return runBatch(p, built, threads, config);
+    let restConfig;
+    try {
+      restConfig = await invoke("derive_config", {
+        base,
+        overrides: runOverrides({ bands: rest, built, libraryIrt }),
+        other: true,
+      });
+    } catch (e) {
+      banner($("start-error"), String(e));
+      screen("input");
+      return;
+    }
+    const diapasef = new Set(diapasefInputs());
+    return runBatch(p, built, threads, config, (f) => (diapasef.has(f) ? config : restConfig));
   }
 
   const req = {

@@ -2,7 +2,7 @@
 //! content hash; config is hashed to invalidate downstream artifacts.
 
 use anyhow::{Context, Result};
-use std::io::{Read, Write};
+use std::io::Write;
 
 /// blake3 hash of a file's bytes, hex-encoded.
 ///
@@ -12,16 +12,9 @@ use std::io::{Read, Write};
 /// bytes as it writes them ([`HashingWrite`], `TableWriter::with_content_hash` and the
 /// other `*_hashed` writers in `table.rs`) removes the read-back instead.
 pub fn blake3_file(path: &str) -> Result<String> {
-    let mut f = std::fs::File::open(path).with_context(|| format!("hashing {path}"))?;
+    let f = std::fs::File::open(path).with_context(|| format!("hashing {path}"))?;
     let mut hasher = blake3::Hasher::new();
-    let mut buf = [0u8; 1 << 16];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
+    hasher.update_reader(f)?;
     Ok(hasher.finalize().to_hex().to_string())
 }
 
@@ -45,7 +38,6 @@ pub fn blake3_str(s: &str) -> String {
 pub struct HashingWrite<W: Write> {
     inner: W,
     hasher: Option<blake3::Hasher>,
-    written: u64,
 }
 
 impl<W: Write> HashingWrite<W> {
@@ -54,13 +46,7 @@ impl<W: Write> HashingWrite<W> {
         HashingWrite {
             inner,
             hasher: hash.then(blake3::Hasher::new),
-            written: 0,
         }
-    }
-
-    /// Bytes forwarded to `inner` so far.
-    pub fn bytes_written(&self) -> u64 {
-        self.written
     }
 
     /// The inner writer and the hex digest of every byte it accepted, or `None` when the
@@ -77,7 +63,6 @@ impl<W: Write> Write for HashingWrite<W> {
         if let Some(h) = self.hasher.as_mut() {
             h.update(&buf[..n]);
         }
-        self.written += n as u64;
         Ok(n)
     }
 
@@ -120,7 +105,6 @@ mod tests {
         // write_all loops over the partial writes; every accepted byte is hashed once.
         w.write_all(&data[..123]).unwrap();
         w.write_all(&data[123..]).unwrap();
-        assert_eq!(w.bytes_written(), data.len() as u64);
         let (sink, digest) = w.finish();
         assert_eq!(sink.out, data);
         assert_eq!(digest.unwrap(), blake3::hash(&data).to_hex().to_string());

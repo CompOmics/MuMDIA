@@ -423,7 +423,7 @@ Options:
       --out-fragments <OUT_FRAGMENTS>
 
       --no-pair-link
-          Keep exactly the listed candidates instead of unioning the decision over `peptidoform_id`. A target and its decoy share that id, so the default keeps pairs together and this breaks pairing unless the list is already pair-complete
+          Keep exactly the listed candidates instead of unioning the decision over `peptidoform_id`. In an imported library a target and its decoy share that id, so the default keeps pairs together; a FASTA-built library gives each decoy its own id and is refused by the default. This breaks pairing unless the list is already pair-complete
 
       --config <CONFIG>
 ```
@@ -540,7 +540,7 @@ Options:
           With --experiment-dir: write <run>/localisation.parquet and localisation_experiment.parquet here instead, and leave the experiment untouched
 
       --sources <SOURCES>
-          With --experiment-dir: only these sources (comma-separated run indices)
+          With --experiment-dir and --out-dir: only these sources (comma-separated run indices). A subset is never written into the experiment
 
       --config <CONFIG>
 ```

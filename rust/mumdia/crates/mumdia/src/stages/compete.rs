@@ -1,8 +1,9 @@
 //! Compete step `mumdia compete` (docs/11_compete_rescore_fdr.md): within each
 //! competition group keep only the best-scoring candidate before target-decoy
 //! counting, so multiple plausible candidates for one elution peak cannot inflate
-//! discoveries. MVP groups by base peptide (target + its decoy + charge/mod
-//! variants); the grouping is configurable.
+//! discoveries. The default groups by peptidoform, charge, label and peak rank, so a
+//! precursor competes only against its own alternative peaks and a target never against
+//! its decoy; the grouping is configurable (`compete.group_by`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,8 +21,8 @@ use mumdia_core::rejection::RejectionReason;
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
 use mumdia_io::table::{
-    publish_copy_of, require_no_nulls, write_table, BatchWriter, Col, FileCopy, SpliceWriter,
-    TableFile, WriteOptions,
+    publish_copy_of, require_no_nulls, write_table, BatchWriter, Col, FileCopy, TableFile,
+    WriteOptions,
 };
 use serde_json::json;
 use tracing::{info, warn};
@@ -39,7 +40,6 @@ pub struct CompeteParams<'a> {
     pub features: &'a str,
     pub out: &'a str,
     pub cfg: &'a CompeteConfig,
-    pub config_hash: &'a str,
     /// The features table's content hash, when the caller already has it (the features
     /// stage's own report hash, from `features::run_hashed`). It is used only when the
     /// competed table is published as the features file's own bytes, which then have
@@ -160,11 +160,10 @@ pub fn run_hashed(p: CompeteParams) -> Result<Written> {
     let keys_ms = t0.elapsed().as_millis();
     let t_resolve = Instant::now();
 
-    // Per-candidate unique-fragment evidence for the `unique_evidence` mode. Prefers
-    // an explicit `unique_fragment_count` feature; otherwise approximates it as
-    // matched-fragment count discounted by the contested fraction; None if neither
-    // is available (mode then falls back to winner-take-all). Read only in that mode:
-    // the other modes never consult it.
+    // Per-candidate unique-fragment evidence for the `unique_evidence` mode: the
+    // matched-fragment count discounted by the contested fraction. None only for a table
+    // without `n_matched_fragments`, which every features set writes; the mode then falls
+    // back to winner-take-all. Read only in that mode: the other modes never consult it.
     let unique_ev: Option<Vec<f64>> = if matches!(p.cfg.mode, CompetitionMode::UniqueEvidence) {
         let unique_ev_src = unique_evidence_with_source(&t);
         // The mode keeps any non-winner whose unique evidence >= unique_evidence_min_fragments.
@@ -194,8 +193,7 @@ pub fn run_hashed(p: CompeteParams) -> Result<Written> {
         }
         if unique_ev_src.is_none() {
             warn!(
-                "compete mode=unique_evidence: no unique_fragment_count / \
-                 (n_matched_fragments, peak_contested_frac/contested_frac) columns; \
+                "compete mode=unique_evidence: no n_matched_fragments column; \
                  falling back to winner-take-all"
             );
         }
@@ -289,7 +287,7 @@ pub fn run_hashed(p: CompeteParams) -> Result<Written> {
     // Published as the features file's bytes: its hash is the features hash, which the
     // caller may already hold. Hashing the output again would read the widest artifact of
     // the run for a value that is known.
-    // A spliced or rewritten table was hashed while it was written.
+    // A rewritten table was hashed while it was written.
     let content_hash = match (published, p.features_hash, streamed_hash) {
         (Published::FeaturesFile(_), Some(h), _) => h.to_string(),
         (_, _, Some(h)) => h,
@@ -305,14 +303,6 @@ pub fn run_hashed(p: CompeteParams) -> Result<Written> {
     // How the table reached disk: `hard_link` / `byte_copy` (the features file's own bytes)
     // or `rewritten`. The values are the same either way; the file bytes and hash are not.
     stats.insert("publish".to_string(), json!(published.as_str()));
-    if let Published::Spliced {
-        rewritten,
-        row_groups,
-    } = published
-    {
-        stats.insert("rewritten_row_groups".to_string(), json!(rewritten));
-        stats.insert("row_groups".to_string(), json!(row_groups));
-    }
     let report = ArtifactReport {
         logical_name: artifact::PSMS_COMPETED.0.to_string(),
         schema_name: artifact::PSMS_COMPETED.0.to_string(),
@@ -442,11 +432,7 @@ enum Published {
     /// Every row survived and the features file already is the competed table, so its bytes
     /// were published unchanged: a hard link, or a byte copy where the link failed.
     FeaturesFile(FileCopy),
-    /// Some rows were removed: the features row groups that lost none were spliced in as
-    /// bytes, and only the `rewritten` of the `row_groups` that did were decoded and
-    /// re-encoded ([`splice_kept_rows`]).
-    Spliced { rewritten: usize, row_groups: usize },
-    /// Decoded and re-encoded batch by batch ([`copy_kept_rows`]).
+    /// Decoded and re-encoded batch by batch ([`copy_kept_rows_with`]).
     Rewritten,
 }
 
@@ -454,7 +440,6 @@ impl Published {
     fn as_str(self) -> &'static str {
         match self {
             Published::FeaturesFile(how) => how.as_str(),
-            Published::Spliced { .. } => "spliced",
             Published::Rewritten => "rewritten",
         }
     }
@@ -468,7 +453,7 @@ enum Reuse {
     No(&'static str),
 }
 
-/// Whether the features file, as written, is already byte for byte what [`copy_kept_rows`]
+/// Whether the features file, as written, is already byte for byte what [`copy_kept_rows_with`]
 /// would write for the rows it holds.
 ///
 /// Four conditions, each necessary:
@@ -529,19 +514,11 @@ fn features_bytes_reusable(
 /// file's bytes are exactly what the copy would write ([`features_bytes_reusable`]) they
 /// are published as the competed table with a hard link, or a byte copy where linking
 /// fails, instead of being decoded and re-encoded column by column. Otherwise, and if the
-/// link and the copy both fail, the rows are rewritten by [`copy_kept_rows`].
+/// link and the copy both fail, the rows are rewritten by [`copy_kept_rows_with`].
 ///
 /// The competed file then has the features file's row groups (65,536 rows) and bytes, and
 /// so the features file's content hash. Every reader decodes the same values in the same
-/// order, which is what the downstream stages see.
-///
-/// When some rows are removed but the row groups that lost none hold at least half the
-/// table's rows ([`splice_pays`]), the table is spliced instead ([`splice_kept_rows`]):
-/// the untouched row groups are copied as bytes and only the ones that lost a row are
-/// rewritten. Otherwise (a grouping that removes many rows, such as `base_peptide`, leaves
-/// few or no untouched groups) splicing would write most of the table twice, once into a
-/// scratch file and once into the output, so the whole table is rewritten directly. A
-/// splice that fails is also followed by the rewrite.
+/// order, which is what the downstream stages see. A table that lost rows is rewritten.
 fn publish_competed(
     t: &TableFile,
     features: &str,
@@ -562,32 +539,7 @@ fn publish_competed(
                  copied as the competed table; rewriting it"
             ),
         },
-        Reuse::Yes => {
-            let spans = row_group_spans(t);
-            if splice_pays(keep, &spans, n) {
-                // The splice only saves work over the rewrite below; it is never required.
-                // `out` is written behind an `AtomicPath` and the scratch files are removed
-                // on drop, so a failed splice leaves nothing behind, and the rewrite then
-                // produces the table the stage always produced.
-                match splice_kept_rows(t, features, out, feat_names, keep, &spans) {
-                    Ok((rows, rewritten, hash)) => {
-                        return Ok((
-                            rows,
-                            Published::Spliced {
-                                rewritten,
-                                row_groups: spans.len(),
-                            },
-                            Some(hash),
-                        ))
-                    }
-                    Err(e) => warn!(
-                        error = %format!("{e:#}"),
-                        "compete: splicing the untouched features row groups into the \
-                         competed table failed; rewriting it"
-                    ),
-                }
-            }
-        }
+        Reuse::Yes => {}
         Reuse::No(reason) => info!(
             reason,
             "compete: the features table's bytes cannot be reused; rewriting the rows"
@@ -606,44 +558,6 @@ fn publish_competed(
     Ok((rows, Published::Rewritten, hash))
 }
 
-/// `(first row, row count)` of each row group of the features file, in file order.
-fn row_group_spans(t: &TableFile) -> Vec<(usize, usize)> {
-    let mut start = 0usize;
-    t.row_group_rows()
-        .into_iter()
-        .map(|len| {
-            let span = (start, len);
-            start += len;
-            span
-        })
-        .collect()
-}
-
-/// How many of the sorted, unique row indices `keep` fall in `[start, start + len)`.
-fn kept_in(keep: &[usize], start: usize, len: usize) -> usize {
-    keep.partition_point(|&r| r < start + len) - keep.partition_point(|&r| r < start)
-}
-
-/// Whether splicing the `n`-row features table beats rewriting it: the non-empty row
-/// groups that keep every row must hold at least half the rows.
-///
-/// A splice rewrites each dirty run into a scratch file and then copies that file's bytes
-/// into the output, so a dirty row is written twice and a clean row once, while a full
-/// rewrite writes every row once but decodes and re-encodes all of them. With the clean
-/// rows at half the table or more, the splice re-encodes at most half the rows and writes
-/// at most 1.5 times the table, and its largest scratch file holds at most half the rows.
-/// Below that, most of the table would go through the scratch file, which costs up to
-/// twice the write traffic and scratch space close to the table's own size. An empty row
-/// group counts for nothing either way.
-fn splice_pays(keep: &[usize], spans: &[(usize, usize)], n: usize) -> bool {
-    let clean_rows: usize = spans
-        .iter()
-        .filter(|&&(s, len)| len > 0 && kept_in(keep, s, len) == len)
-        .map(|&(_, len)| len)
-        .sum();
-    clean_rows > 0 && 2 * clean_rows >= n
-}
-
 /// [`publish_copy_of`], with the test build's fault injection in front of it.
 fn link_or_copy(features: &str, out: &str) -> Result<FileCopy> {
     #[cfg(test)]
@@ -651,17 +565,14 @@ fn link_or_copy(features: &str, out: &str) -> Result<FileCopy> {
     publish_copy_of(features, out)
 }
 
-/// Test-only faults in the fast publication paths, so the fallbacks to the rewrite are
-/// exercised without a filesystem that refuses a link or a splice. Per thread, because the
+/// Test-only faults in the fast publication path, so the fallback to the rewrite is
+/// exercised without a filesystem that refuses a link. Per thread, because the
 /// test harness runs tests concurrently and each stage call publishes on its own thread.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Fault {
     /// [`link_or_copy`] fails before touching the destination.
     Publish,
-    /// [`splice_kept_rows`] fails after it has appended a clean run and written the first
-    /// dirty run's scratch file, so both the output temp and a scratch file exist.
-    Splice,
 }
 
 #[cfg(test)]
@@ -675,98 +586,6 @@ fn inject(at: Fault) -> Result<()> {
         anyhow::bail!("compete: injected {at:?} failure");
     }
     Ok(())
-}
-
-/// Removes a scratch file when dropped, on the error path as on the normal one.
-struct ScratchFile(String);
-
-impl Drop for ScratchFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-/// Write the rows `keep` of the features table to `out` by splicing: every row group that
-/// keeps all its rows is appended as bytes ([`SpliceWriter`], as the pool splices band
-/// tables), and each run of consecutive row groups that lost a row is rewritten by
-/// [`copy_kept_rows`] into a scratch file whose row groups are then appended in its place.
-/// Returns the rows written, how many features row groups were rewritten, and the content
-/// hash of `out`, computed while it was written (the scratch files are not hashed).
-///
-/// The caller has established [`features_bytes_reusable`], so the features file already is
-/// exactly what the copy writes for its rows, and a rewritten run carries the same parquet
-/// schema; the splice would refuse anything else. The rows, their order and their values
-/// are those of the full rewrite. The row-group boundaries are not: the clean groups keep
-/// the features file's, so the file is not byte-identical to a full rewrite.
-fn splice_kept_rows(
-    t: &TableFile,
-    features: &str,
-    out: &str,
-    feat_names: &[String],
-    keep: &[usize],
-    spans: &[(usize, usize)],
-) -> Result<(u64, usize, String)> {
-    let clean: Vec<bool> = spans
-        .iter()
-        .map(|&(s, len)| kept_in(keep, s, len) == len)
-        .collect();
-    let mut w = SpliceWriter::create_hashed(out, features)?;
-    let (mut rows, mut rewritten) = (0u64, 0usize);
-    let mut i = 0usize;
-    while i < spans.len() {
-        let start = i;
-        if clean[i] {
-            while i < spans.len() && clean[i] {
-                i += 1;
-            }
-            rows += w.append_row_groups(features, |k| k >= start && k < i)?;
-            continue;
-        }
-        while i < spans.len() && !clean[i] {
-            i += 1;
-        }
-        rewritten += i - start;
-        let first = spans[start].0;
-        let end = spans[i - 1].0 + spans[i - 1].1;
-        let lo = keep.partition_point(|&r| r < first);
-        let hi = keep.partition_point(|&r| r < end);
-        if lo == hi {
-            // Every row of this run was removed: nothing to write in its place.
-            continue;
-        }
-        let local: Vec<usize> = keep[lo..hi].iter().map(|&r| r - first).collect();
-        let scratch = ScratchFile(format!(
-            "{out}.splice-{}-{first}.parquet",
-            std::process::id()
-        ));
-        copy_kept_rows(
-            &t.span(first, end - first)?,
-            &scratch.0,
-            feat_names,
-            false,
-            &local,
-            COMPETED_ROW_GROUP_ROWS,
-        )?;
-        #[cfg(test)]
-        inject(Fault::Splice)?;
-        let spliced = w.append_row_groups(&scratch.0, |_| true)?;
-        if spliced != local.len() as u64 {
-            anyhow::bail!(
-                "compete: rewrote {} rows of {features} rows {first}..{end} but spliced {spliced}",
-                local.len()
-            );
-        }
-        rows += spliced;
-    }
-    let written = w.close_hashed()?;
-    if written.rows != rows || rows != keep.len() as u64 {
-        anyhow::bail!(
-            "compete: spliced {rows} rows into {out} (file holds {}), expected {}",
-            written.rows,
-            keep.len()
-        );
-    }
-    Ok((rows, rewritten, written.content_hash))
 }
 
 /// The competed table's schema, in exactly the column set and order the previous typed
@@ -829,23 +648,10 @@ fn competed_schema(
 }
 
 /// Copy the surviving rows (`keep`, sorted ascending) of the features table into `out`,
-/// one input batch at a time, in the column set of [`competed_schema`]. The kept rows of a
-/// batch are one contiguous slice of `keep`, and `take` preserves their order, so the
-/// output row order is unchanged.
-fn copy_kept_rows(
-    t: &TableFile,
-    out: &str,
-    feat_names: &[String],
-    synth_peak_rank: bool,
-    keep: &[usize],
-    row_group_rows: usize,
-) -> Result<u64> {
-    let opts = WriteOptions::new().row_group_rows(row_group_rows);
-    Ok(copy_kept_rows_with(t, out, feat_names, synth_peak_rank, keep, opts)?.0)
-}
-
-/// [`copy_kept_rows`] under explicit writer options; returns the rows and, when `opts`
-/// asks for it, the content hash of `out`.
+/// one input batch at a time, in the column set of [`competed_schema`], under the writer
+/// options `opts`; returns the rows and, when `opts` asks for it, the content hash of `out`.
+/// The kept rows of a batch are one contiguous slice of `keep`, and `take` preserves their
+/// order, so the output row order is unchanged.
 fn copy_kept_rows_with(
     t: &TableFile,
     out: &str,
@@ -1041,16 +847,12 @@ fn densify(a: ArrayRef, f: &Field) -> Result<ArrayRef> {
     })
 }
 
-/// Per-candidate unique-evidence estimate plus the name of the column it came from.
+/// Per-candidate unique-evidence estimate plus the name of the column it came from. The
+/// Extended set carries the contested fraction as `peak_contested_frac`, older artifacts
+/// as `contested_frac`.
 fn unique_evidence_with_source(t: &TableFile) -> Option<(Vec<f64>, &'static str)> {
-    if let Some(u) = col_f64(t, "unique_fragment_count") {
-        return Some((u, "unique_fragment_count"));
-    }
     let nm = col_f64(t, "n_matched_fragments")?;
-    let contested = prefer_peak_contested_fraction(
-        col_f64(t, "peak_contested_frac"),
-        col_f64(t, "contested_frac"),
-    );
+    let contested = col_f64(t, "peak_contested_frac").or_else(|| col_f64(t, "contested_frac"));
     match contested {
         Some(cf) => Some((
             nm.iter()
@@ -1061,15 +863,6 @@ fn unique_evidence_with_source(t: &TableFile) -> Option<(Vec<f64>, &'static str)
         )),
         None => Some((nm, "n_matched_fragments")),
     }
-}
-
-/// The Extended set carries the contested fraction as `peak_contested_frac`; older
-/// artifacts as `contested_frac`. Prefer the former.
-fn prefer_peak_contested_fraction(
-    peak_contested: Option<Vec<f64>>,
-    legacy_contested: Option<Vec<f64>>,
-) -> Option<Vec<f64>> {
-    peak_contested.or(legacy_contested)
 }
 
 /// Read a column as f64, accepting an f32 or an i32 column (widened) as well. The columns
@@ -1121,7 +914,7 @@ fn resolve_competition(
             .min_by(|&a, &b| prelim[b].total_cmp(&prelim[a]).then(a.cmp(&b)))
             .expect("a run of equal keys is never empty");
         match mode {
-            CompetitionMode::None | CompetitionMode::FeaturesOnly => {
+            CompetitionMode::None => {
                 keep.extend(members.iter().map(|&(_, i)| i));
             }
             CompetitionMode::WinnerTakeAll => {
@@ -1196,7 +989,6 @@ mod tests {
             features: features.to_str().unwrap(),
             out: features.to_str().unwrap(),
             cfg: &cfg,
-            config_hash: "h",
             features_hash: None,
         })
         .unwrap_err()
@@ -1233,14 +1025,14 @@ mod tests {
     }
 
     #[test]
-    fn none_and_features_only_keep_all() {
+    fn none_keeps_all_and_reads_the_retired_features_only() {
         let g = one_group(vec![0, 1, 2]);
         let prelim = [0.1, 0.9, 0.5];
-        for mode in [CompetitionMode::None, CompetitionMode::FeaturesOnly] {
-            let (keep, removed) = resolve_competition(&g, &prelim, mode, 0.0, 2, None);
-            assert_eq!(keep, vec![0, 1, 2]);
-            assert!(removed.is_empty());
-        }
+        let (keep, removed) = resolve_competition(&g, &prelim, CompetitionMode::None, 0.0, 2, None);
+        assert_eq!(keep, vec![0, 1, 2]);
+        assert!(removed.is_empty());
+        let mode: CompetitionMode = serde_json::from_str(r#""features_only""#).unwrap();
+        assert_eq!(mode, CompetitionMode::None);
     }
 
     #[test]
@@ -1283,10 +1075,26 @@ mod tests {
 
     #[test]
     fn unique_evidence_prefers_extended_peak_contested_fraction() {
-        let selected = prefer_peak_contested_fraction(Some(vec![0.25]), Some(vec![0.75])).unwrap();
-        assert_eq!(selected, vec![0.25]);
-        let legacy = prefer_peak_contested_fraction(None, Some(vec![0.75])).unwrap();
-        assert_eq!(legacy, vec![0.75]);
+        let dir = tmp_dir("contested");
+        let table = |name: &str, contested: &[(&str, f64)]| {
+            let p = dir.join(name).display().to_string();
+            let mut cols = vec![IoCol::F64("n_matched_fragments".into(), vec![4.0])];
+            for &(c, v) in contested {
+                cols.push(IoCol::F64(c.into(), vec![v]));
+            }
+            mumdia_io::table::write_table(&p, cols).unwrap();
+            TableFile::open(&p).unwrap()
+        };
+        let evidence = |t: &TableFile| unique_evidence_with_source(t).unwrap().0;
+        let both = table(
+            "both.parquet",
+            &[("peak_contested_frac", 0.25), ("contested_frac", 0.75)],
+        );
+        assert_eq!(evidence(&both), vec![3.0]);
+        let legacy = table("legacy.parquet", &[("contested_frac", 0.75)]);
+        assert_eq!(evidence(&legacy), vec![1.0]);
+        assert_eq!(evidence(&table("plain.parquet", &[])), vec![4.0]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1341,7 +1149,7 @@ mod tests {
                 .min_by(|&&a, &&b| prelim[b].total_cmp(&prelim[a]).then(a.cmp(&b)))
                 .unwrap();
             match mode {
-                CompetitionMode::None | CompetitionMode::FeaturesOnly => {
+                CompetitionMode::None => {
                     keep.extend(members.iter().copied());
                 }
                 CompetitionMode::WinnerTakeAll => {
@@ -1425,7 +1233,6 @@ mod tests {
         entries.sort_unstable();
         for mode in [
             CompetitionMode::None,
-            CompetitionMode::FeaturesOnly,
             CompetitionMode::WinnerTakeAll,
             CompetitionMode::MarginGated,
             CompetitionMode::UniqueEvidence,
@@ -1712,6 +1519,19 @@ mod tests {
     const TABLE_FEATURES: [&str; 3] = ["charge", "n_matched_fragments", "frag_corr"];
 
     /// Every row of a parquet file as one batch, for a value-for-value comparison.
+    /// [`copy_kept_rows_with`] into row groups of `row_group_rows`, without the hash.
+    fn copy_kept_rows(
+        t: &TableFile,
+        out: &str,
+        feat_names: &[String],
+        synth_peak_rank: bool,
+        keep: &[usize],
+        row_group_rows: usize,
+    ) -> Result<u64> {
+        let opts = WriteOptions::new().row_group_rows(row_group_rows);
+        Ok(copy_kept_rows_with(t, out, feat_names, synth_peak_rank, keep, opts)?.0)
+    }
+
     fn whole_table(path: &str) -> RecordBatch {
         let t = mumdia_io::table::Table::read(path).unwrap();
         arrow::compute::concat_batches(&t.schema, &t.batches).unwrap()
@@ -1727,7 +1547,6 @@ mod tests {
             features,
             out,
             cfg,
-            config_hash: "h",
             features_hash,
         })
         .unwrap();
@@ -1833,77 +1652,10 @@ mod tests {
     }
 
     #[test]
-    fn removing_a_few_rows_splices_the_untouched_row_groups() {
-        // Row 7 takes row 5's peptidoform (both targets, both charge 3), so the default
-        // grouping puts them in one group and row 7 (the lower prelim) is removed. Row 7
-        // is in the second of four 4-row groups: that group is rewritten, the other three
-        // are spliced in as bytes.
-        let dir = tmp_dir("splice");
-        let feats = dir.join("features.parquet");
-        let feats = feats.to_str().unwrap();
-        write_features_table(feats, 16, 4, &[7], false, true, false);
-        let out = dir.join("competed.parquet");
-        let out = out.to_str().unwrap();
-        let cfg = CompeteConfig::default();
-        let (w, rep) = compete_with(feats, out, &cfg, Some(&"f".repeat(64)));
-        assert_eq!(rep.stats["removed"], json!(1));
-        assert_eq!(rep.stats["publish"], json!("spliced"));
-        assert_eq!(rep.stats["rewritten_row_groups"], json!(1));
-        assert_eq!(rep.stats["row_groups"], json!(4));
-        assert_eq!(w.rows, 15);
-        // Not the features bytes, so the output is hashed and the caller's hash ignored.
-        assert_eq!(rep.content_hash, mumdia_io::hash::blake3_file(out).unwrap());
-        assert_eq!(row_group_sizes(out), vec![4, 3, 4, 4]);
-        // The values and their order are exactly the full rewrite's.
-        let keep: Vec<usize> = (0..16).filter(|&r| r != 7).collect();
-        let reference = dir.join("reference.parquet");
-        let reference = reference.to_str().unwrap();
-        rewritten_reference(feats, reference, &keep);
-        assert_eq!(whole_table(out), whole_table(reference));
-        // The scratch file of the rewritten group is gone.
-        let names: Vec<String> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            names
-                .iter()
-                .all(|n| !n.contains(".splice-") && !n.contains(".tmp-")),
-            "{names:?}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_row_group_that_loses_every_row_is_dropped_from_the_splice() {
-        // One row per row group: removing row 7 empties its group, which contributes
-        // nothing, and the fifteen others are spliced.
-        let dir = tmp_dir("splice_empty_group");
-        let feats = dir.join("features.parquet");
-        let feats = feats.to_str().unwrap();
-        write_features_table(feats, 16, 1, &[7], false, true, false);
-        let out = dir.join("competed.parquet");
-        let out = out.to_str().unwrap();
-        let cfg = CompeteConfig::default();
-        let (w, rep) = compete_with(feats, out, &cfg, None);
-        assert_eq!(rep.stats["publish"], json!("spliced"));
-        assert_eq!(rep.stats["rewritten_row_groups"], json!(1));
-        assert_eq!(w.rows, 15);
-        assert_eq!(row_group_sizes(out), vec![1; 15]);
-        let keep: Vec<usize> = (0..16).filter(|&r| r != 7).collect();
-        let reference = dir.join("reference.parquet");
-        let reference = reference.to_str().unwrap();
-        rewritten_reference(feats, reference, &keep);
-        assert_eq!(whole_table(out), whole_table(reference));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn when_every_row_group_loses_a_row_the_table_is_rewritten() {
+    fn a_table_that_loses_rows_is_rewritten() {
         // Rows 4 and 7 duplicate rows 2 and 5, so rows 2 and 7 are removed, one from each
-        // of the two 4-row groups. No group is clean, so splicing would rewrite everything
-        // through scratch files; the table is rewritten directly instead.
-        let dir = tmp_dir("splice_all_dirty");
+        // of the two 4-row groups, and the table is rewritten.
+        let dir = tmp_dir("rewrite_removed");
         let feats = dir.join("features.parquet");
         let feats = feats.to_str().unwrap();
         write_features_table(feats, 8, 4, &[4, 7], false, true, false);
@@ -1976,23 +1728,12 @@ mod tests {
         }
     }
 
-    /// Temporary or scratch files left in `dir`.
+    /// Temporary files left in `dir`.
     fn leftovers(dir: &std::path::Path) -> Vec<String> {
         std::fs::read_dir(dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|n| n.contains(".tmp-") || n.contains(".splice-"))
-            .collect()
-    }
-
-    /// Candidate ids of `path`, which the test tables set to the row index.
-    fn kept_rows(path: &str) -> Vec<usize> {
-        TableFile::open(path)
-            .unwrap()
-            .u32("candidate_id")
-            .unwrap()
-            .into_iter()
-            .map(|c| c as usize)
+            .filter(|n| n.contains(".tmp-"))
             .collect()
     }
 
@@ -2082,115 +1823,6 @@ mod tests {
         );
         assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_failed_splice_falls_back_to_the_rewrite() {
-        // The fault fires after the splice has appended the first clean group and written
-        // the scratch file of the dirty one, so both the output temp and a scratch file
-        // exist when it fails. Neither may survive, and the rewrite must be what the
-        // stage writes without a splice.
-        let dir = tmp_dir("fallback_splice");
-        let feats = dir.join("features.parquet");
-        let feats = feats.to_str().unwrap();
-        write_features_table(feats, 16, 4, &[7], false, true, false);
-        let out = dir.join("competed.parquet");
-        let out = out.to_str().unwrap();
-        let cfg = CompeteConfig::default();
-        let (w, rep) = {
-            let _armed = Armed::new(Fault::Splice);
-            compete_with(feats, out, &cfg, None)
-        };
-        assert_eq!(rep.stats["removed"], json!(1));
-        assert_eq!(rep.stats["publish"], json!("rewritten"));
-        assert!(!rep.stats.contains_key("rewritten_row_groups"));
-        assert_eq!(w.rows, 15);
-        let keep: Vec<usize> = (0..16).filter(|&r| r != 7).collect();
-        let reference = dir.join("reference.parquet");
-        let reference = reference.to_str().unwrap();
-        rewritten_reference(feats, reference, &keep);
-        assert_eq!(
-            std::fs::read(out).unwrap(),
-            std::fs::read(reference).unwrap()
-        );
-        assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn dirty_runs_over_several_row_groups_between_clean_ones_are_spliced() {
-        // Six 4-row groups. Rows 7, 10 and 22 take the peptidoforms of rows 5, 8 and 20,
-        // and on prelim_score (row % 7) rows 7, 8 and 22 lose. Groups 1 and 2 (rows 4-11)
-        // are one dirty run of two groups, rewritten into one scratch file; group 5 is a
-        // second dirty run after the clean groups 3 and 4; groups 0, 3 and 4 are clean and
-        // hold 12 of the 24 rows, which is enough to splice.
-        let dir = tmp_dir("splice_multi");
-        let feats = dir.join("features.parquet");
-        let feats = feats.to_str().unwrap();
-        write_features_table(feats, 24, 4, &[7, 10, 22], false, true, false);
-        let out = dir.join("competed.parquet");
-        let out = out.to_str().unwrap();
-        let cfg = CompeteConfig::default();
-        let (w, rep) = compete_with(feats, out, &cfg, None);
-        assert_eq!(rep.stats["removed"], json!(3));
-        assert_eq!(rep.stats["publish"], json!("spliced"));
-        assert_eq!(rep.stats["rewritten_row_groups"], json!(3));
-        assert_eq!(rep.stats["row_groups"], json!(6));
-        assert_eq!(w.rows, 21);
-        let keep: Vec<usize> = (0..24).filter(|r| ![7, 8, 22].contains(r)).collect();
-        assert_eq!(kept_rows(out), keep);
-        // The two-group dirty run is one re-chunked scratch group of its 6 kept rows.
-        assert_eq!(row_group_sizes(out), vec![4, 6, 4, 4, 3]);
-        let reference = dir.join("reference.parquet");
-        let reference = reference.to_str().unwrap();
-        rewritten_reference(feats, reference, &keep);
-        assert_eq!(whole_table(out), whole_table(reference));
-        assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_splice_is_not_chosen_when_the_untouched_groups_hold_under_half_the_rows() {
-        // Rows 7, 13, 16 and 22 duplicate rows 5, 11, 14 and 20, which removes rows 7, 11,
-        // 14 and 22 from groups 1, 2, 3 and 5. Groups 0 and 4 are clean but hold only 8 of
-        // the 24 rows, so a splice would push most of the table through scratch files; the
-        // table is rewritten directly.
-        let dir = tmp_dir("splice_under_half");
-        let feats = dir.join("features.parquet");
-        let feats = feats.to_str().unwrap();
-        write_features_table(feats, 24, 4, &[7, 13, 16, 22], false, true, false);
-        let out = dir.join("competed.parquet");
-        let out = out.to_str().unwrap();
-        let cfg = CompeteConfig::default();
-        let (w, rep) = compete_with(feats, out, &cfg, None);
-        assert_eq!(rep.stats["removed"], json!(4));
-        assert_eq!(rep.stats["publish"], json!("rewritten"));
-        assert_eq!(w.rows, 20);
-        let keep: Vec<usize> = (0..24).filter(|r| ![7, 11, 14, 22].contains(r)).collect();
-        assert_eq!(kept_rows(out), keep);
-        let reference = dir.join("reference.parquet");
-        let reference = reference.to_str().unwrap();
-        rewritten_reference(feats, reference, &keep);
-        assert_eq!(
-            std::fs::read(out).unwrap(),
-            std::fs::read(reference).unwrap()
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn splice_pays_counts_the_rows_of_non_empty_clean_groups() {
-        let spans = [(0, 4), (4, 0), (4, 4), (8, 4)];
-        // Group 2 loses row 5: clean rows 8 of 12.
-        let keep: Vec<usize> = (0..12).filter(|&r| r != 5).collect();
-        assert!(splice_pays(&keep, &spans, 12));
-        // Groups 0 and 2 lose a row: the clean rows are group 3's 4 of 12, and the empty
-        // group 1 adds nothing.
-        let keep: Vec<usize> = (0..12).filter(|&r| r != 1 && r != 5).collect();
-        assert!(!splice_pays(&keep, &spans, 12));
-        // Only the empty group is clean.
-        let keep: Vec<usize> = (0..12).filter(|&r| r % 4 != 0).collect();
-        assert!(!splice_pays(&keep, &spans, 12));
     }
 
     /// A v1 features table: the bookkeeping columns, and every feature Float64, among them
@@ -2349,7 +1981,6 @@ mod tests {
             features: bad,
             out: dir.join("out.parquet").to_str().unwrap(),
             cfg: &CompeteConfig::default(),
-            config_hash: "test",
             features_hash: None,
         })
         .unwrap_err();
