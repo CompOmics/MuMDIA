@@ -455,8 +455,8 @@ def build_reference(args):
     seed = pq.read_table(args.seed_path, columns=cols)
     confident = pc.and_(
         pc.equal(seed.column("label"), "target"),
-        pc.less(seed.column("spectrum_q").cast(pa.float64()),
-                pa.scalar(float(args.q_train), pa.float64())),
+        pc.less_equal(seed.column("spectrum_q").cast(pa.float64()),
+                      pa.scalar(float(args.q_train), pa.float64())),
     )
     seed = seed.filter(confident).to_pydict()
     ref = {}

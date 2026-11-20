@@ -190,9 +190,8 @@ pub struct AnchorTable {
 /// Write the search anchors of a single-run scored table to `out`, in the seed's column
 /// shape so `deeplc_finetune.py` reads them exactly as it reads `seed_psms.parquet`.
 ///
-/// Selected: targets with a finite `precursor_q < q`, a finite `apex_rt` and a finite
-/// `score`: the strict cut of the seed anchors, which `deeplc_finetune.py` applies to this
-/// table again. `precursor_q` is written to its group's winning row only, so this is already one
+/// Selected: targets with a finite `precursor_q <= q`, a finite `apex_rt` and a finite
+/// `score`. `precursor_q` is written to its group's winning row only, so this is already one
 /// row per precursor; a candidate that still has several rows keeps its best-scoring one
 /// (the first on a tie). Rows are written in ascending `candidate_id`, which makes the
 /// table, and the worker's reference built from it, independent of the scored table's row
@@ -227,7 +226,7 @@ pub fn write_search_anchors(scored: &str, q: f64, out: &str) -> Result<AnchorTab
     for i in 0..t.nrows {
         if !is_target[i]
             || !pq[i].is_finite()
-            || pq[i] >= q
+            || pq[i] > q
             || !apex[i].is_finite()
             || !score[i].is_finite()
         {
@@ -461,7 +460,7 @@ fn bootstrap_and_refit(p: &Refit, library: &str, anchors_path: &str) -> Result<A
     let need = cfg.rt_im_train.min_seed_for_calibration.max(2);
     if table.base_peptides < need {
         anyhow::bail!(
-            "the bootstrap search found {} target base peptides at precursor_q < {q} \
+            "the bootstrap search found {} target base peptides at precursor_q <= {q} \
              (need rt_im_train.min_seed_for_calibration = {need})",
             table.base_peptides
         );
@@ -594,8 +593,7 @@ mod tests {
             &[
                 // cid, peptidoform, z, base, label, score, precursor_q, apex_rt
                 (7, "PEPTIDEK", 2, 70, "target", 5.0, 0.001, 600.0),
-                (3, "ELVISK", 2, 30, "target", 4.0, 0.009, 300.0), // below q: kept
-                (2, "ATQK", 2, 20, "target", 4.5, 0.010, 200.0),   // at q: dropped
+                (3, "ELVISK", 2, 30, "target", 4.0, 0.010, 300.0), // at q: kept
                 (4, "ELVISK", 3, 30, "target", 3.0, 0.005, 301.0), // same base, other charge
                 (9, "DECOYK", 2, 90, "decoy", 9.0, 0.000, 900.0),  // decoy: dropped
                 (5, "LOSERK", 2, 50, "target", 2.0, 1.000, 500.0), // grouped loser: dropped
@@ -624,7 +622,7 @@ mod tests {
         assert_eq!(a.u32("base_peptide_id").unwrap(), vec![30, 30, 70]);
         assert_eq!(a.str("label").unwrap(), vec!["target"; 3]);
         assert_eq!(a.f64("score").unwrap(), vec![4.0, 3.0, 6.0]);
-        assert_eq!(a.f64("spectrum_q").unwrap(), vec![0.009, 0.005, 0.002]);
+        assert_eq!(a.f64("spectrum_q").unwrap(), vec![0.010, 0.005, 0.002]);
         assert_eq!(a.f64("observed_rt").unwrap(), vec![300.0, 301.0, 602.0]);
         // The exact column set and types `deeplc_finetune.py::build_reference` reads, with
         // the engine's string type (utf8, not large_utf8).

@@ -270,11 +270,6 @@ than a number. Both are recorded in every run's `manifest.json`.
 - **`rt_im_train.rt_window_min_s` floors every RT half-window.** Only the adaptive window read
   it; the global `w_rt`, held-out or in-sample, had a literal 1 s floor. The default is 1 s, so
   only a configuration that sets it above a run's `w_rt` changes.
-- **The DeepLC fine-tune and the multi-head calibration take the anchors rt-im-train takes**:
-  `spectrum_q < q_train`, where the worker kept `<=`, so a seed PSM at exactly `q_train` was a
-  reference peptide of the worker and not an anchor of the calibration. The bootstrap search of
-  `rt_im_train.multihead_anchors = "search"` writes its anchors with the same strict cut
-  (`precursor_q < q_train`), so the worker keeps every row it is given.
 - **The held-out split of `rt_im_train.window_holdout_frac` rounds the same way in the worker
   and in the engine** (half away from zero). At a fraction such as 0.0125 the engine held out
   the peptides with `base_peptide_id % 1000 < 13` and the worker excluded only those below 12,

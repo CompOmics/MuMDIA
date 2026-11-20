@@ -1921,7 +1921,7 @@ pub struct RtImTrainConfig {
     /// fitted on. `seed` is the run's confident seed PSMs at `q_train`. `search` adds a
     /// bootstrap pass on that run: the seed-anchored library is searched (rt-im-train,
     /// extract, features, compete and a single-run rescore, in `<run>/rt_bootstrap/`), the
-    /// targets at `precursor_q < q_train` of that search become the anchors (observed RT =
+    /// targets at `precursor_q <= q_train` of that search become the anchors (observed RT =
     /// `apex_rt`), the multi-head calibration is refitted on them, and the run is searched
     /// again on the refitted library. `auto` (the default since 2026-10-12) chooses per
     /// adapting run: `search` when its seed search found fewer than
@@ -2192,10 +2192,10 @@ pub enum MultiheadAnchors {
     /// (`RtImTrainConfig::multihead_search_below`) or its spectra carry 1/K0, else `seed`.
     #[default]
     Auto,
-    /// The run's confident seed PSMs (`spectrum_q < q_train`).
+    /// The run's confident seed PSMs (`spectrum_q <= q_train`).
     Seed,
     /// The confident targets of a bootstrap search of the run on the seed-anchored library
-    /// (`precursor_q < q_train`, observed RT = `apex_rt`).
+    /// (`precursor_q <= q_train`, observed RT = `apex_rt`).
     Search,
 }
 

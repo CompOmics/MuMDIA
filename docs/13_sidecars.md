@@ -511,7 +511,7 @@ Mason-Schamp conversion (N2), which `mumdia_core::constants::im_to_ccs` inverts.
 search-seed and rt-im-train, rewriting `predicted_irt` in a copy of the library
 (`fragment_library_precursors_ft.parquet`) that rt-im-train and extract then read.
 Algorithm: (1) build the reference from confident **target** seed PSMs with
-`spectrum_q < q_train` and a standard-AA sequence (`deeplc_finetune.py:99-104`);
+`spectrum_q <= q_train` and a standard-AA sequence (`deeplc_finetune.py:99-104`);
 (2) auto-scale batch size so each epoch runs >= ~30 gradient steps, clamped to
 [16, 512] (`deeplc_finetune.py:114-117`) because a fixed 512 underfits a small
 (~4k) E.coli seed; (3) `deeplc.finetune(ref_psms, train_kwargs)` transfer-learns

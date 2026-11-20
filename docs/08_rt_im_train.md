@@ -683,7 +683,7 @@ docs/13, "Projection cache", has why the miss is now sharded and what that costs
 ### 4f. Search anchors for the multi-head calibration: `multihead_anchors` (default `auto` since 2026-10-12)
 
 The multi-head calibration of section 4d is fitted on the run's confident seed PSMs
-(`spectrum_q < q_train`): from about 100 on a single cell to over 13,000 on a bulk Astral
+(`spectrum_q <= q_train`): from about 100 on a single cell to over 13,000 on a bulk Astral
 run, from a broad, RT-free search. `rt_im_train.multihead_anchors = "search"` refits it on the
 confident identifications of a full search of the same run instead. `"seed"` never does.
 
@@ -708,7 +708,7 @@ first_run_only`, every run under `per_run`):
    compete and a single-run rescore, all inside `<run>/rt_bootstrap/`
    (`run_experiment::finish_run` plus `rescore::run_hashed`, the same calls as the final
    pass);
-3. the targets at `precursor_q < q_train` of the bootstrap's scored table, one row per
+3. the targets at `precursor_q <= q_train` of the bootstrap's scored table, one row per
    candidate (the best-scoring when several), with observed RT = `apex_rt`, are written to
    `<run>/rt_bootstrap/search_anchors.parquet` in the seed's column shape (`candidate_id`,
    `peptidoform`, `charge`, `base_peptide_id`, `label`, `score`, `spectrum_q` = the
@@ -1249,9 +1249,10 @@ because DeepLC/Keras crash on the Windows cp1252 console. `run_worker` spawns
 column contract.
 
 Inside the worker (`scripts/deeplc_finetune.py`): the reference set is the
-confident target seed PSMs (`label == "target"`, `spectrum_q < q_train`, standard
-residues only via `is_std`, deeplc_finetune.py:117-121): the strict cut of the Rust anchor
-selection (rt_im_train.rs:100), so a seed PSM at exactly `q_train` is an anchor of neither.
+confident target seed PSMs (`label == "target"`, `spectrum_q <= q_train`, standard
+residues only via `is_std`, deeplc_finetune.py:117-121). Note the gate is `<=`
+q_train here, whereas the Rust anchor selection uses strict `<` q_train
+(rt_im_train.rs:100), so the two reference sets can differ by the boundary rows.
 The worker keys the reference dict by `peptidoform` string (`ref[pf] = observed_rt`,
 deeplc_finetune.py:117-121), so it joins seed to library by peptidoform, not by
 `candidate_id` as the Rust stage does, and it keeps one RT per peptidoform by
@@ -1426,7 +1427,7 @@ though the enum variant still exists.
 | `loess_span` | `0.3` | LOESS local-fit fraction; passed as `span` to `Loess::fit` (rt_im_train.rs:137). Fraction of anchors in each local window. |
 | `fallback_rt_window_s` | `120.0` | Fixed half-window (seconds) when anchors are too few (`WindowPlan::Fixed`, rt_im_train.rs:168-175); also the upper clamp for adaptive bin widths (rt_im_train.rs:211). |
 | `finetune_deeplc` | `false` | Enable the DeepLC multitask fine-tune pre-step in `run` (run.rs:265). Requires `predict_frag.deeplc_python` (preflight, run.rs:62-67). On one measured run it was not needed per file once the library iRT had been fine-tuned once: the per-run LOESS reached the same residuals for much less wall clock (see the fine-tune section for the scope of that measurement). |
-| `multihead_anchors` | `auto` | Anchors of the multi-head calibration on the run that adapts the library. `search` refits it on the confident targets (`precursor_q < q_train`, observed RT = `apex_rt`) of a bootstrap search of that run in `<run>/rt_bootstrap/`, and falls back to the seed-anchored library with a warning when that is not possible; refused with `finetune_deeplc`, `multihead_calibration = 0` and `groups.window_groups > 1`. `seed` never does. `auto` is `search` on a run whose seed found fewer than `multihead_search_below` anchors (or only at a relaxed q), else `seed` (section 4f). |
+| `multihead_anchors` | `auto` | Anchors of the multi-head calibration on the run that adapts the library. `search` refits it on the confident targets (`precursor_q <= q_train`, observed RT = `apex_rt`) of a bootstrap search of that run in `<run>/rt_bootstrap/`, and falls back to the seed-anchored library with a warning when that is not possible; refused with `finetune_deeplc`, `multihead_calibration = 0` and `groups.window_groups > 1`. `seed` never does. `auto` is `search` on a run whose seed found fewer than `multihead_search_below` anchors (or only at a relaxed q), else `seed` (section 4f). |
 | `multihead_search_below` | `2500` | `auto`'s threshold on the seed anchor count (distinct target base peptides at `q_train`). |
 | `q1_calibrate` | `"auto"` | On for a ZT Scan search, off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Scanning-quadrupole spectra only: calibrate the Q1 window (centre offset, half-width, edge width) on the seed fragments and write `q1_calibration` to `cal.json`; changes no other artifact (section 4h). |
 | `finetune_epochs` | `25` | Fine-tune epoch cap (`--epochs`); early stopping usually halts sooner. Used only when `finetune_deeplc`. |
@@ -1531,6 +1532,12 @@ though the enum variant still exists.
   config hash and pass it as `RtImTrainParams.config_hash` (run.rs:313,
   main.rs:532), but `run` never reads it (unlike stages that stamp it into their
   report). Do not rely on the report to carry the config hash for Stage B.
+- **Anchor gate is `<`, fine-tune gate is `<=`.** The Rust anchor selection keeps
+  seed rows with `spectrum_q < q_train` (rt_im_train.rs:100), while the DeepLC
+  fine-tune worker keeps `spectrum_q <= q_train` (deeplc_finetune.py:120). The two
+  confident-seed reference sets can therefore differ by the boundary rows. Keep this
+  in mind when reasoning about why the fine-tune reference count and the calibration
+  anchor count are not identical.
 - **Fine-tune joins by peptidoform, Stage B joins by `candidate_id`.** The stage
   maps seed to library iRT through `candidate_id` (rt_im_train.rs:109-113); the worker
   maps seed observed RT to library peptidoforms through the `peptidoform` string
