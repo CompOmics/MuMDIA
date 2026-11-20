@@ -409,8 +409,9 @@ enum Cmd {
         /// localisation_experiment.parquet here instead, and leave the experiment untouched.
         #[arg(long, requires = "experiment_dir")]
         out_dir: Option<String>,
-        /// With --experiment-dir: only these sources (comma-separated run indices).
-        #[arg(long, requires = "experiment_dir", value_delimiter = ',')]
+        /// With --experiment-dir and --out-dir: only these sources (comma-separated run
+        /// indices). A subset is never written into the experiment.
+        #[arg(long, requires = "out_dir", value_delimiter = ',')]
         sources: Vec<u32>,
         #[arg(long)]
         config: Option<String>,

@@ -7508,9 +7508,9 @@ impl Config {
                 l.peak_valley_ratio
             )));
         }
-        if !(l.prior_strength.is_finite() && l.prior_strength >= 0.0) {
+        if !(l.prior_strength.is_finite() && l.prior_strength > 0.0) {
             return Err(Invalid(format!(
-                "localise.prior_strength must be finite and >= 0 (got {})",
+                "localise.prior_strength must be finite and > 0 (got {})",
                 l.prior_strength
             )));
         }
