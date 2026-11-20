@@ -253,7 +253,7 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
-- **Desktop: a diaPASEF search is no longer split into bands (#PRNUM).** "Bands: Automatic" (the
+- **Desktop: a diaPASEF search is no longer split into bands (#351).** "Bands: Automatic" (the
   default) planned the search from the machine's memory alone, so a large search space on a timsTOF
   diaPASEF `.d` was given several bands, and the engine stopped it after Start: bands are refused on
   spectra that carry 1/K0, and the diaPASEF recipe's retrace is refused with bands (`invalid config:
@@ -263,7 +263,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   refused before Start, which checks every file again first. In a batch searched separately, the
   files that are not diaPASEF keep Automatic's plan. Other inputs are planned as before
   (desktop/README.md, "Prescreen, bands and modifications on the Search screen").
-- **Desktop: a prescreen on diaPASEF input is refused before Start (#PRNUM).** The engine refuses
+- **Desktop: a prescreen on diaPASEF input is refused before Start (#351).** The engine refuses
   all three prescreen modes on spectra that carry 1/K0, which the Search screen let through to
   Start; it now names the files and asks to set Prescreen to Off, and the band plan no longer
   counts a prescreen that cannot run there.
