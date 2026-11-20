@@ -290,10 +290,11 @@ than a number. Both are recorded in every run's `manifest.json`.
   recorded in the new run's manifest; it is recorded only when this run's extract writes one.
   The chromatogram tables were published before `psms_extracted` was finished, so a failure
   of that last write left new chromatograms beside the previous PSM table; they are published
-  after it. The footprint refusal advised lowering `windows_in_flight` on the paths that hold
-  the whole run, where it changes nothing, and named the setting responsible only for an
-  all-ion layout; it names it now, and calls a window all-ion when it holds every spectrum of
-  the run rather than whenever a band has one window.
+  after it. The footprint refusal told a run that holds the whole run's matches at once (a
+  co-elution claim, the contested features, the bucketed matcher) to lower
+  `windows_in_flight`, which does not bound that path; it now names the setting that put the
+  run there. It also called every band with one window an all-ion layout, which it now does
+  only for a window that holds every spectrum of the run (or more than 100,000).
 - **Desktop: "Add folder…" selects several spectra folders at once (#335).** A Bruker or Agilent `.d`
   and a Waters `.raw` are directories, so they are added with "Add folder…", and that dialog took
   one folder at a time: the spectra folder picker shared the single-choice setting of the output

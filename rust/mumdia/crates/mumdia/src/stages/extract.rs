@@ -2611,7 +2611,10 @@ fn check_footprint(fp: &Footprint, cfg: &ExtractConfig, sibling_bands: usize) ->
             );
             let causes: Vec<&str> = [
                 (!single_pass, "a co-elution extract.peak_claim"),
-                (cfg.emit_contested_features, "extract.emit_contested_features"),
+                (
+                    cfg.emit_contested_features,
+                    "extract.emit_contested_features",
+                ),
                 (
                     matches!(cfg.matcher, MatcherKind::Bucketed),
                     "extract.matcher = bucketed",
@@ -6705,7 +6708,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     // the stage means the serial encoder bounds extract; a small one means it does not.
     let mut chrom_send_blocked = std::time::Duration::ZERO;
     let mut chrom_chunks_sent = 0u64;
-    let (chrom_w, q1t_w) = std::thread::scope(|sc| -> Result<(TableWriter, Option<TableWriter>)> {
+    let (chrom_w, q1t_w) = std::thread::scope(|sc| -> Result<_> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<Col>>(2);
         // `extract.q1_traces`: the cycle-trace table's writer, on a thread of its own.
         let (qtx, qrx) = std::sync::mpsc::sync_channel::<Vec<Col>>(2);
@@ -7887,7 +7890,10 @@ mod apex_gate_tests {
     #[test]
     fn the_count_picks_the_apex_and_intensity_breaks_its_ties() {
         // Equal counts: the signature intensity.
-        assert_eq!(apex(&[3, 3, 3], 0, &[10.0, 50.0, 20.0], true, None), Some(1));
+        assert_eq!(
+            apex(&[3, 3, 3], 0, &[10.0, 50.0, 20.0], true, None),
+            Some(1)
+        );
         // One fragment more outweighs any intensity; the legacy rule reads intensity only.
         assert_eq!(apex(&[3, 4], 1, &[1e3, 1.0], true, None), Some(1));
         assert_eq!(apex(&[3, 4], 1, &[1e3, 1.0], false, None), Some(0));
@@ -8248,8 +8254,10 @@ mod accumulate_tests {
             })
             .collect();
         for claim in [PeakClaim::WinnerPredictedIntensity, PeakClaim::Proportional] {
-            let mut cfg = ExtractConfig::default();
-            cfg.peak_claim = claim;
+            let cfg = ExtractConfig {
+                peak_claim: claim,
+                ..ExtractConfig::default()
+            };
             let run = |probe: TaskProbe<'_>, threads: usize| {
                 let pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(threads)
@@ -8273,7 +8281,10 @@ mod accumulate_tests {
                 e.0 += 1;
                 e.1 += h.inten;
             }
-            assert!(per_peak.len() > 100, "{claim:?}: the fixture must claim peaks");
+            assert!(
+                per_peak.len() > 100,
+                "{claim:?}: the fixture must claim peaks"
+            );
             for (pk, &(hits, sum)) in &per_peak {
                 if claim == PeakClaim::WinnerPredictedIntensity {
                     assert_eq!(hits, 1, "{claim:?}: peak {pk:?} has one winner");
@@ -8356,9 +8367,11 @@ mod accumulate_tests {
             grid_mz: Vec::new(),
             grid_ppm: Vec::new(),
         };
-        let mut cfg = ExtractConfig::default();
-        cfg.peak_claim = PeakClaim::CoelutionDemix;
-        cfg.demix_max_candidates = 1;
+        let cfg = ExtractConfig {
+            peak_claim: PeakClaim::CoelutionDemix,
+            demix_max_candidates: 1,
+            ..ExtractConfig::default()
+        };
         let (acc, _) = extract_twopass_windows(
             Some(&idx),
             &lib,
@@ -9063,8 +9076,8 @@ mod psms_stream_tests {
 
         let mut w = TableWriter::new(&path).with_content_hash();
         w.write_cols(table(vec![9])).unwrap();
-        let err = close_chromatograms(w, Err::<(), _>(anyhow::anyhow!("psms write failed")))
-            .unwrap_err();
+        let err =
+            close_chromatograms(w, Err::<(), _>(anyhow::anyhow!("psms write failed"))).unwrap_err();
         assert!(err.to_string().contains("psms write failed"), "{err}");
         assert_eq!(
             std::fs::read(&path).unwrap(),
