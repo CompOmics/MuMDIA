@@ -1064,36 +1064,15 @@ mod tests {
     /// how to fill it; the manifest record carries the same text.
     #[test]
     fn a_library_without_annotations_is_warned_about() {
-        use std::sync::{Arc, Mutex};
-
-        #[derive(Clone, Default)]
-        struct Buf(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Buf {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().write(b)
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
+        // No log capture: a sibling test reaching the same warn! while a scoped subscriber
+        // was live cached the callsite as off. ci/check_smoke.py checks the WARN line.
         let d = tmp("missing");
         let plain = library(&d, "plain.parquet", &[ALBU], false);
-        let buf = Buf::default();
-        let writer = buf.clone();
-        let sub = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish();
-        let got = tracing::subscriber::with_default(sub, || resolve_input(None, Some(&plain)));
-        assert_eq!(got.unwrap(), None);
-        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        assert!(log.contains("WARN"), "{log}");
-        assert!(log.contains("no protein annotations"), "{log}");
-        assert!(log.contains(&plain), "{log}");
+        assert_eq!(resolve_input(None, Some(&plain)).unwrap(), None);
 
         let w = missing_warning(&plain);
         for needle in [
+            plain.as_str(),
             "protein_ids, protein_names, genes",
             FILE_NAME,
             "peptides.tsv, precursors.tsv and proteins.tsv are empty",

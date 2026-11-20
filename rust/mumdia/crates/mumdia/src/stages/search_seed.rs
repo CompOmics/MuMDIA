@@ -31,14 +31,13 @@ pub struct SearchSeedParams<'a> {
     pub out: &'a str,
     pub cfg: &'a SearchSeedConfig,
     pub bucket_size: usize,
-    pub config_hash: &'a str,
     /// The precursor table is one isolation-window group's band, written with local ids
     /// `0..n` (`groups.window_groups`), and its fragments sit in the library-wide fragment
     /// table at ids `offset..offset + n`. The seed table is then in band-local ids. `None`
     /// is the ordinary whole-library search.
     pub fragment_offset: Option<u32>,
     /// `library_precursors` is the WHOLE library and this stage searches its rows
-    /// `[first, first + n)`, loaded directly by row span (`Library::load_row_span_with`):
+    /// `[first, first + n)`, loaded directly by row span (`Library::load_for_stage`):
     /// local ids `0..n`, fragments at library-wide ids `first..first + n`, outputs in local
     /// ids exactly as for a band file. A grouped run loads a band this way wherever nothing
     /// rewrites the band's precursor table, instead of writing the band out first.
@@ -129,10 +128,10 @@ impl SeedLibrary {
     /// predicted intensities nor fragment names (the hyperscore is a match count plus
     /// observed intensity, and the mass recalibration walks `frag_mz`), so neither the
     /// library nor the index holds the two payload columns, 12 bytes per fragment at the
-    /// build peak ([`Library::load_mz_only`], [`FragIndex::build_mz_only`]). They are still
-    /// decoded and checked here exactly as the full load checks them, batch by batch, and
-    /// discarded, so a library extract would refuse is refused by the seed, before any
-    /// DeepLC step. The bucketed matcher keeps the full load, because `page_search` serves
+    /// build peak ([`Library::load_mz_only_for_stage`], [`FragIndex::build_mz_only`]). They
+    /// are still decoded and checked here exactly as the full load checks them, batch by
+    /// batch, and discarded, so a library extract would refuse is refused by the seed, before
+    /// any DeepLC step. The bucketed matcher keeps the full load, because `page_search` serves
     /// `idx_int` out of arrays built from the intensities.
     ///
     /// Under `search_seed.count_fragments_once` the fragindex index also carries each
@@ -504,25 +503,17 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
             // the learned tolerance came out too tight. The 50 ppm floor is kept for the
             // narrow-tolerance case, where a wider window would just admit noise.
             let collect_ppm = 50.0_f64.max(cfg.fragment_tol_ppm);
-            // The scan's 1/K0 when this row is one of its anchors.
-            let scan_im = scan.im.as_deref().filter(|_| confident);
-            im_pts.clear();
             for &fmz in mzs {
                 // library m/z is stored f32; widen once, the value is unchanged
                 let fmz = fmz as f64;
                 // The nearest peak within the collection window, ties to the lower m/z
-                // (`spectra::nearest_peak`, shared with the 1/K0 points below).
+                // (`spectra::nearest_peak`, shared with `observed_im`).
                 let nearest = crate::spectra::nearest_peak(&scan.peaks, fmz, collect_ppm);
                 if let Some(j) = nearest {
                     let pp = mumdia_core::constants::ppm_diff(scan.peaks[j].mz as f64, fmz);
                     if confident {
                         devs.push(pp);
                         dev_mz.push(fmz);
-                    }
-                    if let Some(im) = scan_im {
-                        if pp.abs() <= cfg.fragment_tol_ppm {
-                            im_pts.push((im[j] as f64, scan.peaks[j].intensity as f64));
-                        }
                     }
                     if p.emit_calibrants {
                         calibrants.candidate_id.push(gid);
@@ -535,8 +526,9 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
                     }
                 }
             }
-            if scan_im.is_some() {
-                obs_im_c[i] = crate::stats::weighted_median(&mut im_pts);
+            // The observed 1/K0 of the anchors.
+            if confident && has_im {
+                obs_im_c[i] = observed_im(scan, mzs, cfg.fragment_tol_ppm, &mut im_pts);
             }
         }
     }
@@ -553,21 +545,12 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
             let Some(scan) = scan_by_index.get(&b.scan_index) else {
                 continue;
             };
-            let Some(im) = scan.im.as_deref() else {
-                continue;
-            };
-            im_pts.clear();
-            for &fmz in lib.cand_frag_mz(*cid) {
-                let fmz = fmz as f64;
-                let collect_ppm = 50.0_f64.max(cfg.fragment_tol_ppm);
-                if let Some(j) = crate::spectra::nearest_peak(&scan.peaks, fmz, collect_ppm) {
-                    let pp = mumdia_core::constants::ppm_diff(scan.peaks[j].mz as f64, fmz);
-                    if pp.abs() <= cfg.fragment_tol_ppm {
-                        im_pts.push((im[j] as f64, scan.peaks[j].intensity as f64));
-                    }
-                }
-            }
-            obs_im_c[i] = crate::stats::weighted_median(&mut im_pts);
+            obs_im_c[i] = observed_im(
+                scan,
+                lib.cand_frag_mz(*cid),
+                cfg.fragment_tol_ppm,
+                &mut im_pts,
+            );
         }
     }
     // Median offset + 95th-percentile-of-centered tolerance, with the optional robust
@@ -879,6 +862,31 @@ fn search_with_widening_q1(
         );
         (best, None, Some(w))
     }
+}
+
+/// A seed PSM's observed 1/K0: the intensity-weighted median 1/K0 of the nearest peak to
+/// each library fragment within `max(50, tol)` ppm (ties to the lower m/z,
+/// `spectra::nearest_peak`, as the mass calibration collects them), kept when within the
+/// search tolerance `tol`. `None` for a scan without 1/K0 or without such a peak. `pts` is
+/// scratch space. The anchors and the decoy-corrected 1/K0 window sizing both take it.
+fn observed_im(
+    scan: &Ms2Scan,
+    frag_mz: &[f32],
+    tol: f64,
+    pts: &mut Vec<(f64, f64)>,
+) -> Option<f64> {
+    let im = scan.im.as_deref()?;
+    pts.clear();
+    for &fmz in frag_mz {
+        let fmz = fmz as f64;
+        if let Some(j) = crate::spectra::nearest_peak(&scan.peaks, fmz, 50.0_f64.max(tol)) {
+            let pp = mumdia_core::constants::ppm_diff(scan.peaks[j].mz as f64, fmz);
+            if pp.abs() <= tol {
+                pts.push((im[j] as f64, scan.peaks[j].intensity as f64));
+            }
+        }
+    }
+    crate::stats::weighted_median(pts)
 }
 
 /// Peak indices to probe for a scan: the `top_n` most intense (index-ascending

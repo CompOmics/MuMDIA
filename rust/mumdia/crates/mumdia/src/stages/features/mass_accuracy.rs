@@ -53,22 +53,6 @@ fn fin(x: f64) -> f64 {
     }
 }
 
-/// Median of a slice (0.0 if empty). Does not mutate the input.
-fn median(v: &[f64]) -> f64 {
-    if v.is_empty() {
-        return 0.0;
-    }
-    let mut s: Vec<f64> = v.to_vec();
-    s.sort_by(|a, b| a.total_cmp(b));
-    let n = s.len();
-    let m = if n % 2 == 1 {
-        s[n / 2]
-    } else {
-        0.5 * (s[n / 2 - 1] + s[n / 2])
-    };
-    fin(m)
-}
-
 /// Linear-interpolated quantile q in [0,1] over a pre-sorted slice.
 fn quantile_sorted(s: &[f64], q: f64) -> f64 {
     if s.is_empty() {
@@ -153,7 +137,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     sorted.sort_by(|a, b| a.total_cmp(b));
 
     // 1. median absolute ppm
-    let median_abs = median(&absppm);
+    let median_abs = fin(crate::stats::median_or(&mut absppm.clone(), 0.0));
 
     // 2. signed mean ppm
     let signed_mean = fin(ppm.iter().sum::<f64>() / ppm.len() as f64);

@@ -35,8 +35,8 @@ use serde_json::json;
 use tracing::info;
 
 use super::{
-    analyse, calibrate, finish, flr_curve, hypotheses, model, site_string, status, write,
-    LocaliseParams, LocaliseSummary, RunAnalysis, Temperature,
+    analyse, calibrate, call_status, finish, flr_of, hypotheses, model, position_ratio, rates_at,
+    share, site_string, status, write, LocaliseParams, LocaliseSummary, RunAnalysis, Temperature,
 };
 
 /// Inputs of [`run_experiment`].
@@ -76,9 +76,10 @@ pub fn run_experiment(p: ExperimentLocaliseParams) -> Result<ExperimentLocaliseS
     };
     let cfg = first.cfg;
     let mut analyses: Vec<RunAnalysis> = Vec::with_capacity(p.runs.len());
+    let mut proteins = None;
     for r in &p.runs {
         info!(scored = r.scored, "localise: reading the evidence of a run");
-        analyses.push(analyse(r)?);
+        analyses.push(analyse(r, &mut proteins)?);
     }
     let temp = match cfg.fixed_temperature() {
         Some(t) => Temperature::fixed(t),
@@ -297,18 +298,7 @@ fn combine(
         .iter()
         .filter(|c| !c.ll.is_empty() && !rep_of(c).decoy)
         .filter(|c| result_of(c).n_real >= 2)
-        .map(|c| {
-            let res = result_of(c);
-            calibrate::CalPeak {
-                ll: &c.ll,
-                hyps: &res.hyps,
-                on_decoy: &res.on_decoy,
-                n_slots: rep_of(c).split.n_slots(),
-                real_positions: res.positions.len() - res.n_decoy_positions,
-                decoy_positions: res.n_decoy_positions,
-                sdi_share: f64::from(c.sdi.1) / f64::from(c.sdi.0.max(1)),
-            }
-        })
+        .map(|c| calibrate::CalPeak::new(&c.ll, result_of(c), rep_of(c).split.n_slots(), c.sdi))
         .collect();
     // The prior's centre: the run temperature if the runs' evidence were independent, the run
     // temperature times the number of runs summed if every run repeated the same evidence;
@@ -354,13 +344,7 @@ fn combine(
         let n_slots = analyses[r].rows[analyses[r].peaks[p].rep].split.n_slots();
         let call = model::call(&c.ll, &res.hyps, n_slots, xtemp.value);
         c.delta_loglik = Some(model::delta_loglik(&c.ll, call.best));
-        c.status = if res.on_decoy[call.best] {
-            status::DECOY_RESIDUE
-        } else if call.min_site_prob >= cfg.threshold {
-            status::LOCALISED
-        } else {
-            status::AMBIGUOUS
-        };
+        c.status = call_status(res.on_decoy[call.best], call.min_site_prob, cfg.threshold);
         c.best = Some(call.best);
         c.min_site_prob = Some(call.min_site_prob);
         c.post = call.post;
@@ -373,29 +357,15 @@ fn combine(
             !c.ll.is_empty() && !rep_of(c).decoy && result_of(c).n_real >= 2
         })
         .collect();
-    let (rp, dp) = flr_idx.iter().fold((0usize, 0usize), |acc, &i| {
-        let res = result_of(&cons[i]);
-        (
-            acc.0 + res.positions.len() - res.n_decoy_positions,
-            acc.1 + res.n_decoy_positions,
-        )
-    });
-    let ratio = if dp > 0 {
-        rp as f64 / dp as f64
-    } else {
-        f64::NAN
-    };
-    let flr = flr_curve(
-        &flr_idx
+    let ratio = position_ratio(
+        flr_idx
             .iter()
-            .map(|&i| {
-                let c = &cons[i];
-                (
-                    c.min_site_prob.unwrap_or(0.0),
-                    c.status == status::DECOY_RESIDUE,
-                )
-            })
-            .collect::<Vec<_>>(),
+            .map(|&i| result_of(&cons[i]).position_counts()),
+    );
+    let flr = flr_of(
+        flr_idx
+            .iter()
+            .map(|&i| (cons[i].min_site_prob, cons[i].status)),
         ratio,
     );
     for (k, &i) in flr_idx.iter().enumerate() {
@@ -512,19 +482,13 @@ fn combine(
         .iter()
         .filter(|&&i| cons[i].status == status::LOCALISED)
         .count() as u64;
-    let at_threshold = flr_idx
-        .iter()
-        .filter(|&&i| cons[i].min_site_prob.unwrap_or(0.0) >= cfg.threshold)
-        .map(|&i| (cons[i].flr_model.unwrap_or(0.0), cons[i].flr_decoy))
-        .reduce(|x, y| {
-            (
-                x.0.max(y.0),
-                match (x.1, y.1) {
-                    (Some(u), Some(v)) => Some(u.max(v)),
-                    (u, v) => u.or(v),
-                },
-            )
-        });
+    let at_threshold = rates_at(
+        cfg.threshold,
+        flr_idx.iter().map(|&i| {
+            let c = &cons[i];
+            (c.min_site_prob, c.flr_model, c.flr_decoy)
+        }),
+    );
     let runs_summed = |k: usize| {
         flr_idx
             .iter()
@@ -548,11 +512,7 @@ fn combine(
     stats.insert("localised".into(), json!(localised));
     stats.insert(
         "localisation_rate".into(),
-        json!(if with_a_choice > 0 {
-            localised as f64 / with_a_choice as f64
-        } else {
-            f64::NAN
-        }),
+        json!(share(localised, with_a_choice)),
     );
     stats.insert(
         "site_flr_model_at_threshold".into(),

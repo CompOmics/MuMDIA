@@ -129,30 +129,31 @@ encode and decode, `codec.rs`) and `bytes` for the coalescing `ChunkReader`
 (`span_cache.rs`); the `mumdia` bin+lib crate pulls the full set including
 `clap`, `rayon`, `mzdata`, and `tracing`. The engine needs **no cmake and no system C libraries**, which is what the feature
 selection buys: `parquet` uses `default-features = false, features =
-["arrow","snap"]` to drop the C zlib-ng backend that needs cmake and to use the
-pure-Rust SNAPPY codec (`Cargo.toml:36-37`); `mzdata` uses `["mzml",
-"miniz_oxide"]` for a pure-Rust zlib backend (`Cargo.toml:38-39`); `arrow` adds
-`["prettyprint"]` for `inspect` (`Cargo.toml:35`).
+["arrow","snap","zstd"]` to drop the C zlib-ng backend that needs cmake, keeping the
+pure-Rust SNAPPY codec and zstd (`Cargo.toml:43-44`); `mzdata` uses `["mzml",
+"miniz_oxide"]` for a pure-Rust zlib backend (`Cargo.toml:45-47`); `arrow` adds
+`["prettyprint"]` for `inspect` (`Cargo.toml:42`).
 
 It is **not** a pure-Rust build, which this section previously claimed. `cc` is a
-build dependency of exactly two crates, and `cargo tree -i cc` shows both:
+build dependency of four crates, and `cargo tree -i cc` shows them:
 `libmimalloc-sys` compiles the vendored mimalloc C allocator that the binary
-installs globally (`Cargo.toml:40-43`, `main.rs:12-13`), and `blake3` compiles its
-SIMD paths. So a C compiler is required, though nothing external to the dependency
-tree is: no cmake, no system zlib, no vendored library to install first. Every
+installs globally (`Cargo.toml:69`, `main.rs:15`), `blake3` compiles its SIMD paths,
+`zstd-sys` compiles the zstd codec of parquet and timsrust, and `libsqlite3-sys`
+compiles the SQLite that timsrust reads a timsTOF `analysis.tdf` with. So a C compiler
+is required, though nothing external to the dependency tree is: no cmake, no system
+zlib, no vendored library to install first. Every
 supported platform's default toolchain provides the compiler, which is why this went
 unnoticed.
 
-The dropped codecs are visible at the read side, not only at build time. SNAPPY
-is the only codec compiled in, so any Parquet the engine is asked to read must be
-SNAPPY (or uncompressed); a zstd file fails with `Parquet error: Disabled feature
-at compile time: zstd`. `mumdia-io` always writes SNAPPY
-(`mumdia-io/src/table.rs:205`), so this only bites on tables produced outside the
-engine. The same applies to string columns: `Table::str` downcasts to arrow
-`StringArray` and rejects anything else with `column '<name>' is not utf8`
-(`mumdia-io/src/table.rs:503-511`), so a `large_utf8` column is refused. pandas
-and pyarrow default to SNAPPY plus `utf8`; Polars defaults to zstd plus
-`large_utf8` and produces a file the engine cannot load. See
+The codecs are visible at the read side too: SNAPPY, zstd and uncompressed Parquet
+all read; a gzip, brotli or lz4 file fails with `Parquet error: Disabled feature at
+compile time: <feature>`. `mumdia-io` writes SNAPPY unless
+`MUMDIA_PARQUET_COMPRESSION` asks for `zstd` or `uncompressed`
+(`mumdia-io/src/table.rs`, `codec`). String columns are stricter: `Table::str`
+downcasts to arrow `StringArray` and rejects anything else with `column '<name>' is
+not utf8` (`mumdia-io/src/table.rs`, `push_str`), so a `large_utf8` column is refused.
+pandas and pyarrow default to SNAPPY plus `utf8`; Polars defaults to zstd plus
+`large_utf8`, and its `large_utf8` columns are what the engine cannot load. See
 `docs/13_sidecars.md` for the sidecar-side statement of the same contract.
 
 The release profile is `opt-level = 3` with `lto = "thin"`, `codegen-units = 1`
@@ -235,9 +236,7 @@ _`mumdia-core`:_
   by-mass agree; N-term/C-term mods; low-information fragments dropped; the basic
   residue count counts only R/H/K; per-fragment basic sites by slice;
   unknown-mod error; ambiguous-residue error.
-- `rejection.rs`: rejection `code()` strings match the spec; serde round-trip uses
-  the spec spelling; `earliest` keeps the smaller (earlier) stage; `is_rejection`
-  flags only losses; stage order is a monotone ladder.
+- `rejection.rs`: rejection `code()` strings match the spec.
 - `config.rs`: default round-trips (`min_len=5`, `FeatureSet::Minimal`,
   `top_n_peaks=300`, `rescore.strict=true`); unknown key rejected; partial override
   keeps defaults; the `quant.q_filter` enum parses and re-serializes to its snake
@@ -281,8 +280,9 @@ _`mumdia`:_
   (the bit-identity guard for the new options being off); an empty chromatogram
   table preserves every identification instead of dropping it; and predicted
   selection without that column is a clear error rather than a wrong number.
-- `compete.rs`: `winner_take_all` keeps only the winner; `none`/`features_only`
-  keep all; `margin_gated` keeps close losers and removes distant ones;
+- `compete.rs`: `winner_take_all` keeps only the winner; `none` keeps all and
+  reads the retired `features_only`; `margin_gated` keeps close losers and removes
+  distant ones;
   `unique_evidence` keeps losers with enough unique evidence and falls back to
   winner-take-all without evidence data; `unique_evidence` prefers the Extended
   `peak_contested` fraction when it is present; winner-take-all is deterministic

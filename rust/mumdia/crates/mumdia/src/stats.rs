@@ -1,7 +1,7 @@
 //! Shared numeric kernels (docs/14_build_test_deploy_gotchas.md):
 //! population-variance Pearson with a zero-variance guard returning 0, cosine
-//! similarity, spectral angle, intensity-weighted median and mean absolute deviation.
-//! One implementation, unit-tested.
+//! similarity, spectral angle, median, intensity-weighted median and mean absolute
+//! deviation. One implementation, unit-tested.
 
 /// Population Pearson correlation; returns 0 on zero variance (documented guard).
 pub fn pearson(a: &[f64], b: &[f64]) -> f64 {
@@ -191,6 +191,26 @@ pub fn cosine(a: &[f64], b: &[f64]) -> f64 {
 pub fn spectral_angle(a: &[f64], b: &[f64]) -> f64 {
     let c = cosine(a, b).clamp(-1.0, 1.0);
     1.0 - 2.0 * c.acos() / std::f64::consts::PI
+}
+
+/// numpy's `median`: the middle value under `f64::total_cmp`, or the mean of the two middle
+/// values; NaN for an empty slice. Sorts `v` in place.
+pub fn median(v: &mut [f64]) -> f64 {
+    median_or(v, f64::NAN)
+}
+
+/// [`median`], with `empty` for an empty slice.
+pub fn median_or(v: &mut [f64], empty: f64) -> f64 {
+    if v.is_empty() {
+        return empty;
+    }
+    v.sort_by(f64::total_cmp);
+    let n = v.len();
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
+    }
 }
 
 /// Weighted median of `(value, weight)` pairs: the smallest value whose cumulative weight
@@ -518,6 +538,20 @@ mod tests {
             pearson_vs(&ragged[0], &r, &Centered::new(&r)).to_bits(),
             pearson(&ragged[0], &r).to_bits()
         );
+    }
+
+    /// The seven copies this replaced wrote the even case as `0.5 * (a + b)`, `(a + b) * 0.5`
+    /// and `(a + b) / 2.0`: one sum scaled by a power of two, so the same bits.
+    #[test]
+    fn median_odd_even_empty() {
+        assert_eq!(median(&mut [3.0, 1.0, 2.0]), 2.0);
+        assert_eq!(median(&mut [4.0, 1.0, 3.0, 2.0]), 2.5);
+        assert!(median(&mut []).is_nan());
+        assert_eq!(median_or(&mut [], 0.0), 0.0);
+        assert_eq!(median_or(&mut [5.0], 0.0), 5.0);
+        let (a, b) = (0.1f64, 0.7f64);
+        assert_eq!((0.5 * (a + b)).to_bits(), ((a + b) / 2.0).to_bits());
+        assert_eq!(((a + b) * 0.5).to_bits(), ((a + b) / 2.0).to_bits());
     }
 
     #[test]

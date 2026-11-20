@@ -14,7 +14,7 @@ one band's worth by construction, without changing what any stage computes.
 This page is the code-grounded description: how the groups are planned, what each band's
 stages see, what the two pooling stages do, the two calibration modes, the output layout,
 and what has been measured. `groups.rs`, `stages/run_groups.rs`, `stages/seed_pool.rs` and
-`stages/pool.rs` are the sources; `index.rs` (`Library::load_with_fragment_offset`) and
+`stages/pool.rs` are the sources; `index.rs` (`Library::load_for_stage`) and
 `mumdia-io/src/table.rs` (`TableFile::open_rows`, `row_group_stats`) are the loads it rests
 on.
 
@@ -92,13 +92,13 @@ as `name[gNN]`.
 The stages then run unchanged on that band, as if it were the library:
 
 - `search-seed` loads the band straight from the library by row span
-  (`Library::load_row_span_with`: local ids `0..n`, the fragments whose ids lie in the band's
+  (`Library::load_for_stage` with a row span: local ids `0..n`, the fragments whose ids lie in the band's
   range read from the shared, library-wide fragment table). When that table is sorted by
   `candidate_id` at row-group granularity (`scripts/sort_fragments.py`; every library writer
   ends with the sort) the read is selective; an unsorted table still loads through a filtered
   scan of the whole table, with a warning, and costs the scan per band.
-- the RT model (multi-head calibration, the optional fine-tune, or the base-model
-  re-prediction, whichever the configuration resolves to; `docs/08_rt_im_train.md`) runs
+- the RT model (multi-head calibration or the base-model re-prediction, whichever the
+  configuration resolves to; `docs/08_rt_im_train.md`) runs
   on the band table and writes the band's re-predicted table. The DeepLC sidecars rewrite a
   precursor FILE, so a band that an RT model adapts is first written out as a precursor table
   of its own, `groups/gNN/lib_precursors.parquet`, with band-local ids `0..n`
@@ -230,9 +230,7 @@ ones, keeps the higher-scoring row where two bands searched the same candidate, 
 `spectrum_q` over the union with the seed's own target-decoy kernel (`fdr::target_decoy_q`),
 and writes the run-level `seed_psms.parquet`. Beside it goes
 `seed_psms.parquet.masscal.json`, the run's fragment mass calibration, fitted once over the
-bands' calibrant deviations (next subsection). It also writes each band's view of the
-pooled seed, `groups/gNN/seed_psms_pooled.parquet`: the band's own rows, local ids,
-pooled q.
+bands' calibrant deviations (next subsection).
 
 ### 4a. The mass calibration is fitted once, not averaged
 
@@ -335,22 +333,20 @@ band's seed report records `calibrant_deviations`, `calibrant_bytes` and
 and 452 deviations (9,856 and 7,232 B, from 103 and 76 target rows), all 1,068 of them
 accepted. Not yet measured at scale: see section 10.
 
-`masscal.json` gains `masscal_source`, which reads `pooled_deviations` or `band_scalars`. A
-band directory seeded before the sidecar existed has none, and the pool then combines the
-scalars as it always did, naming the missing groups in a warning; if `mass_cal_loess` is set
-it warns separately that the grid cannot be recovered from scalars. A band with no
-calibrants wrote the configured tolerance in place of a learned one, and when the pooled fit
-has fewer than `masscal::MIN_CALIBRANTS` deviations the pool keeps that tolerance rather
-than fitting a percentile of a handful of points, with a warning.
+`masscal.json` gains `masscal_source`, which reads `pooled_deviations`. Every band is seeded
+with `emit_calibrants`, which writes the sidecar even when it is empty, so a band without one
+is an error naming it. When the pooled fit has fewer than `masscal::MIN_CALIBRANTS`
+deviations the pool keeps the configured tolerance rather than fitting a percentile of a
+handful of points, with a warning.
 
 `groups.calibration` decides which anchors each band's calibration sees:
 
 | | `global` (default) | `per_group` |
 |---|---|---|
-| RT model (multi-head / fine-tune) | the pooled seed, joined by peptidoform | the band's seed |
+| RT model (multi-head calibration) | the pooled seed, joined by peptidoform | the band's seed |
 | `rt-im-train` anchors | the pooled seed, iRT read from the seed row (`anchor_irt_from_seed`), one fit shared by every band | the band's seed, iRT joined from the band table |
 | `extract` mass calibration | the pooled `masscal.json` | the band's |
-| `features` seed corroboration and confident elution boundary | the band's view of the pooled seed | the band's seed |
+| `features` seed corroboration and confident elution boundary | the pooled seed (library-wide ids) | the pooled seed (library-wide ids) |
 
 Under `global`, after a per-band re-prediction of the library iRT, the pooled anchors carry
 the library's iRT as it was when seeded; `seed_pool::refresh_irt` then copies each anchor's
@@ -359,7 +355,7 @@ new value from its band's table into `seed_psms_calibrated.parquet`, which is wh
 and only the windows differ, because the precursors do. So it is fitted once:
 `rt_im_train::fit_from_seed` reads the pooled (or refreshed) seed and fits the curve, the
 window width and the optional held-out and adaptive sizing, and every band only applies that
-fit to its own table (`rt_im_train::apply`), writing its `run_windows.parquet` and a
+fit to its own table (`rt_im_train::apply_in_memory`), writing its `run_windows.parquet` and a
 `cal.json` identical to the one it wrote when it fitted for itself
 (`one_fit_applied_writes_what_the_whole_stage_writes`). Before, each band decoded the pooled
 seed and refitted the same curve, one seed decode and one fit per band on the band loop's
@@ -370,8 +366,8 @@ Refitting per band is sound because the multi-head ridge and the base-model re-p
 are deterministic in their anchors: the same pooled anchors give the same head selection,
 the same ridge and the same predictions, so every band carries one model. What it costs is
 one DeepLC worker per band, which section 4b below removes. The optional DeepLC fine-tune is not deterministic and
-would be trained once per band, so a grouped run refuses `rt_im_train.finetune_deeplc`;
-fine-tune the library once beforehand (`docs/08_rt_im_train.md`, once per library) and
+would be trained once per band, so `rt_im_train.finetune_deeplc` with `window_groups > 1` is
+refused when the configuration loads; fine-tune the library once beforehand (`docs/08_rt_im_train.md`, once per library) and
 search that table.
 
 `per_group` is kept for the comparison the design asked for, not as a recommendation: it is
@@ -468,8 +464,8 @@ twice:
   counted, under `per_group` each band's own seed, as the confident target peptides at
   `spectrum_q < rt_im_train.q_train` (`rt_im_train::seed_anchor_bound`, the rows the fit
   takes before it joins their iRT). A seed with fewer than two cannot give a fit with two, so
-  the run stops here, before the MS1 offset, the band slices, the DeepLC sidecars and the
-  extraction decode. Under `per_group` one error names every band whose seed has fewer than
+  the run stops here, before the band slices, the DeepLC sidecars, the extraction decode and
+  the MS1 offset learned on it. Under `per_group` one error names every band whose seed has fewer than
   two. A run without anchors therefore stops right after its seed, not after a DeepLC pass
   over the whole library or after most bands have extracted.
 - **On the fit itself.** A seed with anchors can still give a fit on fewer than two, when the
@@ -690,7 +686,6 @@ out/
   groups/plan.json                   bands, windows, estimates, calibration mode
   groups/gNN/lib_precursors.parquet  the band (local ids), only where an RT model rewrites it
   groups/gNN/seed_psms.parquet       band seed (+ .masscal.json)
-  groups/gNN/seed_psms_pooled.parquet  the band's view of the pooled seed
   groups/gNN/lib_precursors_<model>.parquet  re-predicted band, when an RT model ran
   groups/gNN/run_windows.parquet     the band's RT windows
   groups/gNN/cal.json                the band's RT calibration
@@ -997,7 +992,7 @@ now two phases. Phase 1 runs `rt-im-train` and `extract` for every band and call
 internally -- same confident set, same row-group pruning, same detector -- returning the
 per-anchor half-widths instead of a percentile of them. The run absorbs every band's
 samples, fits `features::bounds_from_samples` once, and phase 2 runs `features` and
-`compete` for every band through `features::run_with_bounds` on that one pair. A run whose
+`compete` for every band through `features::run_with_bounds_hashed` on that one pair. A run whose
 pooled set is genuinely under 20 anchors still falls back, now once rather than band by
 band.
 

@@ -18,7 +18,7 @@ use mumdia_io::table::{write_table_hashed, Col, TableFile};
 use serde_json::json;
 use tracing::info;
 
-use crate::predict::{FragmentPredictor, NativeFrag, NativeRt, RtPredictor};
+use crate::predict::{native_intensities, native_irt, NATIVE_FRAG, NATIVE_RT};
 use crate::sidecar;
 use rayon::prelude::*;
 
@@ -28,7 +28,6 @@ pub struct PredictFragParams<'a> {
     pub out_fragments: &'a str,
     pub cfg: &'a PredictFragConfig,
     pub work_dir: &'a str,
-    pub config_hash: &'a str,
     /// Write the native retention-time model's iRT in place of DeepLC's, because the caller
     /// will re-predict every row with the multi-head calibration before anything reads it
     /// (`predict_frag.defer_deeplc_to_multihead`). Only an orchestrator that runs that
@@ -51,13 +50,18 @@ struct Raw {
     label: String,
     protein: String,
     precursor_mz: f64,
+    /// The library fragments, empty until the intensities are assigned ([`keep_fragments`]).
     frags: Vec<Fragment>,
     irt: f32,
     /// Predicted 1/K0 (V s cm^-2); `None` without an ion-mobility predictor.
     im: Option<f64>,
     frag_int: Vec<f32>,
-    /// Parsed form kept from phase A so `assign_rt`/`assign_intensities` reuse
-    /// it instead of re-parsing `peptidoform` (identical parse output).
+    /// A fragment intensity was not finite, before the m/z limits and the top-N cut.
+    nonfinite_int: bool,
+    /// Fragments the m/z limits removed.
+    out_of_range: u32,
+    /// Parsed form kept from phase A so the predictions reuse it instead of re-parsing
+    /// `peptidoform` (identical parse output).
     parsed: ParsedPeptidoform,
 }
 
@@ -89,11 +93,13 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
     let label = t.str("label")?;
     let protein = t.str("protein")?;
 
-    // Phase A: parse and compute fragments (no intensity yet). Rows are
-    // independent, so map them in parallel; `collect` preserves row order, and
-    // the sequential accumulation below reproduces the exact serial `raws` order
-    // and `n_parse_err` count (raws is re-sorted by precursor m/z at Stage D
-    // build, whose stable sort then breaks m/z ties by this identical order).
+    // Phase A: parse, and drop the candidates without a fragment; the fragments themselves
+    // are generated again when their intensities are assigned ([`keep_fragments`]), so only
+    // the kept ones are ever held for the whole library. Rows are independent, so map them in
+    // parallel; `collect` preserves row order, and the sequential accumulation below
+    // reproduces the exact serial `raws` order and `n_parse_err` count (raws is re-sorted by
+    // precursor m/z at Stage D build, whose stable sort then breaks m/z ties by this
+    // identical order).
     #[allow(clippy::large_enum_variant)] // Raw dominates; boxing would churn the hot map/collect
     enum RowOut {
         Raw(Raw),
@@ -108,26 +114,7 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
                 Err(_) => return RowOut::ParseErr,
             };
             let z = charge[row];
-            let frags = if p.cfg.charge_by_basic_residues {
-                // Composition cap: request every charge up to the smaller of the
-                // precursor charge and the peptide's proton capacity, then keep
-                // each fragment only at charges its own basic sites (Arg/His/Lys
-                // within the fragment) plus its N-terminal amine can hold.
-                let max_z = (1 + parsed.basic_residue_count() as i32).min(z).max(1);
-                let all_charges: Vec<i32> = (1..=max_z).collect();
-                let mut fr = parsed.fragments(&all_charges);
-                fr.retain(|f| {
-                    f.charge <= 1 + parsed.fragment_basic_sites(f.ion_type, f.ordinal) as i32
-                });
-                fr
-            } else {
-                let mut frag_charges = vec![1];
-                if z >= p.cfg.charge2_from_precursor_charge {
-                    frag_charges.push(2);
-                }
-                parsed.fragments(&frag_charges)
-            };
-            if frags.is_empty() {
+            if fragments_of(&parsed, z, p.cfg).is_empty() {
                 return RowOut::Empty;
             }
             RowOut::Raw(Raw {
@@ -138,10 +125,12 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
                 label: label[row].clone(),
                 protein: protein[row].clone(),
                 precursor_mz: parsed.precursor_mz(z),
-                frags,
+                frags: Vec::new(),
                 irt: 0.0,
                 im: None,
                 frag_int: Vec::new(),
+                nonfinite_int: false,
+                out_of_range: 0,
                 parsed,
             })
         })
@@ -231,8 +220,9 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
     // Finite guard at the prediction sidecar boundary. A NaN/Inf predicted iRT or
     // fragment intensity from a misbehaving MS2PIP/DeepLC run would silently
     // corrupt the library and every downstream spectral-similarity feature (and
-    // would misorder the top-N intensity sort below). Fail loudly instead. The
-    // rescore sidecar boundary already guards its feature matrix the same way.
+    // misorder the top-N intensity sort). Fail loudly instead. The intensities were
+    // checked over every fragment before the cut ([`keep_fragments`]). The rescore
+    // sidecar boundary already guards its feature matrix the same way.
     for r in &raws {
         if !r.irt.is_finite() {
             bail!(
@@ -240,7 +230,7 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
                 r.peptidoform
             );
         }
-        if r.frag_int.iter().any(|v| !v.is_finite()) {
+        if r.nonfinite_int {
             bail!(
                 "predict-frag: non-finite predicted fragment intensity for '{}'",
                 r.peptidoform
@@ -248,37 +238,11 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
         }
     }
 
-    // Fragment m/z limits (`predict_frag.fragment_mz_min` / `fragment_mz_max`, opt-in):
-    // a fragment outside them is removed after prediction, so the predicted intensities
-    // are the model's as they were, and before the top-N selection, so its slot goes to a
-    // fragment inside the range.
+    // The fragment m/z limits (`predict_frag.fragment_mz_min` / `fragment_mz_max`, opt-in)
+    // and the top-N cut were applied to each candidate as its intensities were assigned
+    // ([`keep_fragments`]).
     let frag_range = fragment_mz_range(p.cfg);
-    let n_fragments_out_of_range: u64 = match frag_range {
-        Some((lo, hi)) => raws
-            .par_iter_mut()
-            .map(|r| retain_fragments(r, |f| f.mz >= lo && f.mz <= hi) as u64)
-            .sum(),
-        None => 0,
-    };
-
-    // Keep top-N fragments by predicted intensity. Each candidate is independent
-    // (operates only on its own frags/frag_int), so this parallelizes with no
-    // cross-item state; the result per candidate is identical to the serial loop.
-    raws.par_iter_mut().for_each(|r| {
-        let mut order: Vec<usize> = (0..r.frags.len()).collect();
-        order.sort_by(|&a, &b| r.frag_int[b].total_cmp(&r.frag_int[a]));
-        order.truncate(p.cfg.top_n_fragments);
-        order.sort_unstable();
-        // In-place gather: `order` is ascending and `order[dst] >= dst`, so a
-        // forward swap pass compacts the kept fragments into their original
-        // relative order without cloning Fragments or reallocating the Vecs.
-        for (dst, &src) in order.iter().enumerate() {
-            r.frags.swap(dst, src);
-            r.frag_int.swap(dst, src);
-        }
-        r.frags.truncate(order.len());
-        r.frag_int.truncate(order.len());
-    });
+    let n_fragments_out_of_range: u64 = raws.iter().map(|r| u64::from(r.out_of_range)).sum();
     // A candidate the fragment limits left without a fragment goes with its pair, as an
     // unpredicted one does, so a target never stays while its decoy leaves. Without the
     // limits no candidate can be empty here, and the default path is the one it was.
@@ -590,14 +554,12 @@ fn assign_predictions(p: &PredictFragParams, raws: &mut [Raw]) -> Result<Predict
     let (frag_id, frag_missing) = match (frag_req, frag_out) {
         (Some(fr), Some(map)) => fr.apply(p, raws, map)?,
         _ => {
-            let m = NativeFrag;
             // Per-row and independent: each candidate's intensities depend only on its own
             // parsed peptidoform and fragment list, with no cross-row reduction, so this is
             // bit-identical in parallel (no float accumulation order to change).
-            raws.par_iter_mut().for_each(|r| {
-                r.frag_int = m.predict_intensities(&r.parsed, &r.frags);
-            });
-            (m.identity(), Vec::new())
+            raws.par_iter_mut()
+                .for_each(|r| keep_fragments(r, p.cfg, native_intensities));
+            (NATIVE_FRAG.to_string(), Vec::new())
         }
     };
     let im = match (im_req, im_out) {
@@ -633,21 +595,33 @@ struct ImKeys {
     row_ids: Vec<u32>,
 }
 
+/// The first-seen payload of every distinct key of `rows`, in first-seen order, and each
+/// row's index into them. A request names a key by that index, so it does not depend on
+/// hashing.
+fn first_seen<K: std::hash::Hash + Eq, T>(
+    rows: impl IntoIterator<Item = (K, T)>,
+) -> (Vec<T>, Vec<u32>) {
+    let mut ids: HashMap<K, u32> = HashMap::new();
+    let (mut firsts, mut row_ids) = (Vec::new(), Vec::new());
+    for (key, payload) in rows {
+        let next = firsts.len() as u32;
+        row_ids.push(*ids.entry(key).or_insert_with(|| {
+            firsts.push(payload);
+            next
+        }));
+    }
+    (firsts, row_ids)
+}
+
 impl ImKeys {
     fn of<'a>(rows: impl IntoIterator<Item = (&'a str, i32, f64)>) -> Self {
-        let mut uniq: HashMap<(&'a str, i32), u32> = HashMap::new();
-        let mut keys = Self::default();
-        for (peptidoform, charge, mz) in rows {
-            let next = keys.peps.len() as u32;
-            let id = *uniq.entry((peptidoform, charge)).or_insert_with(|| {
-                keys.peps.push(peptidoform.to_string());
-                keys.charges.push(charge);
-                keys.mzs.push(mz);
-                next
-            });
-            keys.row_ids.push(id);
+        let (firsts, row_ids) = first_seen(rows.into_iter().map(|r| ((r.0, r.1), r)));
+        Self {
+            peps: firsts.iter().map(|r| r.0.to_string()).collect(),
+            charges: firsts.iter().map(|r| r.1).collect(),
+            mzs: firsts.iter().map(|r| r.2).collect(),
+            row_ids,
         }
-        keys
     }
 
     fn ids(&self) -> Vec<u32> {
@@ -742,13 +716,13 @@ enum RtRequest {
     Deeplc(DeeplcRequest),
 }
 
-/// The DeepLC request: one prediction per unique peptidoform (RT is charge-independent).
+/// The DeepLC request: one prediction per unique peptidoform (RT is charge-independent), in
+/// first-seen row order, and each row's index into them.
 struct DeeplcRequest {
     python: String,
     script: String,
-    uniq: HashMap<String, u32>,
-    ids: Vec<u32>,
     peps: Vec<String>,
+    row_ids: Vec<u32>,
 }
 
 impl RtRequest {
@@ -771,23 +745,15 @@ impl RtRequest {
                 })?;
                 let script =
                     crate::sidecar::resolve_script(&p.cfg.sidecar_script_dir, "deeplc_worker.py");
-                // Dedup by peptidoform (RT is charge-independent).
-                let mut uniq: HashMap<String, u32> = HashMap::new();
-                let (mut ids, mut peps) = (Vec::new(), Vec::new());
-                for r in raws.iter() {
-                    if !uniq.contains_key(&r.peptidoform) {
-                        let id = uniq.len() as u32;
-                        uniq.insert(r.peptidoform.clone(), id);
-                        ids.push(id);
-                        peps.push(r.peptidoform.clone());
-                    }
-                }
+                let (peps, row_ids) = first_seen(
+                    raws.iter()
+                        .map(|r| (r.peptidoform.as_str(), r.peptidoform.as_str())),
+                );
                 Ok(Self::Deeplc(DeeplcRequest {
                     python: python.to_string(),
                     script,
-                    uniq,
-                    ids,
-                    peps,
+                    peps: peps.into_iter().map(str::to_string).collect(),
+                    row_ids,
                 }))
             }
         }
@@ -801,27 +767,24 @@ impl RtRequest {
     ) -> Result<(String, Vec<usize>)> {
         match self {
             Self::Native | Self::Placeholder => {
-                let m = NativeRt;
                 // Per-row and independent (no cross-row reduction) -> bit-identical in parallel.
                 raws.par_iter_mut().for_each(|r| {
-                    r.irt = m.predict_irt(&r.parsed);
+                    r.irt = native_irt(&r.parsed);
                 });
                 let id = if matches!(self, Self::Placeholder) {
                     format!(
-                        "{} (placeholder: DeepLC deferred to the multi-head calibration)",
-                        m.identity()
+                        "{NATIVE_RT} (placeholder: DeepLC deferred to the multi-head calibration)"
                     )
                 } else {
-                    m.identity()
+                    NATIVE_RT.to_string()
                 };
                 Ok((id, Vec::new()))
             }
             Self::Deeplc(req) => {
                 let out = out.expect("a DeepLC request is called before it is applied");
                 let mut missing = Vec::new();
-                for (i, r) in raws.iter_mut().enumerate() {
-                    let uid = req.uniq[&r.peptidoform];
-                    match out.get(&uid) {
+                for (i, (r, id)) in raws.iter_mut().zip(&req.row_ids).enumerate() {
+                    match out.get(id) {
                         Some(&v) => r.irt = v,
                         None => missing.push(i),
                     }
@@ -837,13 +800,8 @@ impl RtRequest {
 
 impl DeeplcRequest {
     fn call(&self, p: &PredictFragParams) -> Result<HashMap<u32, f32>> {
-        sidecar::run_deeplc(
-            &self.python,
-            &self.script,
-            p.work_dir,
-            &self.ids,
-            &self.peps,
-        )
+        let ids: Vec<u32> = (0..self.peps.len() as u32).collect();
+        sidecar::run_deeplc(&self.python, &self.script, p.work_dir, &ids, &self.peps)
     }
 }
 
@@ -933,52 +891,68 @@ impl FragRequest {
                 FragModel::Peptdeep => bail!("AlphaPeptDeep returned no predictions"),
             }
         }
-        let native = NativeFrag;
-        // Parallel across rows: each row writes only its own `frag_int` and reads only its
-        // own parsed peptidoform, fragment list and worker entry. `par_iter_mut` preserves the
+        // Parallel across rows: each row writes only its own fragments and reads only its
+        // own parsed peptidoform and worker entry. `par_iter_mut` preserves the
         // element-to-index mapping, and the per-row float work (the native charge-2 fallback
         // and the per-charge-group max-normalizations) is self-contained, so this is
         // bit-identical to the serial loop. The worker call already happened -- what is
-        // parallelized here is the per-row native prediction and normalization, which is real
-        // CPU work, not sidecar wait.
+        // parallelized here is the per-row fragment generation and normalization, which is
+        // real CPU work, not sidecar wait.
         //
         // A candidate the worker returned nothing for is reported to the caller, which drops
-        // it with its pair; it used to receive the native heuristic silently, under a
-        // library-wide model identity (docs/29 #17). AlphaPeptDeep goes through the same
-        // `ms2pip_values`: its worker always emits both fragment charges, so
+        // it with its pair, so it gets no fragment; it used to receive the native heuristic
+        // silently, under a library-wide model identity (docs/29 #17). AlphaPeptDeep goes
+        // through the same `ms2pip_values`: its worker always emits both fragment charges, so
         // `model_has_charge2` holds and every fragment is on one scale.
-        let covered: Vec<bool> = raws
+        // Per row: whether the worker covered it, and whether charge-2 fragments took the
+        // native heuristic because the model predicts no charge-2 series.
+        let covered: Vec<(bool, bool)> = raws
             .par_iter_mut()
             .enumerate()
             .map(|(i, r)| match map.get(&(i as u32)) {
                 Some(per) if !per.is_empty() => {
-                    let keys: Vec<(u8, u16, u8)> = r
-                        .frags
-                        .iter()
-                        .map(|fr| {
-                            (
-                                fr.ion_type.symbol() as u8,
-                                fr.ordinal as u16,
-                                fr.charge.clamp(1, 255) as u8,
-                            )
-                        })
-                        .collect();
-                    let nat = native.predict_intensities(&r.parsed, &r.frags);
-                    r.frag_int = ms2pip_values(&keys, per, &nat);
-                    true
+                    let mut heuristic = false;
+                    keep_fragments(r, p.cfg, |parsed, frags| {
+                        let keys: Vec<(u8, u16, u8)> = frags
+                            .iter()
+                            .map(|fr| {
+                                (
+                                    fr.ion_type.symbol() as u8,
+                                    fr.ordinal as u16,
+                                    fr.charge.clamp(1, 255) as u8,
+                                )
+                            })
+                            .collect();
+                        let (vals, h) =
+                            ms2pip_values(&keys, per, || native_intensities(parsed, frags));
+                        heuristic = h;
+                        vals
+                    });
+                    (true, heuristic)
                 }
-                _ => {
-                    r.frag_int = vec![0.0; r.frags.len()];
-                    false
-                }
+                _ => (false, false),
             })
             .collect();
         let missing: Vec<usize> = covered
             .iter()
             .enumerate()
-            .filter(|(_, &c)| !c)
+            .filter(|(_, c)| !c.0)
             .map(|(i, _)| i)
             .collect();
+        let n_heuristic = covered.iter().filter(|c| c.1).count();
+        if n_heuristic > 0 {
+            tracing::warn!(
+                candidates = n_heuristic,
+                model = %p.cfg.ms2pip_model,
+                "predict-frag: the fragment model predicts no charge-2 series, so the charge-2 \
+                 fragments of these candidates take the native heuristic, each charge group \
+                 normalised to its own peak. On a whole-proteome FASTA library with 6 fragments \
+                 and charge-2 fragments from precursor charge 2 that regime left the seed with \
+                 no confident PSM (docs/06). Use a model with a charge-2 series (HCDch2, \
+                 CIDch2), or set predict_frag.charge2_from_precursor_charge = 99 to build no \
+                 charge-2 fragment"
+            );
+        }
         let id = match self.model {
             FragModel::Ms2pip => {
                 let version = sidecar::module_version(&self.python, "ms2pip")
@@ -1045,6 +1019,65 @@ fn fragment_mz_range(cfg: &PredictFragConfig) -> Option<(f64, f64)> {
         cfg.fragment_mz_min.unwrap_or(f64::NEG_INFINITY),
         cfg.fragment_mz_max.unwrap_or(f64::INFINITY),
     ))
+}
+
+/// Every b/y fragment of a candidate at the fragment charges `cfg` allows for precursor charge
+/// `z`, before any intensity, m/z limit or top-N cut.
+fn fragments_of(parsed: &ParsedPeptidoform, z: i32, cfg: &PredictFragConfig) -> Vec<Fragment> {
+    if cfg.charge_by_basic_residues {
+        // Composition cap: request every charge up to the smaller of the
+        // precursor charge and the peptide's proton capacity, then keep
+        // each fragment only at charges its own basic sites (Arg/His/Lys
+        // within the fragment) plus its N-terminal amine can hold.
+        let max_z = (1 + parsed.basic_residue_count() as i32).min(z).max(1);
+        let all_charges: Vec<i32> = (1..=max_z).collect();
+        let mut fr = parsed.fragments(&all_charges);
+        fr.retain(|f| f.charge <= 1 + parsed.fragment_basic_sites(f.ion_type, f.ordinal) as i32);
+        fr
+    } else {
+        let mut frag_charges = vec![1];
+        if z >= cfg.charge2_from_precursor_charge {
+            frag_charges.push(2);
+        }
+        parsed.fragments(&frag_charges)
+    }
+}
+
+/// Give `r` its library fragments: every fragment ([`fragments_of`]) with the intensity
+/// `intensities` assigns over all of them, then the fragment m/z limits and the top-N cut, in
+/// that order. Only the kept fragments stay allocated: a 15-mer has 50 at two charges, the
+/// library keeps `top_n_fragments`.
+///
+/// A fragment outside the m/z limits is removed after prediction, so the predicted
+/// intensities are the model's as they were, and before the top-N selection, so its slot
+/// goes to a fragment inside the range. Each candidate is independent, so callers run this
+/// in parallel.
+fn keep_fragments(
+    r: &mut Raw,
+    cfg: &PredictFragConfig,
+    intensities: impl FnOnce(&ParsedPeptidoform, &[Fragment]) -> Vec<f32>,
+) {
+    r.frags = fragments_of(&r.parsed, r.charge, cfg);
+    r.frag_int = intensities(&r.parsed, &r.frags);
+    r.nonfinite_int = r.frag_int.iter().any(|v| !v.is_finite());
+    if let Some((lo, hi)) = fragment_mz_range(cfg) {
+        r.out_of_range = retain_fragments(r, |f| f.mz >= lo && f.mz <= hi) as u32;
+    }
+    // Top-N by predicted intensity, ties in fragment order (a stable sort).
+    let mut order: Vec<usize> = (0..r.frags.len()).collect();
+    order.sort_by(|&a, &b| r.frag_int[b].total_cmp(&r.frag_int[a]));
+    order.truncate(cfg.top_n_fragments);
+    order.sort_unstable();
+    // In-place gather: `order` is ascending and `order[dst] >= dst`, so a forward swap pass
+    // compacts the kept fragments into their original relative order.
+    for (dst, &src) in order.iter().enumerate() {
+        r.frags.swap(dst, src);
+        r.frag_int.swap(dst, src);
+    }
+    r.frags.truncate(order.len());
+    r.frag_int.truncate(order.len());
+    r.frags.shrink_to_fit();
+    r.frag_int.shrink_to_fit();
 }
 
 /// Keep the fragments of `r` for which `keep` holds, with their intensities, in their
@@ -1142,11 +1175,13 @@ fn drop_unpredicted(raws: &mut Vec<Raw>, missing: &[&[usize]]) -> (u64, u64) {
     ((before - raws.len()) as u64, n_pairs)
 }
 
-/// One candidate's fragment intensities from its MS2PIP predictions.
+/// One candidate's fragment intensities from its MS2PIP predictions, and whether any of them
+/// took the native heuristic.
 ///
 /// `keys` are the candidate's fragments as `(ion byte, ordinal, charge)`, `per` the
 /// worker's predictions for it, `native` the heuristic intensities for the same
-/// fragments. Two regimes, decided by what the model emitted:
+/// fragments, computed only when the first regime below has a charge-2 fragment to fill.
+/// Two regimes, decided by what the model emitted:
 ///
 /// - **Charge-1 series only** (HCD2021 and the other single-charge models): charge-1
 ///   fragments take the prediction (0.0 when the ordinal is missing), charge-2 fragments
@@ -1165,9 +1200,11 @@ fn drop_unpredicted(raws: &mut Vec<Raw>, missing: &[&[usize]]) -> (u64, u64) {
 fn ms2pip_values(
     keys: &[(u8, u16, u8)],
     per: &HashMap<(u8, u16, u8), f32>,
-    native: &[f32],
-) -> Vec<f32> {
+    native: impl FnOnce() -> Vec<f32>,
+) -> (Vec<f32>, bool) {
     let model_has_charge2 = per.keys().any(|k| k.2 >= 2);
+    let heuristic = !model_has_charge2 && keys.iter().any(|k| k.2 >= 2);
+    let native = if heuristic { native() } else { Vec::new() };
     let mut vals: Vec<f32> = keys
         .iter()
         .enumerate()
@@ -1202,7 +1239,7 @@ fn ms2pip_values(
             }
         }
     }
-    vals
+    (vals, heuristic)
 }
 
 /// Count distinct precursors (candidate_ids) whose fragments fall in each 0.01 Da
@@ -1315,14 +1352,15 @@ mod cardinality_tests {
         per.insert((b'b', 2, 1), 0.05f32);
         per.insert((b'y', 3, 1), 0.20f32);
         let native = [0.9f32, 0.9, 0.5, 0.25];
-        let v = ms2pip_values(&keys, &per, &native);
+        let v = ms2pip_values(&keys, &per, || native.to_vec());
         // Charge-1 from the model, normalised to its own peak; charge-2 from the
         // heuristic, normalised to its own peak.
-        assert_eq!(v, vec![0.25, 1.0, 1.0, 0.5]);
-        // A charge-1 ordinal the model did not emit is 0.0, not the heuristic.
+        assert_eq!(v, (vec![0.25, 1.0, 1.0, 0.5], true));
+        // A charge-1 ordinal the model did not emit is 0.0, not the heuristic, which a
+        // candidate without a charge-2 fragment never computes.
         let keys2 = [(b'b', 2, 1), (b'b', 5, 1)];
-        let v2 = ms2pip_values(&keys2, &per, &[0.9, 0.9]);
-        assert_eq!(v2, vec![1.0, 0.0]);
+        let v2 = ms2pip_values(&keys2, &per, || unreachable!());
+        assert_eq!(v2, (vec![1.0, 0.0], false));
     }
 
     #[test]
@@ -1369,9 +1407,8 @@ mod cardinality_tests {
         per.insert((b'y', 3, 1), 0.20f32);
         per.insert((b'y', 3, 2), 0.10f32);
         // y4(2) is absent from the predictions: 0.0, never the heuristic.
-        let native = [0.9f32, 0.9, 0.9, 0.9];
-        let v = ms2pip_values(&keys, &per, &native);
-        assert_eq!(v, vec![0.25, 1.0, 0.5, 0.0]);
+        let v = ms2pip_values(&keys, &per, || unreachable!());
+        assert_eq!(v, (vec![0.25, 1.0, 0.5, 0.0], false));
     }
 
     #[test]
@@ -1471,7 +1508,6 @@ mod im_tests {
             out_fragments: &out_f,
             cfg: &cfg,
             work_dir: &path("work"),
-            config_hash: "h",
             rt_placeholder: false,
             run_has_im: false,
         })
@@ -1546,7 +1582,6 @@ mod im_tests {
             out_fragments: &frag,
             cfg,
             work_dir: &path("work"),
-            config_hash: "h",
             rt_placeholder: false,
             run_has_im: false,
         });

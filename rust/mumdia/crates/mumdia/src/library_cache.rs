@@ -202,14 +202,8 @@ impl LibraryCache {
         run_has_im: bool,
         engine: (&str, &str),
     ) -> Option<Self> {
-        // `"auto"` is `libraries/` under the engine's cache root (`crate::cache`).
-        let dir = crate::cache::library_dir(cfg)?.path;
-        match key_material(cfg, fasta, rt_placeholder, run_has_im, engine) {
-            Ok(material) => {
-                let text = serde_json::to_string(&material).expect("key material serializes");
-                let key = mumdia_io::hash::blake3_str(&text)[..24].to_string();
-                Some(Self { dir, key, material })
-            }
+        match Self::keyed(cfg, fasta, rt_placeholder, run_has_im, engine)? {
+            Ok(cache) => Some(cache),
             Err(e) => {
                 warn!(
                     error = %format!("{e:#}"),
@@ -219,6 +213,40 @@ impl LibraryCache {
                 None
             }
         }
+    }
+
+    /// [`LibraryCache::for_config`] without the log: `None` when no cache is configured, an
+    /// error when the key cannot be determined.
+    fn keyed(
+        cfg: &Config,
+        fasta: &str,
+        rt_placeholder: bool,
+        run_has_im: bool,
+        engine: (&str, &str),
+    ) -> Option<Result<Self>> {
+        // `"auto"` is `libraries/` under the engine's cache root (`crate::cache`).
+        let dir = crate::cache::library_dir(cfg)?.path;
+        Some(
+            key_material(cfg, fasta, rt_placeholder, run_has_im, engine).map(|material| {
+                let text = serde_json::to_string(&material).expect("key material serializes");
+                let key = mumdia_io::hash::blake3_str(&text)[..24].to_string();
+                Self { dir, key, material }
+            }),
+        )
+    }
+
+    /// Whether the cache holds this FASTA's library as a build without a placeholder iRT
+    /// stores it (`build-library`'s, with DeepLC's retention times), by the size check a
+    /// restore makes first. False when no cache is configured or the key cannot be read.
+    pub fn holds_predicted(
+        cfg: &Config,
+        fasta: &str,
+        run_has_im: bool,
+        engine: (&str, &str),
+    ) -> bool {
+        Self::keyed(cfg, fasta, false, run_has_im, engine)
+            .and_then(Result::ok)
+            .is_some_and(|c| c.validate(&c.entry_dir(), false).is_ok())
     }
 
     /// The entry's directory.
@@ -830,8 +858,16 @@ mod tests {
         let p2 = run2.join(TABLES[0]).to_string_lossy().into_owned();
         let f2 = run2.join(TABLES[1]).to_string_lossy().into_owned();
         assert!(cache.restore(&p2, &f2).is_none(), "empty cache is a miss");
+        let holds = |cfg: &Config| {
+            LibraryCache::holds_predicted(cfg, &fasta.to_string_lossy(), false, ("0", "sha"))
+        };
+        assert!(!holds(&cfg));
 
         cache.store(&p1, &f1);
+        assert!(
+            holds(&cfg),
+            "the entry a build without a placeholder stored"
+        );
         let (wp, wf) = cache.restore(&p2, &f2).expect("stored library is a hit");
         assert_eq!((wp.rows, wf.rows), (10, 11));
         assert_eq!(wp.content_hash, "hash-a-0");

@@ -2,7 +2,7 @@
 
 Usage: python sort_fragments.py <lib_fragments.parquet> [--buckets N] [--tmp DIR]
 
-The engine's range load (`Library::load_range_with`) reads one candidate-id range of the
+The engine's band load (`Library::load_for_stage`) reads one candidate-id range of the
 fragment table by parquet row-group statistics, which needs the table sorted by
 `candidate_id` at row-group granularity. The library writers produce that order; this is
 the one-time fix for a table written before they did. Two streaming passes over the file

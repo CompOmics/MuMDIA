@@ -168,8 +168,8 @@ recipe").
 run loop calls; it drives the lower-level transform `make_decoy` (digest.rs:101)
 and guarantees the decoy differs from its target, matches no target sequence, and
 is unique among emitted decoys. The configured transform is tried first
-(`attempt == 0`); on any collision it retries with an independently reseeded
-`Scramble` up to `MAX_DECOY_ATTEMPTS` (64, digest.rs:22), returning the sequence
+(`attempt == 0`); on any collision it retries with a `Scramble` reseeded per attempt
+up to `MAX_DECOY_ATTEMPTS` (64, digest.rs:22), returning the sequence
 and the retry count (digest.rs:144-156). If every attempt collides, it returns
 `None` and the pair is dropped. Tests `collision_safe_decoy_avoids_targets_and_other_decoys`
 (digest.rs:382) and `impossible_low_complexity_decoy_drops_pair` (digest.rs:403)
@@ -184,15 +184,19 @@ strategies keep the C-terminal residue fixed and rewrite the interior `b[..n-1]`
   C-terminal `K`/`R` in place while moving the N-terminus. Test
   `reverse_decoy_keeps_cterm` (digest.rs:367) pins `PEPTIDER -> EDITPEPR`.
 - `DecoyStrategy::Scramble` (digest.rs:114): a deterministic Fisher-Yates shuffle
-  of the first `n-1` residues. The PRNG state is seeded per peptide as
-  `rng_seed ^ fnv1a(pep)` (digest.rs:117) and advanced with `splitmix64`
+  of the first `n-1` residues. The PRNG state is `seed ^ fnv1a(pep)` (digest.rs:117),
+  advanced with `splitmix64`
   (digest.rs:159). The loop runs `i` from `len-2` down to `1` and swaps index `i`
   with a uniform `j` in `0..=i` (digest.rs:118-122), so every interior position
   including index 0 (the N-terminal residue) can move while the last residue is
   re-appended untouched. Test `scramble_is_deterministic` (digest.rs:374) pins
-  reproducibility and the fixed C-terminus. `collision_safe_decoy` also mixes an
-  `attempt`-indexed constant into this seed (digest.rs:145) so each retry is a
-  distinct but deterministic scramble.
+  reproducibility and the fixed C-terminus. `collision_safe_decoy` passes
+  `rng_seed ^ attempt * C ^ fnv1a(pep)` as the seed (digest.rs:145), so the two
+  `fnv1a(pep)` terms cancel: the shuffle depends on `rng_seed` and the attempt only,
+  and every peptide of one length gets the same permutation at one attempt. That is
+  as valid a decoy as reversal, and each retry is a distinct, deterministic
+  permutation; seeding per peptide would change every FASTA library with a collision
+  retry, so it would need an entrapment check first.
 - `DecoyStrategy::DiannShift` and `DecoyStrategy::None` return `None`
   (digest.rs:126-127); `DiannShift` is unrealized here by design (the comment
   notes it would be a predict-frag fragment-shift; see the clean-room boundary in
@@ -286,8 +290,8 @@ a live silent-drop path.
 | `collision_safe_decoy` | digest.rs:137 | Wrap `make_decoy` with target/other-decoy collision checks and up to `MAX_DECOY_ATTEMPTS` reseeded-scramble retries; `None` drops the pair |
 | `make_decoy` | digest.rs:101 | One transform: reverse or seeded-scramble decoy of the interior, C-term fixed; `None` if `len < 3` or strategy `None`/`DiannShift` |
 | `splitmix64` | digest.rs:159 | Deterministic PRNG step for the scramble shuffle |
-| `fnv1a` | digest.rs:167 | Per-peptide hash mixed into the scramble seed |
-| `DigestParams` | digest.rs:176 | `fasta`, `out`, `cfg: &DigestConfig`, `rng_seed`, `config_hash`, `protein_n_term` (record the protein N-terminus flag, peptides v2) |
+| `fnv1a` | digest.rs:167 | Sequence hash in the scramble seed; cancels through `collision_safe_decoy` (see `Scramble`) |
+| `DigestParams` | digest.rs:176 | `fasta`, `out`, `cfg: &DigestConfig`, `rng_seed`, `protein_n_term` (record the protein N-terminus flag, peptides v2) |
 | `starts_protein` | digest.rs | Whether a peptide at `start` starts its protein: position 0, or position 1 after an initiator `M` under `n_term_met_excision` |
 | `peptidoforms::run` | peptidoforms.rs:186 | Stage A2 entry point; validate rules, enumerate mods+charges, write `peptidoforms.parquet` |
 | `validated_rules` | peptidoforms.rs:125 | Validate charges and fixed/variable rules (stacking, overlap, dedup, unknown-mod policy) before expansion |
@@ -295,7 +299,7 @@ a live silent-drop path.
 | `proforma` | peptidoforms.rs:19 | Build ProForma-lite string from stripped peptide + `(slot, name)` mods; slot 0 is the N-terminal group `[Name]-` |
 | `variable_combos` | peptidoforms.rs:58 | Enumerate modified-site subsets up to `max_var`, expanding per-site alternatives |
 | `expand_site_choices` | peptidoforms.rs:34 | Enumerate the per-site alternative assignments for one selected set of sites |
-| `PeptidoformsParams` | peptidoforms.rs:179 | `peptides`, `out`, `cfg: &PeptidoformsConfig`, `config_hash` |
+| `PeptidoformsParams` | peptidoforms.rs:179 | `peptides`, `out`, `cfg: &PeptidoformsConfig` |
 | `unimod_mass` | mass.rs:13 | Name -> monoisotopic delta allowlist (the set of mods that validate) |
 | `is_standard_residue` | constants.rs:54 | The 20-residue allowlist gating digest output |
 
@@ -347,9 +351,8 @@ types elsewhere, not here). `DecoyConfig` (config.rs:172) carries only
 - **Determinism.** Emission order is FASTA order then in-protein sequence order,
   preserved by the `order` vector (digest.rs:206), not by HashMap iteration. Ids
   are a single monotonic counter. Scramble is fully deterministic for a fixed
-  `rng_seed` because the PRNG is seeded per peptide from the sequence
-  (digest.rs:117); `collision_safe_decoy`'s retry reseeding is `attempt`-indexed
-  (digest.rs:145), so which pairs drop is deterministic too. No floats are summed
+  `rng_seed` because its seed is a function of `rng_seed` and the attempt
+  (digest.rs:117, digest.rs:145), so which pairs drop is deterministic too. No floats are summed
   in either stage, so the numeric-order determinism concerns from other stages do
   not apply.
 - **Target/decoy pairing.** A decoy's `target_id` points at its target's `id` and
@@ -406,11 +409,11 @@ types elsewhere, not here). `DecoyConfig` (config.rs:172) carries only
   offending rule (peptidoforms.rs:104-112). Test
   `skip_policy_removes_unknown_modification` (peptidoforms.rs:350) pins the `skip`
   path.
-- **`config_hash` param is unused.** Both `DigestParams.config_hash`
-  (digest.rs:181) and `PeptidoformsParams.config_hash` (peptidoforms.rs:183) are
-  threaded from the CLI/orchestrator but never read inside either `run`. The
+- **No configuration hash in the parameters.** Neither stage records one: the
   content hash written to the report comes from `blake3_file` over the output
-  Parquet (digest.rs:318, peptidoforms.rs:274), not from `config_hash`.
+  Parquet (digest.rs:318, peptidoforms.rs:274), and the manifest records the
+  configuration hash (`Written::record`). The unread `config_hash` field both
+  parameter structs carried was removed.
 - **`decoy_strategy` string is derived by Debug-formatting the enum**
   (`format!("{:?}", ...).to_lowercase()`, digest.rs:260). It is a display string,
   not a parseable round-trip; changing enum variant names changes the column
@@ -596,7 +599,7 @@ digest's `peptides.parquet` and report are byte-identical to those before the ch
   would need a different span enumeration in `digest_with`, not just a rule.
 - **New decoy scheme.** Add a `DecoyStrategy` variant (config.rs:17) and a match
   arm in `make_decoy` (digest.rs:107). Preserve the C-terminal residue and
-  determinism (seed the PRNG from the sequence as scramble does, digest.rs:117).
+  determinism (seed any PRNG from `rng_seed`, as scramble does, digest.rs:117).
   The target/other-decoy collision guard is applied for free by
   `collision_safe_decoy` (digest.rs:137) around any transform, but only its
   `attempt == 0` path uses the new strategy; every retry falls back to `Scramble`,

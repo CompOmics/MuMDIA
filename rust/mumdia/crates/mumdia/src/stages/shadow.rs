@@ -84,7 +84,6 @@ pub struct ShadowRows<'a> {
     pub apex_rt: &'a [f64],
     pub precursor_mz: &'a [f64],
     pub score: &'a [f64],
-    pub is_decoy: &'a [bool],
     /// First-pass accepted targets (the possible lenders).
     pub accepted: &'a [bool],
     /// The peak each row selected (`selected_peak_rank`), which with `cid` finds the row's
@@ -242,17 +241,17 @@ fn q1_runs(
 }
 
 /// The apex 1/K0 of every row, joined from its run's `psms_extracted` on
-/// `(candidate_id, peak_rank)`; `None` for a row without one. All `None` when the 1/K0 term
-/// is off, and, with a warning, when the caller passed no `psms_extracted` for the runs.
+/// `(candidate_id, peak_rank)`; `None` for a row without one. Empty when the 1/K0 term is
+/// off, and, with a warning, when the caller passed no `psms_extracted` for the runs, so
+/// the default costs nothing per row: read it through `apex_im`.
 fn apex_ims(
     rows: &ShadowRows,
     inputs: &ShadowInputs,
     prm: ShadowParams,
     n_sources: usize,
 ) -> Result<Vec<Option<f64>>> {
-    let n = rows.cid.len();
     if prm.im_tol <= 0.0 {
-        return Ok(vec![None; n]);
+        return Ok(Vec::new());
     }
     if inputs.psms_extracted.len() < n_sources {
         tracing::warn!(
@@ -261,7 +260,7 @@ fn apex_ims(
             "rescore: shadow_im_tolerance is set, but this rescore has no psms_extracted for \
              every run; the shadow test runs without its 1/K0 term"
         );
-        return Ok(vec![None; n]);
+        return Ok(Vec::new());
     }
     let by_source: Vec<std::collections::BTreeMap<(u32, i32), f64>> = inputs.psms_extracted
         [..n_sources]
@@ -279,13 +278,18 @@ fn apex_ims(
             crate::stages::extract::apex_im_by_peak(p)
         })
         .collect::<Result<_>>()?;
-    Ok((0..n)
+    Ok((0..rows.cid.len())
         .map(|i| {
             by_source[rows.source[i] as usize]
                 .get(&(rows.cid[i], rows.peak_rank[i]))
                 .copied()
         })
         .collect())
+}
+
+/// Row `i`'s apex 1/K0 from [`apex_ims`], `None` when it has none or the term is off.
+fn apex_im(im: &[Option<f64>], i: usize) -> Option<f64> {
+    im.get(i).copied().flatten()
 }
 
 /// Isolation windows of one run as ascending `(lower, upper)`.
@@ -383,7 +387,7 @@ fn q1_shadow(
         {
             continue;
         }
-        if let (Some(a), Some(b)) = (im[i], im[j]) {
+        if let (Some(a), Some(b)) = (apex_im(im, i), apex_im(im, j)) {
             if (a - b).abs() > prm.im_tol {
                 continue;
             }
@@ -443,36 +447,39 @@ pub fn flag(rows: &ShadowRows, inputs: &ShadowInputs, prm: ShadowParams) -> Resu
         .iter()
         .map(|p| read_windows(p))
         .collect::<Result<_>>()?;
-    let win: Vec<Option<u32>> = (0..n)
-        .map(|i| window_of(&windows[rows.source[i] as usize], rows.precursor_mz[i]))
-        .collect();
+    // Only the accepted and the examined rows read their window, so it is found per row.
+    let win = |i: usize| window_of(&windows[rows.source[i] as usize], rows.precursor_mz[i]);
     let im = apex_ims(rows, inputs, prm, n_sources)?;
 
     // The label-blind region of each run: its top `region x accepted` rows by score.
-    let mut by_source: Vec<Vec<usize>> = vec![Vec::new(); n_sources];
+    let mut by_source: Vec<Vec<u32>> = vec![Vec::new(); n_sources];
     for i in 0..n {
-        by_source[rows.source[i] as usize].push(i);
+        by_source[rows.source[i] as usize].push(i as u32);
     }
     let mut in_region = vec![false; n];
     for idx in by_source.iter_mut() {
-        let nacc = idx.iter().filter(|&&i| rows.accepted[i]).count();
-        idx.sort_by(|&a, &b| rows.score[b].total_cmp(&rows.score[a]).then(a.cmp(&b)));
+        let nacc = idx.iter().filter(|&&i| rows.accepted[i as usize]).count();
+        idx.sort_by(|&a, &b| {
+            rows.score[b as usize]
+                .total_cmp(&rows.score[a as usize])
+                .then(a.cmp(&b))
+        });
         for &i in idx.iter().take(prm.region.saturating_mul(nacc)) {
-            in_region[i] = true;
+            in_region[i as usize] = true;
         }
     }
 
     // Lenders per (run, window): (apex_rt, score, cid, base), ascending by apex_rt.
     let mut lenders: HashMap<(u32, u32), Vec<Lender>> = HashMap::new();
-    for (i, wi) in win.iter().enumerate() {
+    for i in 0..n {
         if rows.accepted[i] {
-            if let Some(w) = *wi {
+            if let Some(w) = win(i) {
                 lenders.entry((rows.source[i], w)).or_default().push((
                     rows.apex_rt[i],
                     rows.score[i],
                     rows.cid[i],
                     rows.base[i],
-                    im[i],
+                    apex_im(&im, i),
                 ));
             }
         }
@@ -529,7 +536,7 @@ pub fn flag(rows: &ShadowRows, inputs: &ShadowInputs, prm: ShadowParams) -> Resu
                     prm,
                 );
             }
-            let (Some(w), Some(own)) = (win[i], frags.get(&rows.cid[i])) else {
+            let (Some(w), Some(own)) = (win(i), frags.get(&rows.cid[i])) else {
                 return false;
             };
             let Some(cands) = lenders.get(&(rows.source[i], w)) else {
@@ -546,7 +553,7 @@ pub fn flag(rows: &ShadowRows, inputs: &ShadowInputs, prm: ShadowParams) -> Resu
                     continue;
                 }
                 // The 1/K0 term: a lender separated in mobility shares no fragment peak.
-                if let (Some(a), Some(b)) = (im[i], c.4) {
+                if let (Some(a), Some(b)) = (apex_im(&im, i), c.4) {
                     if (a - b).abs() > prm.im_tol {
                         continue;
                     }
@@ -677,7 +684,6 @@ mod tests {
         let apex = vec![100.0, 100.5, 100.5];
         let mz = vec![412.3, 410.0, 410.0];
         let score = vec![0.99, 0.9, 0.9];
-        let is_decoy = vec![false, true, false];
         let accepted = vec![true, false, false];
         let peak_rank = vec![0i32; 3];
         let rows = ShadowRows {
@@ -687,7 +693,6 @@ mod tests {
             apex_rt: &apex,
             precursor_mz: &mz,
             score: &score,
-            is_decoy: &is_decoy,
             accepted: &accepted,
             peak_rank: &peak_rank,
         };
@@ -758,7 +763,6 @@ mod tests {
         let apex = vec![100.0, 101.0, 110.0, 100.5, 100.0, 100.2];
         let mz = vec![410.0, 405.0, 405.0, 410.0, 430.0, 415.0];
         let score = vec![0.99, 0.95, 0.95, 0.95, 0.95, 0.999];
-        let is_decoy = vec![false, true, false, true, false, false];
         let accepted = vec![true, false, false, false, false, false];
         let peak_rank = vec![0i32; 6];
         let windows = vec![win];
@@ -769,7 +773,6 @@ mod tests {
             apex_rt: &apex,
             precursor_mz: &mz,
             score: &score,
-            is_decoy: &is_decoy,
             accepted: &accepted,
             peak_rank: &peak_rank,
         };

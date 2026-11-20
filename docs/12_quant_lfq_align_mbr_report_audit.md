@@ -33,9 +33,9 @@ stages that operate across multiple runs.
 
 | path | role |
 |---|---|
-| `rust/mumdia/crates/mumdia/src/stages/quant.rs` | `quant` stage + `run_lfq_combine`/`size_factors` for `quant-lfq` |
+| `rust/mumdia/crates/mumdia/src/stages/quant.rs` | `quant` stage, its chromatogram reader and the cross-run fit (`fit_cross_run`) |
 | `rust/mumdia/crates/mumdia/src/stages/quant_norm.rs` | cross-run normalisation (`quant-normalise`, `quant.normalisation`, default `stable_set`) |
-| `rust/mumdia/crates/mumdia/src/quant_lfq.rs` | MaxLFQ/directLFQ ratio-alignment core (`lfq_profile`, `maxlfq`, `directlfq`) |
+| `rust/mumdia/crates/mumdia/src/quant_lfq.rs` | MaxLFQ/directLFQ ratio-alignment core (`lfq_profile`, `maxlfq`, `directlfq`) and the `quant-lfq` combine with its size factors (`run_lfq_combine_grouped`) |
 | `rust/mumdia/crates/mumdia/src/stages/align.rs` | Stage D2 cross-run RT alignment |
 | `rust/mumdia/crates/mumdia/src/stages/report.rs` | `peptides.tsv` + `precursors.tsv` + `proteins.tsv` writer |
 | `rust/mumdia/crates/mumdia/src/stages/audit.rs` | candidate identification-loss ladder |
@@ -130,7 +130,7 @@ sequence) and `<out>.precursor.parquet` (by peptidoform + charge), each with col
 `group` (str), `charge` (i32; -1 for peptide level), `run`, `quantity`, `n_features`,
 from the same normalized feature matrix and LFQ engine. The protein output is
 unchanged. Unlike `quant` and
-`align`, `run_lfq_combine` writes no `<out>.report.json`: it calls `write_table` and
+`align`, `run_lfq_combine_grouped` writes no `<out>.report.json`: it calls `write_table` and
 logs, with no `ArtifactReport` (`quant.rs:720`). `--quantity-column` names the input
 intensity column (`quantity` by default; `quantity_normalised` for the tables below).
 `--condition`, once per input in input order, estimates the size factors within each
@@ -252,7 +252,8 @@ handler prints a one-line summary (`main.rs:806`).
 experiment root, rows selected on the experiment-wide `peptide_q_value` /
 `pg_q_value`, an `n_runs` column counting the runs whose own `run_psm_q` accepts
 the precursor or group, and one quantity column per run (`quantity_<run>` from each
-run's `peptide_quant.parquet`, `lfq_<run>` from `lfq_maxlfq.parquet`). When every
+run's `peptide_quant.parquet`, `lfq_<run>` from `lfq_maxlfq.parquet`, empty for a run in
+which the group has no feature, where the matrix holds 0). When every
 run's `peptide_quant` is v3 (`mbr.first_pass_flag`), one `first_pass_<run>` column per run
 follows the quantity columns: `true` or `false` from the run's `first_pass_id`, empty where
 the run has no quant row for the precursor; otherwise there is no such column. No per-run
@@ -354,7 +355,7 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
 
    The three grouped columns (`peptide_q_value`, `precursor_q`, `pg_q_value`) are
    sparse: `grouped_q` assigns the computed q only to each group's single
-   best-scoring row and writes 1.0 to every losing sibling (`rescore.rs:721-728`).
+   best-scoring row and writes 1.0 to every losing sibling (`grouped_q`).
    After an experiment-wide rescore the grouping is experiment-wide too, so each
    group's winner lives in exactly one run and a per-run slice retains only about
    `1/n_runs` of the populated rows. `PeptideQ`/`PrecursorQ` are therefore
@@ -1191,14 +1192,14 @@ one cycle), or the key itself on the cycle traces of `q1_fragments`; on any othe
 20 to the last digit), the identifications unchanged. The ZT Scan recipe uses 4
 (docs/37_ztscan.md, section 6, has the mechanism, the table and why not wider).
 
-### quant-lfq (`quant.rs:657`, `run_lfq_combine`)
+### quant-lfq (`quant_lfq.rs`, `run_lfq_combine_grouped`)
 
 Reads each input table and builds `data: protein_group -> feature_key -> Vec<Option<f64>>`
-of length N runs (`quant.rs:666`). The feature key is `peptidoform|charge` for MaxLFQ
-and `peptidoform|charge|fragment_name` for directLFQ (`quant.rs:682`). Missing entries
-stay `None`. `size_factors` (`quant.rs:753`) computes one global size factor per run;
+of length N runs. The feature key is `peptidoform|charge` for MaxLFQ
+and `peptidoform|charge|fragment_name` for directLFQ. Missing entries
+stay `None`. `size_factors_counted` (`quant_lfq.rs`) computes one global size factor per run;
 when `normalize != None` every present value is divided by its run factor before
-rollup (`quant.rs:703`). For each protein group the feature-by-run matrix is passed to
+rollup. For each protein group the feature-by-run matrix is passed to
 `lfq_profile` (`quant_lfq.rs:84`) and the per-run abundances are written long-form.
 
 `lfq_profile` is the MaxLFQ least-squares reconstruction:
@@ -1214,21 +1215,26 @@ rollup (`quant.rs:703`). For each protein group the feature-by-run matrix is pas
   with partial pivoting), giving log-abundances. The exp-profile is then scaled so the
   component preserves its measured total intensity (`quant_lfq.rs:176`).
 
-`size_factors` methods (`quant.rs:753`):
-- `MedianRatio` (default, DESeq-style): over complete-case features (positive in all
-  runs) take each run's log2 deviation from the per-feature mean; the run factor is
-  `2^median` of those deviations. Robust so a spike-in design's real fold changes are
-  not flattened (test `median_ratio_recovers_global_scale_not_real_changes`,
-  `quant.rs:918`).
+Size factor methods (`size_factors_counted`):
+- `MedianRatio` (default, DESeq-style): over complete-case features (positive in every
+  run that holds a quantified feature) take each run's log2 deviation from the
+  per-feature mean; the run factor is `2^median` of those deviations. Robust so a
+  spike-in design's real fold changes are not flattened (test
+  `median_ratio_recovers_global_scale_not_real_changes`). A run with no quantified
+  feature (a blank well, a failed injection) keeps factor 1 with `n_features` 0, and
+  the others are estimated without it; before 2026-11-19 such a run left no complete
+  feature, and every run kept factor 1.
 - `Median`: align each run's median log2 intensity to the median of the per-run
   medians.
 - `None`: all factors 1.0.
 
 Determinism: medians sort in place, the matrix is iterated in `BTreeMap` key order.
-With a single input, `run_lfq_combine` reduces to the per-run sum.
-If no positive feature is complete across all runs, `MedianRatio` returns identity
-factors (`1.0`) without estimating a scale correction. Inspect the logged
-`size_factors`; identity may mean either balanced data or no usable complete cases.
+With a single input, `run_lfq_combine_grouped` reduces to the per-run sum.
+If no positive feature is complete across the runs that hold one, `MedianRatio` returns
+identity factors (`1.0`) without estimating a scale correction. It warns, naming the
+runs, when a run holds no quantified feature or when the factors rest on fewer than 20
+complete features; `lfq_size_factors.tsv` gives every run's `n_features`, and 0 there
+means that no factor was estimated for it.
 
 `MedianRatio` is blind to sample composition. On a mixed-proteome design every
 complete-case feature of a changed species pulls the median, so the factors shift every
@@ -1780,13 +1786,10 @@ invoked only when `extract.emit_candidate_audit` is set (`run.rs:428`), with
 `q_threshold = 0.01`, `run_id = out_dir`, and no entrapment substring; standalone,
 `mumdia audit` takes those as CLI args.
 
-`RejectionReason` (`rejection.rs:19`) is a 17-variant enum with a stable
-SCREAMING_SNAKE_CASE `code()` (`rejection.rs:50`), a `stage_order()` ladder position
-(0 earliest, `Reported` = 255, `rejection.rs:76`), an `is_rejection()` predicate
-(true for any non-`Reported` reason, `rejection.rs:100`), and `earliest()` to keep the
-smaller stage (`rejection.rs:106`). The variants are grouped by pipeline stage in the
-source (search space, candidate generation/pruning, extraction, ranking, competition,
-FDR/reporting).
+`RejectionReason` (`rejection.rs:22`) is a 12-variant enum with a stable
+SCREAMING_SNAKE_CASE `code()` (`rejection.rs:50`). The variants are declared in pipeline
+order (search space, candidate generation/pruning, extraction, ranking, competition,
+FDR/reporting); `audit.rs` tests the stages in that order and keeps the first loss.
 
 ## Key types and functions
 
@@ -1801,7 +1804,7 @@ FDR/reporting).
 | `add_protein_base_quantity` | quant.rs:220 | record one base peptide's max quantity for protein rollup |
 | `rollup_protein_bases` | quant.rs:238 | TopNSum/Sum over unique quantifiable base peptides |
 | `quant::run` | quant.rs:259 | full quant stage |
-| `run_lfq_combine` | quant.rs:657 | build the protein-by-run matrix for `quant-lfq` |
+| `run_lfq_combine_grouped` | quant_lfq.rs | build the protein-by-run matrix for `quant-lfq` |
 | `size_factors` | quant.rs:753 | per-run normalization factors (MedianRatio/Median/None) |
 | `median_sorted` | quant.rs:818 | in-place median helper (empty = 0.0; assumes finite, no NaN) |
 | `lfq_profile` | quant_lfq.rs:84 | MaxLFQ least-squares per-sample profile |
@@ -1820,7 +1823,7 @@ FDR/reporting).
 | `qcell` | report.rs:39 | quantity cell formatting (1 decimal; empty on NaN) |
 | `AuditParams` / `audit::run` | audit.rs:28 / 64 | candidate loss ladder |
 | `load_extract_reasons` | audit.rs:51 | optional `<psms>.audit.parquet` refinement (no producer yet) |
-| `RejectionReason` | rejection.rs:19 | earliest-loss category enum (`code`/`stage_order`/`is_rejection`/`earliest`) |
+| `RejectionReason` | rejection.rs:22 | earliest-loss category enum (`code`) |
 | `resolve_script` | sidecar.rs:20 | locate a worker script relative to CWD or the binary |
 | `run_worker` | sidecar.rs:217 | spawn `python <script> <args>`; error on non-zero exit |
 
@@ -1839,7 +1842,7 @@ FDR/reporting).
 - `q_filter` (`PeptideQ`): which q column to filter on:
   `PeptideQ`/`PrecursorQ`/`PsmQ`/`RunPsmQ`. Use `PeptideQ`/`PrecursorQ` only
   after a single-run rescore, because the grouped columns are populated on group
-  winners only (`rescore.rs:721-728`). For experiment-wide rescoring, slice by
+  winners only (`grouped_q`). For experiment-wide rescoring, slice by
   `source` and normally use `RunPsmQ`; `q_filter` alone does not select the run.
   `run-experiment` ignores this field and forces `PsmQ` (`run_experiment.rs:498`).
 - `fragment_selection` (`PatternFit` since 2026-11-07, previously `ObservedArea`):
@@ -1915,14 +1918,14 @@ but do not affect the wired `mumdia mbr` path.
   and an explicit `quant_status`. LFQ ignores null, non-finite, and nonpositive
   values.
 - **Competition affects matrix completeness.** The default upstream
-  `group_by=precursor` collapses charge/modification siblings separately within
-  each label. `peptidoform_charge` preserves them, but changes the rescoring/FDR
-  population and must be benchmarked before production use.
+  `group_by = peptidoform_charge` keeps charge and modification siblings as separate
+  precursors; `base_peptide` collapses them to one winner within each label, which
+  changes the rescoring/FDR population and the matrix.
 - **MS1 traces excluded.** `ms1_*` chromatogram rows are precursor channels and never
   enter peak detection or the top-N sum (`quant.rs:303`).
 - **Grouped q columns are populated on group winners only.** `grouped_q`
-  (`rescore.rs:673`) writes the computed q to the single best-scoring row of each
-  group and 1.0 to every loser (`rescore.rs:721-728`). This keeps a losing
+  writes the computed q to the single best-scoring row of each
+  group and 1.0 to every loser. This keeps a losing
   charge/modification sibling from inheriting the winner's q, but it means
   `peptide_q_value`, `precursor_q`, and `pg_q_value` are sparse. After an
   experiment-wide rescore each group has one winner across the whole experiment,
@@ -1979,14 +1982,12 @@ but do not affect the wired `mumdia mbr` path.
   the PSM `q_value` (recorded as `q_unit`).
 - **audit reason coverage.** In the current chain `audit.rs` can only ever emit
   `DID_NOT_SURVIVE_EXTRACTION`, `OUTCOMPETED_BY_TARGET`/`OUTCOMPETED_BY_DECOY`, `FAILED_PRECURSOR_FDR`,
-  `FAILED_PEPTIDE_FDR`, and `REPORTED`. The five refined extract codes
+  `FAILED_PEPTIDE_FDR`, `REMOVED_DURING_REPORTING` (a decoy that passes every gate, which
+  the report never writes), and `REPORTED`. The five refined extract codes
   (`NO_FRAGMENT_TRACES`, `NO_VALID_FRAGMENTS`, `PEAK_NOT_SELECTED`, `RT_PRUNED`,
   `WRONG_ISOLATION_WINDOW`) are matched by `load_extract_reasons` (`audit.rs:139`) but
-  need the absent sidecar to fire. The six remaining enum variants
-  (`PEPTIDE_NOT_GENERATED`, `MODIFICATION_NOT_ALLOWED`, `CHARGE_OUT_OF_RANGE`,
-  `PRECURSOR_MZ_OUT_OF_RANGE`, `CANDIDATE_CAP_REACHED`, `REMOVED_DURING_REPORTING`) have
-  no producer at all: even a sidecar string of that name falls to the `_ => DidNotSurviveExtraction`
-  arm (`audit.rs:145`).
+  need the absent sidecar to fire; any other sidecar string falls to the
+  `_ => DidNotSurviveExtraction` arm (`audit.rs:145`).
 - **report.json coverage is partial.** `quant` writes reports for
   `peptide_quant`, `protein_quant`, and emitted `fragment_quant`; the peak-bounds
   diagnostic gets none. `quant-lfq` and `mbr` write no `report.json`; `align` and `audit` do
@@ -2021,9 +2022,9 @@ but do not affect the wired `mumdia mbr` path.
 - **Consume `alignment.parquet` in MBR** instead of the worker's internal
   `binned_map`, so the RT map is computed once and shared; align already records the
   p95 residual that should set `rt_window_s`.
-- **Add an audit reason:** extend `RejectionReason` (`rejection.rs:19`) with a
-  `code()`, `stage_order()`, and a branch in the ladder (`audit.rs:136`); prefer
+- **Add an audit reason:** extend `RejectionReason` (`rejection.rs:22`) at its pipeline
+  position, with a `code()` arm and a branch in the ladder (`audit.rs:136`); prefer
   emitting it from the in-extract sidecar so `load_extract_reasons` can pass it through.
 - **New quant artifact column:** add the `Col` in the relevant `write_table`
   (`quant.rs:487`/`519`/`558`), bump the schema version in
-  `mumdia-core/src/schema.rs`, and update the consumer (`report.rs`, `run_lfq_combine`).
+  `mumdia-core/src/schema.rs`, and update the consumer (`report.rs`, `run_lfq_combine_grouped`).

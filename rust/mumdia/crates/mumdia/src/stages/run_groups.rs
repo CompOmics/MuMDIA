@@ -100,7 +100,6 @@ pub struct Pooled {
     /// false`), the bands' own tables in band order, each with the overlap losers it does
     /// not contribute.
     pub chromatograms: Vec<super::quant::ChromTable>,
-    pub features: String,
     /// The competed tables rescore reads for this run, in row order: the pooled
     /// `psms_competed.parquet`, or, when it was not written (`groups.pool_competed =
     /// false`), the bands' own tables in band order. Always one table, the pooled one,
@@ -121,8 +120,6 @@ fn windows_of(path: &str) -> Result<Vec<(f64, f64)>> {
 fn band_lib_name(rt_model: &str) -> &'static str {
     if rt_model.starts_with("multihead") {
         "lib_precursors_multihead.parquet"
-    } else if rt_model == "finetuned" {
-        "lib_precursors_ft.parquet"
     } else {
         "lib_precursors_deeplc.parquet"
     }
@@ -521,17 +518,8 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     let t0 = Instant::now();
     let cfg = g.cfg;
     let ch = g.config_hash;
-    // The multi-head ridge and the base-model re-prediction are deterministic in the
-    // anchors, so fitting them per band on the pooled anchors gives every band the same
-    // model. A fine-tune is not: trained per band it would give each band a different
-    // model, and cost the training once per band. Until the fine-tune can be trained once
-    // and applied per band, a grouped run refuses it; fine-tune the library once beforehand
-    // (docs/08, once-per-library) and search that table instead.
-    if cfg.rt_im_train.finetune_deeplc {
-        bail!(
-            "rt_im_train.finetune_deeplc is not supported with groups.window_groups > 1: the fine-tune would be trained separately in every group (non-deterministic, and the training cost once per group). Fine-tune the library once beforehand and search the fine-tuned table, or leave the default multi-head calibration on"
-        );
-    }
+    // `Config::validate` refuses `rt_im_train.finetune_deeplc` here, so the RT model below
+    // is a multi-head calibration, a base-model re-prediction or the library's own.
     let d = |name: &str| format!("{}/{}", g.out_dir, name);
     let gd = |i: usize, name: &str| format!("{}/groups/g{i:02}/{name}", g.out_dir);
 
@@ -701,7 +689,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             std::fs::create_dir_all(gd(b.index, ""))?;
             // The seed reads the band straight from the library by row span: the same
             // library, value for value, as a band file of those rows
-            // (`Library::load_row_span_with`), without writing one. Until 2026-09-25 every
+            // (`Library::load_for_stage`), without writing one. Until 2026-09-25 every
             // band was written out first, whether or not anything rewrote it, which on a
             // 203.5M-precursor library without an RT model was the whole precursor table
             // written again for every run. A band file is now written only where a DeepLC
@@ -717,7 +705,6 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 out: &seed,
                 cfg: &cfg.search_seed,
                 bucket_size: cfg.extract.bucket_size,
-                config_hash: ch,
                 fragment_offset: None,
                 ms2_scans: Some(&ms2_scans),
                 // The band writes its calibrant deviations so `seed-pool` can fit the
@@ -794,12 +781,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         .map(|b| seed_pool::BandSeed {
             path: b.seed.clone(),
             offset: b.offset,
-            rows: b.n as u32,
         })
-        .collect();
-    let masscals: Vec<String> = bands
-        .iter()
-        .map(|b| crate::masscal::json_path(&b.seed))
         .collect();
     // The bands' calibrant deviations, so the fragment tolerance is fitted once over the
     // whole run rather than averaged from the bands' own p95s on their own q.
@@ -810,7 +792,6 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     info!(stage = %"seed-pool", "run: stage start");
     let n = seed_pool::run(seed_pool::SeedPoolParams {
         seeds: &seeds,
-        masscals: &masscals,
         calibrants: &calibrants,
         cfg: &cfg.search_seed,
         out: &pooled_seed,
@@ -878,15 +859,6 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 (None, counts)
             }
         };
-    // The MS1 offset is one per run, so it is learned once from the pooled seed rather than
-    // per band (a band holds too few anchors for a stable median).
-    let ext_cfg = crate::stages::ms1cal::extract_cfg(
-        &cfg.extract,
-        &pooled_seed,
-        &g.converted.ms1,
-        cfg.rt_im_train.q_train,
-    )?;
-
     // --- RT model per band, against the pooled or the band's own anchors
     let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
     let python = cfg.predict_frag.deeplc_python.as_deref();
@@ -897,8 +869,6 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         .repredicts_library_irt(g.library_input, has_deeplc);
     let rt_model = if g.mh_heads > 0 {
         format!("multihead-{}", g.mh_heads)
-    } else if cfg.rt_im_train.finetune_deeplc {
-        "finetuned".to_string()
     } else if repredict {
         "base".to_string()
     } else {
@@ -955,9 +925,8 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     // A previous run of the same experiment that planned the same bands under the same
     // library wrote the same bytes (a slice is a deterministic function of the library and
     // the row span), so its slices are taken instead where `slices_from` offers them.
-    let per_band_sidecar = g.shared_bands.is_none()
-        && !keep_caller_irt
-        && (g.mh_heads > 0 || cfg.rt_im_train.finetune_deeplc || repredict);
+    let per_band_sidecar =
+        g.shared_bands.is_none() && !keep_caller_irt && (g.mh_heads > 0 || repredict);
     if per_band_sidecar {
         let reuse_dir = g
             .slices_from
@@ -1024,10 +993,10 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             if g.irt_placeholder && g.mh_heads > 0 {
                 crate::sidecar::require_every_row_repredicted(&out)?;
             }
-            let rows = mumdia_io::table::nrows(&out)?;
-            record_opt(
-                g.man.as_deref_mut(),
-                record_artifact(
+            if keep_records {
+                let rows = mumdia_io::table::nrows(&out)?;
+                record_hashing(
+                    g.man.as_deref_mut(),
                     &format!(
                         "{}[g{:02}]",
                         artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
@@ -1038,8 +1007,8 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                     rows,
                     &rt_model,
                     ch,
-                )?,
-            );
+                )?;
+            }
             repredicted.push((out.clone(), b.offset));
             b.prec = out;
             b.span = None;
@@ -1069,25 +1038,6 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             if g.irt_placeholder {
                 crate::sidecar::require_every_row_repredicted(&out)?;
             }
-            Some(out)
-        } else if cfg.rt_im_train.finetune_deeplc {
-            let out = gd(b.index, "lib_precursors_ft.parquet");
-            info!(stage = %"deeplc-finetune", group = b.index, "run: stage start");
-            crate::sidecar::run_deeplc_finetune(
-                python.expect("preflight guarantees deeplc_python when finetune_deeplc is set"),
-                &script,
-                &b.prec,
-                anchors,
-                &out,
-                cfg.rt_im_train.finetune_epochs,
-                cfg.rt_im_train.finetune_patience,
-                cfg.rt_im_train.q_train,
-                cfg.rt_im_train.finetune_batch,
-                cfg.rt_im_train.window_holdout_frac,
-                cfg.rng_seed,
-                rayon::current_num_threads(),
-                cfg.rt_im_train.deeplc_predict_shards,
-            )?;
             Some(out)
         } else if repredict {
             let out = gd(b.index, "lib_precursors_deeplc.parquet");
@@ -1168,7 +1118,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             |_| {
                 planned_frag_tol(
                     &crate::masscal::json_path(&pooled_seed),
-                    ext_cfg.frag_tol_ppm,
+                    cfg.extract.frag_tol_ppm,
                 )
             },
         )?;
@@ -1210,6 +1160,14 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             bands = bands.len(),
             "groups: spectra decoded once for the extraction phase and shared"
         );
+        // The MS1 offset is one per run, so it is learned once from the pooled seed rather
+        // than per band (a band holds too few anchors for a stable median), on these scans.
+        let ext_cfg = crate::stages::ms1cal::extract_cfg_scans(
+            &cfg.extract,
+            &pooled_seed,
+            &ms1_scans,
+            cfg.rt_im_train.q_train,
+        )?;
         // `groups.parallel` bands at a time, through the same bounded queue as the seeding
         // phase, most expensive first. Each band in flight holds its own extraction working
         // set, so that bound is what the stage's memory scales with; the artifacts are pooled
@@ -1342,7 +1300,6 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 out: "",
                 out_pin: "",
                 cfg: &cfg.features,
-                config_hash: ch,
                 // A grouped run is never retraced (`Config::validate`).
                 imc_ref_w: false,
                 q1_tolerances: None,
@@ -1417,7 +1374,6 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                     out: &feats,
                     out_pin: &pin,
                     cfg: &cfg.features,
-                    config_hash: ch,
                     imc_ref_w: false,
                     q1_tolerances: None,
                 },
@@ -1438,7 +1394,6 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 features: &feats,
                 out: &competed,
                 cfg: &cfg.compete,
-                config_hash: ch,
                 features_hash: Some(&features_written.content_hash),
             })?;
             if keep_records {
@@ -1494,15 +1449,18 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     // the pooled table would hold, in its order, and nothing else reads that table: see
     // `groups.pool_competed`.
     let pooled_competed_path = d("psms_competed.parquet");
+    // The candidate audit reads the pooled extracted and competed tables, and only a single
+    // `run` (the caller with a manifest) runs it; `run-experiment` says so once.
+    let audit = cfg.extract.emit_candidate_audit && keep_records;
     // The transfer variants of match-between-runs read the pooled competed table; the second
     // pass reads the scored table and searches again, so it needs none.
-    let competed_readers = cfg.extract.emit_candidate_audit || cfg.mbr.strategy.transfers();
+    let competed_readers = audit || cfg.mbr.strategy.transfers();
     let pool_competed = cfg.groups.pool_competed || !bands_disjoint || competed_readers;
     if !cfg.groups.pool_competed {
         if pool_competed {
             info!(
                 bands_disjoint,
-                audit = cfg.extract.emit_candidate_audit,
+                audit,
                 mbr = ?cfg.mbr.strategy,
                 "groups: groups.pool_competed is off, but the competed table is pooled: the \
                  bands overlap, or the candidate audit or match-between-runs reads it"
@@ -1513,18 +1471,6 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 "groups: the competed rows stay per band and rescore reads the band tables \
                  (groups.pool_competed = false)"
             );
-            // A pooled table left by an earlier run into this directory is not this run's,
-            // and nothing would say so: take it away with its companions.
-            for f in [
-                pooled_competed_path.clone(),
-                format!("{pooled_competed_path}.report.json"),
-                format!("{pooled_competed_path}.schema.json"),
-            ] {
-                if std::path::Path::new(&f).exists() {
-                    std::fs::remove_file(&f)
-                        .with_context(|| format!("removing an earlier run's {f}"))?;
-                }
-            }
         }
     }
     // The chromatograms have one reader, quant, which can read the band tables itself with
@@ -1540,28 +1486,37 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
              overlap losers (groups.pool_chromatograms = false)"
         );
     }
-    // A pooled table (or loser sets) an earlier run left here under the other setting is
-    // not this run's, and nothing would say so: take it away with its report, so that
-    // neither a later standalone quant nor a reader of the directory mistakes it for this
-    // run's.
-    let stale = if pool_chromatograms {
-        &losers_path
-    } else {
-        &pooled_chrom_path
-    };
-    for f in [stale.clone(), format!("{stale}.report.json")] {
-        if std::path::Path::new(&f).exists() {
-            std::fs::remove_file(&f).with_context(|| format!("removing an earlier run's {f}"))?;
-        }
+    // The pooled extracted table has exactly one reader, the candidate audit, and that is
+    // off by default. Pooling it anyway read and rewrote every band's extracted rows for a
+    // file nothing opens; the per-band tables stay where they are either way.
+    let pool_psms = audit;
+    if !pool_psms {
+        info!(
+            groups = arts.len(),
+            "groups: psms_extracted stays per band (nothing but the candidate audit of a single run reads the pooled table)"
+        );
+    }
+    let psms_path = d("psms_extracted.parquet");
+    // A pooled table (or loser sets) an earlier run left here under other settings is not
+    // this run's, and nothing would say so: take it away with its companions, so that neither
+    // a later standalone stage nor a reader of the directory mistakes it for this run's.
+    let stale = [
+        (!pool_competed).then_some(&pooled_competed_path),
+        Some(if pool_chromatograms {
+            &losers_path
+        } else {
+            &pooled_chrom_path
+        }),
+        (!pool_psms).then_some(&psms_path),
+    ];
+    for path in stale.into_iter().flatten() {
+        crate::stages::delete_intermediate(path, "earlier run's pooled table")?;
     }
     let mut out = Pooled {
         seed: pooled_seed,
-        psms: d("psms_extracted.parquet"),
+        psms: psms_path,
         // Filled in below, once the pool has found the overlap losers.
         chromatograms: Vec::new(),
-        // Not pooled: nothing reads a run-level features table (compete's output carries
-        // the feature columns), and on a real run it is 55 GB of writes per run.
-        features: String::new(),
         competed: if pool_competed {
             vec![pooled_competed_path.clone()]
         } else {
@@ -1569,16 +1524,6 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         },
         rt_model,
     };
-    // The pooled extracted table has exactly one reader, the candidate audit, and that is
-    // off by default. Pooling it anyway read and rewrote every band's extracted rows for a
-    // file nothing opens; the per-band tables stay where they are either way.
-    let pool_psms = cfg.extract.emit_candidate_audit;
-    if !pool_psms {
-        info!(
-            groups = arts.len(),
-            "groups: psms_extracted stays per band (extract.emit_candidate_audit is off, and nothing else reads the pooled table)"
-        );
-    }
     info!(stage = %"pool", groups = arts.len(), "run: stage start");
     let stats = pool::run(pool::PoolParams {
         bands: &arts,

@@ -66,11 +66,6 @@ pub fn x_domain_inliers(xs: &[f64]) -> Vec<bool> {
 pub struct Loess {
     grid_x: Vec<f64>,
     grid_y: Vec<f64>,
-    /// The global least-squares line: the fit for fewer than four points, and the
-    /// value a degenerate local window (no spread) falls back to. Not the
-    /// extrapolation model.
-    slope: f64,
-    intercept: f64,
     /// Extrapolation slope below the first and above the last grid point; the boundary
     /// grid VALUE plus this slope keeps `predict` continuous at both ends.
     ///
@@ -92,52 +87,7 @@ impl Loess {
     /// Fit a LOESS model. `span` is the fraction of points in each local fit.
     /// `grid_n` is the number of grid points for later interpolation.
     pub fn fit(xs: &[f64], ys: &[f64], span: f64, grid_n: usize) -> Loess {
-        let (slope, intercept) = linear_fit(xs, ys);
-        // sort points by x
-        let mut idx: Vec<usize> = (0..xs.len()).collect();
-        idx.sort_by(|&a, &b| xs[a].total_cmp(&xs[b]));
-        let sx: Vec<f64> = idx.iter().map(|&i| xs[i]).collect();
-        let sy: Vec<f64> = idx.iter().map(|&i| ys[i]).collect();
-        let n = sx.len();
-        if n < 4 {
-            // too few points: grid is just the linear line
-            let (lo, hi) = (
-                sx.first().cloned().unwrap_or(0.0),
-                sx.last().cloned().unwrap_or(1.0),
-            );
-            let grid_x: Vec<f64> = (0..grid_n.max(2))
-                .map(|k| lo + (hi - lo) * k as f64 / (grid_n.max(2) - 1) as f64)
-                .collect();
-            let grid_y: Vec<f64> = grid_x.iter().map(|&x| slope * x + intercept).collect();
-            return Loess {
-                grid_x,
-                grid_y,
-                slope,
-                intercept,
-                lo_slope: slope,
-                hi_slope: slope,
-            };
-        }
-        let k = ((span * n as f64).ceil() as usize).clamp(3, n);
-        let (lo, hi) = (sx[0], sx[n - 1]);
-        let gn = grid_n.max(2);
-        let mut grid_x = Vec::with_capacity(gn);
-        let mut grid_y = Vec::with_capacity(gn);
-        for g in 0..gn {
-            let x = lo + (hi - lo) * g as f64 / (gn - 1) as f64;
-            let (y, _) = local_linear(&sx, &sy, x, k, slope, intercept);
-            grid_x.push(x);
-            grid_y.push(y);
-        }
-        let (lo_slope, hi_slope) = boundary_slopes(&grid_x, &grid_y, slope);
-        Loess {
-            grid_x,
-            grid_y,
-            slope,
-            intercept,
-            lo_slope,
-            hi_slope,
-        }
+        Loess::fit_robust(xs, ys, span, grid_n, 0)
     }
 
     /// [`Loess::fit`] with `iters` robustness iterations (Cleveland 1979): after each fit
@@ -145,20 +95,36 @@ impl Loess {
     /// residuals, so a few gross outliers (false anchors) cannot pull the curve. 0 is
     /// exactly [`Loess::fit`].
     pub fn fit_robust(xs: &[f64], ys: &[f64], span: f64, grid_n: usize, iters: usize) -> Loess {
-        if iters == 0 || xs.len() < 4 {
-            return Loess::fit(xs, ys, span, grid_n);
-        }
         let (slope, intercept) = linear_fit(xs, ys);
+        // sort points by x
         let mut idx: Vec<usize> = (0..xs.len()).collect();
         idx.sort_by(|&a, &b| xs[a].total_cmp(&xs[b]));
         let sx: Vec<f64> = idx.iter().map(|&i| xs[i]).collect();
         let sy: Vec<f64> = idx.iter().map(|&i| ys[i]).collect();
         let n = sx.len();
+        let gn = grid_n.max(2);
+        if n < 4 {
+            // too few points: grid is just the linear line
+            let (lo, hi) = (
+                sx.first().cloned().unwrap_or(0.0),
+                sx.last().cloned().unwrap_or(1.0),
+            );
+            let grid_x: Vec<f64> = (0..gn)
+                .map(|k| lo + (hi - lo) * k as f64 / (gn - 1) as f64)
+                .collect();
+            let grid_y: Vec<f64> = grid_x.iter().map(|&x| slope * x + intercept).collect();
+            return Loess {
+                grid_x,
+                grid_y,
+                lo_slope: slope,
+                hi_slope: slope,
+            };
+        }
         let k = ((span * n as f64).ceil() as usize).clamp(3, n);
         let mut rw = vec![1.0f64; n];
         for _ in 0..iters {
             let resid: Vec<f64> = (0..n)
-                .map(|i| sy[i] - local_linear_w(&sx, &sy, Some(&rw), sx[i], k, slope, intercept).0)
+                .map(|i| sy[i] - local_linear_w(&sx, &sy, Some(&rw), sx[i], k, slope, intercept))
                 .collect();
             let abs: Vec<f64> = resid.iter().map(|r| r.abs()).collect();
             let s = percentile(&abs, 0.5);
@@ -174,22 +140,20 @@ impl Loess {
                 };
             }
         }
+        // No weights at all without iterations: the plain fit.
+        let rw = (iters > 0).then_some(&rw[..]);
         let (lo, hi) = (sx[0], sx[n - 1]);
-        let gn = grid_n.max(2);
         let mut grid_x = Vec::with_capacity(gn);
         let mut grid_y = Vec::with_capacity(gn);
         for g in 0..gn {
             let x = lo + (hi - lo) * g as f64 / (gn - 1) as f64;
-            let (y, _) = local_linear_w(&sx, &sy, Some(&rw), x, k, slope, intercept);
             grid_x.push(x);
-            grid_y.push(y);
+            grid_y.push(local_linear_w(&sx, &sy, rw, x, k, slope, intercept));
         }
         let (lo_slope, hi_slope) = boundary_slopes(&grid_x, &grid_y, slope);
         Loess {
             grid_x,
             grid_y,
-            slope,
-            intercept,
             lo_slope,
             hi_slope,
         }
@@ -210,9 +174,6 @@ impl Loess {
             return f64::NAN;
         }
         let g = &self.grid_x;
-        if g.len() < 2 {
-            return self.slope * x + self.intercept;
-        }
         if x <= g[0] {
             return self.grid_y[0] + self.lo_slope * (x - g[0]);
         }
@@ -269,22 +230,9 @@ fn boundary_slopes(grid_x: &[f64], grid_y: &[f64], global_slope: f64) -> (f64, f
     (clamp(secant(0, step)), clamp(secant(n - 1 - step, n - 1)))
 }
 
-/// Weighted local linear regression at `x0` over the `k` nearest points
-/// (tricubic weights): the fitted value at `x0` and the slope of the local line.
-/// Falls back to the global line (value and slope) if degenerate.
-fn local_linear(
-    sx: &[f64],
-    sy: &[f64],
-    x0: f64,
-    k: usize,
-    slope: f64,
-    intercept: f64,
-) -> (f64, f64) {
-    local_linear_w(sx, sy, None, x0, k, slope, intercept)
-}
-
-/// [`local_linear`] with an optional per-point robustness weight multiplying the tricubic
-/// one (`None` is exactly the unweighted fit).
+/// Weighted local linear regression at `x0` over the `k` nearest points (tricubic
+/// weights, times an optional per-point robustness weight; `None` is exactly the
+/// unweighted fit): the fitted value at `x0`. Falls back to the global line if degenerate.
 fn local_linear_w(
     sx: &[f64],
     sy: &[f64],
@@ -293,7 +241,7 @@ fn local_linear_w(
     k: usize,
     slope: f64,
     intercept: f64,
-) -> (f64, f64) {
+) -> f64 {
     let n = sx.len();
     // find window of k nearest by walking from the insertion point
     let mut lo = sx.partition_point(|&x| x < x0);
@@ -338,12 +286,16 @@ fn local_linear_w(
     }
     let denom = sw * swxx - swx * swx;
     if sw < 1e-12 || denom.abs() < 1e-12 {
-        return (slope * x0 + intercept, slope);
+        return slope * x0 + intercept;
     }
     let b = (sw * swxy - swx * swy) / denom;
     let a = (swy - b * swx) / sw;
-    (a + b * x0, b)
+    a + b * x0
 }
+
+/// The robust standard deviation of a normal sample per unit of its median absolute
+/// deviation.
+pub const MAD_TO_SIGMA: f64 = 1.4826;
 
 /// The p-th percentile (0..1) of the values (a copy is sorted).
 pub fn percentile(values: &[f64], p: f64) -> f64 {
@@ -440,7 +392,7 @@ mod tests {
         let xs: Vec<f64> = (0..55).map(|i| i as f64 * 2.0).collect();
         let ys: Vec<f64> = xs.iter().map(|x| 500.0 + 24.0 * x + noise()).collect();
         let lo = Loess::fit(&xs, &ys, 0.3, 200);
-        let (slope, _) = linear_fit(&xs, &ys);
+        let (slope, intercept) = linear_fit(&xs, &ys);
         for s in [lo.lo_slope, lo.hi_slope] {
             assert!(s >= 0.0, "an inverted extrapolation slope: {s}");
             assert!(
@@ -457,7 +409,7 @@ mod tests {
         assert!((lo.predict(xn) - lo.predict(xn - 1e-6)).abs() < 1.0);
         // And the error one decade outside the anchors stays within a search window.
         let far = lo.predict(x0 - 30.0);
-        let linear = slope * (x0 - 30.0) + lo.intercept;
+        let linear = slope * (x0 - 30.0) + intercept;
         assert!(
             (far - linear).abs() < 600.0,
             "extrapolation {far} is implausibly far from the global line {linear}"
@@ -488,9 +440,6 @@ mod tests {
         let robust = Loess::fit_robust(&xs, &ys, 0.3, 200, 2);
         assert!((plain.predict(100.0) - 200.0).abs() > 3.0);
         assert!((robust.predict(100.0) - 200.0).abs() < 0.5);
-        // zero iterations is the plain fit, bit for bit
-        let zero = Loess::fit_robust(&xs, &ys, 0.3, 200, 0);
-        assert_eq!(zero.predict(57.3).to_bits(), plain.predict(57.3).to_bits());
     }
 
     /// 2000 anchors on a curved 2000-3500 s gradient (a straight line survives any grid)

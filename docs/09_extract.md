@@ -67,9 +67,8 @@ the CLI in `main.rs:535` (`Cmd::Extract`) and from the orchestrator in
   separate, non-destructive seed-probing limit and does not change the evidence
   available here.
 - `library_precursors` + `library_fragments` (Parquet): loaded once into
-  `Library::load_with` (`extract.rs:1306`) at `cfg.bucket_size`. `load_with`
-  skips building the bucketed `page_search` index when the fragindex backend is
-  selected (`index.rs:73`).
+  `Library::load_for_stage` at `cfg.bucket_size`, which skips building the
+  bucketed `page_search` index when the fragindex backend is selected.
 - `run_windows` (Parquet): per-candidate RT windows, columns `candidate_id`,
   `rt_pred_cal`, `rt_lo`, `rt_hi`, read by `read_run_windows` and scattered into the
   dense `rt_lo`/`rt_hi`/`rt_cal` arrays indexed by `candidate_id`. The decoded
@@ -141,8 +140,10 @@ then publishes neither table: the chromatogram writer is dropped unclosed
 (`close_chromatograms`), so its temporary file is removed and a chromatograms table
 already at the path stays as it was, as the `psms_extracted` one does. Publishing
 the chromatograms there would put a truncated table beside an older
-`psms_extracted`. Before the rows were streamed, the psms table was written after
-the chromatograms were complete, so this case could not arise.
+`psms_extracted`. The chromatogram table (and the cycle-trace table) is published
+only after `psms_extracted` is, so a failure of that table's last write (its tail
+chunk and footer, or the whole table under `emit_demix_features`) leaves both
+previous tables in place as well.
 
 On spectra that carry 1/K0 the table is v4 (`artifact::psms_extracted(has_im)`):
 `apex_im` is filled and three nullable Float64 columns follow it, before
@@ -307,9 +308,11 @@ The ceiling is `extract.max_footprint_gib`: unset (`auto`), the machine's physic
 (the cgroup limit when a container sets a smaller one, read by `memlog::total_memory`),
 looked up only once the estimate passes 4 GiB; a number is a ceiling of your own; `0` turns
 the check off. Under `groups.parallel` each band in flight gets its share. The refusal names
-the estimate, the ceiling and, when one window holds more than 100,000 MS2 spectra or the
-run has a single window, the all-ion layout and the convert key that undoes the case it was
-written for. The key is not part of the canonical configuration.
+the estimate, the ceiling and, when one window holds more than 100,000 MS2 spectra or every
+spectrum of the run, the all-ion layout and the convert key that undoes the case it was
+written for; on a path that holds the whole run it names the setting that put it there
+instead of `windows_in_flight`, which does not bound that path. The key is not part of the
+canonical configuration.
 
 Every run logs the estimate (`extract: estimated hit store`, `resident_gib`, `run_gib`,
 `busiest_window_scans`) and, on the streamed path, the matches the tasks actually returned
@@ -515,16 +518,21 @@ There are three accumulation paths:
   `CoelutionDemix`, and `CoelutionShadow`, and for `CoelutionMultiCue` **only**
   when `claim_cues.reassign` is also set: `CoelutionMultiCue` ships
   non-destructive, feeding the contested/apportioned features only. When the
-  two-pass path is triggered by `emit_contested_features` alone (a non-co-elution
-  `peak_claim`), pass 2 still computes the contested statistics but the returned
+  two-pass path is triggered by `emit_contested_features` alone (`peak_claim =
+  none`), pass 2 still computes the contested statistics but the returned
   accumulation is the base full-intensity `acc1`, not the reassigned `acc2`
   (`extract.rs:1274`). So `emit_contested_features` adds the soft-competition
-  features **without** altering any extracted intensity. `restrict` is honored
-  inside both passes via the push closure (`extract.rs:853`, `extract.rs:907`).
+  features **without** altering any extracted intensity. The per-peak claims
+  `winner_predicted_intensity` and `proportional` are refused with it, because this
+  path would return every claimant's full peak under them. `restrict` is honored
+  inside both passes through `Guard::claims`.
 
-Per-peak claim strategies (`PeakClaim`, `config.rs:132`; applied in the serial
-single-pass loop at `extract.rs:1500` and mirrored in the parallel path at
-`extract.rs:718`):
+Per-peak claim strategies (`PeakClaim`, `config.rs:132`), applied by `apply_claim` in
+the serial single-pass loop and in the streamed path's probing tasks. Under
+`WinnerPredictedIntensity` and `Proportional` the streamed path probes each isolation
+window as one task (`accumulate_groups`), so every claimant of a peak competes for it
+whatever the thread count; until 2026-11 it cut the window into candidate sub-ranges,
+each of which picked its own winner or normalised its own shares:
 - `None`: every matching candidate gets the full peak intensity (legacy default).
 - `WinnerPredictedIntensity`: only the claimant with the highest predicted
   intensity keeps the peak; ties break by lowest `candidate_id` for determinism
@@ -684,14 +692,18 @@ qualifies, then by a per-scan score:
   breaks sub-integer ties. This is interference-resistant in wide-window DIA
   because intensity is chimeric. It is the default; when false, the legacy
   `sig_sum * prior` is used (`extract.rs:1902`), bit-identical to the pre-feature
-  behaviour. In practice the tie-break carries no intensity information:
-  `sig_sum` is an observed intensity in the thousands, so `sig_sum/(sig_sum+1)` is
-  about 0.9999 at every scan, and among scans of equal count the RT prior decides.
+  behaviour. The score is f32 (`pick_apex`): once `sig_sum` passes about 2e6 to 8e6
+  (by count), `n_frag + sig_sum/(sig_sum+1)` rounds to `n_frag + 1`, scans of equal
+  count tie, and the RT prior decides between them or, without one (the engine
+  default; the shipped presets set 120 s), the earliest of them wins.
 - **Intensity inside the count region** (`apex_refine_intensity`, default false,
   benchmark-gated): the qualifying scans, widened by the rolling half-width
   (`apex_count_window / 2`), form the region where the peptide elutes; the apex is
   the scan in that region with the largest signature intensity times the prior. The
-  count still decides where the peak is, intensity which scan is its top. Without
+  count still decides where the peak is, intensity which scan is its top. A scan
+  without signature intensity never takes the apex, so where none of the top
+  fragments is seen in the region the count's apex stands (until 2026-11 the
+  region's first scan took it). Without
   it the count also picks the scan, and on a tailing peak the rolling count is
   largest after the intensity maximum. Measured on Astral REP1 with
   `apex_count_window` 5 (88,092 accepted precursors, `bench/apex/apex_offset.py`): the summed fragment intensity
@@ -1087,8 +1099,8 @@ All three keys stay off and benchmark-gated: a second ZT Scan acquisition could 
 converted with its isolation targets for this measurement (docs/04_convert.md, "SCIEX ZT
 Scan DIA"), and CLAUDE.md asks for one before any default changes.
 
-The Q1 calibration that the per-fragment decisions of a later change are to read
-(`rt_im_train.q1_calibrate`, docs/08_rt_im_train.md, section 4h) found the window centred
+The Q1 calibration the per-fragment decisions read (section 12; `rt_im_train.q1_calibrate`,
+docs/08_rt_im_train.md, section 4h) found the window centred
 on its target and wider and softer than its nominal 3.8 m/z: whole within 0.57 m/z of
 its centre and nothing beyond 4.56 m/z. The trapezoid of `q1_profile` above is the nominal
 one (one step of edge, the half-width as read).
@@ -1513,7 +1525,7 @@ the bound fraction. Deterministic: every sum runs in fragment, cycle and step or
 | `sum_near` | `extract.rs:495` | Sum intensities within a ppm window (m/z-sorted) |
 | `enumerate_peaks` | `peaks.rs:52` | Pure top-K peak-group enumerator |
 | `PeakGroup` | `peaks.rs:22` | One enumerated peak (apex/start/end idx, apex intensity, area, rank) |
-| `Library::load_with` | `index.rs:73` | Load the SoA library, optionally skipping the bucketed index |
+| `Library::load_for_stage` | `index.rs` | Load the SoA library (whole, band file or row span), optionally skipping the bucketed index |
 | `Library::candidate_range` | `index.rs:341` | Candidate-id range for an isolation window |
 | `Library::cand_frags` | `index.rs:312` | Fragment m/z, predicted intensity, and interned name-id slices |
 | `Library::page_search` | `index.rs:350` | Bucketed-backend fragment probe |
@@ -1665,15 +1677,14 @@ here for one index.
 - **`apex_im` is null on every 3D run** (v2); only a v4 table, written from spectra
   with 1/K0, fills it, together with `apex_im_mad`, `ms1_apex_im` and `im_pred_cal`.
   Read the version (`extract::psms_schema`) or the column, never assume a value.
-- **`restrict_candidates` only forces the serial path in the non-two-pass case.**
-  In the non-two-pass branch the parallel window accumulation is used only when a
-  fragindex is present **and** there is no `restrict` list (`extract.rs:1455`); a
-  `restrict` list therefore routes to the slower serial single-pass loop, which
-  honors the allowlist and every non-co-elution `peak_claim` strategy. In the
-  two-pass branch (`Coelution*` or `emit_contested_features`) extraction stays on
-  the parallel `extract_twopass_windows` path regardless of `restrict`, which
-  applies the allowlist inside each pass's push closure (`extract.rs:853`,
-  `extract.rs:907`, wired at `extract.rs:1578`).
+- **`restrict_candidates` keeps the path the run takes without one.** Since
+  2026-09-18 the streamed path applies the allowlist inside each probing task,
+  before the peak claim, as the serial (bucketed) loop does; until then an allowlist
+  routed to the serial loop, whose whole-run accumulator ignores `windows_in_flight`.
+  The two-pass branch (`Coelution*` or `emit_contested_features`) applies it in every
+  pass (`Guard::claims`). The file's ids are library-wide, as in every table extract
+  writes: a band (`--fragment-offset`) keeps the ids that fall in it, rebased onto
+  its own.
 - **`peaks.parquet` is not scored** and never enters FDR; it is a research
   sidecar. The `peak_rank` **column** of `psms_extracted` is a different thing:
   rank-0 rows are the ordinary selected apex, and ranks >= 1 appear only under
@@ -1724,9 +1735,10 @@ tests encode the behavioral invariants that gate tuning must preserve.
 - **A new peak-claim strategy**: add a `PeakClaim` variant (`config.rs:132`); if it
   needs elution profiles, extend the two-pass trigger (`extract.rs:1443`), the
   `reassign` predicate (`extract.rs:1557`), and the reassignment match in
-  `extract_twopass_windows` (`extract.rs:1236`); otherwise add it to the serial
-  single-pass match (`extract.rs:1500`) and the parallel accumulation
-  (`extract.rs:718`). Keep tie-breaks deterministic (lowest `candidate_id`). Prefer
+  `extract_twopass_windows` (`extract.rs:1236`); otherwise add it to `apply_claim`,
+  which the serial and the streamed single-pass paths share, and, when it compares a
+  peak's claimants, to the claims for which `accumulate_groups` probes each window as
+  one task. Keep tie-breaks deterministic (lowest `candidate_id`). Prefer
   a cue in `ClaimCues` (`config.rs:192`) over a new variant when the change is
   really a new per-claimant weight: `claim_cue_multiplier` (`extract.rs:163`)
   already composes them and defaults each to 1.0.

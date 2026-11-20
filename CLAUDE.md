@@ -445,7 +445,8 @@ fine-tuning also is not guaranteed deterministic.
 - A Bruker `.d` with diaPASEF frames is read natively (timsrust, 1/K0 per peak); every
   other `.d` goes to msconvert as a 3D run. The one 4D predicate is "the spectra carry
   per-peak 1/K0" (`instrument`, `params.reader = "timsrust"`), never the instrument name.
-- Every TIMS key is off by default: `convert.tdf_mz_valley`/`tdf_im_valley`,
+- Every TIMS key except `convert.tdf_ms1_denoise` (the native MS1 noise filter, on by
+  default since 0.7.0) is off by default: `convert.tdf_mz_valley`/`tdf_im_valley`,
   `predict_frag.im_predictor`, `search_seed.count_fragments_once`, `frag_tol_mad_k`,
   `extract.im_gate`, `features.im_features`, `retrace.*`, `rt_im_train.anchor_x_filter`,
   `rescore.shadow_im_tolerance` and the cross-run quant selectors. Promote one only in its
@@ -524,7 +525,7 @@ fine-tuning also is not guaranteed deterministic.
   - `peptide_q_value`: base/stripped peptide;
   - `pg_q_value`: protein-accession-set group.
 - The grouped q columns (`peptide_q_value`, `precursor_q`, `pg_q_value`) are
-  written only to each group's single winning row (`rescore.rs:721-728`); losers
+  written only to each group's single winning row (`grouped_q` in `rescore.rs`); losers
   get 1.0. Under an experiment-wide rescore the grouping is experiment-wide, so
   a per-run count on those columns is diluted by roughly 1/n_runs and is
   meaningless. The correct per-file unit there is `run_psm_q`.
@@ -578,9 +579,9 @@ fine-tuning also is not guaranteed deterministic.
   transfer (`rt_transfer`) stays opt-in because its transfers measured 2.3-2.7%
   entrapment FDP. docs/12, "Second pass".
 - `rescore --competed` accepts many tables, stamps `source` with the index of
-  the input table each PSM came from (`rescore.rs:65-70,108`), and computes a
-  per-source `run_psm_q` alongside the pooled `q_value`
-  (`rescore.rs:403-408`). Pooling therefore never costs per-run FDR, and
+  the input table each PSM came from (the input merge of `rescore::run_hashed`), and
+  computes a per-source `run_psm_q` alongside the pooled `q_value`
+  (`per_source_q`). Pooling therefore never costs per-run FDR, and
   sub-batching is free in `run_psm_q` terms. It is not free in pooled-`q_value`
   terms, because the `1/T` floor moves with the pool, so a batched run and a
   single pooled run do not produce identical `q_value` columns. Batch to fit RAM,
@@ -609,8 +610,9 @@ sections 10-16:
   matrix with no parquet encode or decode and scores byte-identically to `parquet` (checked
   at scale on the six-run Astral and five-run AIF pools); it is 4 bytes a value on disk, so
   the sidecar space check refuses a work directory that cannot hold that, where `parquet`
-  only warned. mokapot and entrapment sidecars still receive the tab-separated PIN
-  (`mokapot.read_pin` cannot read parquet), automatically and with a warning.
+  only warned. mokapot still receives the tab-separated PIN (`mokapot.read_pin` cannot
+  read parquet), automatically and with a warning; the entrapment sidecar always receives
+  its own parquet table.
 - The rescore process tree is about half as tall since 2026-09-16, at identical
   identifications. Under `rescore.strict` (the production setting) with a sidecar classifier
   the engine releases its own `FeatureMatrix` as soon as the handoff parquet is written,
@@ -812,13 +814,15 @@ sections 10-16:
   host with more than 8 cores (`DEEPLC_FT_THREADS` bounds training only). The default
   still owes the survey's doxy sweep (32-128 threads on HYE and AIF, head set, peptides at
   1% on `run_psm_q` over three NN seeds; docs/13, "DeepLC thread cap").
-- `rt_im_train.deeplc_predict_shards` (default 1) splits that whole-library prediction
+- `rt_im_train.deeplc_predict_shards` (default 0 since 0.5.0: automatic, one process per 8
+  threads of the prediction budget; 1 is one process) splits that whole-library prediction
   across processes of `budget / K` threads, with the calibration or fine-tuned model
   fitted once in the parent and no refit per shard. Bit-identical to one process at
-  equal threads per process, float-equivalent at the same `--threads`. It is not known to
-  pay: on the one desktop measured the forward pass dominated and scaled with threads,
-  so 4 x 2 threads equalled 1 x 8 (docs/08, "Sharded whole-library prediction"); it stays
-  opt-in until measured where one process stops scaling, on two acquisitions.
+  equal threads per process, float-equivalent at the same `--threads`. Measured with 8
+  processes of 8 threads against one on an EPYC 9354: six-run Astral 26:00 -> 18:02,
+  five-run AIF 29:47 -> 21:04, peptides at 1% inside the seed spread (CHANGELOG 0.5.0).
+  On a desktop the forward pass scaled with threads, so 4 x 2 threads equalled 1 x 8
+  (docs/08, "Sharded whole-library prediction").
 - Any parquet written outside `mumdia-io` and read by the engine must use arrow
   `utf8` string columns. Polars defaults to `large_utf8`, which the engine rejects
   ("column 'peptidoform' is not utf8"). Snappy, zstd and uncompressed files all read:
@@ -833,17 +837,19 @@ sections 10-16:
   (default 4). A feature matrix marginally over the threshold silently falls to
   the much slower disk-backed streaming memmap; a 4.31 GB matrix against the
   4.00 GB default took the slow path.
-- `chromatograms.parquet` has two layouts. v1 (the default, schema 1) stores every row's
-  whole `rt` axis and `intensity` trace. v2 (`extract.chromatogram_schema = 2`, schema
-  2, `CHROMATOGRAMS_V2`) stores the lists as `rt_axis` and `intensity_trimmed`, plus
-  `trace_offset` and `trace_len`: each candidate's axis once per parquet row group (an
-  empty `rt_axis` means the last axis that candidate wrote in the same row group) and each
-  trace trimmed to its first-to-last run of values that are not `+0.0`. A v2 row group
-  decodes on its own, so a reader must start at a row group or at a candidate's first
-  row. `mumdia::chromatograms::Decoder` is the reference reader and
-  `mumdia::chromatograms::rewrite` converts either way; convert to v1 before handing the
-  table to a tool outside the engine. The lists are renamed so that such a tool, or an
-  engine binary from before v2, stops at the missing `rt` instead of misreading v2.
+- `chromatograms.parquet` has two layouts. v2 (the default since 2026-09-27,
+  `extract.chromatogram_schema = 2`, schema 2, `CHROMATOGRAMS_V2`) stores the lists as
+  `rt_axis` and `intensity_trimmed`, plus `trace_offset` and `trace_len`: each
+  candidate's axis once per parquet row group (an empty `rt_axis` means the last axis that
+  candidate wrote in the same row group) and each trace trimmed to its first-to-last run of
+  values that are not `+0.0`. A v2 row group decodes on its own, so a reader must start at
+  a row group or at a candidate's first row. v1 (`extract.chromatogram_schema = 1`, schema 1) stores every row's whole `rt`
+  axis and `intensity` trace. `mumdia::chromatograms::Decoder` is the reference reader;
+  `mumdia::chromatograms::rewrite` converts either way but is a Rust function with no CLI
+  command, so a user who hands the table to a tool outside the engine sets
+  `extract.chromatogram_schema = 1` for that run. The lists are renamed so that such a
+  tool, or an engine binary from before v2, stops at the missing `rt` instead of
+  misreading v2.
 
 ## Quantification rules
 
@@ -1039,7 +1045,7 @@ sensitivity result for it.
   workers at the same time, which leaves the library byte-identical; it is off because
   each worker sizes itself from the whole thread count and neither the wall time nor the
   peak of the pair was measured at that scale. `predict_frag.defer_deeplc_to_multihead`
-  (opt-in) skips the DeepLC pass when the multi-head calibration re-predicts every row
+  (default true) skips the DeepLC pass when the multi-head calibration re-predicts every row
   anyway (docs/06).
 
 ## Changes that remain benchmark-gated

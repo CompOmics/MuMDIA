@@ -25,7 +25,7 @@ maximum intensity (`rust/mumdia/crates/mumdia-core/src/config.rs:413`).
 **candidate_id**. The dense integer key for one library entry (a peptidoform at a
 charge). It is a precondition of the fragment index that `candidate_id` be the
 contiguous range `0..n` in precursor-row order, and that precursors be sorted
-ascending by precursor m/z; `Library::load` checks both and fails loudly if
+ascending by precursor m/z; `Library::load_for_stage` checks both and fails loudly if
 violated (`rust/mumdia/crates/mumdia/src/index.rs:74`,
 `rust/mumdia/crates/mumdia/src/index.rs:135`). This lets the inverted index recover
 the isolation-window candidate slice by a binary search over `candidate_id`, since
@@ -110,7 +110,7 @@ proteome into the search library and treats those spike-in PSMs as real negative
 empirical-null analog of target-decoy q that also feels the chimeric interference
 in-silico decoys under-model (`rust/mumdia/crates/mumdia/src/fdr.rs:64`). A PSM is
 classified as entrapment when its protein contains `entrapment_marker` (with
-exclude/contaminant carve-outs, `rust/mumdia/crates/mumdia/src/stages/rescore.rs:577`).
+exclude/contaminant carve-outs, `classify_entrapment` in `rust/mumdia/crates/mumdia/src/stages/rescore.rs`).
 Opt-in via `RescorerKind::Entrapment`; the default path relies on target-decoy FDR.
 
 **final ID (vs seed)**. The identifications reported to the user, produced by
@@ -191,7 +191,7 @@ the PIN file with a logistic-regression default; the default `rescore.strict=tru
 makes failure fatal. Setting strict false explicitly enables native compatibility
 fallback
 (`rust/mumdia/crates/mumdia-core/src/config.rs:941`,
-`rust/mumdia/crates/mumdia/src/stages/rescore.rs:172`). See `percolator_lite`.
+`native_scores` in `rust/mumdia/crates/mumdia/src/stages/rescore.rs`). See `percolator_lite`.
 
 **nn_torch**. An opt-in PyTorch semi-supervised MLP rescoring sidecar
 (`RescorerKind::NnTorch`, `nn_rescore_worker.py`) over the same PIN contract as
@@ -218,7 +218,7 @@ no external dependency.
 **precursor**. The intact peptide ion selected for fragmentation, i.e. a
 peptidoform at a charge, characterized by its precursor m/z. It is the grouping key
 for `precursor_q` (peptidoform + charge,
-`rust/mumdia/crates/mumdia/src/stages/rescore.rs:388`) and the reporting unit of
+`rescore::run_hashed`) and the reporting unit of
 `peptides.tsv`, whose rows are precursors, not stripped sequences
 (`rust/mumdia/crates/mumdia/src/stages/report.rs:93`). Under the default
 `compete.group_by = base_peptide`, however, competition has already deleted the
@@ -245,7 +245,7 @@ library and PSM tables are ProForma-lite.
 unit for protein-level FDR. The MVP grouping keys on the protein-accession-set
 string (decoys carry a `DECOY_` prefix), and full parsimony/razor inference is a
 later option; `pg_q_value` is the target-decoy q over the best PSM per group
-(`rust/mumdia/crates/mumdia/src/stages/rescore.rs:306`).
+(`grouped_q` in `rust/mumdia/crates/mumdia/src/stages/rescore.rs`).
 
 **PSM (peptide-spectrum match)**. One hypothesis pairing a candidate peptidoform
 with observed spectral evidence at a retention-time apex. `extract` emits one
@@ -261,7 +261,7 @@ reports. The native estimator is the conservative no-pi0 target-decoy form
 blocks collapsed to one q and monotonized so q is non-increasing with score
 (`rust/mumdia/crates/mumdia/src/fdr.rs:7`,
 `rust/mumdia/crates/mumdia/src/fdr.rs:38`). `rescore` writes several q columns for
-different grouping contexts (`rust/mumdia/crates/mumdia/src/stages/rescore.rs:461`):
+different grouping contexts (`rescore::run_hashed`):
 
 | Column | Grouped over | Use when |
 |---|---|---|
@@ -273,12 +273,12 @@ different grouping contexts (`rust/mumdia/crates/mumdia/src/stages/rescore.rs:46
 | `pg_q_value` | best PSM per protein group | protein-level FDR |
 
 The `run_psm_q` / `experiment_psm_q` split and the `QuantQColumn` caveats are
-documented at `rust/mumdia/crates/mumdia/src/stages/rescore.rs:340` and
+documented at `per_source_q` in `rust/mumdia/crates/mumdia/src/stages/rescore.rs` and
 `rust/mumdia/crates/mumdia-core/src/config.rs:772`.
 
 The three grouped columns (`precursor_q`, `peptide_q_value`, `pg_q_value`) are
 written only to each group's single winning row; every losing sibling keeps 1.0
-(`rust/mumdia/crates/mumdia/src/stages/rescore.rs:721-728`). After an
+(`grouped_q` in `rust/mumdia/crates/mumdia/src/stages/rescore.rs`). After an
 experiment-wide rescore the grouping spans the whole experiment, so counting one
 run on a grouped column understates it by roughly `1/n_runs`. Use `run_psm_q` as
 the per-file unit there. Always name both the row unit and the q column when
@@ -321,6 +321,6 @@ uses: score real (target) library entries against paired decoys and estimate the
 FDR at each score threshold from the decoy count. The engine reports native
 target-decoy q-values at PSM, peptide, and protein-group level as its trusted FDR
 estimate (`rust/mumdia/crates/mumdia/src/fdr.rs:1`). A decoy-free library makes
-these q-values invalid, so `Library::load` fails loudly when it finds no decoys
+these q-values invalid, so `Library::load_for_stage` fails loudly when it finds no decoys
 (`rust/mumdia/crates/mumdia/src/index.rs:152`). See `q-value`, `decoy`,
 `entrapment`.

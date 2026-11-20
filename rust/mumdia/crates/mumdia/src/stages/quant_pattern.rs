@@ -95,19 +95,7 @@ impl PatternFit {
     }
 }
 
-/// numpy's `median`: the middle value, or the mean of the two middle values; NaN for none.
-pub fn median(v: &mut [f64]) -> f64 {
-    if v.is_empty() {
-        return f64::NAN;
-    }
-    v.sort_by(f64::total_cmp);
-    let n = v.len();
-    if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        (v[n / 2 - 1] + v[n / 2]) / 2.0
-    }
-}
+pub use crate::stats::median;
 
 /// numpy's `quantile(..., method = "linear")` of a sorted, non-empty slice.
 pub fn quantile_sorted(v: &[f64], q: f64) -> f64 {
@@ -601,10 +589,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn numpy_median_and_quantile() {
-        assert!(median(&mut []).is_nan());
-        assert_eq!(median(&mut [3.0, 1.0, 2.0]), 2.0);
-        assert_eq!(median(&mut [4.0, 1.0, 2.0, 3.0]), 2.5);
+    fn numpy_quantile() {
         let v = [1.0, 2.0, 4.0, 8.0, 16.0];
         // numpy.quantile([1, 2, 4, 8, 16], [0, 0.2, 0.6, 0.95, 1])
         assert_eq!(quantile_sorted(&v, 0.0), 1.0);

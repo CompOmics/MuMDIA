@@ -16,17 +16,14 @@
 
 use std::process::Command;
 
+/// The trimmed stdout of a successful git command (empty when it printed nothing), or
+/// `None` when git could not run or failed.
 fn git(args: &[&str]) -> Option<String> {
     let out = Command::new("git").args(args).output().ok()?;
     if !out.status.success() {
         return None;
     }
-    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    Some(String::from_utf8(out.stdout).ok()?.trim().to_string())
 }
 
 fn main() {
@@ -35,10 +32,9 @@ fn main() {
     // A dirty worktree must be visible: a number produced from uncommitted code is
     // not reproducible from the named commit, and saying so is the whole point.
     let dirty = match git(&["status", "--porcelain", "--untracked-files=no"]) {
-        Some(s) if !s.is_empty() => true,
-        Some(_) => false,
+        Some(s) => !s.is_empty(),
         // Unknown git state is not the same as clean; do not claim clean.
-        None => false,
+        None => true,
     };
     let sha = if dirty && sha != "unknown" {
         format!("{sha}-dirty")

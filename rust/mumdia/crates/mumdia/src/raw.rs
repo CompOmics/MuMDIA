@@ -3,15 +3,20 @@
 //!
 //! # Why conversion is a child process and not a linked reader
 //!
-//! `mzdata` can read several vendor formats directly, and that was rejected on
-//! build grounds rather than capability. Those readers need the vendors' own
-//! libraries and, for Thermo and SCIEX, a .NET runtime, while the workspace pins
+//! `mzdata` can read several vendor formats directly, and that was rejected for the
+//! default build on build grounds rather than capability. Those readers need the vendors'
+//! own libraries and, for Thermo and SCIEX, a .NET runtime, while the workspace pins
 //! `mzdata` to `default-features = false, features = ["mzml", "miniz_oxide"]`
 //! so that building MuMDIA needs no vendor SDK, C++ or .NET toolchain. Linking a
 //! vendor reader imposes that on every build on every platform, including the ones
-//! that never see a vendor file.
+//! that never see a vendor file. The Thermo reader is therefore opt-in (below).
 //!
-//! # The one native reader: timsTOF diaPASEF
+//! # The native readers: timsTOF diaPASEF, and Thermo on request
+//!
+//! A Thermo `.raw` is read directly only under `convert.thermo_native`, in an engine built
+//! with the `thermo` feature, which no release build enables: mzdata's Thermo reader hosts
+//! Thermo's RawFileReader on a .NET 8 runtime, and [`ensure_mzml`] passes the `.raw`
+//! through unconverted.
 //!
 //! A Bruker `.d` holding diaPASEF frames is read by `stages::convert` itself, through
 //! timsrust ([`Vendor::BrukerTdf`]). The format is an SQLite index plus zstd frames, so no
@@ -216,14 +221,6 @@ fn probe_tdf(tdf: &Path) -> rusqlite::Result<bool> {
         )
         .optional()?;
     Ok(compression.as_deref().map(str::trim) == Some("2"))
-}
-
-/// Is this path a Thermo `.raw` file?
-///
-/// Kept as its own function because callers outside this module ask exactly this
-/// question, and because the desktop application mirrors it.
-pub fn is_thermo_raw(path: &str) -> bool {
-    detect(path) == Vendor::Thermo
 }
 
 /// Locate ThermoRawFileParser.
@@ -523,19 +520,17 @@ fn msconvert_vendor_args(vendor: Vendor) -> Vec<String> {
 /// A short, stable discriminator for an input path.
 ///
 /// Used to keep two inputs that share a file stem from colliding on one converted
-/// mzML. Derived from the absolute path so it is stable across runs; the hash is
-/// truncated because it only has to separate the handful of inputs in one experiment,
-/// not resist collision attacks.
+/// mzML. Derived from the absolute path with blake3, so it is stable across runs and
+/// across Rust releases (std's `DefaultHasher` may change between them, and a new name
+/// converts the file again); the hash is truncated because it only has to separate the
+/// handful of inputs in one experiment, not resist collision attacks.
 fn path_discriminator(input: &Path) -> String {
-    use std::hash::{Hash, Hasher};
     let abs = input
         .canonicalize()
         .unwrap_or_else(|_| input.to_path_buf())
         .to_string_lossy()
         .to_lowercase();
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    abs.hash(&mut h);
-    format!("{:08x}", h.finish() as u32)
+    mumdia_io::hash::blake3_str(&abs)[..8].to_string()
 }
 
 /// Is there another vendor input in `dir` that would produce the same mzML name?
@@ -554,16 +549,6 @@ fn stem_is_ambiguous(dir: &Path, stem: &str, this: &Path) -> bool {
         .any(|p| p.file_stem().is_some_and(|f| f.to_string_lossy() == stem))
 }
 
-/// Return an mzML path for `input`, converting a vendor file first if needed.
-///
-/// Anything already readable is returned unchanged, so every caller can route its
-/// spectra path through this without caring what format it is.
-///
-/// The converted file goes beside the input when that directory is writable, which
-/// makes it reusable across runs and findable afterwards, and into `fallback_dir`
-/// otherwise (a read-only share being the ordinary case). With
-/// `convert.reuse_converted` an mzML already sitting beside the input and newer
-/// than it is used as-is.
 /// Name the missing `.wiff.scan` when a SCIEX conversion fails without one.
 ///
 /// SCIEX keeps the spectra in a `.wiff.scan` companion beside the `.wiff`; the `.wiff`
@@ -890,7 +875,8 @@ pub fn discard_converted(mzml: &str) {
         Ok(()) => info!(
             mzml,
             bytes,
-            "convert: deleted the converted mzML now that its spectra are written              (convert.keep_converted_mzml = false)"
+            "convert: deleted the converted mzML now that its spectra are written \
+             (convert.keep_converted_mzml = false)"
         ),
         Err(e) => warn!(mzml, error = %e, "convert: could not delete the converted mzML"),
     }
@@ -931,6 +917,16 @@ pub fn ensure_mzml_all(
     crate::sched::map_bounded(inputs, limit, |m| ensure_mzml(m, cfg, fallback_dir))
 }
 
+/// Return an mzML path for `input`, converting a vendor file first if needed.
+///
+/// Anything already readable is returned unchanged, so every caller can route its
+/// spectra path through this without caring what format it is.
+///
+/// The converted file goes beside the input when that directory is writable, which
+/// makes it reusable across runs and findable afterwards, and into `fallback_dir`
+/// otherwise (a read-only share being the ordinary case). With
+/// `convert.reuse_converted` an mzML already sitting beside the input and newer
+/// than it is used as-is.
 pub fn ensure_mzml(
     input: &str,
     cfg: &ConvertConfig,
@@ -998,9 +994,6 @@ pub fn ensure_mzml(
 
     warn_about_ion_mobility(vendor);
 
-    // Thermo goes to ThermoRawFileParser when one is available, because it needs no
-    // vendor licence and the desktop application can install it. msconvert is the
-    // fallback there and the only option everywhere else.
     // Thermo prefers ThermoRawFileParser, because it needs no vendor licence and the
     // desktop application can install it; msconvert is a legitimate alternative
     // there and the only option everywhere else.
@@ -1852,8 +1845,13 @@ mod tests {
             path_discriminator(&rb),
             "two different inputs must not share a discriminator"
         );
-        // Stable across calls, or the cache would miss every run.
+        // Stable across calls, or the cache would miss every run, and across toolchains:
+        // a path that does not exist is hashed as written.
         assert_eq!(path_discriminator(&ra), path_discriminator(&ra));
+        assert_eq!(
+            path_discriminator(Path::new("/definitely/not/here/sample.raw")),
+            "d6c6055a"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1917,6 +1915,59 @@ mod tests {
         assert_eq!(serial, concurrent);
         assert_eq!(concurrent[1], "plain.mzML");
         assert!(concurrent[3].ends_with("c.mzML"), "{}", concurrent[3]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The converter run, with a stand-in ThermoRawFileParser that writes 190 KB to each
+    /// stream before its output: both pipes are drained at once (draining one to its end
+    /// first deadlocked once the other filled), the mzML lands at `<stem>.mzML` with no
+    /// partial left behind, and a zero exit that wrote nothing is an error. On a helper
+    /// thread, so a deadlock fails the test instead of hanging the suite.
+    #[cfg(unix)]
+    #[test]
+    fn a_converter_run_drains_both_streams_and_renames_only_a_written_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("converter-run");
+        let raw = d.join("sample.raw");
+        std::fs::write(&raw, b"x").unwrap();
+        let convert = |name: &str, write: &str| {
+            let parser = d.join(name);
+            std::fs::write(
+                &parser,
+                format!(
+                    "#!/bin/sh\n\
+                     while [ $# -gt 0 ]; do [ \"$1\" = -b ] && out=$2; shift; done\n\
+                     yes progress-on-stderr | head -n 10000 >&2\n\
+                     yes progress-on-stdout | head -n 10000\n\
+                     {write}\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&parser, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let cfg = ConvertConfig {
+                thermo_raw_parser: parser.to_string_lossy().into_owned(),
+                reuse_converted: false,
+                ..ConvertConfig::default()
+            };
+            let input = raw.to_string_lossy().into_owned();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(ensure_mzml(&input, &cfg, None));
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the converter run deadlocked")
+        };
+        let out = convert("writes", "printf '<mzML/>' > \"$out\"").unwrap();
+        assert_eq!(out, d.join("sample.mzML").to_string_lossy());
+        assert_eq!(std::fs::read(&out).unwrap(), b"<mzML/>");
+        let msg = convert("writes-nothing", "").unwrap_err().to_string();
+        assert!(msg.contains("exited successfully but wrote no"), "{msg}");
+        let partials = std::fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".partial-"))
+            .count();
+        assert_eq!(partials, 0);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

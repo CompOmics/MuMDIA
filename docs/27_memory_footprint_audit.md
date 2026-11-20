@@ -282,13 +282,13 @@ copies of the features table, so `2 x 8 N D` plus strings. On the default key
 about half the rows are deleted here (`CLAUDE.md`, competition key), which is
 why the stages after compete are smaller than features.
 
-### 1.8 rescore (`stages/rescore.rs:60-140, 831-846`)
+### 1.8 rescore (`stages/rescore.rs`, `rescore::run`)
 
 Loads the competed table, then transposes into `feats: Vec<Vec<f64>>`
-(`rescore.rs:60`), row-major with one heap allocation per PSM. Per row:
+(`rescore::run`), row-major with one heap allocation per PSM. Per row:
 `8 D` = 3096 bytes payload + 24 bytes `Vec` header + allocator overhead. The
-comment at `rescore.rs:831-832` records about 27 GB for an experiment-wide pool.
-`fcols: Vec<Vec<f64>>` (`rescore.rs:94`) is the column-major copy that exists
+comment in `rescore::run` records about 27 GB for an experiment-wide pool.
+`fcols: Vec<Vec<f64>>` is the column-major copy that exists
 during the transpose, so the transient peak is `2 x 8 N D` plus the Arrow
 batches. The PIN TSV is then written for the sidecar (text, about 4 KB per row,
 disk only).
@@ -380,7 +380,7 @@ Concretely:
 - features: keep `traces_full` as `Vec<f32>` flat with an offsets array
   (one allocation, not one per trace), and compute correlations in f64 from the
   f32 values. Emit the feature table as f32. The rescore stage already writes
-  f32 features for the sidecar (`rescore.rs:826-829`) and the NN worker trains
+  f32 features for the sidecar (`HandoffWriter`) and the NN worker trains
   on float32, so the classifier input is unchanged. Native linear and mokapot
   paths gain a rounding at the 7th significant digit; treat as "mostly similar"
   and validate as in section 5.
@@ -455,7 +455,7 @@ runs more loaders than `--threads` allows.
   about 3.8 GB and a 128 GB server keeps the fast path up to 15 GB. This is the
   same knob that already bit once (`CLAUDE.md`, sidecar contracts).
 - Drop `feats` in Rust before waiting on the sidecar; the scores come back by
-  flat row index (`rescore.rs:760`), so only the metadata columns are needed
+  flat row index (`HandoffWriter::push_row`), so only the metadata columns are needed
   afterwards. This removes the Rust-plus-Python double residency in rank 4.
 
 ### 3.6 quant: read only accepted rows
