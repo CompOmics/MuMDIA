@@ -300,11 +300,6 @@ impl Encoder {
         }
     }
 
-    /// Rows encoded so far.
-    pub fn rows(&self) -> u64 {
-        self.row
-    }
-
     /// Encode the next row: candidate `cid`, with its v1 axis and trace.
     pub fn encode(&mut self, cid: u32, rt: Vec<f32>, intensity: Vec<f32>) -> Result<EncodedRow> {
         self.encode_im(cid, rt, intensity, None)
@@ -700,8 +695,8 @@ impl Rows {
 /// chromatograms 12.0% smaller; docs/03 "Float encodings planned from the first rows"). In
 /// v2 the column holds about one axis per candidate and mostly empty lists, and PLAIN is
 /// kept there as well: against a dictionary axis it measured 2.7% smaller on an AIF run and
-/// 3.2% and 0.3% larger on an entrapment and an Astral run (`v2_on_a_real_artifact`,
-/// docs/15_data_dictionary.md "Layout v2"), which is no case for a second rule.
+/// 3.2% and 0.3% larger on an entrapment and an Astral run (docs/15_data_dictionary.md
+/// "Layout v2"), which is no case for a second rule.
 pub fn writer(path: &str, row_group_rows: usize, layout: Layout) -> TableWriter {
     TableWriter::new(path)
         .with_row_group_rows(row_group_rows)
@@ -1393,166 +1388,5 @@ mod tests {
         let tf = TableFile::open(&v1).unwrap();
         assert!(tf.has_column(RT) && tf.has_column(INTENSITY));
         assert!(Layout::V2.trace_columns().iter().all(|c| !tf.has_column(c)));
-    }
-
-    /// The layouts measured on a real run, and held to the same downstream bytes.
-    ///
-    /// `MUMDIA_CHROM_V2_DIR` is a run directory holding `chromatograms.parquet`,
-    /// `psms_extracted.parquet`, `seed_psms.parquet` and `psms_scored.parquet` (or
-    /// `scored.parquet`);
-    /// `MUMDIA_CHROM_V2_OUT` is a scratch directory. The artifact is rewritten in the
-    /// current v1 layout (so both arms come from today's writer), in v2, and in v2 with a
-    /// dictionary-encoded `rt`; the sizes and write times are printed. Features (the
-    /// Extended set with the confident bounds) and quant then run on v1 and v2, and every
-    /// table they write must be byte-identical; their wall times are printed as well.
-    ///
-    /// ```text
-    /// MUMDIA_CHROM_V2_DIR=run MUMDIA_CHROM_V2_OUT=scratch \
-    ///   cargo test -p mumdia --release --lib -- --ignored --nocapture v2_on_a_real_artifact
-    /// ```
-    #[test]
-    #[ignore = "measurement; needs MUMDIA_CHROM_V2_DIR and MUMDIA_CHROM_V2_OUT"]
-    fn v2_on_a_real_artifact() {
-        use crate::stages::{features, quant};
-        use std::time::Instant;
-        let (Ok(dir), Ok(out)) = (
-            std::env::var("MUMDIA_CHROM_V2_DIR"),
-            std::env::var("MUMDIA_CHROM_V2_OUT"),
-        ) else {
-            println!("set MUMDIA_CHROM_V2_DIR and MUMDIA_CHROM_V2_OUT to run this");
-            return;
-        };
-        std::fs::create_dir_all(&out).unwrap();
-        let at = |d: &str, f: &str| {
-            std::path::Path::new(d)
-                .join(f)
-                .to_string_lossy()
-                .to_string()
-        };
-        let src = at(&dir, "chromatograms.parquet");
-        let size = |p: &str| std::fs::metadata(p).unwrap().len();
-        let mb = |b: u64| b as f64 / 1e6;
-        println!("source {src}: {:.1} MB", mb(size(&src)));
-        let arm = |name: &str, layout: Layout, w: TableWriter, path: &str| {
-            let t = Instant::now();
-            let rows = rewrite_into(&src, layout, ROW_GROUP_ROWS, w).unwrap();
-            println!(
-                "{name}: {rows} rows, {:.1} MB, rewritten in {:.1} s",
-                mb(size(path)),
-                t.elapsed().as_secs_f64()
-            );
-        };
-        let v1 = at(&out, "chrom_v1.parquet");
-        let v2 = at(&out, "chrom_v2.parquet");
-        let v2_dict = at(&out, "chrom_v2_dict_rt.parquet");
-        arm(
-            "v1",
-            Layout::V1,
-            writer(&v1, ROW_GROUP_ROWS, Layout::V1),
-            &v1,
-        );
-        arm(
-            "v2",
-            Layout::V2,
-            writer(&v2, ROW_GROUP_ROWS, Layout::V2),
-            &v2,
-        );
-        arm(
-            "v2, rt dictionary",
-            Layout::V2,
-            TableWriter::new(&v2_dict).with_row_group_rows(ROW_GROUP_ROWS),
-            &v2_dict,
-        );
-        println!(
-            "v2 against v1: {:.1}% smaller",
-            100.0 * (1.0 - size(&v2) as f64 / size(&v1) as f64)
-        );
-        // Stored values, the survey's measure.
-        let values = |p: &str| -> (u64, u64) {
-            let tf = TableFile::open(p).unwrap();
-            let layout = Layout::of(&tf).unwrap();
-            let (rc, ic) = (layout.rt_column(), layout.intensity_column());
-            let (mut r, mut i) = (0u64, 0u64);
-            for b in tf.batches(Some(&[rc, ic]), 1 << 14).unwrap() {
-                let b = b.unwrap();
-                let s = b.schema();
-                let rt = ListF32::of(b.column(s.index_of(rc).unwrap()), "rt").unwrap();
-                let it = ListF32::of(b.column(s.index_of(ic).unwrap()), "i").unwrap();
-                for k in 0..b.num_rows() {
-                    r += rt.row_slice(k, "rt").unwrap().len() as u64;
-                    i += it.row_slice(k, "i").unwrap().len() as u64;
-                }
-            }
-            (r, i)
-        };
-        let (r1, i1) = values(&v1);
-        let (r2, i2) = values(&v2);
-        println!("list values: rt {r1} -> {r2}, intensity {i1} -> {i2}");
-
-        let fcfg = mumdia_core::config::FeaturesConfig {
-            set: mumdia_core::config::FeatureSet::Extended,
-            bound_from_confident: true,
-            ..Default::default()
-        };
-        let seed = at(&dir, "seed_psms.parquet");
-        let psms = at(&dir, "psms_extracted.parquet");
-        // `scored.parquet` where a benchmark directory renamed it.
-        let scored = ["psms_scored.parquet", "scored.parquet"]
-            .iter()
-            .map(|f| at(&dir, f))
-            .find(|p| std::path::Path::new(p).exists())
-            .expect("a psms_scored.parquet (or scored.parquet) in MUMDIA_CHROM_V2_DIR");
-        let mut outputs: Vec<Vec<String>> = Vec::new();
-        for (tag, chrom) in [("v1", &v1), ("v2", &v2)] {
-            let feats = at(&out, &format!("features_{tag}.parquet"));
-            let t = Instant::now();
-            features::run(features::FeaturesParams {
-                psms: &psms,
-                chromatograms: chrom,
-                seed: Some(&seed),
-                out: &feats,
-                out_pin: "",
-                cfg: &fcfg,
-                config_hash: "test",
-                imc_ref_w: false,
-                q1_tolerances: None,
-            })
-            .unwrap();
-            let tf = t.elapsed().as_secs_f64();
-            let (pep, prot, frag) = (
-                at(&out, &format!("peptide_{tag}.parquet")),
-                at(&out, &format!("protein_{tag}.parquet")),
-                at(&out, &format!("fragment_{tag}.parquet")),
-            );
-            let t = Instant::now();
-            quant::run(quant::QuantParams {
-                psms_scored: &scored,
-                chromatograms: &[quant::ChromTable::whole(chrom)],
-                out_peptide: &pep,
-                out_protein: &prot,
-                out_fragment: Some(&frag),
-                out_peak_bounds: None,
-                out_quant_fragments: None,
-                cfg: &mumdia_core::config::QuantConfig::default(),
-                config_hash: "test",
-                cross_run: None,
-                export_cross_run: false,
-                first_pass_ids: None,
-                q1: None,
-            })
-            .unwrap();
-            println!(
-                "{tag}: features {tf:.1} s, quant {:.1} s",
-                t.elapsed().as_secs_f64()
-            );
-            outputs.push(vec![feats, pep, prot, frag]);
-        }
-        for (a, b) in outputs[0].iter().zip(&outputs[1]) {
-            assert!(
-                std::fs::read(a).unwrap() == std::fs::read(b).unwrap(),
-                "{a} and {b} differ"
-            );
-            println!("identical: {a} = {b}");
-        }
     }
 }

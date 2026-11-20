@@ -5,7 +5,7 @@
 //! This is what a second pass searches: the survivors of a first pass, or of `prescan`, as
 //! a library of their own. A contiguous m/z *band* of a library needs none of this, because
 //! a band is a row range and the engine reads one directly
-//! (`groups::write_band_slice` plus `Library::load_with_fragment_offset`); this stage is for
+//! (`groups::write_band_slice` plus `Library::load_for_stage`); this stage is for
 //! an arbitrary set of ids scattered through the library.
 //!
 //! Pair-linked by construction: a target and its decoy share `peptidoform_id` (the decoy

@@ -190,7 +190,7 @@ the only source of iRT; both training and application use it. On a run whose see
 the 1/K0 alike) is built only when it is used: under `anchor_irt_from_seed` (a pooled seed of a grouped
 run) the seed table carries the iRT and nothing is joined. When it is used and the
 library carries `candidate_id` as the row-aligned range `0..n`, which is the layout
-the engine writes and `Library::load` requires, the join is the id itself, a direct index
+the engine writes and `Library::load_for_stage` requires, the join is the id itself, a direct index
 into the columns. Any other layout gets a hash table from id to row, in which the last row
 with a given id wins, as in the historical `HashMap<u32, f64>` of the iRT. The hash table was built unconditionally before
 2026-09-25 and was about 4.5 GB of transient on an unbanded 203M-row library; the

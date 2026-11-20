@@ -25,7 +25,7 @@ maximum intensity (`rust/mumdia/crates/mumdia-core/src/config.rs:413`).
 **candidate_id**. The dense integer key for one library entry (a peptidoform at a
 charge). It is a precondition of the fragment index that `candidate_id` be the
 contiguous range `0..n` in precursor-row order, and that precursors be sorted
-ascending by precursor m/z; `Library::load` checks both and fails loudly if
+ascending by precursor m/z; `Library::load_for_stage` checks both and fails loudly if
 violated (`rust/mumdia/crates/mumdia/src/index.rs:74`,
 `rust/mumdia/crates/mumdia/src/index.rs:135`). This lets the inverted index recover
 the isolation-window candidate slice by a binary search over `candidate_id`, since
@@ -321,6 +321,6 @@ uses: score real (target) library entries against paired decoys and estimate the
 FDR at each score threshold from the decoy count. The engine reports native
 target-decoy q-values at PSM, peptide, and protein-group level as its trusted FDR
 estimate (`rust/mumdia/crates/mumdia/src/fdr.rs:1`). A decoy-free library makes
-these q-values invalid, so `Library::load` fails loudly when it finds no decoys
+these q-values invalid, so `Library::load_for_stage` fails loudly when it finds no decoys
 (`rust/mumdia/crates/mumdia/src/index.rs:152`). See `q-value`, `decoy`,
 `entrapment`.

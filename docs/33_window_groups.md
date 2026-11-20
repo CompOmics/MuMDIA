@@ -14,7 +14,7 @@ one band's worth by construction, without changing what any stage computes.
 This page is the code-grounded description: how the groups are planned, what each band's
 stages see, what the two pooling stages do, the two calibration modes, the output layout,
 and what has been measured. `groups.rs`, `stages/run_groups.rs`, `stages/seed_pool.rs` and
-`stages/pool.rs` are the sources; `index.rs` (`Library::load_with_fragment_offset`) and
+`stages/pool.rs` are the sources; `index.rs` (`Library::load_for_stage`) and
 `mumdia-io/src/table.rs` (`TableFile::open_rows`, `row_group_stats`) are the loads it rests
 on.
 
@@ -92,7 +92,7 @@ as `name[gNN]`.
 The stages then run unchanged on that band, as if it were the library:
 
 - `search-seed` loads the band straight from the library by row span
-  (`Library::load_row_span_with`: local ids `0..n`, the fragments whose ids lie in the band's
+  (`Library::load_for_stage` with a row span: local ids `0..n`, the fragments whose ids lie in the band's
   range read from the shared, library-wide fragment table). When that table is sorted by
   `candidate_id` at row-group granularity (`scripts/sort_fragments.py`; every library writer
   ends with the sort) the read is selective; an unsorted table still loads through a filtered

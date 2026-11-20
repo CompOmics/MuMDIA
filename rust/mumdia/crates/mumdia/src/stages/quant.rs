@@ -182,7 +182,7 @@ impl BaselineAuto {
             .copied()
             .filter(|x| x.is_finite())
             .collect();
-        let median = (!known.is_empty()).then(|| median_sorted(&mut known));
+        let median = (!known.is_empty()).then(|| crate::stats::median_or(&mut known, 0.0));
         BaselineAuto {
             applied: median.is_some_and(|m| m < threshold),
             shares,
@@ -3238,8 +3238,8 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             }
         }
         if left.len() >= 20 {
-            let ml = median_sorted(&mut left);
-            let mr = median_sorted(&mut right);
+            let ml = crate::stats::median_or(&mut left, 0.0);
+            let mr = crate::stats::median_or(&mut right, 0.0);
             info!(
                 anchors = left.len(),
                 med_left_s = ml,
@@ -3768,7 +3768,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                 .flat_map(|a| a.zero_counts.iter())
                 .map(|&(z, n)| z as f64 / n as f64)
                 .collect();
-            (!v.is_empty()).then(|| median_sorted(&mut v))
+            (!v.is_empty()).then(|| crate::stats::median_or(&mut v, 0.0))
         })
         .flatten();
     let applied_win: Vec<(f64, f64, f64)> =
@@ -4759,13 +4759,13 @@ pub fn fit_cross_run(fragment_tables: &[String], cfg: &QuantConfig) -> Result<Cr
                 .into_iter()
                 .map(|(f, v)| {
                     let mut ls: Vec<f64> = v.iter().map(|x| x.0).collect();
-                    let med = median_sorted(&mut ls);
+                    let med = crate::stats::median_or(&mut ls, 0.0);
                     let mut dev: Vec<f64> = v.iter().map(|x| (x.0 - med).abs()).collect();
-                    let dev = median_sorted(&mut dev);
+                    let dev = crate::stats::median_or(&mut dev, 0.0);
                     // No finite correlation is a median of 0, so a weight of 0.
                     let mut corr: Vec<f64> =
                         v.iter().map(|x| x.1).filter(|x| x.is_finite()).collect();
-                    let corr = median_sorted(&mut corr);
+                    let corr = crate::stats::median_or(&mut corr, 0.0);
                     (f, corr.max(0.0) / (dev + 0.1))
                 })
                 .collect();
@@ -5165,7 +5165,7 @@ fn size_factors_counted(
                     factor: if lr[k].is_empty() {
                         1.0
                     } else {
-                        2f64.powf(median_sorted(&mut lr[k]))
+                        2f64.powf(crate::stats::median_or(&mut lr[k], 0.0))
                     },
                 })
                 .collect()
@@ -5189,7 +5189,7 @@ fn size_factors_counted(
                     if logs[k].is_empty() {
                         0.0
                     } else {
-                        median_sorted(&mut logs[k])
+                        crate::stats::median_or(&mut logs[k], 0.0)
                     }
                 })
                 .collect();
@@ -5197,7 +5197,7 @@ fn size_factors_counted(
             let target = if m2.is_empty() {
                 0.0
             } else {
-                median_sorted(&mut m2)
+                crate::stats::median_or(&mut m2, 0.0)
             };
             (0..n)
                 .map(|k| SizeFactor {
@@ -5241,21 +5241,6 @@ fn grouped_size_factors(
         }
     }
     out
-}
-
-/// Median of a slice, sorting in place (ascending). Even lengths average the two
-/// middle values. Empty slice returns 0.0. Values are assumed finite (no NaN).
-fn median_sorted(v: &mut [f64]) -> f64 {
-    if v.is_empty() {
-        return 0.0;
-    }
-    v.sort_by(|a, b| a.total_cmp(b));
-    let m = v.len();
-    if m % 2 == 1 {
-        v[m / 2]
-    } else {
-        (v[m / 2 - 1] + v[m / 2]) * 0.5
-    }
 }
 
 #[cfg(test)]
@@ -5451,13 +5436,6 @@ mod tests {
         assert_eq!(hi1, 7.0);
         // grace=0 stops at the first sub-threshold scan -> last above-threshold rt 5.
         assert_eq!(hi0, 5.0);
-    }
-
-    #[test]
-    fn median_sorted_odd_even_empty() {
-        assert_eq!(median_sorted(&mut [3.0, 1.0, 2.0]), 2.0);
-        assert_eq!(median_sorted(&mut [4.0, 1.0, 3.0, 2.0]), 2.5);
-        assert_eq!(median_sorted(&mut []), 0.0);
     }
 
     #[test]

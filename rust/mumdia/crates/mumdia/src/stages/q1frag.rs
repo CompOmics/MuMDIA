@@ -717,19 +717,9 @@ pub struct Summary {
     pub width: f64,
 }
 
-/// The median of `v` (the mean of the middle two of an even count); 0 when empty.
+/// The median of `v` ([`crate::stats::median`], of a copy); 0 when empty.
 fn median(v: &[f64]) -> f64 {
-    if v.is_empty() {
-        return 0.0;
-    }
-    let mut s = v.to_vec();
-    s.sort_by(f64::total_cmp);
-    let n = s.len();
-    if n % 2 == 1 {
-        s[n / 2]
-    } else {
-        0.5 * (s[n / 2 - 1] + s[n / 2])
-    }
+    crate::stats::median_or(&mut v.to_vec(), 0.0)
 }
 
 /// Median absolute deviation of `v` around its median (unscaled).

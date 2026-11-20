@@ -282,6 +282,16 @@ than a number. Both are recorded in every run's `manifest.json`.
   rebuilt every decoy of the library that way, predicted ones included; a library predicted
   with `--met-excision`, which the desktop's build passes, closes that gap at the source.
   Decoys are built with `make_reverse_decoys.py` followed by `predict_decoys.py build`.
+- **Dead code of the library index and the matchers.** Six `Library` loaders that only tests
+  called (`load`, `load_with`, `load_range_with`, `load_with_fragment_offset`, `load_mz_only`,
+  `load_row_span_with`; stages use `load_for_stage` and `load_mz_only_for_stage`),
+  `Library::release_fragment_payload`, `index::deconvolve`, `FragIndex::tol_ppm`,
+  `chromatograms::Encoder::rows`, and three ignored micro-benchmarks of settled decisions
+  (their numbers stay in the code comments and docs/06, docs/15). The equivalence-gate
+  scorers (`matchers::naive`, `score_scan_count_dot`) are compiled for tests only. The seven
+  private copies of the median in quant, the cross-run LFQ, the Q1 fragment model and two
+  feature families now call one kernel, `stats::median` / `stats::median_or`; every table is
+  byte-identical.
 
 ### Fixed
 
@@ -289,6 +299,12 @@ than a number. Both are recorded in every run's `manifest.json`.
   a failed `git status` as a clean worktree, so the binary's `git_sha`, which every manifest
   records, could name a commit without `-dirty` for code that differed from it. An unknown
   state now counts as dirty; a build without git still records `unknown`.
+- **The bucketed matcher reads every posting at the lower edge of its tolerance.** A run of
+  equal fragment m/z (a shared ion such as y1) can end one bucket of the bucketed index and
+  start the next; a probe whose lower bound equalled that m/z started at the last such bucket
+  and missed the postings before it. Only a configuration that sets `search_seed.matcher` or
+  `extract.matcher` to `"bucketed"` reaches this; the default `fragindex` matcher is
+  unchanged, and so is every default output.
 - **Desktop: "Add folder…" selects several spectra folders at once (#335).** A Bruker or Agilent `.d`
   and a Waters `.raw` are directories, so they are added with "Add folder…", and that dialog took
   one folder at a time: the spectra folder picker shared the single-choice setting of the output

@@ -2575,9 +2575,8 @@ pub struct ExtractConfig {
     /// bit, so every table downstream of extract is byte-identical; only the chromatogram
     /// table changes (smaller, with a different content hash). A reader outside the engine,
     /// or an engine binary from before v2, reads only `rt` and `intensity` and stops at their
-    /// absence from a v2 table: set `1` for such a reader, or convert a table with
-    /// `mumdia::chromatograms::rewrite`. The pool splices band tables of one layout only, so
-    /// all bands of a grouped run share it.
+    /// absence from a v2 table: set `1` for such a reader. The pool splices band tables of
+    /// one layout only, so all bands of a grouped run share it.
     ///
     /// Measured before the default changed: on a six-run Astral experiment and a five-run
     /// Orbitrap AIF experiment (imported HYE library, multi-head calibration, `nn_torch`)
@@ -5116,7 +5115,7 @@ pub enum GroupRtAdaptation {
 ///
 /// A group of isolation windows can only select precursors whose m/z lies in the group's
 /// band, so its seed, calibration, extract, features and compete need only that band of the
-/// library (`Library::load_with_fragment_offset`): the library, the hit accumulator and the
+/// library (`Library::load_for_stage`): the library, the hit accumulator and the
 /// accepted rows are all one band's worth instead of the whole run's, which is what bounds
 /// the memory of a search against a library of 10^8 precursors. Only rescore, quant and
 /// report see everything, after the group artifacts are pooled with library-wide ids. The
