@@ -920,6 +920,17 @@ inputs at Start, so a plan computed before the last change cannot decide the run
 "Automatic" that resolves to one band leaves the preset's own `groups` block alone;
 "Off" and "Custom" write it.
 
+diaPASEF input is searched in one piece. The engine refuses bands on spectra that carry
+1/K0 (the bands are cut in m/z, and the windows of a diaPASEF run share m/z ranges and
+differ in their 1/K0 slots; docs/35_diapasef.md), and the diaPASEF recipe turns on
+retrace, which config validation refuses with bands. When a selected input is a timsTOF
+diaPASEF `.d` (the same `vendor_of` check that labels it in the file list), "Automatic"
+is one band and writes it over the preset's own `groups` block
+(`sizing::in_one_piece`). The note under Bands says so, and says when the estimate
+exceeds the memory budget, where a smaller search space or a machine with more memory
+is the answer instead of bands. A "Custom" count above one on such input is refused
+before Start.
+
 The size comes from the library footer in library mode (`mumdia inspect`, rows only)
 and from the FASTA otherwise (`sizing::fasta_space`): a digest under the screen's
 cleavage rule with its missed cleavages and lengths (every window of the length range

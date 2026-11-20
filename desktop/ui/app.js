@@ -145,6 +145,13 @@ const state = {
   ztscan: {
     probes: {}, hwTyped: false, off: null, analysisTouched: false, analysisChoice: null, lib: null,
   },
+  // The vendor check of each selected spectra file (`vendor_of`), by path, kept once it
+  // answered: the list shows it, and the band plan and the search problems need to know
+  // which inputs are diaPASEF (`diapasefInputs`).
+  vendors: {},
+  // Whether the last band plan was asked for diaPASEF input, so the list re-plans when the
+  // answer changes.
+  spaceDiapasef: false,
 };
 
 function readStored(key, fallback) {
@@ -2892,12 +2899,7 @@ async function renderMzmlList() {
 
     // Say which files need something that is not installed, per file, here rather
     // than as one aggregate blocker after Start.
-    let v = null;
-    try {
-      v = await invoke("vendor_of", { path: f });
-    } catch {
-      /* Detection is advisory; preflight is the authority. */
-    }
+    const v = await vendorOf(f);
     if (v && v.label === DIAPASEF_LABEL) anyDiapasef = true;
     if (v && v.needs !== "Nothing") {
       const ok =
@@ -2932,6 +2934,8 @@ async function renderMzmlList() {
     $("lib-for").value = anyDiapasef ? "diapasef" : "other";
     refreshLibForNote();
   }
+  // diaPASEF input is planned in one piece, so the band plan follows the selection.
+  if (anyDiapasef !== state.spaceDiapasef) scheduleSpace();
   // Which of them the engine would refuse for want of a Q1 half-width; asked once per file.
   refreshZtscanNote();
 }
@@ -3216,6 +3220,28 @@ function ztscanOverrides() {
 
 // What `vendor_of` calls a .d the engine reads natively, with its ion mobility.
 const DIAPASEF_LABEL = "Bruker timsTOF diaPASEF .d";
+
+// The vendor check of one spectra file, asked once and kept (`state.vendors`). Null when
+// the check could not answer, which is asked again next time: detection is advisory, and
+// the engine's preflight is the authority.
+async function vendorOf(f) {
+  if (state.vendors[f]) return state.vendors[f];
+  let v = null;
+  try {
+    v = await invoke("vendor_of", { path: f });
+  } catch {
+    /* Advisory, as above. */
+  }
+  if (v) state.vendors[f] = v;
+  return v;
+}
+
+// The selected inputs the engine reads as diaPASEF (`raw::Vendor::BrukerTdf`), by the
+// vendor checks made so far. The engine refuses bands on them (docs/35_diapasef.md), so the
+// band plan searches them in one piece and a custom band count is a search problem.
+function diapasefInputs() {
+  return state.picks.mzml.filter((f) => state.vendors[f]?.label === DIAPASEF_LABEL);
+}
 
 // What the "Library for" choice changes, under the library source chosen above it.
 function refreshLibForNote() {
@@ -4099,6 +4125,7 @@ function spaceRequest(libPrecursors) {
     max_variable_mods: maxVariableMods(),
     keep_fraction: prescreenKeep(),
     threads: Number.isFinite(threads) && threads > 0 ? threads : null,
+    diapasef: diapasefInputs().length > 0,
   };
 }
 
@@ -4109,9 +4136,11 @@ function scheduleSpace() {
 
 async function refreshSpace() {
   const seq = ++state.spaceSeq;
+  const req = spaceRequest();
+  state.spaceDiapasef = req.diapasef;
   let s = null;
   try {
-    s = await invoke("search_space", { req: spaceRequest() });
+    s = await invoke("search_space", { req });
   } catch (e) {
     s = { reason: `Could not size the search: ${e}`, plan: null, machine: null };
   }
@@ -4172,6 +4201,9 @@ function renderSpace() {
       const per = 4 + (plan.unbanded_gb - 4) / c.bands;
       line += ` About ${(per * c.parallel).toFixed(0)} GB in flight against a budget of ${plan.budget_gb.toFixed(0)} GB.`;
     }
+    if (c.bands > 1 && diapasefInputs().length) {
+      line += " diaPASEF spectra cannot be split into bands: choose Automatic or Off.";
+    }
     parts.push(line);
   }
   const m = s?.machine;
@@ -4182,18 +4214,24 @@ function renderSpace() {
 }
 
 // The band count this search uses. Automatic sizes the inputs being started now, so a
-// stale plan from before the last change cannot decide it.
+// stale plan from before the last change cannot decide it. On diaPASEF input Automatic is
+// one band (the plan says why, `sizing::in_one_piece`), written out so that a preset with
+// bands of its own cannot split the search either: the engine refuses bands there.
 async function resolveBands(libPrecursors) {
   const mode = $("bands").value;
   if (mode === "off") return { bands: 1, parallel: 1, explicit: true };
   if (mode === "custom") return { ...customBands(), explicit: true };
+  const req = spaceRequest(libPrecursors);
+  const onePiece = { bands: 1, parallel: 1, explicit: true };
   try {
-    const s = await invoke("search_space", { req: spaceRequest(libPrecursors) });
+    const s = await invoke("search_space", { req });
     state.space = s;
+    state.spaceDiapasef = req.diapasef;
     renderSpace();
+    if (req.diapasef) return onePiece;
     return { bands: s.plan.bands, parallel: s.plan.parallel, explicit: false };
   } catch {
-    return { bands: 1, parallel: 1, explicit: false };
+    return req.diapasef ? onePiece : { bands: 1, parallel: 1, explicit: false };
   }
 }
 
@@ -4257,6 +4295,14 @@ function searchProblems() {
     out.push(
       "The prescreen after retention-time calibration cannot be combined with bands yet. " +
         "Set Bands to Off, or choose the prescreen before prediction."
+    );
+  }
+  const diapasef = diapasefInputs();
+  if (diapasef.length && $("bands").value === "custom" && customBands().bands > 1) {
+    out.push(
+      "diaPASEF spectra cannot be split into bands: their windows share m/z ranges and " +
+        "differ in ion mobility, so the engine searches them in one piece. Set Bands to " +
+        `Automatic or Off for these files: ${diapasef.map(baseName).join(", ")}.`
     );
   }
   const zt = ztscanFiles();
@@ -5193,6 +5239,9 @@ async function startSearch() {
     return;
   }
 
+  // Which inputs are diaPASEF decides the bands: a check the list has not finished yet is
+  // finished here, before the problems are read and the bands resolved.
+  await Promise.all(p.mzml.map(vendorOf));
   const problems = searchProblems();
   if (problems.length) {
     banner($("start-error"), problems.join("\n\n"));

@@ -170,6 +170,12 @@ pub struct SpaceRequest {
     pub precursor_mz_min: Option<f64>,
     #[serde(default)]
     pub precursor_mz_max: Option<f64>,
+    /// A selected input is a timsTOF diaPASEF `.d`, which the engine reads with its ion
+    /// mobility. The engine searches such spectra in one piece: it refuses
+    /// `groups.window_groups > 1` on them (`refuse_unsupported_on_4d`, docs/35_diapasef.md),
+    /// so the plan is one band ([`in_one_piece`]).
+    #[serde(default)]
+    pub diapasef: bool,
 }
 
 /// The mean monoisotopic residue mass of a tryptic proteome, in Da: the estimate's stand-in
@@ -284,6 +290,11 @@ pub fn estimate(req: &SpaceRequest, engine: Option<&Path>) -> Space {
     let searched = precursors.map(|p| (p as f64 * keep).round() as u64);
     let threads = req.threads.filter(|&t| t > 0).unwrap_or(m.threads);
     let plan = band_plan(searched, m.total_memory_bytes, threads);
+    let plan = if req.diapasef {
+        in_one_piece(plan)
+    } else {
+        plan
+    };
     Space {
         precursors,
         peptides,
@@ -525,6 +536,40 @@ pub fn band_plan(precursors: Option<u64>, memory: Option<u64>, threads: usize) -
     }
 }
 
+/// The plan for diaPASEF input: one band, whatever the memory.
+///
+/// The engine refuses window groups on spectra that carry 1/K0
+/// (`stages::run::refuse_unsupported_on_4d`): the groups are cut in m/z, and the windows of a
+/// diaPASEF run share m/z ranges and differ in their 1/K0 slots. The diaPASEF recipe also
+/// turns on retrace, which config validation refuses with bands. Splitting is therefore no
+/// answer to a search that does not fit, and the note says so instead of proposing bands.
+pub fn in_one_piece(plan: BandPlan) -> BandPlan {
+    const WHY: &str = "diaPASEF spectra are searched in one piece: the engine cannot split \
+                       their windows into bands.";
+    let note = match plan.unbanded_gb {
+        Some(gb) if gb > plan.budget_gb => format!(
+            "{WHY} About {gb:.0} GB estimated, more than the {:.0} GB this machine can give a \
+             search, so it may run out of memory; a smaller search space (fewer variable \
+             modifications, missed cleavages or charges) or a machine with more memory avoids \
+             that.",
+            plan.budget_gb
+        ),
+        Some(gb) => format!(
+            "{WHY} About {gb:.0} GB estimated, within the {:.0} GB this machine can give a \
+             search.",
+            plan.budget_gb
+        ),
+        None => format!("{WHY} {}", plan.note),
+    };
+    BandPlan {
+        bands: 1,
+        parallel: 1,
+        band_gb: plan.unbanded_gb,
+        note,
+        ..plan
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,6 +599,7 @@ mod tests {
             threads: None,
             precursor_mz_min: None,
             precursor_mz_max: None,
+            diapasef: false,
         }
     }
 
@@ -729,6 +775,52 @@ ACDEFGHIKL
                 }
             }
         }
+    }
+
+    #[test]
+    fn diapasef_input_is_planned_in_one_piece_whatever_the_memory() {
+        // A phospho search space on a 68 GB desktop: 60% is 40.8 GB, so about 60M
+        // precursors would be split into 4 bands, one at a time. The engine refuses that on
+        // diaPASEF input, so the plan is one band and the note says it may not fit.
+        let split = band_plan(Some(60_000_000), Some(68_000_000_000), 24);
+        assert_eq!((split.bands, split.parallel), (4, 1));
+        let p = in_one_piece(split.clone());
+        assert_eq!((p.bands, p.parallel), (1, 1));
+        assert_eq!(p.band_gb, split.unbanded_gb);
+        assert_eq!(
+            (p.budget_gb, p.unbanded_gb),
+            (split.budget_gb, split.unbanded_gb)
+        );
+        assert!(
+            p.note
+                .starts_with("diaPASEF spectra are searched in one piece"),
+            "{}",
+            p.note
+        );
+        assert!(p.note.contains("may run out of memory"), "{}", p.note);
+        // A search that fits is one band as before, with no warning.
+        let fits = in_one_piece(band_plan(Some(10_900_000), Some(128_000_000_000), 32));
+        assert_eq!((fits.bands, fits.parallel), (1, 1));
+        assert!(fits.note.contains("within the"), "{}", fits.note);
+        assert!(!fits.note.contains("run out of memory"), "{}", fits.note);
+        // Without an estimate the reason the plan gave is kept.
+        let unknown = in_one_piece(band_plan(Some(60_000_000), None, 24));
+        assert_eq!(unknown.bands, 1);
+        assert!(
+            unknown.note.contains("could not be read"),
+            "{}",
+            unknown.note
+        );
+    }
+
+    #[test]
+    fn a_request_without_the_diapasef_flag_reads_as_not_diapasef() {
+        // A frontend from before the flag, or a search without spectra, plans as before.
+        let r: SpaceRequest = serde_json::from_str(r#"{"mode": "fasta"}"#).unwrap();
+        assert!(!r.diapasef);
+        let r: SpaceRequest =
+            serde_json::from_str(r#"{"mode": "fasta", "diapasef": true}"#).unwrap();
+        assert!(r.diapasef);
     }
 
     #[test]

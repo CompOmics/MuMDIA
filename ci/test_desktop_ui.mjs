@@ -162,6 +162,8 @@ function load() {
     "saveSettings",
     "setMode",
     "resolveBands",
+    "vendorOf",
+    "diapasefInputs",
     "runOverrides",
     "captureSearch",
     "currentSetup",
@@ -1396,6 +1398,90 @@ test("a setup with an implausible m/z limit is refused, naming the field and its
   for (const [id, min, max] of [["d-prmin", 100, 6000], ["d-prmax", 100, 6000], ["d-frmin", 50, 4000], ["d-frmax", 50, 4000]]) {
     assert.match(HTML, new RegExp(`id="${id}" min="${min}" max="${max}"`), id);
   }
+});
+
+// What `vendor_of` answers: a .d is a diaPASEF run, anything else an mzML.
+const vendorAnswer = ({ path }) =>
+  path.endsWith(".d")
+    ? { label: "Bruker timsTOF diaPASEF .d", needs: "Nothing" }
+    : { label: "mzML", needs: "Nothing" };
+
+// Select one spectra file and finish its vendor check, as the list does.
+async function pick(p, path) {
+  p.api.state.picks.mzml = [path];
+  await p.api.vendorOf(path);
+}
+
+test("Automatic searches diaPASEF input in one piece, whatever the plan proposes", async () => {
+  const p = await profile();
+  p.answers.vendor_of = vendorAnswer;
+  const asked = [];
+  let plan = { bands: 4, parallel: 1, budget_gb: 41, unbanded_gb: 124, note: "" };
+  p.answers.search_space = ({ req }) => {
+    asked.push(req.diapasef);
+    return { plan, machine: null };
+  };
+  assert.equal(p.el("bands").value, "auto");
+  // A search space too large for this machine: an mzML is split as the plan says.
+  await pick(p, "/d/REP01.mzML");
+  assert.deepEqual((await searchConfig(p)).derived.groups, { window_groups: 4, parallel: 1 });
+  // A diaPASEF .d is one band, which the engine accepts, and the plan was asked for it.
+  await pick(p, "/d/run.d");
+  assert.deepEqual([...p.api.diapasefInputs()], ["/d/run.d"]);
+  assert.deepEqual((await searchConfig(p)).derived.groups, { window_groups: 1, parallel: 1 });
+  assert.deepEqual(asked, [false, true]);
+  // A preset with bands of its own: Automatic at one band leaves them to an mzML, and
+  // writes one band over them for a diaPASEF .d.
+  plan = { bands: 1, parallel: 1, budget_gb: 41, unbanded_gb: 20, note: "" };
+  p.files[p.el("preset").value].groups = { window_groups: 3, parallel: 1 };
+  await pick(p, "/d/REP01.mzML");
+  assert.equal((await searchConfig(p)).derived.groups.window_groups, 3);
+  await pick(p, "/d/run.d");
+  assert.deepEqual((await searchConfig(p)).derived.groups, { window_groups: 1, parallel: 1 });
+});
+
+test("a custom band count on diaPASEF input is a problem before Start", async () => {
+  const p = await profile();
+  p.answers.vendor_of = vendorAnswer;
+  const diapasefProblem = () =>
+    [...p.api.searchProblems()].filter((m) => /diaPASEF spectra cannot be split into bands/.test(m));
+  await pick(p, "/d/run.d");
+  p.el("bands").value = "custom";
+  p.el("bands-n").value = "2";
+  const found = diapasefProblem();
+  assert.equal(found.length, 1);
+  assert.match(found[0], /run\.d/);
+  assert.match(found[0], /Set Bands to Automatic or Off/);
+  // One custom band, Automatic and Off are not problems.
+  p.el("bands-n").value = "1";
+  assert.deepEqual(diapasefProblem(), []);
+  p.el("bands-n").value = "2";
+  for (const mode of ["auto", "off"]) {
+    p.el("bands").value = mode;
+    assert.deepEqual(diapasefProblem(), [], mode);
+  }
+  // Nor are bands on an mzML.
+  p.el("bands").value = "custom";
+  await pick(p, "/d/REP01.mzML");
+  assert.deepEqual(diapasefProblem(), []);
+});
+
+test("a vendor check that could not answer is asked again, an answer is kept", async () => {
+  const p = load();
+  let up = false;
+  p.answers.vendor_of = (args) => {
+    if (!up) throw "the backend is not ready";
+    return vendorAnswer(args);
+  };
+  p.api.state.picks.mzml = ["/d/run.d"];
+  assert.equal(await p.api.vendorOf("/d/run.d"), null);
+  assert.deepEqual([...p.api.diapasefInputs()], []);
+  up = true;
+  assert.equal((await p.api.vendorOf("/d/run.d")).label, "Bruker timsTOF diaPASEF .d");
+  assert.deepEqual([...p.api.diapasefInputs()], ["/d/run.d"]);
+  const asked = p.calls.filter(([n]) => n === "vendor_of").length;
+  await p.api.vendorOf("/d/run.d");
+  assert.equal(p.calls.filter(([n]) => n === "vendor_of").length, asked);
 });
 
 let failed = 0;

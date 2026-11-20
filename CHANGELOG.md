@@ -253,6 +253,15 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **Desktop: a diaPASEF search is no longer split into bands (#PRNUM).** "Bands: Automatic" (the
+  default) planned the search from the machine's memory alone, so a large search space on a timsTOF
+  diaPASEF `.d` was given several bands, and the engine stopped it after Start: bands are refused on
+  spectra that carry 1/K0, and the diaPASEF recipe's retrace is refused with bands (`invalid config:
+  retrace.enabled is not supported with groups.window_groups > 1`). With a diaPASEF input selected,
+  Automatic is now one band, written over a preset's own bands; the note under Bands says why, and
+  says when the estimate exceeds the memory budget. A custom band count above one on such input is
+  refused before Start. Other inputs are planned as before (desktop/README.md, "Prescreen, bands and
+  modifications on the Search screen").
 - **Desktop: "Add folder…" selects several spectra folders at once (#335).** A Bruker or Agilent `.d`
   and a Waters `.raw` are directories, so they are added with "Add folder…", and that dialog took
   one folder at a time: the spectra folder picker shared the single-choice setting of the output
