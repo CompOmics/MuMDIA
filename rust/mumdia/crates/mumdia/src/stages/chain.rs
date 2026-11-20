@@ -335,7 +335,6 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
         features: &feats,
         out: &competed,
         cfg: &cfg.compete,
-        config_hash: ch,
         features_hash: Some(&wf.content_hash),
     })?;
     keep(

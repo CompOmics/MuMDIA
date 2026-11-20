@@ -273,6 +273,12 @@ than a number. Both are recorded in every run's `manifest.json`.
   `_q1c` / `_for` and the unread `FeaturesParams::config_hash`), and a test now checks how
   the stage feeds the default-on RT-window family. Every table, the PIN and the
   configuration hash are unchanged.
+- **Retrace and `mumdia mobilogram` share their `.d` reading.** The frame index, the scan to
+  1/K0 axis and the lookup of the `.d` a spectra artifact was read from were written twice,
+  once per stage; they now live once in `convert::tims_frames`. A missing `.d`, or spectra
+  that were not read natively, is reported in the same words by both, each adding its own way
+  out. Retrace's MS1 mass-residual median uses the shared median, and the unread
+  `CompeteParams::config_hash` is gone. Every output is byte-identical.
 
 ### Removed
 
@@ -303,6 +309,17 @@ than a number. Both are recorded in every run's `manifest.json`.
   private copies of the median in quant, the cross-run LFQ, the Q1 fragment model and two
   feature families now call one kernel, `stats::median` / `stats::median_or`; every table is
   byte-identical.
+- **`compete.mode = features_only`.** It kept the same candidates as `none` through the same
+  code; the name only described an intent. A configuration that sets it still loads and runs
+  as `none`, with the same identifications, but its config hash and the compete report's
+  `params.mode` now say `none`.
+- **Compete's row-group splice.** When competition removed a few rows, compete copied the
+  features row groups that lost none as bytes and rewrote only the others. The shipped
+  grouping removes no row, and a grouping that removes many dirties every row group and was
+  rewritten anyway, so the path ran only for a handful of duplicate rows. Such a table is now
+  rewritten, with the same rows, order and values; its row groups and file hash can differ, and
+  the compete report no longer carries `publish = spliced`, `rewritten_row_groups` or
+  `row_groups`.
 
 ### Fixed
 
@@ -427,6 +444,16 @@ than a number. Both are recorded in every run's `manifest.json`.
   run with window groups, the desktop's memory bands included, logged that the key was set
   but had fewer than 20 anchors. The fit now returns at once with the key off; the result
   was already no global bounds.
+- **A shadow test that cannot demote is refused.** With the test on (`rescore.shadow_min_shared`
+  above 0, the default), a zero or negative `rescore.shadow_ppm` or `rescore.shadow_rt_s`, or
+  `rescore.shadow_region = 0`, demoted nothing while the run still reported the test as on. The
+  configuration is now refused, and the message names `shadow_min_shared = 0` as the off
+  switch.
+- **The help of `compete.group_by` and `compete.unique_evidence_min_fragments`, which the
+  desktop application's settings show.** The first named `precursor`, a value the parser has
+  refused since it became `base_peptide`; the second promised a `unique_fragment_count` feature
+  that no build writes, and a fallback that cannot happen. Both now say what the code does:
+  the unique evidence is `n_matched_fragments` x (1 - `peak_contested_frac`).
 
 ### Security
 

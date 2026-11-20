@@ -296,7 +296,6 @@ fn features_compete_rescore_run_on_crafted_input() {
         features: &feats,
         out: &competed,
         cfg: &cfg.compete,
-        config_hash: "test",
         features_hash: None,
     })
     .unwrap();
@@ -447,7 +446,6 @@ fn search_stages_return_the_hashes_of_the_files_they_wrote() {
         features: &feats,
         out: &competed,
         cfg: &cfg.compete,
-        config_hash: "test",
         features_hash: Some(&wfeat.content_hash),
     })
     .unwrap();
@@ -511,7 +509,6 @@ fn downstream_bytes(psms: &str, chrom: &str, cfg: &Config, tag: &str) -> Vec<Vec
         features: &feats,
         out: &competed,
         cfg: &cfg.compete,
-        config_hash: "test",
         features_hash: None,
     })
     .unwrap();

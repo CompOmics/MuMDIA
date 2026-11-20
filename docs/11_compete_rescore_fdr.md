@@ -281,26 +281,22 @@ the winner as the highest `prelim_score`, ties broken by smallest row index
   `(loser, winner)` (compete.rs:349-358). This is the arm that deletes the
   charge/mod siblings described above; the deleted rows never reach rescore.
 - `None`: keep all members, remove nothing (compete.rs:346-348). FDR handles the
-  ambiguity downstream.
-- `FeaturesOnly`: identical retained set to `None` (same match arm,
-  compete.rs:346); the distinct name documents intent for the experiment matrix,
-  the idea being that conflict/contested features carry the interference signal
-  into rescoring instead of removal.
+  ambiguity downstream. The retired `features_only`, which kept the same set, is read
+  as `none`.
 - `UniqueEvidence`: keep the winner; keep a loser only when its unique-fragment
   evidence `>= unique_evidence_min_fragments` (compete.rs:359-372). Evidence comes
-  from `unique_evidence_with_source` (compete.rs:279-298): prefers an explicit
-  `unique_fragment_count` column, else approximates it as
-  `n_matched_fragments * (1 - contested_frac)` (the multiplier `(1 - contested)`
-  clamped to [0,1]), else raw `n_matched_fragments`, else `None`. The contested
-  fraction is resolved by `prefer_peak_contested_fraction` (compete.rs:301-306),
-  which prefers the Extended-feature `peak_contested_frac` column and falls back to
-  the legacy `contested_frac` spelling. Each column is read through `col_f64`,
-  which accepts an f64, an f32 (widened exactly) or an i32 encoding, so an
-  integer-typed fragment count is handled without a schema mismatch. The features
-  writer keeps all four columns as f64 (`F64_FEATURE_COLUMNS`), because an f32
-  contested fraction could move `n * (1 - c)` across the integer threshold. If the mode is
-  selected but no column is available it warns and falls back to winner-take-all
-  (compete.rs:133-139, 366 `.unwrap_or(false)`).
+  from `unique_evidence_with_source`: `n_matched_fragments * (1 - c)` (the multiplier
+  `(1 - c)` clamped to [0,1]) with the contested fraction `c` from the Extended-feature
+  `peak_contested_frac` column, else the legacy `contested_frac` spelling, else raw
+  `n_matched_fragments`. `peak_contested_frac` is 0 unless
+  `extract.emit_contested_features` is on, so by default the evidence is the matched
+  count. Each column is read through `col_f64`, which accepts an f64, an f32 (widened
+  exactly) or an i32 encoding, so an integer-typed fragment count is handled without a
+  schema mismatch. The features writer keeps these columns as f64
+  (`F64_FEATURE_COLUMNS`), because an f32 contested fraction could move `n * (1 - c)`
+  across the integer threshold. Every features set writes `n_matched_fragments`; a
+  table without it (not written by `mumdia features`) makes the mode warn and fall
+  back to winner-take-all.
 - `MarginGated`: keep the winner; remove a loser only when
   `prelim[win] - prelim[m] >= margin`, otherwise keep it (compete.rs:373-385).
   Conservative removal for the low-FDR region.
@@ -322,13 +318,13 @@ Its fields are wall-clock milliseconds:
 |---|---|
 | `keys_ms` | footer open, the streamed key columns (`label`, `prelim_score`, `peak_rank`, the grouping columns) and the sort of the `(key, row)` array |
 | `resolve_ms` | the unique-evidence estimate (that mode only) and `resolve_competition` |
-| `write_ms` | writing the competed table and its `<out>.schema.json`; a spliced or rewritten table is hashed during this write (docs/03 "Hash on write") |
+| `write_ms` | writing the competed table and its `<out>.schema.json`; a rewritten table is hashed during this write (docs/03 "Hash on write") |
 | `audit_ms` | the optional `<out>.compete_audit.parquet` (0 when the audit is off) |
 | `hash_ms` | the blake3 content hash recorded in `<out>.report.json`: near 0 when the hash came from the write or is the features hash of a hard-linked table; a read-back of the file only for a linked or copied table without `features_hash` |
 | `elapsed_ms` | the whole stage |
 
 On a wide features table `write_ms` dominates: the keys are a few columns, the
-table is every feature column, and the hash of a spliced or rewritten table is
+table is every feature column, and the hash of a rewritten table is
 computed while it is written. `hash_ms` is large only for a standalone compete
 that links or copies the features file without being given its hash. The same line names how the table was
 published (`publish`, next section).
@@ -348,7 +344,7 @@ publishes them as the competed table:
    (`mumdia_io::table::publish_copy_of`);
 2. if the filesystem refuses the link (another volume, FAT, some network and sync
    folders), a byte copy into the same temp name;
-3. if that fails too, the rows are rewritten by `copy_kept_rows`, as before.
+3. if that fails too, the rows are rewritten by `copy_kept_rows_with`, as before.
 
 The features bytes are reusable only when all of these hold, and each is necessary:
 the Arrow schema is exactly the competed schema (the 11 bookkeeping columns, then the
@@ -361,30 +357,11 @@ rewrites. A features v1 table fails the first condition, because its feature
 columns are all Float64 and the competed schema declares most of them Float32, so it
 is always rewritten into the v4 layout.
 
-When some rows are removed, the same four conditions hold, and the non-empty
-features row groups that lost no row hold at least half of the table's rows
-(`splice_pays`), the table is spliced instead (`splice_kept_rows`): the untouched row
-groups are appended as bytes through `SpliceWriter`, as the pool splices band tables,
-and each run of consecutive row groups that lost a row is rewritten by
-`copy_kept_rows` into a scratch file (`<out>.splice-<pid>-<row>.parquet`, removed
-afterwards) whose row groups take its place. A row group that lost every row
-contributes nothing. A splice writes each dirty row twice (into the scratch file, then
-into the output) and each clean row once, while a full rewrite writes every row once
-but decodes and re-encodes all of them. The half-the-rows threshold bounds the splice
-at 1.5 times the table's write traffic, half of it re-encoded, with no scratch file
-larger than half the table. Below it, which is the usual case for a grouping that
-removes many rows (`base_peptide` removed 23% of the rows on HYE B01, from most row
-groups), most of the table would pass through a scratch file, up to twice the write
-traffic and scratch space close to the table's size, so the table is rewritten
-directly. A splice that fails for any reason (for example a scratch file the splice
-refuses) is logged as a warning and followed by the same full rewrite; the output temp
-and the scratch files are removed first. The spliced file holds the rewrite's rows in
-the rewrite's order with its values; its row groups are the features file's where they
-were untouched, so it is not byte-identical to a full rewrite. Under the shipped
-defaults no row is removed and this path does not run.
+When some rows are removed, the table is rewritten. Under the shipped defaults no row
+is removed.
 
-The report's `stats.publish` records which path ran: `hard_link`, `byte_copy`,
-`spliced` (with `rewritten_row_groups` and `row_groups`) or `rewritten`. After a link or a copy the competed file has the features file's row
+The report's `stats.publish` records which path ran: `hard_link`, `byte_copy` or
+`rewritten`. After a link or a copy the competed file has the features file's row
 groups and bytes, so its `content_hash` IS the features hash. An orchestrator passes
 the features stage's own hash as `CompeteParams::features_hash`, and compete records it
 rather than reading the file again; the standalone `mumdia compete` passes none and
@@ -858,14 +835,11 @@ counts feed a hyperscore-style term; `n` is small so the naive loop is fine.
 | `compete::run` | compete.rs:28 | full compete stage: group, resolve, write competed table + optional audit |
 | `compete::resolve_competition` | compete.rs:321 | pure per-mode within-group resolution; returns kept indices + removal pairs |
 | `compete::unique_evidence_with_source` | compete.rs:279 | derive per-candidate unique-fragment evidence for `UniqueEvidence` mode, plus the column it came from |
-| `compete::prefer_peak_contested_fraction` | compete.rs:301 | choose the Extended `peak_contested_frac`, else the legacy `contested_frac` |
 | `compete::col_f64` | compete.rs:309 | read a numeric column as f64, accepting an f64 or i32 encoding |
-| `CompeteParams` | compete.rs:21 | `features`, `out`, `cfg`, `config_hash`, `features_hash` (the features stage's report hash, reused when the competed table is the features file's bytes) |
+| `CompeteParams` | compete.rs:21 | `features`, `out`, `cfg`, `features_hash` (the features stage's report hash, reused when the competed table is the features file's bytes) |
 | `compete::run_hashed` | compete.rs | `run`, returning the row count and the report content hash (`mumdia_io::report::Written`) |
-| `compete::publish_competed` | compete.rs | publish the kept rows: the features file's bytes when they are exactly the competed table, a splice when few rows are removed, otherwise (or when either fast path fails) `copy_kept_rows` |
+| `compete::publish_competed` | compete.rs | publish the kept rows: the features file's bytes when every row is kept and they are exactly the competed table, otherwise (or when the link and the copy fail) `copy_kept_rows_with` |
 | `compete::features_bytes_reusable` | compete.rs | the four conditions under which the features bytes can stand in for the competed table |
-| `compete::splice_kept_rows` | compete.rs | some rows removed: splice the untouched features row groups, rewrite the others |
-| `compete::splice_pays` | compete.rs | whether the non-empty untouched row groups hold at least half the rows, so a splice beats a full rewrite |
 | `rescore::run` | rescore.rs:41 | full rescore stage: concat, dispatch, multi-context q, scored table |
 | `rescore::validate_feature_schema` | rescore.rs:596 | reject a concat whose feature companions differ in id or ordered columns |
 | `rescore::native_scores` | rescore.rs:616 | thin wrapper calling `percolator_lite` with the config knobs |
@@ -898,11 +872,11 @@ one dead field kept in the struct (the `percolator` classifier is unwired).
 
 | field | default | effect |
 |---|---|---|
-| `group_by` | `base_peptide` | despite the name, groups by stripped peptide: all charge **and** modification variants of one `base_peptide_id` share a group, separately within target and decoy labels; `apex` also buckets by rounded apex RT; `peptidoform_charge` keeps each peptidoform+charge separate and is required for a PTM search |
+| `group_by` | `peptidoform_charge` | keeps each peptidoform+charge separate and is required for a PTM search; `base_peptide` groups by stripped peptide: all charge **and** modification variants of one `base_peptide_id` share a group, separately within target and decoy labels; `apex` also buckets by rounded apex RT |
 | `apex_rt_tolerance_s` | `5.0` | RT bucket width (s) for `group_by = apex` (compete.rs:90) |
-| `mode` | `winner_take_all` | within-group resolution (`CompetitionMode`, config.rs:873): `winner_take_all`, `none`, `features_only`, `unique_evidence`, `margin_gated` |
+| `mode` | `winner_take_all` | within-group resolution (`CompetitionMode`, config.rs:873): `winner_take_all`, `none` (`features_only` is read as `none`), `unique_evidence`, `margin_gated` |
 | `margin` | `0.0` | score margin required to remove a loser under `margin_gated` (compete.rs:379) |
-| `unique_evidence_min_fragments` | `2` | min unique-fragment count for a loser to survive under `unique_evidence` (compete.rs:361-366) |
+| `unique_evidence_min_fragments` | `2` | min unique-fragment evidence, `n_matched_fragments * (1 - peak_contested_frac)`, for a loser to survive under `unique_evidence` (compete.rs:361-366) |
 | `emit_competition_audit` | `false` | write `<out>.compete_audit.parquet` (compete.rs:193) |
 
 All non-default `mode` values are part of the sensitivity program and are

@@ -1912,9 +1912,9 @@ but do not affect the wired `mumdia mbr` path.
   and an explicit `quant_status`. LFQ ignores null, non-finite, and nonpositive
   values.
 - **Competition affects matrix completeness.** The default upstream
-  `group_by=precursor` collapses charge/modification siblings separately within
-  each label. `peptidoform_charge` preserves them, but changes the rescoring/FDR
-  population and must be benchmarked before production use.
+  `group_by = peptidoform_charge` keeps charge and modification siblings as separate
+  precursors; `base_peptide` collapses them to one winner within each label, which
+  changes the rescoring/FDR population and the matrix.
 - **MS1 traces excluded.** `ms1_*` chromatogram rows are precursor channels and never
   enter peak detection or the top-N sum (`quant.rs:303`).
 - **Grouped q columns are populated on group winners only.** `grouped_q`

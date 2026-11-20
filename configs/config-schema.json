@@ -3367,7 +3367,7 @@
       "optional": false,
       "default": "peptidoform_charge",
       "default_text": "`peptidoform_charge`",
-      "help": "Competition grouping: `precursor` collapses charge/modification siblings separately within each target/decoy label; targets and decoys therefore do not compete directly. `apex` also groups by rounded apex RT; `peptidoform_charge` keeps each peptidoform+charge as its own group (precursor-level, as DIA-NN/Spectronaut report), so sibling charges of one peptide are not collapsed.",
+      "help": "Competition grouping, always within one target/decoy label, so a target never competes against its own decoy. `peptidoform_charge` (the default) makes each peptidoform + charge its own group, so sibling charge states and modforms of one peptide are separate precursors; `base_peptide` collapses every charge and modification sibling of one stripped peptide to a single winner; `apex` groups each base peptide by rounded apex RT.",
       "gates": [],
       "source_struct": "CompeteConfig",
       "choices": [
@@ -3404,7 +3404,6 @@
       "choices": [
         "winner_take_all",
         "none",
-        "features_only",
         "unique_evidence",
         "margin_gated"
       ]
@@ -3433,7 +3432,7 @@
       "optional": false,
       "default": 2,
       "default_text": "2",
-      "help": "Minimum distinct unique-fragment count a loser must have to survive under `unique_evidence` (needs the `unique_fragment_count` feature; falls back to winner-take-all when the column is absent).",
+      "help": "Minimum unique-fragment evidence a loser must have to survive under `unique_evidence`: its `n_matched_fragments` x (1 - `peak_contested_frac`), which is the matched-fragment count itself unless `extract.emit_contested_features` is on.",
       "gates": [],
       "source_struct": "CompeteConfig"
     },
