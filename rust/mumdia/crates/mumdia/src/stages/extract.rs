@@ -3156,7 +3156,7 @@ const MIN_CANDIDATES_PER_TASK: usize = 4096;
 /// `extract.gate_support_min`, or 0 (off) when it is unset. The gate is defined on the
 /// window-mean score, so under any other `gate_mode` it is off whatever the setting, and the
 /// report does not name it. It was the default on 1/K0 spectra at 0.845 from 2026-10-18 to
-/// 2026-11-17 and was turned off because it cost identifications at every load measured,
+/// 2026-11-19 and was turned off because it cost identifications at every load measured,
 /// from 200 pg to 50 ng (docs/35_diapasef.md section 16).
 fn support_gate_min(cfg: &ExtractConfig) -> f64 {
     match cfg.gate_mode {

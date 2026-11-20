@@ -408,7 +408,7 @@ listed with its default and effect. Fields marked **default-off**, **inert**, or
 
 | Enum | file:line | Variants (default in bold) | Notes |
 |---|---|---|---|
-| `DecoyStrategy` | config.rs:17-28 | **`reverse`**, `scramble`, `diann_shift`, `none` | `diann_shift` rejected by validate; `none` produces no decoys (invalid FDR) |
+| `DecoyStrategy` | config.rs:17-28 | **`reverse`**, `scramble`, `diann_shift`, `none` | `diann_shift` rejected by validate; `none` produces no decoys (invalid FDR), and a FASTA `run` / `run-experiment` refuses it before the digest |
 | `MatcherKind` | config.rs:38-42 | `bucketed`, **`fragindex`** | fragment-matcher backend for search-seed + extract |
 | `Enzyme` | config.rs | **`trypsin_p`**, `trypsin`, `lys_c`, `lys_n`, `arg_c`, `asp_n`, `glu_c`, `chymotrypsin`, `non_specific`, `custom` | cleavage preset or a custom rule (docs/05, "Cleavage rules") |
 | `CalibrationMethod` | config.rs:56-61 | **`loess`**, `linear`, `none` | `none` rejected by validate (falls through to linear) |
@@ -776,15 +776,15 @@ selection dominate.
 | `promote_top_peaks` | 1 | K peak groups PROMOTED to real feature/rescore rows, each carrying `peak_rank` (selected apex stays rank 0). Must be `<= retain_top_peaks`. **Behaviour-changing and entrapment-gated**: it changes the extracted row population, so compete/rescore must collapse per candidate or the decoy null is K-inflated |
 | `alt_peak_min_area_frac` | 0.10 | min integrated area of a promoted alternate as a fraction of the rank-0 peak; only used when `promote_top_peaks > 1` |
 | `alt_peak_min_separation_s` | 5.0 | min apex-RT separation of a promoted alternate from the rank-0 apex; only used when `promote_top_peaks > 1` |
-| `emit_candidate_audit` | `false` | **default-off**; in `run` gates the separate `audit` stage that writes `candidate_audit.parquet` (`run.rs:428-429`); no stage writes `<psms>.audit.parquet`, although `audit` will read it if present (`audit.rs:52`), so the field's own doc comment overstates what extraction does; no-op for standalone `mumdia extract` (P0.3) |
+| `emit_candidate_audit` | `false` | **default-off**; in `run` gates the separate `audit` stage that writes `candidate_audit.parquet`; no stage writes `<psms>.audit.parquet`, although `audit` will read it if present (`load_extract_reasons`); no-op for standalone `mumdia extract` (P0.3) |
 | `apex_evidence_rank` | `true` | evidence-count apex. On by default: the legacy signature-intensity score is 0.0 at every qualifying scan when none of the top-K predicted fragments is observed, which silently selects the lowest-RT qualifying scan |
 | `emit_gate_diagnostics` | `false` | **default-off** four gate-score columns |
-| `gate_mode` | `apex_pearson` | which spectral score `gate_min_score` thresholds |
+| `gate_mode` | `window_mean` | which spectral score `gate_min_score` thresholds |
 | `gate_coelution_min` | 0.5 | second threshold for `gate_mode = combined` |
 
-The gate default was relaxed from a historical 0.5 to 0.2, briefly set to 0.6
-and measured back to 0.2 (docs/18)
-(config.rs:692-697). Every default-off knob is explicitly documented as
+Under `apex_pearson` the gate default was relaxed from a historical 0.5 to 0.2,
+briefly set to 0.6 and measured back to 0.2 (docs/18); since 2026-10-08 the default
+is `window_mean` at 0.6, a different score. Every default-off knob is explicitly documented as
 requiring entrapment/target-decoy FDR validation before use.
 
 ### `FeaturesConfig` (config.rs:760-823)
@@ -846,9 +846,9 @@ requiring entrapment/target-decoy FDR validation before use.
 | `entrapment_ratio` | 1.0 | N_real_lib / N_entrap_lib scaling |
 | `strict` | `true` | fail on a rescorer sidecar failure or unsupported classifier; set false only for explicit compatibility fallback |
 | `handoff` | `raw` | how the feature matrix reaches a sidecar rescorer (`Handoff`): a row-major f32 `.npy` matrix, byte-identical in scores to `parquet`; mokapot/entrapment fall back to TSV automatically (docs/28 section 11, docs/13) |
-| `features` / `features_file` | `None` | explicit feature projection by name (inline list or one-name-per-line file); strict: a missing name is an error |
+| `features` / `features_file` | `None` | explicit feature projection by name (inline list or one-name-per-line file); strict: a missing name is an error. Mutually exclusive, and an empty inline list is refused at load |
 | `feature_preset` | `all` | named list used when no explicit list is set: `all` every column, `compact` the embedded 114-feature list of docs/28 section 12 (3.4x smaller rescore matrix; the option for pooled rescoring on small machines, -1.2% on the held-out HYE B01 pool). Preset names the table lacks are skipped with a log line |
-| `train_neg_ratio` | 3.0 | cap on decoys per positive in each training fold (0 = every decoy) |
+| `train_neg_ratio` | 2.0 | cap on decoys per positive in each training fold (0 = every decoy) |
 | `train_neg_select` | `hybrid` | which decoys survive the cap: `random`, `margin` (highest-scoring), `hybrid` (`train_margin_frac` from the margin, rest random) |
 | `train_margin_frac` | 0.5 | margin share under `hybrid` |
 | `train_subsample` | 0.0 | random fraction of training rows kept after the cap (0 = all) |
@@ -933,6 +933,8 @@ stale.
   sidecar settings, and invalid numeric bounds are rejected. It is not a general
   scientific validator. `DecoyStrategy::None` is still accepted but produces no
   decoys and therefore no valid target-decoy FDR; treat it as diagnostic-only.
+  `digest` and `build-library` write such a target-only library, and a FASTA `run`
+  or `run-experiment` refuses it before the digest.
 - **`deny_unknown_fields` everywhere.** A misspelled key fails the whole load, so
   a config file cannot silently ignore a setting the author intended.
 - **An enum variant name is not a specification of what it keys.**

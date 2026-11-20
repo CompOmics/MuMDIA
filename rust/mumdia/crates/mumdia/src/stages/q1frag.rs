@@ -294,7 +294,8 @@ pub fn read_model(cal_json: &str) -> Result<Q1FragModel> {
 /// extract` alike: the calibrated model (with the decision tolerances under
 /// `extract.q1_fragments`) and the Q1-deconvolution tolerance from the run's `cal_json` when
 /// the decision or the deconvolved evidence reads them, the re-pick (`retrace.q1_repick`), and
-/// the feature families whose evidence extract computes.
+/// the feature families whose evidence extract computes (these two by
+/// [`ExtractConfig::set_search_keys`](mumdia_core::config::ExtractConfig::set_search_keys)).
 pub fn configure_extract(
     cfg: &mumdia_core::config::Config,
     cal_json: Option<&str>,
@@ -308,19 +309,11 @@ pub fn configure_extract(
              Q1 calibration: pass --q1-cal",
         )?;
         ext.q1_model = Some(read_model_opts(cal, decision)?);
-        if decision {
-            ext.q1_repick = cfg.retrace.q1_repick.on();
-            ext.q1_repick_peaks = cfg.retrace.q1_repick_peaks;
-        }
         if q1_dec {
             ext.q1_dec_tol_steps = Some(read_deconvolution_tol(cal)?);
         }
     }
-    ext.ms1_envelope = cfg.features.ms1_envelope;
-    ext.q1_precursor = cfg.features.q1_precursor.on();
-    ext.q1_multiscale = cfg.features.q1_multiscale.on();
-    ext.q1_dec_features = cfg.features.q1_deconvolved.on();
-    ext.q1_separable = cfg.features.q1_separable;
+    ext.set_search_keys(cfg);
     Ok(())
 }
 

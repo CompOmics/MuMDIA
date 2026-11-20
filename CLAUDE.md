@@ -445,7 +445,8 @@ fine-tuning also is not guaranteed deterministic.
 - A Bruker `.d` with diaPASEF frames is read natively (timsrust, 1/K0 per peak); every
   other `.d` goes to msconvert as a 3D run. The one 4D predicate is "the spectra carry
   per-peak 1/K0" (`instrument`, `params.reader = "timsrust"`), never the instrument name.
-- Every TIMS key is off by default: `convert.tdf_mz_valley`/`tdf_im_valley`,
+- Every TIMS key except `convert.tdf_ms1_denoise` (the native MS1 noise filter, on by
+  default since 0.7.0) is off by default: `convert.tdf_mz_valley`/`tdf_im_valley`,
   `predict_frag.im_predictor`, `search_seed.count_fragments_once`, `frag_tol_mad_k`,
   `extract.im_gate`, `features.im_features`, `retrace.*`, `rt_im_train.anchor_x_filter`,
   `rescore.shadow_im_tolerance` and the cross-run quant selectors. Promote one only in its
@@ -813,13 +814,15 @@ sections 10-16:
   host with more than 8 cores (`DEEPLC_FT_THREADS` bounds training only). The default
   still owes the survey's doxy sweep (32-128 threads on HYE and AIF, head set, peptides at
   1% on `run_psm_q` over three NN seeds; docs/13, "DeepLC thread cap").
-- `rt_im_train.deeplc_predict_shards` (default 1) splits that whole-library prediction
+- `rt_im_train.deeplc_predict_shards` (default 0 since 0.5.0: automatic, one process per 8
+  threads of the prediction budget; 1 is one process) splits that whole-library prediction
   across processes of `budget / K` threads, with the calibration or fine-tuned model
   fitted once in the parent and no refit per shard. Bit-identical to one process at
-  equal threads per process, float-equivalent at the same `--threads`. It is not known to
-  pay: on the one desktop measured the forward pass dominated and scaled with threads,
-  so 4 x 2 threads equalled 1 x 8 (docs/08, "Sharded whole-library prediction"); it stays
-  opt-in until measured where one process stops scaling, on two acquisitions.
+  equal threads per process, float-equivalent at the same `--threads`. Measured with 8
+  processes of 8 threads against one on an EPYC 9354: six-run Astral 26:00 -> 18:02,
+  five-run AIF 29:47 -> 21:04, peptides at 1% inside the seed spread (CHANGELOG 0.5.0).
+  On a desktop the forward pass scaled with threads, so 4 x 2 threads equalled 1 x 8
+  (docs/08, "Sharded whole-library prediction").
 - Any parquet written outside `mumdia-io` and read by the engine must use arrow
   `utf8` string columns. Polars defaults to `large_utf8`, which the engine rejects
   ("column 'peptidoform' is not utf8"). Snappy, zstd and uncompressed files all read:
@@ -1042,7 +1045,7 @@ sensitivity result for it.
   workers at the same time, which leaves the library byte-identical; it is off because
   each worker sizes itself from the whole thread count and neither the wall time nor the
   peak of the pair was measured at that scale. `predict_frag.defer_deeplc_to_multihead`
-  (opt-in) skips the DeepLC pass when the multi-head calibration re-predicts every row
+  (default true) skips the DeepLC pass when the multi-head calibration re-predicts every row
   anyway (docs/06).
 
 ## Changes that remain benchmark-gated

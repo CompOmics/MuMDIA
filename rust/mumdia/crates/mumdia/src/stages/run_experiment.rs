@@ -64,7 +64,6 @@ pub struct RunExperimentParams<'a> {
 }
 
 fn preflight(p: &RunExperimentParams) -> Result<()> {
-    use mumdia_core::config::RescorerKind;
     if p.mzmls.len() < 2 {
         anyhow::bail!(
             "run-experiment needs >= 2 --mzml files (got {})",
@@ -86,7 +85,9 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
             }
         }
         (None, None) => match p.fasta {
-            Some(f) if std::path::Path::new(f).exists() => {}
+            Some(f) if std::path::Path::new(f).exists() => {
+                crate::stages::run::refuse_decoy_free_digest(p.config)?
+            }
             Some(f) => anyhow::bail!("--fasta not found: {f}"),
             None => {
                 anyhow::bail!("provide either --fasta or both --lib-precursors and --lib-fragments")
@@ -100,41 +101,9 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
     {
         warn!("{w}");
     }
-    if cfg.rt_im_train.finetune_deeplc && cfg.predict_frag.deeplc_python.is_none() {
-        anyhow::bail!("rt_im_train.finetune_deeplc requires predict_frag.deeplc_python");
-    }
-    // Explicit count: hard requirement. Automatic default: degrade with a warning, so a
-    // native Python-free experiment stays runnable (`run.rs` says the same).
-    if cfg.rt_im_train.multihead_calibration.is_some_and(|n| n > 0)
-        && cfg.predict_frag.deeplc_python.is_none()
-    {
-        anyhow::bail!(
-            "rt_im_train.multihead_calibration requires predict_frag.deeplc_python (DeepLC \
-             >= 4.5.0): it calibrates the base model against each run's confident seed PSMs"
-        );
-    }
-    if cfg.rt_im_train.multihead_calibration.is_none()
-        && !cfg.rt_im_train.finetune_deeplc
-        && cfg.predict_frag.deeplc_python.is_none()
-    {
-        warn!(
-            "no DeepLC interpreter resolved, so retention-time multi-head calibration is \
-             not running; it is the default and was worth 4.8% of peptides on AIF and \
-             14.3% on Astral. Set predict_frag.deeplc_python (\"auto\" discovers one)."
-        );
-    }
-    if p.lib_precursors.is_some()
-        && matches!(
-            cfg.rt_im_train.library_irt,
-            mumdia_core::config::LibraryIrt::Deeplc
-        )
-        && cfg.predict_frag.deeplc_python.is_none()
-    {
-        anyhow::bail!(
-            "rt_im_train.library_irt = deeplc requires predict_frag.deeplc_python; set \
-             library_irt = library to keep the imported iRT"
-        );
-    }
+    // `python::resolve` ran first and refused every role this configuration requires
+    // without a usable interpreter (`Role::required_by`).
+    crate::stages::run::warn_without_deeplc(cfg);
     // Check the interpreters EXIST, not merely that the fields are set. The rescore runs
     // after every per-run chain, so on an 83-file batch a mistyped `rescore.python` used to
     // discard days of compute at the final stage. A wrong path is also the most likely error
@@ -148,7 +117,7 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
         ("mbr.python", cfg.mbr.python.as_deref()),
     ] {
         if let Some(exe) = path {
-            if !std::path::Path::new(exe).exists() {
+            if crate::python::interpreter_missing(exe) {
                 anyhow::bail!(
                     concat!(
                         "{} points at an interpreter that does not exist: {}. A config ",
@@ -161,22 +130,6 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
                 );
             }
         }
-    }
-    if matches!(
-        cfg.rescore.classifier,
-        RescorerKind::Mokapot | RescorerKind::NnTorch
-    ) && cfg.rescore.python.is_none()
-    {
-        anyhow::bail!(
-            "rescore.classifier={:?} requires rescore.python",
-            cfg.rescore.classifier
-        );
-    }
-    if cfg.mbr.strategy.transfers() && cfg.mbr.python.is_none() {
-        anyhow::bail!(
-            "mbr.strategy = {:?} (the rescuable-tier transfer) requires mbr.python",
-            cfg.mbr.strategy
-        );
     }
     refuse_unchecked_cross_run_step(cfg)?;
     Ok(())
