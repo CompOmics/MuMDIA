@@ -178,8 +178,10 @@ The stage entry point is `run(p: RtImTrainParams)` (rt_im_train.rs:72). Standalo
 it is invoked as `mumdia rt-im-train --seed-psms <p> --lib-precursors <p>
 --out-windows <p> --out-cal <p> [--config <p>]` (the `RtImTrain` subcommand,
 main.rs:94-105, dispatched at main.rs:517-534); the `run` orchestrator calls the
-same `run` function directly (run.rs:307-314). Both call sites build the config
-hash and pass it as `config_hash`, but the stage never reads it (see gotchas).
+same `run` function directly (run.rs:307-314). Both relax `q_train` through
+`anchor_q_ladder` on a seed short of anchors (`plan_anchors`, `with_anchor_cut`) before
+the call. Both call sites build the config hash and pass it as `config_hash`, but the
+stage never reads it (see gotchas).
 
 ### 1. Join iRT to candidates
 
