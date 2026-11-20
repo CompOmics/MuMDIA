@@ -346,6 +346,21 @@ than a number. Both are recorded in every run's `manifest.json`.
   run searched with the recipe, 376 of the 405 row groups opened with a straddling candidate (6,061
   of 6,472 with `MUMDIA_CHROM_ROW_GROUP_ROWS` at 4,096) and none of them needed a window the rest
   of its row group did not hold, so every table of that search is unchanged.
+- **Shadow demotion is per run in a pooled rescore (docs/11, "rescore: shadow demotion and its
+  Q1 term").** Its first pass grouped the precursor q on peptidoform and charge over the whole
+  pool, and a grouped q goes to the group's best row only, so a precursor accepted in several
+  runs was accepted, and lent its fragments, in its best run alone: every other run lost that
+  lender and the share of its examined region (`shadow_region x accepted`) that it sized. The
+  first pass now groups on run, peptidoform and charge, as the demotion is described. One run
+  has the same groups and writes the same tables; a pooled rescore (`run` with several
+  `--mzml`, `run-experiment`) demotes about three times as many shadows over three runs, so its
+  scores and counts change: on the ProteoBench Astral entrapment set (three runs pooled, three
+  NN seeds) +1.8% precursors at an experiment-wide 1% with the paired entrapment FDP
+  0.89% -> 0.86%, and +1.5% per run at 0.67% -> 0.62%. The stage interns peptidoform and
+  charge once instead of twice, and the shadow test no longer holds an apex 1/K0 and an isolation window for every pooled row (24 bytes a
+  row, about 6 GB at a 259M-row pool): it keeps 1/K0 values only with `shadow_im_tolerance`
+  set and finds the window of the rows it reads, and its rows drop the label it never read,
+  with the same output.
 - **Desktop: "Add folder…" selects several spectra folders at once (#335).** A Bruker or Agilent `.d`
   and a Waters `.raw` are directories, so they are added with "Add folder…", and that dialog took
   one folder at a time: the spectra folder picker shared the single-choice setting of the output
