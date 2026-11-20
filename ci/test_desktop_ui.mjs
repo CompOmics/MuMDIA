@@ -162,6 +162,9 @@ function load() {
     "saveSettings",
     "setMode",
     "resolveBands",
+    "vendorOf",
+    "diapasefInputs",
+    "separateRestBands",
     "runOverrides",
     "captureSearch",
     "currentSetup",
@@ -1395,6 +1398,156 @@ test("a setup with an implausible m/z limit is refused, naming the field and its
   // The HTML bounds the fields to the same range, so the stepper never writes a 1 into them.
   for (const [id, min, max] of [["d-prmin", 100, 6000], ["d-prmax", 100, 6000], ["d-frmin", 50, 4000], ["d-frmax", 50, 4000]]) {
     assert.match(HTML, new RegExp(`id="${id}" min="${min}" max="${max}"`), id);
+  }
+});
+
+// What `vendor_of` answers: a .d is a diaPASEF run, anything else an mzML.
+const vendorAnswer = ({ path }) =>
+  path.endsWith(".d")
+    ? { label: "Bruker timsTOF diaPASEF .d", needs: "Nothing" }
+    : { label: "mzML", needs: "Nothing" };
+
+// Select one spectra file and finish its vendor check, as the list does.
+async function pick(p, path) {
+  p.api.state.picks.mzml = [path];
+  await p.api.vendorOf(path);
+}
+
+test("Automatic searches diaPASEF input in one piece, whatever the plan proposes", async () => {
+  const p = await profile();
+  p.answers.vendor_of = vendorAnswer;
+  const asked = [];
+  let plan = { bands: 4, parallel: 1, budget_gb: 41, unbanded_gb: 124, note: "" };
+  p.answers.search_space = ({ req }) => {
+    asked.push(req.diapasef);
+    return { plan, machine: null };
+  };
+  assert.equal(p.el("bands").value, "auto");
+  // A search space too large for this machine: an mzML is split as the plan says.
+  await pick(p, "/d/REP01.mzML");
+  assert.deepEqual((await searchConfig(p)).derived.groups, { window_groups: 4, parallel: 1 });
+  // A diaPASEF .d is one band, which the engine accepts, and the plan was asked for it.
+  await pick(p, "/d/run.d");
+  assert.deepEqual([...p.api.diapasefInputs()], ["/d/run.d"]);
+  assert.deepEqual((await searchConfig(p)).derived.groups, { window_groups: 1, parallel: 1 });
+  assert.deepEqual(asked, [false, true]);
+  // A preset with bands of its own: Automatic at one band leaves them to an mzML, and
+  // writes one band over them for a diaPASEF .d.
+  plan = { bands: 1, parallel: 1, budget_gb: 41, unbanded_gb: 20, note: "" };
+  p.files[p.el("preset").value].groups = { window_groups: 3, parallel: 1 };
+  await pick(p, "/d/REP01.mzML");
+  assert.equal((await searchConfig(p)).derived.groups.window_groups, 3);
+  await pick(p, "/d/run.d");
+  assert.deepEqual((await searchConfig(p)).derived.groups, { window_groups: 1, parallel: 1 });
+});
+
+test("a custom band count on diaPASEF input is a problem before Start", async () => {
+  const p = await profile();
+  p.answers.vendor_of = vendorAnswer;
+  const diapasefProblem = () =>
+    [...p.api.searchProblems()].filter((m) => /diaPASEF spectra cannot be split into bands/.test(m));
+  await pick(p, "/d/run.d");
+  p.el("bands").value = "custom";
+  p.el("bands-n").value = "2";
+  const found = diapasefProblem();
+  assert.equal(found.length, 1);
+  assert.match(found[0], /run\.d/);
+  assert.match(found[0], /Set Bands to Automatic or Off/);
+  // One custom band, Automatic and Off are not problems.
+  p.el("bands-n").value = "1";
+  assert.deepEqual(diapasefProblem(), []);
+  p.el("bands-n").value = "2";
+  for (const mode of ["auto", "off"]) {
+    p.el("bands").value = mode;
+    assert.deepEqual(diapasefProblem(), [], mode);
+  }
+  // Nor are bands on an mzML.
+  p.el("bands").value = "custom";
+  await pick(p, "/d/REP01.mzML");
+  assert.deepEqual(diapasefProblem(), []);
+});
+
+test("a prescreen on diaPASEF input is a problem before Start", async () => {
+  const p = await profile();
+  p.answers.vendor_of = vendorAnswer;
+  const problem = () =>
+    [...p.api.searchProblems()].filter((m) => /prescreen cannot be used on diaPASEF/.test(m));
+  await pick(p, "/d/run.d");
+  assert.equal(p.el("prescreen").value, "off");
+  assert.deepEqual(problem(), []);
+  // Every mode the engine refuses there, named with the file.
+  for (const mode of selectOptions(HTML, "prescreen").filter((m) => m !== "off")) {
+    p.el("prescreen").value = mode;
+    const found = problem();
+    assert.equal(found.length, 1, mode);
+    assert.match(found[0], /run\.d/);
+  }
+  // An mzML with a prescreen is not.
+  await pick(p, "/d/REP01.mzML");
+  assert.deepEqual(problem(), []);
+});
+
+test("a fresh vendor check replaces an answer from before a copy completed", async () => {
+  const p = load();
+  // A .d still being copied has no analysis.tdf_bin yet and reads as a plain Bruker .d.
+  let copied = false;
+  let down = false;
+  p.answers.vendor_of = (args) => {
+    if (down) throw "the backend is not ready";
+    return copied ? vendorAnswer(args) : { label: "Bruker .d", needs: "Msconvert" };
+  };
+  const asked = () => p.calls.filter(([n]) => n === "vendor_of").length;
+  p.api.state.picks.mzml = ["/d/run.d"];
+  assert.equal((await p.api.vendorOf("/d/run.d", true)).label, "Bruker .d");
+  assert.deepEqual([...p.api.diapasefInputs()], []);
+  copied = true;
+  // Without `fresh` the kept answer serves, as the synchronous checks read it.
+  const before = asked();
+  assert.equal((await p.api.vendorOf("/d/run.d")).label, "Bruker .d");
+  assert.equal(asked(), before);
+  // The list and Start ask again, and the answer is replaced.
+  assert.equal((await p.api.vendorOf("/d/run.d", true)).label, "Bruker timsTOF diaPASEF .d");
+  assert.deepEqual([...p.api.diapasefInputs()], ["/d/run.d"]);
+  // A check that cannot answer keeps the last answer.
+  down = true;
+  assert.equal((await p.api.vendorOf("/d/run.d", true)).label, "Bruker timsTOF diaPASEF .d");
+  assert.deepEqual([...p.api.diapasefInputs()], ["/d/run.d"]);
+  // With no answer at all, the file is not taken for diaPASEF.
+  p.api.state.picks.mzml = ["/d/other.d"];
+  assert.equal(await p.api.vendorOf("/d/other.d", true), null);
+  assert.deepEqual([...p.api.diapasefInputs()], []);
+});
+
+test("a batch searched separately keeps Automatic's bands for its files that are not diaPASEF", async () => {
+  const p = await profile();
+  p.answers.vendor_of = vendorAnswer;
+  const asked = [];
+  p.answers.search_space = ({ req }) => {
+    asked.push(req.diapasef);
+    return { plan: { bands: 4, parallel: 1, budget_gb: 41, unbanded_gb: 124, note: `plan ${req.diapasef}` }, machine: null };
+  };
+  const select = async (files) => {
+    p.api.state.picks.mzml = files;
+    for (const f of files) await p.api.vendorOf(f);
+  };
+  // A .d with an mzML: the selection is one band, the mzML keeps the plan's four.
+  await select(["/d/run.d", "/d/REP01.mzML"]);
+  assert.deepEqual({ ...(await p.api.resolveBands(null)) }, { bands: 1, parallel: 1, explicit: true });
+  const shown = p.api.state.space;
+  assert.deepEqual({ ...(await p.api.separateRestBands(null)) }, { bands: 4, parallel: 1, explicit: false });
+  assert.deepEqual(asked, [true, false]);
+  // Planning the other files does not change what the Bands note describes.
+  assert.equal(p.api.state.space, shown);
+  assert.equal(p.api.state.spaceDiapasef, true);
+  // Nothing to separate when every file, or no file, is diaPASEF, or Bands is not Automatic.
+  await select(["/d/run.d", "/d/run2.d"]);
+  assert.equal(await p.api.separateRestBands(null), null);
+  await select(["/d/REP01.mzML", "/d/REP02.mzML"]);
+  assert.equal(await p.api.separateRestBands(null), null);
+  await select(["/d/run.d", "/d/REP01.mzML"]);
+  for (const mode of ["off", "custom"]) {
+    p.el("bands").value = mode;
+    assert.equal(await p.api.separateRestBands(null), null, mode);
   }
 });
 

@@ -481,6 +481,21 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **Desktop: a diaPASEF search is no longer split into bands (#351).** "Bands: Automatic" (the
+  default) planned the search from the machine's memory alone, so a large search space on a timsTOF
+  diaPASEF `.d` was given several bands, and the engine stopped it after Start: bands are refused on
+  spectra that carry 1/K0, and the diaPASEF recipe's retrace is refused with bands (`invalid config:
+  retrace.enabled is not supported with groups.window_groups > 1`). With a diaPASEF input selected,
+  Automatic is now one band, written over a preset's own bands; the note under Bands says why, and
+  says when the estimate exceeds the memory budget, naming `extract.windows_in_flight` 1 as the
+  lever that works there (bands for diaPASEF are #350). A custom band count above one on such input is
+  refused before Start, which checks every file again first. In a batch searched separately, the
+  files that are not diaPASEF keep Automatic's plan. Other inputs are planned as before
+  (desktop/README.md, "Prescreen, bands and modifications on the Search screen").
+- **Desktop: a prescreen on diaPASEF input is refused before Start (#351).** The engine refuses
+  all three prescreen modes on spectra that carry 1/K0, which the Search screen let through to
+  Start; it now names the files and asks to set Prescreen to Off, and the band plan no longer
+  counts a prescreen that cannot run there.
 - **A build whose `git status` fails no longer claims a clean tree.** The build script read
   a failed `git status` as a clean worktree, so the binary's `git_sha`, which every manifest
   records, could name a commit without `-dirty` for code that differed from it. An unknown
