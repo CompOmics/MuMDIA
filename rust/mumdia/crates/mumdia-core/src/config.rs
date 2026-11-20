@@ -808,7 +808,7 @@ pub enum PrescreenTraceScore {
 pub struct PrescreenTagsConfig {
     /// Neutral residue-mass tolerance of a tag edge (Da); `edge_tol_da / z` in m/z.
     pub edge_tol_da: f64,
-    /// Highest fragment charge of a tag edge.
+    /// Highest fragment charge of a tag edge: 1 or 2, the charges a tag key holds.
     pub max_charge: i32,
     /// Also allow two-residue gap steps; every compatible residue pair is kept as an
     /// alternative and gapped three-peak ladders are keyed separately from four-peak ones.
@@ -7335,11 +7335,16 @@ impl Config {
                     p.tags.positioned_residues
                 )));
             }
-            if p.tags.max_charge < 1 || p.trace.scans < 1 || p.trace.min_detections < 1 {
+            if !(1..=2).contains(&p.tags.max_charge) {
+                return Err(Invalid(format!(
+                    "prescreen.tags.max_charge must be 1 or 2 (got {}); a tag key holds \
+                     fragment charges 1-2",
+                    p.tags.max_charge
+                )));
+            }
+            if p.trace.scans < 1 || p.trace.min_detections < 1 {
                 return Err(Invalid(
-                    "prescreen.tags.max_charge, prescreen.trace.scans and \
-                     prescreen.trace.min_detections must be >= 1"
-                        .into(),
+                    "prescreen.trace.scans and prescreen.trace.min_detections must be >= 1".into(),
                 ));
             }
             if p.delayed_modforms && p.retrieval != PrescreenRetrieval::Tags {
@@ -7374,6 +7379,17 @@ impl Config {
                     return Err(Invalid(format!(
                         "prescreen.scope_mods entry {m:?} must be RESIDUE:UniModName, e.g. \
                          M:Oxidation (n/c for the termini)"
+                    )));
+                }
+            }
+            for m in &p.tags.extra_mods {
+                let ok = m.split_once(':').is_some_and(|(r, n)| {
+                    !n.is_empty() && r.len() == 1 && r.as_bytes()[0].is_ascii_uppercase()
+                });
+                if !ok {
+                    return Err(Invalid(format!(
+                        "prescreen.tags.extra_mods entry {m:?} must be RESIDUE:UniModName, e.g. \
+                         M:Oxidation"
                     )));
                 }
             }
@@ -7855,6 +7871,28 @@ mod tests {
             r#"{"peptidoforms": {"precursor_mz_max": 0}}"#,
             r#"{"predict_frag": {"fragment_mz_min": 2000, "fragment_mz_max": 150}}"#,
             r#"{"predict_frag": {"fragment_mz_max": -5}}"#,
+        ] {
+            let c: Config = serde_json::from_str(bad).unwrap();
+            assert!(c.validate().is_err(), "{bad} validated");
+        }
+    }
+
+    /// A tag key holds fragment charges 1-2, and a `prescreen.tags.extra_mods` entry is one
+    /// residue letter and a modification name (an empty residue used to panic, `n` to mean N).
+    #[test]
+    fn prescreen_tag_charge_and_extra_mods_are_validated() {
+        let ok: Config = serde_json::from_str(
+            r#"{"prescreen": {"tags": {"max_charge": 1, "extra_mods": ["M:Oxidation"]}}}"#,
+        )
+        .unwrap();
+        assert!(ok.validate().is_ok());
+        for bad in [
+            r#"{"prescreen": {"tags": {"max_charge": 3}}}"#,
+            r#"{"prescreen": {"tags": {"max_charge": 0}}}"#,
+            r#"{"prescreen": {"tags": {"extra_mods": [":Oxidation"]}}}"#,
+            r#"{"prescreen": {"tags": {"extra_mods": ["n:Acetyl"]}}}"#,
+            r#"{"prescreen": {"tags": {"extra_mods": ["Met:Oxidation"]}}}"#,
+            r#"{"prescreen": {"tags": {"extra_mods": ["M:"]}}}"#,
         ] {
             let c: Config = serde_json::from_str(bad).unwrap();
             assert!(c.validate().is_err(), "{bad} validated");

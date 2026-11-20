@@ -80,15 +80,6 @@ pub struct PrescreenParams<'a> {
     pub tags_only: bool,
 }
 
-/// What the stage kept, for the orchestrator's log and manifest.
-#[derive(Clone, Debug, Default)]
-pub struct PrescreenSummary {
-    pub screened: u64,
-    pub kept: u64,
-    pub cutoff: Option<f64>,
-    pub bypass_reason: Option<String>,
-}
-
 /// Fragment-rarity bin of an m/z: `rint(100 m/z)`, ties to even as numpy's `rint`.
 #[inline]
 fn bin_of(mz: f64) -> i64 {
@@ -442,45 +433,71 @@ impl Spectra {
                 .then(rt[a].total_cmp(&rt[b]))
                 .then(a.cmp(&b))
         });
-        let per: Vec<Vec<(f32, f32)>> = order
+        // Peaks kept per spectrum first; then each spectrum is sorted in a per-thread buffer and
+        // written into its own slice, so no second copy of every peak is held.
+        let usable = |m: f32| m.is_finite() && m >= 0.0;
+        let counts: Vec<usize> = order
             .par_iter()
             .map(|&s| {
-                let mut p: Vec<(f32, f32)> = mzs[moff[s]..moff[s + 1]]
+                let c = mzs[moff[s]..moff[s + 1]]
                     .iter()
-                    .copied()
-                    .zip(ints[moff[s]..moff[s + 1]].iter().copied())
-                    .filter(|(m, _)| m.is_finite() && *m >= 0.0)
-                    .collect();
+                    .filter(|&&m| usable(m))
+                    .count();
+                if top_peaks > 0 {
+                    c.min(top_peaks)
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let mut total = 0;
+        let mut offsets = vec![0];
+        for &c in &counts {
+            total += c;
+            offsets.push(total);
+        }
+        let mut mz = vec![0.0f32; total];
+        let mut positive = vec![false; total];
+        let mut intensity = vec![0.0f32; if keep_intensity { total } else { 0 }];
+        order
+            .par_iter()
+            .zip(split_mut(&mut mz, counts.iter().copied()))
+            .zip(split_mut(&mut positive, counts.iter().copied()))
+            .zip(split_mut(
+                &mut intensity,
+                counts.iter().map(|&c| if keep_intensity { c } else { 0 }),
+            ))
+            .for_each_init(Vec::new, |p, (((&s, mz), positive), intensity)| {
+                p.clear();
+                p.extend(
+                    mzs[moff[s]..moff[s + 1]]
+                        .iter()
+                        .copied()
+                        .zip(ints[moff[s]..moff[s + 1]].iter().copied())
+                        .filter(|&(m, _)| usable(m)),
+                );
                 if top_peaks > 0 && p.len() > top_peaks {
                     // The prescan's tie-break: intensity descending, then ascending m/z.
                     p.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.total_cmp(&b.0)));
                     p.truncate(top_peaks);
                 }
                 p.sort_by(|a, b| a.0.total_cmp(&b.0));
-                p
-            })
-            .collect();
+                debug_assert_eq!(p.len(), mz.len());
+                for (k, &(m, i)) in p.iter().enumerate() {
+                    mz[k] = m;
+                    positive[k] = i > 0.0;
+                    if let Some(x) = intensity.get_mut(k) {
+                        *x = i;
+                    }
+                }
+            });
         drop(mzs);
         drop(ints);
-        let total: usize = per.iter().map(Vec::len).sum();
-        let mut offsets = Vec::with_capacity(order.len() + 1);
-        let mut mz = Vec::with_capacity(total);
-        let mut positive = Vec::with_capacity(total);
-        let mut intensity = Vec::with_capacity(if keep_intensity { total } else { 0 });
-        let mut max_mz = 0.0f64;
-        offsets.push(0);
-        for p in &per {
-            for &(m, i) in p {
-                mz.push(m);
-                positive.push(i > 0.0);
-                if keep_intensity {
-                    intensity.push(i);
-                }
-                max_mz = max_mz.max(m as f64);
-            }
-            offsets.push(mz.len());
-        }
-        drop(per);
+        // Each spectrum's last peak is its highest m/z.
+        let max_mz = offsets
+            .windows(2)
+            .filter(|w| w[1] > w[0])
+            .fold(0.0f64, |a, w| a.max(mz[w[1] - 1] as f64));
         let mut groups: Vec<WindowGroup> = Vec::new();
         for (k, &s) in order.iter().enumerate() {
             match groups.last_mut() {
@@ -508,6 +525,16 @@ impl Spectra {
     fn peaks(&self, s: usize) -> &[f32] {
         &self.mz[self.offsets[s]..self.offsets[s + 1]]
     }
+}
+
+/// `v` cut into consecutive slices of `lens`.
+fn split_mut<T>(mut v: &mut [T], lens: impl Iterator<Item = usize>) -> Vec<&mut [T]> {
+    lens.map(|n| {
+        let (head, tail) = std::mem::take(&mut v).split_at_mut(n);
+        v = tail;
+        head
+    })
+    .collect()
 }
 
 /// Candidate inputs shared by every window. The residue masses are not stored: they follow
@@ -562,6 +589,8 @@ fn score_in_group(
     if let (Some(o), false) = (occ, repeat) {
         let ne = b - a;
         let mut ub = vec![0.0f64; ne];
+        // A peak below `low_mz_threshold` counts `low_mz_weight` times its bin weight.
+        let peak_weight = cfg.low_mz_weight.max(1.0);
         let mut touched: Vec<usize> = Vec::new();
         for &rev in orientations {
             fragment_mz(masses, rev, c.nz, frag);
@@ -580,7 +609,7 @@ fn score_in_group(
                         if ub[k] == 0.0 {
                             touched.push(k);
                         }
-                        ub[k] += w;
+                        ub[k] += w * peak_weight;
                     }
                 }
             }
@@ -764,14 +793,18 @@ fn group_members(sp: &Spectra, cands: &[Option<Candidate>], pmz: &[f64]) -> Vec<
         .map(|(i, g)| (g.lower, g.upper, i))
         .collect();
     by_lower.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.2.cmp(&b.2)));
+    // A window holding `m` has `lower > m - width`; twice the widest width leaves room for
+    // the rounding of the widths, so the scan starts at the first window that can hold `m`.
+    let reach = 2.0 * by_lower.iter().map(|w| w.1 - w.0).fold(0.0f64, f64::max);
     let mut members: Vec<Vec<u32>> = vec![Vec::new(); sp.groups.len()];
     for (i, c) in cands.iter().enumerate() {
         if c.is_none() {
             continue;
         }
         let m = pmz[i];
+        let j = by_lower.partition_point(|w| w.0 < m - reach);
         let k = by_lower.partition_point(|w| w.0 <= m);
-        for &(lo, hi, g) in &by_lower[..k] {
+        for &(lo, hi, g) in &by_lower[j..k] {
             if lo <= m && m < hi {
                 members[g].push(i as u32);
             }
@@ -788,7 +821,14 @@ fn score_all(
     cfg: &PrescreenConfig,
     masses_of: &(dyn Fn(usize) -> Vec<f64> + Sync),
 ) -> (Vec<f64>, Vec<f64>) {
-    let mut repeat = vec![0.0f64; cands.len()];
+    let mut repeat = vec![
+        0.0f64;
+        if cfg.repeat_bonus > 0.0 {
+            cands.len()
+        } else {
+            0
+        }
+    ];
     let mut score: Vec<f64> = cands
         .iter()
         .map(|c| if c.is_some() { 0.0 } else { f64::NAN })
@@ -819,8 +859,9 @@ fn score_all(
         for (&i, (v, r)) in members[gi].iter().zip(got) {
             let s = &mut score[i as usize];
             *s = s.max(v);
-            let q = &mut repeat[i as usize];
-            *q = q.max(r);
+            if let Some(q) = repeat.get_mut(i as usize) {
+                *q = q.max(r);
+            }
         }
     }
     (score, repeat)
@@ -978,7 +1019,7 @@ pub fn filter_rows(input: &str, id_col: &str, survivors: &str, out: &str) -> Res
     Ok(rows)
 }
 
-pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
+pub fn run(p: PrescreenParams) -> Result<()> {
     let t0 = Instant::now();
     let mut inputs = vec![("--lib-precursors", p.library_precursors), ("--ms2", p.ms2)];
     if let Some(rw) = p.run_windows {
@@ -1042,11 +1083,12 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
             .collect()
     };
     let (mut label_id, label_dict) = lib.str_interned("label")?;
-    let mut rows: Vec<usize> = (0..lib.nrows).collect();
     drop(lib);
-    if p.sample_candidates > 0 && p.sample_candidates < rows.len() {
+    // Library row of each screened candidate; `None` is the identity (no evaluation sample).
+    let rows = if p.sample_candidates > 0 && p.sample_candidates < cid.len() {
         // Keep a candidate when a seeded hash of its id falls below the sampling fraction:
         // independent of label and row order.
+        let mut rows: Vec<usize> = (0..cid.len()).collect();
         let frac = p.sample_candidates as f64 / rows.len() as f64;
         let salt = cfg.seed ^ 0x5A4D_504C_455F_5345;
         rows.retain(|&i| {
@@ -1064,13 +1106,16 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
             sampled = rows.len(),
             "prescreen: evaluation sample; the survivors cover the sample only"
         );
-    }
+        Some(rows)
+    } else {
+        None
+    };
     let pform = |i: usize| {
-        let r = rows[i];
+        let r = rows.as_ref().map_or(i, |r| r[i]);
         let s = &pform_data[pform_off[r]..pform_off[r + 1]];
         s.strip_prefix("DECOY_").unwrap_or(s)
     };
-    let n = rows.len();
+    let n = cid.len();
 
     // Per-candidate RT bounds, joined by candidate_id through a dense lookup.
     let maxc = cid.iter().copied().max().unwrap_or(0) as usize;
@@ -1113,7 +1158,8 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
         .iter()
         .filter(|c| matches!(c, Some(Candidate { rt: None, .. })))
         .count();
-    if unbounded > 0 {
+    // Before prediction there are no windows by design; only a missing window is news.
+    if unbounded > 0 && p.run_windows.is_some() {
         warn!(
             candidates = unbounded,
             of = n,
@@ -1234,7 +1280,9 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
     } else {
         base_score
     };
-    let mut score = base_score.clone();
+    // The scores table is the only reader of the base score once `score` changes.
+    let base_for_table = cfg.write_scores.then(|| base_score.clone());
+    let mut score = base_score;
     let mut scales: Option<(f64, Vec<f64>)> = None;
     if let Some(e) = &ext_out {
         if enough && weights.iter().any(|&w| w > 0.0) {
@@ -1243,21 +1291,21 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
                 v.sort_by(f64::total_cmp);
                 quantile_linear(&v, 0.95).max(1e-12)
             };
-            let bs = q95(&|i| base_score[i]);
+            let bs = q95(&|i| score[i]);
             let cs: Vec<f64> = (0..ext::N_EXT)
                 .map(|k| q95(&|i| e.components[i][k]))
                 .collect();
-            for i in 0..n {
-                if score[i].is_nan() {
+            for (x, c) in score.iter_mut().zip(&e.components) {
+                if x.is_nan() {
                     continue;
                 }
-                let mut s = base_score[i] / bs;
+                let mut s = *x / bs;
                 for k in 0..ext::N_EXT {
                     if weights[k] > 0.0 {
-                        s += weights[k] * e.components[i][k] / cs[k];
+                        s += weights[k] * c[k] / cs[k];
                     }
                 }
-                score[i] = s;
+                *x = s;
             }
             scales = Some((bs, cs));
         }
@@ -1266,7 +1314,7 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
     // Retrieval: without the rescue route an unretrieved candidate is dropped; its score
     // before that is kept to count retrieval losses separately from scoring losses.
     let retrieved: Option<Vec<bool>> = ext_out.as_ref().and_then(|e| e.retrieved.clone());
-    let pre_retrieval = score.clone();
+    let pre_retrieval = retrieved.is_some().then(|| score.clone());
     if let Some(r) = &retrieved {
         if !cfg.rescue {
             for i in 0..n {
@@ -1413,7 +1461,7 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
             ),
         ],
     )?;
-    if cfg.write_scores {
+    if let Some(base_score) = &base_for_table {
         let path = format!("{}.scores.parquet", p.out.trim_end_matches(".parquet"));
         let mut idx: Vec<usize> = (0..n).collect();
         idx.sort_unstable_by_key(|&i| cid[i]);
@@ -1512,7 +1560,7 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
         stats.insert("base_scale_q95".into(), json!(bs));
         stats.insert("component_scales_q95".into(), json!(cs));
     }
-    if let Some(r) = &retrieved {
+    if let (Some(r), Some(pre_retrieval)) = (&retrieved, &pre_retrieval) {
         // Losses are judged against the cutoff the score alone would set: without the rescue
         // route an unretrieved candidate scores -inf, and when retrieval removes more than the
         // target share the calibrated cutoff itself becomes -inf.
@@ -1612,12 +1660,7 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
         elapsed_ms = elapsed as u64,
         "prescreen: done"
     );
-    Ok(PrescreenSummary {
-        screened: n as u64,
-        kept: rows,
-        cutoff,
-        bypass_reason: bypass,
-    })
+    Ok(())
 }
 
 /// numpy's default (linear) quantile on a sorted slice.
@@ -2227,6 +2270,12 @@ mod tests {
         TableFile::open(path).unwrap().u32("candidate_id").unwrap()
     }
 
+    fn stats(out: &str) -> serde_json::Value {
+        let rep: serde_json::Value =
+            mumdia_io::json::read_json(&format!("{out}.report.json")).unwrap();
+        rep["stats"].clone()
+    }
+
     #[test]
     fn end_to_end_keeps_the_planted_candidates_and_reports_the_cutoff() {
         let dir = scratch("e2e");
@@ -2234,7 +2283,7 @@ mod tests {
         let out = format!("{dir}/survivors.parquet");
         let mut c = cfg();
         c.write_scores = true;
-        let sum = run(PrescreenParams {
+        run(PrescreenParams {
             ms2: &ms2,
             library_precursors: &lib,
             run_windows: Some(&rw),
@@ -2246,8 +2295,8 @@ mod tests {
             tags_only: false,
         })
         .unwrap();
-        assert!(sum.bypass_reason.is_none());
-        assert!(sum.cutoff.is_some());
+        assert!(stats(&out)["bypass_reason"].is_null());
+        assert!(stats(&out)["cutoff"].is_f64());
         let kept = survivors(&out);
         assert!(
             (0..120u32).all(|i| kept.contains(&i)),
@@ -2293,7 +2342,7 @@ mod tests {
         let dir = scratch("bypass");
         let (ms2, lib, rw) = synthetic_run(&dir, 120, 10, false);
         let out = format!("{dir}/survivors.parquet");
-        let sum = run(PrescreenParams {
+        run(PrescreenParams {
             ms2: &ms2,
             library_precursors: &lib,
             run_windows: Some(&rw),
@@ -2305,7 +2354,10 @@ mod tests {
             tags_only: false,
         })
         .unwrap();
-        assert!(sum.bypass_reason.unwrap().contains("min_calibration"));
+        assert!(stats(&out)["bypass_reason"]
+            .as_str()
+            .unwrap()
+            .contains("min_calibration"));
         assert_eq!(survivors(&out).len(), 120);
 
         // Out-of-scope candidates pass through; a scope nothing matches bypasses as well.
@@ -2313,7 +2365,7 @@ mod tests {
         c.scope = PrescreenScope::Modified;
         c.scope_mods = vec!["M:Oxidation".into()];
         c.min_calibration = 1;
-        let sum = run(PrescreenParams {
+        run(PrescreenParams {
             ms2: &ms2,
             library_precursors: &lib,
             run_windows: Some(&rw),
@@ -2325,7 +2377,7 @@ mod tests {
             tags_only: false,
         })
         .unwrap();
-        assert!(sum.bypass_reason.is_some());
+        assert!(stats(&out)["bypass_reason"].is_string());
         assert_eq!(survivors(&out).len(), 120);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2489,7 +2541,7 @@ mod tests {
         let (ms2, lib, rw) = synthetic_run(&dir, 300, 80, false);
         let out = format!("{dir}/s.parquet");
         let go = |c: PrescreenConfig| {
-            let sum = run(PrescreenParams {
+            run(PrescreenParams {
                 ms2: &ms2,
                 library_precursors: &lib,
                 run_windows: Some(&rw),
@@ -2501,22 +2553,20 @@ mod tests {
                 tags_only: false,
             })
             .unwrap();
-            let rep: serde_json::Value =
-                mumdia_io::json::read_json(&format!("{out}.report.json")).unwrap();
-            (sum, survivors(&out), rep["stats"].clone())
+            (survivors(&out), stats(&out))
         };
-        let (_, all, _) = go(cfg());
+        let (all, _) = go(cfg());
         let mut c = cfg();
         c.retrieval = mumdia_core::config::PrescreenRetrieval::Tags;
         c.write_scores = true;
-        let (_, rescued, st) = go(c.clone());
+        let (rescued, st) = go(c.clone());
         assert_eq!(rescued, all, "the rescue route scores every candidate");
         let ret = scores_table(&out).u32("candidate_id").unwrap();
         assert_eq!(ret.len(), 300);
         assert!(st["retrieved"].as_u64().unwrap() >= 80);
         assert!(st["tag_paths"].as_u64().unwrap() > 0);
         c.rescue = false;
-        let (_, strict, st) = go(c.clone());
+        let (strict, st) = go(c.clone());
         assert!(strict.iter().all(|x| rescued.contains(x)));
         assert!(
             (0..80u32).all(|i| strict.contains(&i)),
@@ -2524,7 +2574,7 @@ mod tests {
         );
         assert!(st.get("retrieval_losses").is_some() && st.get("scoring_losses").is_some());
         c.delayed_modforms = true;
-        let (_, delayed, st) = go(c);
+        let (delayed, st) = go(c);
         assert_eq!(
             delayed, strict,
             "delayed enumeration retrieves the same set"
@@ -2541,8 +2591,8 @@ mod tests {
         e.mass_hypotheses.enabled = true;
         e.mass_hypotheses.sample_spectra = 5;
         e.write_scores = true;
-        let (sum, kept, st) = go(e);
-        assert!(sum.cutoff.is_some() && !kept.is_empty());
+        let (kept, st) = go(e);
+        assert!(st["cutoff"].is_f64() && !kept.is_empty());
         assert!(st["component_scales_q95"].is_array());
         let t = scores_table(&out);
         for name in ext::NAMES {
@@ -2613,29 +2663,42 @@ mod tests {
         let dir = scratch("tagpre");
         let (ms2, lib, _) = synthetic_run(&dir, 200, 60, false);
         let out = format!("{dir}/s.parquet");
-        let sum = run(PrescreenParams {
-            ms2: &ms2,
-            library_precursors: &lib,
-            run_windows: None,
-            ms1: None,
-            out: &out,
-            config: &conf(cfg()),
-            config_hash: "t",
-            sample_candidates: 0,
-            tags_only: true,
-        })
-        .unwrap();
-        assert!(sum.cutoff.is_none() && sum.bypass_reason.is_none());
-        let kept = survivors(&out);
+        let go = |config: &Config| {
+            run(PrescreenParams {
+                ms2: &ms2,
+                library_precursors: &lib,
+                run_windows: None,
+                ms1: None,
+                out: &out,
+                config,
+                config_hash: "t",
+                sample_candidates: 0,
+                tags_only: true,
+            })
+            .unwrap();
+            survivors(&out)
+        };
+        let kept = go(&conf(cfg()));
+        let st = stats(&out);
+        assert!(st["cutoff"].is_null() && st["bypass_reason"].is_null());
         assert!(
             (0..60u32).all(|i| kept.contains(&i)),
             "planted ladders carry tags"
         );
         assert!(kept.len() < 200, "{}", kept.len());
-        let rep: serde_json::Value =
-            mumdia_io::json::read_json(&format!("{out}.report.json")).unwrap();
-        assert_eq!(rep["stats"]["tags_only"], true);
-        assert!(rep["stats"]["retrieved"].as_u64().unwrap() >= 60);
+        assert_eq!(st["tags_only"], true);
+        assert!(st["retrieved"].as_u64().unwrap() >= 60);
+        // A variable protein N-terminal rule is no residue state: the run goes through.
+        let mut acetyl = conf(cfg());
+        acetyl
+            .peptidoforms
+            .variable_mods
+            .push(mumdia_core::config::ResidueMod {
+                residue: '*',
+                name: "Acetyl".into(),
+                position: mumdia_core::config::ModPosition::ProteinNTerm,
+            });
+        assert_eq!(go(&acetyl), kept);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2756,6 +2819,10 @@ mod tests {
                 c.frag_tol_da = 0.012;
                 c.repeat_bonus = 0.1;
                 c.crowding_exponent = 0.25;
+            } else if round % 4 == 2 {
+                // The pruned path (no repeat bonus) with low-m/z peaks weighted above 1.
+                c.low_mz_weight = 2.0;
+                c.crowding_exponent = 0.25;
             }
             for pf in &peps {
                 let cand = Candidate { nz: 2, rt: None };
@@ -2776,6 +2843,83 @@ mod tests {
                 };
                 assert_eq!(run(None), run(Some(&occ)), "{pf} round {round}");
             }
+        }
+    }
+
+    /// Two overlapping windows: a candidate inside both is a member of both groups and keeps the
+    /// larger of its two group scores; the others belong to their own window only.
+    #[test]
+    fn a_candidate_in_two_windows_keeps_its_best_group_score() {
+        let full = planted("PEPTIDEK", 2);
+        let half: Vec<(f32, f32)> = full.iter().copied().step_by(2).collect();
+        // Window 0 [400, 425) holds the whole ladder, window 1 [420, 445) half of it.
+        let mut sp = one_window(vec![
+            (100.0, full),
+            (110.0, vec![(1999.5, 1.0)]),
+            (100.0, half),
+            (110.0, vec![(1998.5, 1.0)]),
+        ]);
+        sp.groups = vec![
+            WindowGroup {
+                lower: 400.0,
+                upper: 425.0,
+                first: 0,
+                count: 2,
+            },
+            WindowGroup {
+                lower: 420.0,
+                upper: 445.0,
+                first: 2,
+                count: 2,
+            },
+        ];
+        let pmz = [410.0, 422.0, 440.0];
+        let cands: Vec<Option<Candidate>> = (0..3)
+            .map(|_| Some(Candidate { nz: 2, rt: None }))
+            .collect();
+        let members = group_members(&sp, &cands, &pmz);
+        assert_eq!(members, vec![vec![0, 1], vec![1, 2]]);
+        let m = residue_masses("PEPTIDEK").unwrap();
+        let (score, _) = score_all(&sp, &cands, &members, &cfg(), &|_| m.clone());
+        assert!(score[0] > score[2] && score[2] > 0.0, "{score:?}");
+        assert_eq!(score[1], score[0]);
+    }
+
+    /// Window membership equals a scan of every window, for overlapping windows of mixed widths
+    /// and precursors on the window bounds.
+    #[test]
+    fn group_members_match_a_scan_of_every_window() {
+        let mut st = 0xBEEFu64;
+        let mut next = || {
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (st >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut sp = one_window(Vec::new());
+        sp.groups = (0..40)
+            .map(|_| {
+                let lower = 400.0 + next() * 600.0;
+                WindowGroup {
+                    lower,
+                    upper: lower + 0.5 + next() * 50.0,
+                    first: 0,
+                    count: 0,
+                }
+            })
+            .collect();
+        let mut pmz: Vec<f64> = (0..2000).map(|_| 350.0 + next() * 750.0).collect();
+        pmz.extend(sp.groups.iter().flat_map(|g| [g.lower, g.upper]));
+        let cands: Vec<Option<Candidate>> = pmz
+            .iter()
+            .map(|_| Some(Candidate { nz: 2, rt: None }))
+            .collect();
+        let members = group_members(&sp, &cands, &pmz);
+        for (g, w) in sp.groups.iter().enumerate() {
+            let want: Vec<u32> = (0..pmz.len() as u32)
+                .filter(|&i| w.lower <= pmz[i as usize] && pmz[i as usize] < w.upper)
+                .collect();
+            assert_eq!(members[g], want, "window {g}");
         }
     }
 

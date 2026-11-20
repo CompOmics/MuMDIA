@@ -89,7 +89,7 @@ section 1 near 50% reduction, so they are for experiments.
 |---|---|
 | `retrieval = "tags"`, `rescue` | Database-free tag discovery (`tags.rs`) then retrieval: a candidate is retrieved when one of its trimers, in its own residue states and at a fragment charge it can carry, was observed in an eligible spectrum. `rescue = true` (default) scores the unretrieved candidates anyway; `false` drops them. The report separates `retrieval_losses` (unretrieved candidates the score would have kept) from `scoring_losses`. |
 | `delayed_modforms` | Retrieve backbone families on backbone states first and examine forms only in retrieved families. Same retrieved set as form-by-form retrieval (tested); `retrieval_forms_skipped_by_family` counts the saving. `retrieval::forms_with_tag` is the delayed generator, equal as a set to enumeration-first generation filtered on the tag (tested with two modification types). |
-| `tags.*` | Edge tolerance 0.005 Da neutral (0.005/z m/z), fragment charges 1-2, whole-path RMS sigma 0.003 Da, optional `gap_edges` (two-residue steps, every compatible pair kept, three-peak ladders keyed separately from four-peak ones), `extra_mods`. The alphabet comes from `peptidoforms.fixed_mods`/`variable_mods`: I and L merged, a fixed modification replaces its residue's state, a variable one adds a state; positions the alphabet cannot express break the trimers covering them and are never substituted. There is no peak, degree or path-count cap. |
+| `tags.*` | Edge tolerance 0.005 Da neutral (0.005/z m/z), fragment charges 1-2, whole-path RMS sigma 0.003 Da, optional `gap_edges` (two-residue steps, every compatible pair kept, three-peak ladders keyed separately from four-peak ones), `extra_mods`. The alphabet comes from `peptidoforms.fixed_mods`/`variable_mods`: I and L merged, a fixed modification replaces its residue's state, a variable one adds a state, a terminal rule adds none; positions the alphabet cannot express break the trimers covering them and are never substituted. There is no peak, degree or path-count cap. |
 | `complement_bonus` | Complementary-ion support of observed tag paths: complements of the four path peaks for the candidate's neutral mass, on distinct peaks off the path, never reused; 2/3/4 complements give 1/3, 2/3, 1 times the path fit, times spectrum tag information, divided by `sqrt(L)`. |
 | `tag_bonus`, `fasta_bonus` | Spectrum-side tag information times path fit, and the library-side information from the backbone/position index (`retrieval::BackboneIndex`), kept as separate columns. Each distinct trimer counts once. |
 | `flank_bonus` | Positioned ladders whose endpoints sit at the candidate's own b or y masses. |
@@ -200,7 +200,8 @@ the paths sixteenfold (5.8 billion on Astral) for no retention change.
 per-spectrum 0.01 Da bin-occupancy bitmap, which answers "is any peak within tolerance" without
 searching the peak list, and upper-bound pruning over a per-window inverted bin index, which
 skips a spectrum once the bins a candidate could still match cannot beat its best spectrum so
-far (all peaks in one bin share one weight, with a 1e-9 margin). Over whole libraries the scores
+far (all peaks in one bin share one weight, scaled by `low_mz_weight` when it exceeds 1, with a
+1e-9 margin). Over whole libraries the scores
 were identical to the unpruned ones (10,881,402 Astral and 203,443,548 immunopeptidomics
 candidates, maximum absolute difference 0). Astral without retention times: 4:40 -> 3:21
 (bitmap) -> 1:11 (pruning); immunopeptidomics with retention times: 18:53 -> 6:42 (scoring

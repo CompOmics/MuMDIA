@@ -195,7 +195,7 @@ Database-free tag discovery used by retrieval and the optional evidence componen
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
 | `edge_tol_da` | `f64` | `0.005` |  | Neutral residue-mass tolerance of a tag edge (Da); `edge_tol_da / z` in m/z. |
-| `max_charge` | `i32` | `2` |  | Highest fragment charge of a tag edge. |
+| `max_charge` | `i32` | `2` |  | Highest fragment charge of a tag edge: 1 or 2, the charges a tag key holds. |
 | `gap_edges` | `bool` | `false` |  | Also allow two-residue gap steps; every compatible residue pair is kept as an alternative and gapped three-peak ladders are keyed separately from four-peak ones. |
 | `rms_sigma_da` | `f64` | `0.003` |  | Sigma of the whole-path soft weight `exp(-0.5 (rms / sigma)^2)` (Da). |
 | `extra_mods` | `Vec<String>` | `[]` |  | Variable states added to the chemistry configuration's alphabet, `RESIDUE:Name`. |
