@@ -11,7 +11,8 @@
 //!    precursors the two runs share (`ALIGN_BINS` bins, at least `MIN_SHARED` shared; a run
 //!    with fewer keeps its own scale and is counted as unaligned);
 //! 2. the consensus is the median of a precursor's mapped apexes; a precursor accepted
-//!    experiment-wide but in no single run takes the apex of its winning row.
+//!    experiment-wide but in no single run takes the apex of its winning row, mapped the same
+//!    way.
 //!
 //! On a run with ion mobility the pair also gets a consensus 1/K0 the same way: each run's
 //! apex 1/K0 of the same confident apexes (joined from its `psms_extracted` on
@@ -84,7 +85,8 @@ pub struct EmpiricalLibrary {
     pub runs_aligned: usize,
     /// Runs with confident apexes but fewer than `MIN_SHARED` shared with the reference.
     pub runs_unaligned: usize,
-    /// Entries accepted in no single run, which take their winning row's apex.
+    /// Entries accepted in no single run, which take their winning row's apex, mapped onto the
+    /// reference.
     pub entries_from_winner: u64,
     /// Entries the library has no paired decoy for; they are searched without one.
     pub entries_without_decoy: u64,
@@ -129,7 +131,8 @@ pub struct ImConsensusSummary {
     pub offsets: BTreeMap<u32, f64>,
     /// Entries whose 1/K0 is the median over their runs.
     pub entries_from_runs: u64,
-    /// Entries with no confident run that has a 1/K0, which take their winning row's.
+    /// Entries with no confident run that has a 1/K0, which take their winning row's, moved by
+    /// that run's offset.
     pub entries_from_winner: u64,
     /// Entries with no finite 1/K0 at all, which keep the library's `predicted_im`.
     pub entries_without_im: u64,
@@ -169,11 +172,19 @@ pub struct RunDiagnostics {
     pub dropped_outside_library: u64,
 }
 
+/// Fewest shared pairs each extrapolation slope of a [`Curve`] spans. A bin of a curve fitted on
+/// a few hundred pairs holds 2 or 3 of them, and the slope through the two outer bin medians
+/// alone is then noise.
+const OUTER_SLOPE_PAIRS: usize = 20;
+
 /// A monotone binned-median curve mapping one run's retention times onto the reference's.
 #[derive(Clone, Debug)]
 pub(crate) struct Curve {
     cx: Vec<f64>,
     cy: Vec<f64>,
+    /// Bins between the two medians each extrapolation slope runs through: enough for
+    /// `OUTER_SLOPE_PAIRS` pairs, so 1 from `ALIGN_BINS * OUTER_SLOPE_PAIRS` pairs on.
+    edge: usize,
 }
 
 fn median_sorted(v: &[f64]) -> f64 {
@@ -192,11 +203,13 @@ impl Curve {
         pairs.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
         let n = pairs.len();
         let (mut cx, mut cy) = (Vec::with_capacity(bins), Vec::with_capacity(bins));
+        let mut smallest = usize::MAX;
         for b in 0..bins {
             let (lo, hi) = (b * n / bins, (b + 1) * n / bins);
             if hi <= lo {
                 continue;
             }
+            smallest = smallest.min(hi - lo);
             let xs: Vec<f64> = pairs[lo..hi].iter().map(|p| p.0).collect();
             let mut ys: Vec<f64> = pairs[lo..hi].iter().map(|p| p.1).collect();
             ys.sort_by(f64::total_cmp);
@@ -208,11 +221,15 @@ impl Curve {
                 cy[i] = cy[i - 1];
             }
         }
-        Curve { cx, cy }
+        Curve {
+            cx,
+            cy,
+            edge: OUTER_SLOPE_PAIRS.div_ceil(smallest),
+        }
     }
 
     /// Linear interpolation between the bin medians, and linear extrapolation past the outer
-    /// ones along the outer two.
+    /// ones along the slope to the median `edge` bins inward.
     pub(crate) fn map(&self, x: f64) -> f64 {
         let (cx, cy) = (&self.cx, &self.cy);
         let n = cx.len();
@@ -222,11 +239,12 @@ impl Curve {
             _ => {}
         }
         let slope = |a: usize, b: usize| (cy[b] - cy[a]) / (cx[b] - cx[a]).max(1e-9);
+        let k = self.edge.min(n - 1);
         if x <= cx[0] {
-            return cy[0] + (x - cx[0]) * slope(0, 1);
+            return cy[0] + (x - cx[0]) * slope(0, k);
         }
         if x >= cx[n - 1] {
-            return cy[n - 1] + (x - cx[n - 1]) * slope(n - 2, n - 1);
+            return cy[n - 1] + (x - cx[n - 1]) * slope(n - 1 - k, n - 1);
         }
         let k = cx.partition_point(|&c| c <= x);
         let t = (x - cx[k - 1]) / (cx[k] - cx[k - 1]);
@@ -329,6 +347,8 @@ pub(crate) struct Consensus {
     pub reference: Option<u32>,
     pub aligned: usize,
     pub unaligned: usize,
+    /// Each aligned non-reference run's curve onto the reference, by source.
+    pub curves: BTreeMap<u32, Curve>,
 }
 
 /// The run with the most confident apexes in `obs`, the lowest source on a tie.
@@ -351,21 +371,8 @@ fn reference_of(obs: &[(u32, u32, f64)]) -> Option<u32> {
 /// candidate_id, apex)`) with it. The reference, and a run without a curve, keep their own
 /// scale.
 pub(crate) fn alignment(obs: &[(u32, u32, f64)]) -> (Option<u32>, BTreeMap<u32, Curve>) {
-    let Some(ref_s) = reference_of(obs) else {
-        return (None, BTreeMap::new());
-    };
-    let onto = consensus_onto(obs, ref_s, |shared| {
-        Align::Curve(Curve::fit(shared, ALIGN_BINS))
-    });
-    let curves = onto
-        .maps
-        .into_iter()
-        .filter_map(|(s, a)| match a {
-            Align::Curve(c) => Some((s, c)),
-            Align::Offset(_) => None,
-        })
-        .collect();
-    (Some(ref_s), curves)
+    let c = consensus(obs);
+    (c.reference, c.curves)
 }
 
 pub(crate) fn consensus(obs: &[(u32, u32, f64)]) -> Consensus {
@@ -375,13 +382,14 @@ pub(crate) fn consensus(obs: &[(u32, u32, f64)]) -> Consensus {
             reference: None,
             aligned: 0,
             unaligned: 0,
+            curves: BTreeMap::new(),
         };
     };
     let Onto {
         medians,
         aligned,
         unaligned,
-        ..
+        maps,
     } = consensus_onto(obs, ref_s, |shared| {
         Align::Curve(Curve::fit(shared, ALIGN_BINS))
     });
@@ -393,6 +401,13 @@ pub(crate) fn consensus(obs: &[(u32, u32, f64)]) -> Consensus {
         reference: Some(ref_s),
         aligned,
         unaligned,
+        curves: maps
+            .into_iter()
+            .filter_map(|(s, a)| match a {
+                Align::Curve(c) => Some((s, c)),
+                Align::Offset(_) => None,
+            })
+            .collect(),
     }
 }
 
@@ -744,15 +759,16 @@ pub fn build_library(p: &BuildParams) -> Result<EmpiricalLibrary> {
         .collect();
     let cons = consensus(&obs);
     let mut irt: BTreeMap<u32, f32> = cons.rt.iter().map(|(&c, &(v, _))| (c, v)).collect();
-    // Entries accepted in no single run take the raw apex of their winning row: on the
-    // reference scale when that row is the reference run's, within the alignment's shift of it
-    // otherwise. The second pass calibrates every run against this scale anyway.
+    // Entries accepted in no single run take the apex of their winning row, put on the
+    // reference's scale by that run's curve as every other entry's apexes are (a run without
+    // one keeps its own scale).
     let mut from_winner = 0u64;
     for &c in &scan.entries {
         if let (std::collections::btree_map::Entry::Vacant(slot), Some(w)) =
             (irt.entry(c), scan.winner.get(&c))
         {
-            slot.insert(w.rt as f32);
+            let rt = cons.curves.get(&w.source).map_or(w.rt, |k| k.map(w.rt));
+            slot.insert(rt as f32);
             from_winner += 1;
         }
     }
@@ -793,10 +809,11 @@ pub fn build_library(p: &BuildParams) -> Result<EmpiricalLibrary> {
                     Some(v)
                 }
                 None => {
-                    let w = scan
-                        .winner
-                        .get(&c)
-                        .and_then(|w| apex_im.get(&(w.source, c)).copied());
+                    // The winning row's, moved onto the reference by its run's offset.
+                    let w = scan.winner.get(&c).and_then(|w| {
+                        let d = ic.offsets.get(&w.source).copied().unwrap_or(0.0);
+                        apex_im.get(&(w.source, c)).map(|&v| v + d)
+                    });
                     if w.is_some() {
                         from_win += 1;
                     }
@@ -1068,6 +1085,29 @@ mod tests {
         let k = Curve::fit(pairs, 80);
         let ys: Vec<f64> = (0..800).map(|x| k.map(x as f64)).collect();
         assert!(ys.windows(2).all(|w| w[1] >= w[0]));
+    }
+
+    #[test]
+    fn a_thin_curve_extrapolates_along_its_trend_not_through_two_near_tied_bins() {
+        // 200 pairs on y = x - 3 (bins of 2 and 3 pairs), the first two bins near-tied in x:
+        // the slope through their medians alone is 9.47 and put 200 s at -652.7 s.
+        let mut pairs = vec![
+            (300.0, 296.0),
+            (300.5, 298.0),
+            (301.0, 303.0),
+            (301.2, 306.0),
+            (301.5, 309.0),
+        ];
+        pairs.extend((5..200).map(|i| (280.0 + 5.0 * i as f64, 277.0 + 5.0 * i as f64)));
+        let k = Curve::fit(pairs, ALIGN_BINS);
+        assert!((k.map(200.0) - 197.0).abs() < 5.0, "{}", k.map(200.0));
+        assert!((k.map(1500.0) - 1497.0).abs() < 5.0, "{}", k.map(1500.0));
+        // From 1,600 pairs (bins of 20) the slopes still run through the outer two bins.
+        let mut wide: Vec<(f64, f64)> = (0..1600).map(|i| (i as f64, i as f64)).collect();
+        wide[20..40].iter_mut().for_each(|p| p.1 += 10.0);
+        let k = Curve::fit(wide, ALIGN_BINS);
+        let two = k.cy[0] + (-100.0 - k.cx[0]) * ((k.cy[1] - k.cy[0]) / (k.cx[1] - k.cx[0]));
+        assert_eq!(k.map(-100.0), two);
     }
 
     #[test]
@@ -1497,12 +1537,42 @@ mod tests {
         }
         // The selected rank's 1/K0, put on the reference's scale, not the other rank's.
         assert!((pim[2 * 100].unwrap() - (0.8 + 1e-4 * 100.0)).abs() < 1e-9);
-        // Target 0 was confident in no run: its winner (run 1, rank 1) gives the raw value.
-        assert!((pim[0].unwrap() - 0.81).abs() < 1e-12, "{:?}", pim[0]);
         let json: serde_json::Value =
             mumdia_io::json::read_json(&format!("{out}/empirical_library.json")).unwrap();
         assert_eq!(json["im"]["offsets"]["0"], 0.0);
         assert!(json.get("diagnostics").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Target 0 was confident in no run, and its winning row is run 1's, which elutes 20 s
+    /// later and 0.01 higher in 1/K0 than the reference run 0: both values come back onto the
+    /// reference's scale.
+    #[test]
+    fn a_winner_only_entry_takes_its_winning_row_on_the_reference_scale() {
+        let dir = tmp("winner");
+        let (lp, lf, scored, psms) = im_experiment(&dir, 250, true);
+        let lib = build_library(&BuildParams {
+            scored: &scored,
+            lib_precursors: &lp,
+            lib_fragments: &lf,
+            psms_extracted: &psms,
+            out_dir: &format!("{dir}/emp"),
+            q: 0.01,
+        })
+        .unwrap();
+        assert_eq!(
+            (lib.reference_source, lib.entries_from_winner),
+            (Some(0), 1)
+        );
+        let t = TableFile::open(&lib.precursors).unwrap();
+        let irt = t.f32("predicted_irt").unwrap();
+        let pim = t.opt_f64("predicted_im").unwrap();
+        assert!(
+            irt[0].abs() < 1e-3,
+            "run 1's 20 s is the reference's 0 s: {}",
+            irt[0]
+        );
+        assert!((pim[0].unwrap() - 0.80).abs() < 1e-9, "{:?}", pim[0]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

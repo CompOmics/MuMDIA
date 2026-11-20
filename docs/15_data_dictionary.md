@@ -1203,7 +1203,7 @@ apex 1/K0):
 | `runs_unaligned` | integer | runs with apex 1/K0 values sharing fewer than 200 precursors with the reference; they keep their own scale |
 | `offsets` | object | per `source`, the median of (reference - run) apex 1/K0 over the shared precursors; 0 for the reference |
 | `entries_from_runs` | integer | entries whose 1/K0 is the median over their confident runs |
-| `entries_from_winner` | integer | entries with no confident run carrying a 1/K0, which take their winning row's |
+| `entries_from_winner` | integer | entries with no confident run carrying a 1/K0, which take their winning row's, moved by that run's offset |
 | `entries_without_im` | integer | entries with no finite 1/K0, which keep the library's `predicted_im` |
 
 `empirical_library.json`, `diagnostics` (written after the pooled second-pass rescore; logged on
