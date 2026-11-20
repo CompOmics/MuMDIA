@@ -50,7 +50,7 @@ contracts); the citations below point there.
 | `rust/mumdia/crates/mumdia-core/src/manifest.rs` | `Manifest` and `ArtifactRecord` (`manifest.rs:10`, `manifest.rs:22`). |
 | `rust/mumdia/crates/mumdia-core/src/config.rs` | The single typed serde `Config` (`config.rs:973`) with per-stage sections and `apply_profile` (`config.rs:1107`). |
 | `rust/mumdia/crates/mumdia-io/src/table.rs` | The `Col`/`Table` typed Parquet layer every stage writes through (`table.rs:23`). |
-| `rust/mumdia/crates/mumdia-io/src/lib.rs` | `record_artifact`, `inspect`, `init_logging`, blake3 hashing. |
+| `rust/mumdia/crates/mumdia-io/src/lib.rs` | `record_artifact`, `inspect`, `init_logging_level`, blake3 hashing. |
 
 ### Crate responsibilities and predictor plumbing
 

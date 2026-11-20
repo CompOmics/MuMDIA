@@ -33,7 +33,7 @@ The crate is declared in `lib.rs:6-13` (`config`, `constants`, `error`,
 | Path | Role |
 |---|---|
 | `rust/mumdia/crates/mumdia-core/src/config.rs` | All config structs + every strategy enum; `Config::from_json`, `validate`, `apply_profile`, `canonical_json` (1585 lines) |
-| `rust/mumdia/crates/mumdia-core/src/constants.rs` | Physical constants (`PROTON`, `WATER`, `AMMONIA`, `ISOTOPE_SPACING`), `residue_mass`, `mass_to_mz`, ppm predicates |
+| `rust/mumdia/crates/mumdia-core/src/constants.rs` | Physical constants (`PROTON`, `WATER`, `ISOTOPE_SPACING`), `residue_mass`, `mass_to_mz`, ppm predicates |
 | `rust/mumdia/crates/mumdia-core/src/mass.rs` | `unimod_mass`, `IonType`, `Fragment`, `ParsedPeptidoform`, `parse_peptidoform`, b/y fragment generation |
 | `rust/mumdia/crates/mumdia-core/src/schema.rs` | Frozen `(name, version)` ids for every artifact; `PSMS_SCORED` and `PSMS_COMPETED` are v4, `FEATURES`/`PSMS_EXTRACTED`/`PEPTIDE_QUANT`/`PROTEIN_GROUP_QUANT` are v2, all others v1 |
 | `rust/mumdia/crates/mumdia-core/src/manifest.rs` | `Manifest` + `ArtifactRecord` (provenance) |
@@ -279,8 +279,7 @@ difference; a maintainer must not treat them as interchangeable.
 
 - `ppm_diff(observed, theoretical)` (`constants.rs:66-68`):
   `1e6 * (observed - theoretical) / theoretical`. **Signed**, normalized by the
-  **theoretical** mass. Used for reporting a mass error and for
-  `ppm_match(obs, theo, tol) = |ppm_diff| <= tol` (`constants.rs:72-74`).
+  **theoretical** mass. Used for reporting a mass error.
 - `ppm_bounds(mz, tol)` (`constants.rs:78-81`): returns `(mz - d, mz + d)` with
   `d = mz * tol * 1e-6`. **Symmetric window centered on the query** `mz`,
   normalized by the query itself.
@@ -334,7 +333,7 @@ data model has one `mods[i]` slot per residue plus separate terminal deltas
 | `residue_mass` | constants.rs:26-51 | 20-AA monoisotopic table; `None` for ambiguous |
 | `is_standard_residue` | constants.rs:54-56 | `residue_mass(aa).is_some()` boolean form |
 | `mass_to_mz` | constants.rs:59-62 | Neutral mass -> m/z |
-| `ppm_diff` / `ppm_match` | constants.rs:66-74 | Theoretical-relative signed ppm + tolerance test |
+| `ppm_diff` | constants.rs:66-68 | Theoretical-relative signed ppm |
 | `ppm_bounds` | constants.rs:78-81 | Query-centered symmetric m/z window |
 | `within_ppm` | constants.rs:92-96 | Min-relative canonical index predicate |
 | `parse_peptidoform` | mass.rs:187-249 | ProForma-lite parser |
@@ -345,7 +344,7 @@ data model has one `mods[i]` slot per residue plus separate terminal deltas
 | `unimod_mass` | mass.rs:13-32 | 11-name UniMod subset |
 | `Manifest` / `ArtifactRecord` | manifest.rs:9-51 | Run provenance; `new`/`record`/`get` (manifest.rs:33-51) |
 | `record_artifact` | mumdia-io/src/lib.rs:20-39 | Build `ArtifactRecord`, hash file |
-| `RejectionReason` | rejection.rs:19-113 | Ordered identification-loss ladder |
+| `RejectionReason` | rejection.rs:20-67 | Identification-loss ladder, in pipeline order; `code()` |
 | `Label` | types.rs:33-51 | Target/Decoy; `.pin()` = +1/-1, `.is_decoy()` |
 
 ### Core data types (`types.rs`)
@@ -378,36 +377,27 @@ docs/18_findings_and_decisions.md).
 
 ### Candidate-audit reason ladder (`rejection.rs`)
 
-`RejectionReason` is the ordered identification-loss ladder written to the
-candidate-audit table (`emit_candidate_audit` / `mumdia audit`). Each candidate's
-row records the EARLIEST stage at which it was lost, so the aggregate answers
-"where was each DIA-NN-only precursor first lost?" without conflating later
-stages. The serialized spelling is `SCREAMING_SNAKE_CASE` and equals
-`code()`; `code()` (rejection.rs:50-71) is the stable string written to
-Parquet/JSON without a serde round-trip. `stage_order()` (rejection.rs:76-97) is
-the ladder position (0 = earliest); `earliest(a, b)` (rejection.rs:106-112) keeps
-the smaller `stage_order` and `Reported` never overrides a real rejection;
-`is_rejection()` (rejection.rs:100-102) is true for any non-`Reported` variant.
+`RejectionReason` is the identification-loss ladder written to the candidate-audit
+table (`emit_candidate_audit` / `mumdia audit`). The audit (`stages/audit.rs`) tests the
+stages in pipeline order and records the first at which a candidate was lost, so the
+aggregate answers "where was each missing precursor first lost?" without conflating later
+stages; `compete` writes the two `OUTCOMPETED_*` codes to its own audit table. `code()`
+(rejection.rs:50-66) is the stable `SCREAMING_SNAKE_CASE` string written to Parquet/JSON.
 
-| `stage_order` | Variant / `code()` | Stage lost at |
-|---|---|---|
-| 0 | `PeptideNotGenerated` / `PEPTIDE_NOT_GENERATED` | search space (A) |
-| 1 | `ModificationNotAllowed` / `MODIFICATION_NOT_ALLOWED` | search space (A) |
-| 2 | `ChargeOutOfRange` / `CHARGE_OUT_OF_RANGE` | search space (A) |
-| 3 | `PrecursorMzOutOfRange` / `PRECURSOR_MZ_OUT_OF_RANGE` | search space (A) |
-| 4 | `NoValidFragments` / `NO_VALID_FRAGMENTS` | search space (A) |
-| 5 | `WrongIsolationWindow` / `WRONG_ISOLATION_WINDOW` | search space (A) |
-| 6 | `RtPruned` / `RT_PRUNED` | candidate generation (B) |
-| 7 | `CandidateCapReached` / `CANDIDATE_CAP_REACHED` | candidate generation (B) |
-| 8 | `NoFragmentTraces` / `NO_FRAGMENT_TRACES` | extraction (C, D) |
-| 9 | `DidNotSurviveExtraction` / `DID_NOT_SURVIVE_EXTRACTION` (was `NoPeakGroup` / `NO_PEAK_GROUP` before docs/29 #16) | extraction (C, D) |
-| 10 | `PeakNotSelected` / `PEAK_NOT_SELECTED` | peak/peptide ranking (E) |
-| 11 | `OutcompetedByTarget` / `OUTCOMPETED_BY_TARGET` | competition (G) |
-| 12 | `OutcompetedByDecoy` / `OUTCOMPETED_BY_DECOY` | competition (G) |
-| 13 | `FailedPrecursorFdr` / `FAILED_PRECURSOR_FDR` | FDR + reporting (H) |
-| 14 | `FailedPeptideFdr` / `FAILED_PEPTIDE_FDR` | FDR + reporting (H) |
-| 15 | `RemovedDuringReporting` / `REMOVED_DURING_REPORTING` | FDR + reporting (H) |
-| 255 | `Reported` / `REPORTED` | sentinel: reached the final report (not a loss) |
+| Variant / `code()` | Stage lost at |
+|---|---|
+| `NoValidFragments` / `NO_VALID_FRAGMENTS` | search space (A) |
+| `WrongIsolationWindow` / `WRONG_ISOLATION_WINDOW` | search space (A) |
+| `RtPruned` / `RT_PRUNED` | candidate generation (B) |
+| `NoFragmentTraces` / `NO_FRAGMENT_TRACES` | extraction (C, D) |
+| `DidNotSurviveExtraction` / `DID_NOT_SURVIVE_EXTRACTION` (was `NoPeakGroup` / `NO_PEAK_GROUP` before docs/29 #16) | extraction (C, D) |
+| `PeakNotSelected` / `PEAK_NOT_SELECTED` | peak/peptide ranking (E) |
+| `OutcompetedByTarget` / `OUTCOMPETED_BY_TARGET` | competition (G) |
+| `OutcompetedByDecoy` / `OUTCOMPETED_BY_DECOY` | competition (G) |
+| `FailedPrecursorFdr` / `FAILED_PRECURSOR_FDR` | FDR + reporting (H) |
+| `FailedPeptideFdr` / `FAILED_PEPTIDE_FDR` | FDR + reporting (H) |
+| `RemovedDuringReporting` / `REMOVED_DURING_REPORTING` | FDR + reporting (H) |
+| `Reported` / `REPORTED` | sentinel: reached the final report (not a loss) |
 
 ## Configuration
 
@@ -930,7 +920,7 @@ stale.
 ## Invariants, determinism, gotchas
 
 - **Single source of masses.** No crate outside `mumdia-core` defines a residue
-  mass, `PROTON`, `WATER`, `AMMONIA`, or `ISOTOPE_SPACING`
+  mass, `PROTON`, `WATER`, or `ISOTOPE_SPACING`
   (`constants.rs:10-22`). `ISOTOPE_SPACING = 1.003354835` is the 13C-12C mass
   difference used for MS1 envelope spacing. `PROTON = 1.007276466812` is the
   physically correct proton mass, deliberately not DIA-NN's H-atom value
@@ -938,7 +928,7 @@ stale.
   CODATA/AME; nothing is copied from another engine (clean-room boundary).
 - **Three ppm predicates are not interchangeable.** `within_ppm` (min-relative)
   is the only one the fragment index may use; `ppm_bounds` (query-centered) and
-  `ppm_diff`/`ppm_match` (theoretical-relative) disagree at the tolerance edge.
+  `ppm_diff` (theoretical-relative) disagree at the tolerance edge.
   Substituting one for another shifts which fragments match at the boundary.
 - **Validation is targeted and fail-loud for known invalid states.** Invalid
   decoy/calibration settings, impossible rescorer coverage, missing required

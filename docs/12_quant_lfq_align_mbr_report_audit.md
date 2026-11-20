@@ -1780,13 +1780,10 @@ invoked only when `extract.emit_candidate_audit` is set (`run.rs:428`), with
 `q_threshold = 0.01`, `run_id = out_dir`, and no entrapment substring; standalone,
 `mumdia audit` takes those as CLI args.
 
-`RejectionReason` (`rejection.rs:19`) is a 17-variant enum with a stable
-SCREAMING_SNAKE_CASE `code()` (`rejection.rs:50`), a `stage_order()` ladder position
-(0 earliest, `Reported` = 255, `rejection.rs:76`), an `is_rejection()` predicate
-(true for any non-`Reported` reason, `rejection.rs:100`), and `earliest()` to keep the
-smaller stage (`rejection.rs:106`). The variants are grouped by pipeline stage in the
-source (search space, candidate generation/pruning, extraction, ranking, competition,
-FDR/reporting).
+`RejectionReason` (`rejection.rs:22`) is a 12-variant enum with a stable
+SCREAMING_SNAKE_CASE `code()` (`rejection.rs:50`). The variants are declared in pipeline
+order (search space, candidate generation/pruning, extraction, ranking, competition,
+FDR/reporting); `audit.rs` tests the stages in that order and keeps the first loss.
 
 ## Key types and functions
 
@@ -1820,7 +1817,7 @@ FDR/reporting).
 | `qcell` | report.rs:39 | quantity cell formatting (1 decimal; empty on NaN) |
 | `AuditParams` / `audit::run` | audit.rs:28 / 64 | candidate loss ladder |
 | `load_extract_reasons` | audit.rs:51 | optional `<psms>.audit.parquet` refinement (no producer yet) |
-| `RejectionReason` | rejection.rs:19 | earliest-loss category enum (`code`/`stage_order`/`is_rejection`/`earliest`) |
+| `RejectionReason` | rejection.rs:22 | earliest-loss category enum (`code`) |
 | `resolve_script` | sidecar.rs:20 | locate a worker script relative to CWD or the binary |
 | `run_worker` | sidecar.rs:217 | spawn `python <script> <args>`; error on non-zero exit |
 
@@ -1979,14 +1976,12 @@ but do not affect the wired `mumdia mbr` path.
   the PSM `q_value` (recorded as `q_unit`).
 - **audit reason coverage.** In the current chain `audit.rs` can only ever emit
   `DID_NOT_SURVIVE_EXTRACTION`, `OUTCOMPETED_BY_TARGET`/`OUTCOMPETED_BY_DECOY`, `FAILED_PRECURSOR_FDR`,
-  `FAILED_PEPTIDE_FDR`, and `REPORTED`. The five refined extract codes
+  `FAILED_PEPTIDE_FDR`, `REMOVED_DURING_REPORTING` (a decoy that passes every gate, which
+  the report never writes), and `REPORTED`. The five refined extract codes
   (`NO_FRAGMENT_TRACES`, `NO_VALID_FRAGMENTS`, `PEAK_NOT_SELECTED`, `RT_PRUNED`,
   `WRONG_ISOLATION_WINDOW`) are matched by `load_extract_reasons` (`audit.rs:139`) but
-  need the absent sidecar to fire. The six remaining enum variants
-  (`PEPTIDE_NOT_GENERATED`, `MODIFICATION_NOT_ALLOWED`, `CHARGE_OUT_OF_RANGE`,
-  `PRECURSOR_MZ_OUT_OF_RANGE`, `CANDIDATE_CAP_REACHED`, `REMOVED_DURING_REPORTING`) have
-  no producer at all: even a sidecar string of that name falls to the `_ => DidNotSurviveExtraction`
-  arm (`audit.rs:145`).
+  need the absent sidecar to fire; any other sidecar string falls to the
+  `_ => DidNotSurviveExtraction` arm (`audit.rs:145`).
 - **report.json coverage is partial.** `quant` writes reports for
   `peptide_quant`, `protein_quant`, and emitted `fragment_quant`; the peak-bounds
   diagnostic gets none. `quant-lfq` and `mbr` write no `report.json`; `align` and `audit` do
@@ -2021,8 +2016,8 @@ but do not affect the wired `mumdia mbr` path.
 - **Consume `alignment.parquet` in MBR** instead of the worker's internal
   `binned_map`, so the RT map is computed once and shared; align already records the
   p95 residual that should set `rt_window_s`.
-- **Add an audit reason:** extend `RejectionReason` (`rejection.rs:19`) with a
-  `code()`, `stage_order()`, and a branch in the ladder (`audit.rs:136`); prefer
+- **Add an audit reason:** extend `RejectionReason` (`rejection.rs:22`) at its pipeline
+  position, with a `code()` arm and a branch in the ladder (`audit.rs:136`); prefer
   emitting it from the in-extract sidecar so `load_extract_reasons` can pass it through.
 - **New quant artifact column:** add the `Col` in the relevant `write_table`
   (`quant.rs:487`/`519`/`558`), bump the schema version in

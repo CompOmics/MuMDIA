@@ -278,7 +278,6 @@ pub fn parse_peptidoform(s: &str) -> Result<ParsedPeptidoform, MassError> {
 /// Parse a `[...]` group starting at `open` (index of `[`). Returns the mass
 /// delta and the index just past the closing `]`.
 fn parse_bracket(s: &str, open: usize) -> Result<(f64, usize), MassError> {
-    let bytes = s.as_bytes();
     let close = s[open..]
         .find(']')
         .map(|off| open + off)
@@ -291,7 +290,6 @@ fn parse_bracket(s: &str, open: usize) -> Result<(f64, usize), MassError> {
     } else {
         return Err(MassError::UnknownModification(inner.to_string()));
     };
-    let _ = bytes; // silence unused in some cfgs
     Ok((mass, close + 1))
 }
 
@@ -390,9 +388,9 @@ mod tests {
     // (1.007276466812) from the hydrogen-ATOM mass (1.007825035), a 0.55 mDa difference
     // that is the classic error in this field and one the constants file explicitly calls
     // out. No test referenced `residue_mass`, none pinned an individual residue, none
-    // asserted a fragment m/z at any charge, and `WATER`, `AMMONIA` and
-    // `ISOTOPE_SPACING` were unpinned. The two other mass tests are self-consistency
-    // checks that pass unchanged if every residue mass is wrong by the same amount.
+    // asserted a fragment m/z at any charge, and `WATER` and `ISOTOPE_SPACING` were
+    // unpinned. The two other mass tests are self-consistency checks that pass unchanged
+    // if every residue mass is wrong by the same amount.
     //
     // This class of defect is INVISIBLE to the end-to-end smoke test by construction:
     // `ci/make_fixture_mzml.py` plants its peaks by reading the engine's own library, so
@@ -404,7 +402,7 @@ mod tests {
     // as tabulated by the Unimod and PSI-MS references. Tolerances are absolute Da and
     // deliberately tight enough to catch a substituted constant, not merely a typo.
 
-    use crate::constants::{AMMONIA, ISOTOPE_SPACING};
+    use crate::constants::ISOTOPE_SPACING;
 
     /// Tight enough to separate the proton from the hydrogen atom (0.55 mDa apart).
     const MDA: f64 = 1e-5;
@@ -426,7 +424,6 @@ mod tests {
             "the proton/H-atom difference is one electron mass; check PROTON"
         );
         assert!((WATER - 18.010_564_684).abs() < MDA, "WATER = {WATER}");
-        assert!((AMMONIA - 17.026_549_1).abs() < MDA, "AMMONIA = {AMMONIA}");
         // 13C - 12C = 13.003354835 - 12. Once shipped 485 ppm wrong.
         assert!(
             (ISOTOPE_SPACING - 1.003_354_835).abs() < 1e-9,

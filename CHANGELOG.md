@@ -216,6 +216,23 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **The engine's shared crates lose code nothing used (docs/02, docs/03).** `mumdia-core`
+  drops `ppm_match`, the `AMMONIA` constant and the five candidate-audit reason codes nothing
+  produced (`PEPTIDE_NOT_GENERATED`, `MODIFICATION_NOT_ALLOWED`, `CHARGE_OUT_OF_RANGE`,
+  `PRECURSOR_MZ_OUT_OF_RANGE`, `CANDIDATE_CAP_REACHED`), with the ladder helpers only their
+  tests called; the codes the audit writes keep their spelling. `mumdia-io` drops
+  `init_logging`, `write_batches_hashed`, the unhashed `write_table_chunked` and its unused
+  `thiserror` dependency. The file-publication code (`AtomicPath`, `publish_copy_of`,
+  `publish_byte_copy`) moves from `table.rs` to `publish.rs` and stays reachable under
+  `mumdia_io::table`, and the typed column getters of `Table` and `TableFile` share one decode
+  loop per reader. Every artifact is byte-identical. docs/14 no longer says that zstd Parquet
+  cannot be read.
+- **`build-library` counts its targets without holding the library's label column.** The
+  count read the whole `label` column into Arrow strings first, about 2 GB on a
+  203-million-row library; it now streams the column in 65,536-row batches.
+- **The prescreen uses the engine's 13C-12C spacing.** It defined its own `ISOTOPE_SPACING`,
+  7e-11 Da from the shared constant. Only a search with `prescreen.enabled` reads it, and only
+  a peak at a tolerance edge can tell the two apart.
 - **The library helpers share their peptidoform and fragment-table rules
   (`scripts/_lib_io.py`).** The stripped sequence, the `DECOY_` marker, the I/L key, the
   ProForma N-terminal group, the fragment-table schema and the 0.01 Da cardinality bins were
@@ -248,6 +265,9 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Removed
 
+- **`MUMDIA_PARQUET_PLAN` (docs/03).** It turned off the float-encoding plan of capped
+  writers, for a byte comparison against binaries from before 0.5.0; release checks compare
+  decoded tables. A set variable is now ignored.
 - **`scripts/assemble_survivors.py` and `scripts/shard_parquet.py` (docs/32).**
   `assemble_survivors.py` was a deprecated copy of `mumdia sub-library --survivors`, which
   applies the same pair link on `peptidoform_id` while streaming both tables (1.6 GB against
@@ -265,6 +285,10 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **A build whose `git status` fails no longer claims a clean tree.** The build script read
+  a failed `git status` as a clean worktree, so the binary's `git_sha`, which every manifest
+  records, could name a commit without `-dirty` for code that differed from it. An unknown
+  state now counts as dirty; a build without git still records `unknown`.
 - **Desktop: "Add folder…" selects several spectra folders at once (#335).** A Bruker or Agilent `.d`
   and a Waters `.raw` are directories, so they are added with "Add folder…", and that dialog took
   one folder at a time: the spectra folder picker shared the single-choice setting of the output

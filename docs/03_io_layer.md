@@ -37,8 +37,9 @@ the schema-id tuples).
 
 | path | role |
 |---|---|
-| `rust/mumdia/crates/mumdia-io/src/lib.rs` | crate root: `init_logging`, `record_artifact`, `inspect`; re-exports the modules |
+| `rust/mumdia/crates/mumdia-io/src/lib.rs` | crate root: `init_logging_level`, `record_artifact`, `inspect`; re-exports the modules |
 | `rust/mumdia/crates/mumdia-io/src/table.rs` | `Col` enum (write side), `write_table`, `Table` (read side) and the typed getters |
+| `rust/mumdia/crates/mumdia-io/src/publish.rs` | `AtomicPath` (write to a sibling temp name, then rename), `publish_copy_of` / `publish_byte_copy`; re-exported from `table` |
 | `rust/mumdia/crates/mumdia-io/src/span_cache.rs` | `SpanCache`, the coalescing `ChunkReader` behind `TableFile::scan` with `ScanOptions::coalesced()` |
 | `rust/mumdia/crates/mumdia-io/src/codec.rs` | `ColumnEncoder` (parallel column encode), the codec pool (`CodecPool`, `claim`, `codec_threads`, `set_codec_threads`) shared by encode and parallel decode |
 | `rust/mumdia/crates/mumdia-io/src/report.rs` | `ArtifactReport` struct + `write_for` (the `.report.json` sidecar) |
@@ -175,13 +176,13 @@ The list above describes the original single-batch write. `write_table` now hand
 the writer the rows in `WRITE_TABLE_CHUNK_ROWS` (65,536-row) chunks through a
 `TableWriter`, which keeps one chunk of Arrow arrays resident instead of a second
 copy of the whole table; the row groups still fall at the writer's 1,048,576-row
-default. `write_table_chunked(path, nrows, chunk)` is the same write for a caller
-that produces its rows chunk by chunk: `chunk(start..end)` is called for exactly the
-ranges `write_table` would cut (one empty range for an empty table), so the file is
-byte-identical to `write_table` over the concatenated columns, including the page
-framing of an all-null column, which a different chunk sequence would move
-(`write_table_chunked_writes_the_write_table_file`). `write_table_chunked_hashed`
-is the same write, hashed as it is written ("Hash on write" below). `rt-im-train`
+default. `write_table_chunked_hashed(path, nrows, chunk)` is the same write for a
+caller that produces its rows chunk by chunk, hashed as it is written ("Hash on write"
+below): `chunk(start..end)` is called for exactly the ranges `write_table` would cut
+(one empty range for an empty table), so the file is byte-identical to `write_table`
+over the concatenated columns, including the page framing of an all-null column,
+which a different chunk sequence would move
+(`write_table_chunked_writes_the_write_table_file`). `rt-im-train`
 writes `run_windows.parquet` this way, so the seven whole columns (76 bytes per
 candidate) are never resident.
 
@@ -233,8 +234,7 @@ Values are unchanged; bytes and content hashes of capped writers change;
 uncapped writers do not plan and are byte-identical to parquet-rs's defaults.
 The same rows plan the same encodings in any chunking
 (`the_plan_depends_on_the_rows_not_the_chunks`), so the output stays
-deterministic. `MUMDIA_PARQUET_PLAN=0` restores the unplanned layout, for a
-byte comparison against a binary from before the plan. A pooled table spliced
+deterministic. A pooled table spliced
 from band artifacts carries each band's own plan in its row groups, which is
 legal parquet. This is F2 of the 2026-09-25 performance survey.
 
@@ -598,10 +598,10 @@ digest of the finished file. A writer can therefore hash while it writes:
 - hashing is opt-in per writer: `WriteOptions::content_hash()` for
   `BatchWriter::with_options`, `TableWriter::with_content_hash()`,
   `SpliceWriter::create_hashed`, `write_table_hashed`,
-  `write_table_chunked_hashed` and `write_batches_hashed`. The digest is finalised after parquet has written the
+  and `write_table_chunked_hashed`. The digest is finalised after parquet has written the
   footer (`ColumnEncoder::into_inner`, which ends in
-  `SerializedFileWriter::into_inner`, for `TableWriter`, `BatchWriter` and
-  `write_batches`; `SerializedFileWriter::into_inner` directly for
+  `SerializedFileWriter::into_inner`, for `TableWriter` and `BatchWriter`;
+  `SerializedFileWriter::into_inner` directly for
   `SpliceWriter`; both write the same footer bytes as `close`) and returned as a
   `report::Written { rows, content_hash }` by the writer's `close_hashed`;
 - it is off for files nobody records: the pool's per-row-group rewrite temp
@@ -754,9 +754,10 @@ string (`main.rs:713`).
 
 ### Logging
 
-`init_logging()` (`lib.rs:13`) initializes `tracing_subscriber` once, honouring
-`RUST_LOG` and defaulting to `info`, with `with_target(false)`. It uses
-`try_init` so a second call is a no-op rather than a panic.
+`init_logging_level(level)` (`lib.rs`) initializes `tracing_subscriber` once: an
+explicit level wins, then `RUST_LOG`, then `info`, with `with_target(false)`. It logs
+to stderr, with ANSI colour only on a terminal, and uses `try_init` so a second call
+is a no-op rather than a panic.
 
 ## Key types and functions
 
@@ -766,8 +767,7 @@ string (`main.rs:713`).
 | `Col::field` | `table.rs:83` | Arrow `Field`; scalars non-nullable, `Opt*`/lists nullable |
 | `Col::into_array` | `table.rs:107` | consuming move of the `Vec` into an `ArrayRef` (copy once) |
 | `write_table` | `table.rs:151` | validate + write one SNAPPY Parquet batch; returns row count |
-| `write_table_chunked` | `table.rs` | the `write_table` file, built from caller-produced 65,536-row chunks |
-| `write_table_chunked_hashed` | `table.rs` | `write_table_chunked`, returning the rows and the content hash taken while writing |
+| `write_table_chunked_hashed` | `table.rs` | the `write_table` file, built from caller-produced 65,536-row chunks; returns the rows and the content hash taken while writing |
 | `Table` (struct) | `table.rs:200` | read-back table: schema, batches, nrows |
 | `Table::read` | `table.rs:207` | read a Parquet file fully into memory |
 | `Table::column_names` | `table.rs:227` | schema field names, in order |
@@ -800,7 +800,7 @@ string (`main.rs:713`).
 | `record_artifact_with_hash` | `lib.rs` | the same record from a hash the caller already has |
 | `report::Written` | `report.rs` | an output's row count and report content hash, returned by each stage's `run_hashed`; `Written::record` builds the manifest record |
 | `inspect` | `lib.rs:43` | schema + head(<=10, first batch) + row count as a string |
-| `init_logging` | `lib.rs:13` | `tracing` init honouring `RUST_LOG`, default `info` |
+| `init_logging_level` | `lib.rs` | `tracing` init: an explicit level, else `RUST_LOG`, else `info`; logs to stderr |
 
 ## Configuration
 
@@ -900,20 +900,13 @@ Astral and +7% / -24% on diaPASEF; run_windows -14% / -21%. Neither is a default
   `LargeList`, so an artifact whose encoding differs between two builds (32- vs
   64-bit offsets) still reads identically; do not assume a fixed offset width
   when consuming chromatograms.
-- **Test coverage is one round-trip.** The crate's only unit test is
-  `roundtrip_mixed_columns` (`table.rs:438`), which writes then reads back
-  `U32`/`F64`/`Str`/`OptF64`/`ListF32`/`LargeListF32`, asserting among other
-  things that a `LargeListF32` column cross-reads through `list_f32`. `hash.rs`,
-  `json.rs`, `report.rs`, and `lib.rs` (`inspect`, `record_artifact`,
-  `init_logging`) have no unit tests, and the integer/bool null gotcha and the
-  `Opt*`/`ListF64` reader gaps above are consequently not exercised by the suite.
 
 ## How to extend / modify
 
 - **Add a new column type.** Add a variant to `Col` (`table.rs:23`) and extend
   the four matches: `name`, `len`, `field`, `into_array`. Decide nullability in
-  `field`. Then add the matching read-side getter on `Table` following the
-  downcast + concatenate pattern of the existing getters, and be explicit about
+  `field`. Then add the matching read side: a `push_*` decoder and a one-line getter
+  on `Table` and on `TableFile` through their `decode` helpers, and be explicit about
   null handling (prefer an `opt_*` return over a silent sentinel for anything
   that can be null in practice).
 - **Add a null-aware integer/string getter.** This is the standing correctness

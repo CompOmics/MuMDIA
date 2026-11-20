@@ -9,13 +9,12 @@
 //!
 //! Optional MS1 support: in the scans within `ms1_rt_s` before and after the spectrum, a
 //! monoisotopic peak within max(0.005 Da, `ms1_ppm`) gives link 1, plus the +1 isotope at
-//! 1.00335483507 / z link 2. A permissive supporting observation, not an isotope-envelope fit.
+//! `ISOTOPE_SPACING / z` link 2. A permissive supporting observation, not an isotope-envelope
+//! fit.
 
-use mumdia_core::constants::PROTON;
+use mumdia_core::constants::{ISOTOPE_SPACING, PROTON};
 
 use super::tags::{fit_weight, nearest, path_rms, Alphabet, Graph};
-
-pub const ISOTOPE_SPACING: f64 = 1.003_354_835_07;
 
 /// One MS1 scan: retention time, m/z ascending, intensities.
 pub type Ms1Scan = (f64, Vec<f64>, Vec<f32>);
