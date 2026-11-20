@@ -51,11 +51,12 @@ def _load(name):
     return module
 
 
-def _assigned(script, names):
+def _assigned(script, names, **imported):
     """Module-level constants and functions of `script`, without importing it (the DeepLC
-    and torch workers import their frameworks at the top)."""
+    and torch workers import their frameworks at the top). `imported` stands in for the
+    names the script imports."""
     tree = ast.parse((SCRIPTS / script).read_text(encoding="utf-8"))
-    namespace = {"re": re}
+    namespace = {"re": re, **imported}
     for node in tree.body:
         if (isinstance(node, ast.Assign)
                 and any(isinstance(t, ast.Name) and t.id in names for t in node.targets)) or (
@@ -196,19 +197,20 @@ def test_the_decoy_tokenizer_never_reads_a_terminal_group_as_residues():
 
 def test_deeplc_predicts_n_terminally_modified_rows():
     """`is_std` is the filter for what DeepLC predicts. `[Acetyl]-PEPK` must pass it, and
-    the shard recipe must select the same rows (its constants are pinned to the worker's)."""
-    w = _assigned("deeplc_finetune.py", {"STD", "MOD_RE", "strip_mods", "base_pf", "is_std"})
+    the shard recipe, which takes its rules from `_deeplc_common` as the worker does, must
+    select the same rows."""
+    common = _load("_deeplc_common")
+    w = _assigned("deeplc_finetune.py", {"STD", "strip_mods", "base_pf", "is_std"},
+                  MOD_RE=common.MOD_RE)
     for pf in ("[Acetyl]-PEPTIDEK", "DECOY_[Acetyl]-KEDITPEP", "[Acetyl]-M[Oxidation]PEPK",
                "PEPTIDEK", "PEPC[Carbamidomethyl]K"):
         assert w["is_std"](pf), pf
     assert not w["is_std"]("PEPUK")
     assert w["strip_mods"]("[Acetyl]-S[Phospho]EK") == "SEK"
-    r = _assigned("mh_shard_predict.py", {"MOD_RE", "STD_RE"})
-    assert r["MOD_RE"] == w["MOD_RE"]
     import pyarrow.compute as pc
     col = pa.array(["[Acetyl]-PEPK", "PEPK", "-PEPK", "[Acetyl]-PEPUK"])
-    stripped = pc.replace_substring_regex(col, r["MOD_RE"], "")
-    keep = pc.match_substring_regex(stripped, r["STD_RE"]).to_pylist()
+    stripped = pc.replace_substring_regex(col, common.MOD_RE, "")
+    keep = pc.match_substring_regex(stripped, common.STD_FULL_RE).to_pylist()
     assert keep == [True, True, False, False]
 
 

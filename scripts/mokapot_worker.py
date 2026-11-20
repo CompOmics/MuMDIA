@@ -10,14 +10,16 @@ with an env that has mokapot + pyarrow (py312_mumdia).
 
 Model is env-switchable so the linear-vs-NN A/B needs no code edit:
     MUMDIA_RESCORE_MODEL = nn  (default)  -> sklearn MLPClassifier in mokapot.Model
+                         = logreg         -> L2 logistic regression (MUMDIA_LR_C,
+                                             MUMDIA_LR_MAX_ITER); the Docker image sets it
                          = percolator     -> mokapot's default linear model
 NN hyperparameters (only read when MODEL=nn):
-    MUMDIA_NN_HIDDEN     = "64,32"   comma-separated hidden layer sizes
+    MUMDIA_NN_HIDDEN     = "128,64,64,32"  comma-separated hidden layer sizes
     MUMDIA_NN_SOLVER     = "adam"    adam scales to large PSM sets; lbfgs is more
                                      reproducible but memory-heavy here
     MUMDIA_NN_MAX_ITER   = "200"     NN epochs per fit
     MUMDIA_NN_ALPHA      = "1e-4"    L2 penalty
-    MUMDIA_BREW_ITERS    = "5"       mokapot semi-supervised iterations (Model.max_iter)
+    MUMDIA_BREW_ITERS    = "20"      mokapot semi-supervised iterations (Model.max_iter)
 
 Determinism note (docs/14_build_test_deploy_gotchas.md): NN training is only
 approximately reproducible. random_state/rng are pinned to 0, but with solver=adam
@@ -51,29 +53,9 @@ def make_model(mokapot):
         )
         # scaler=None -> StandardScaler (features are on mixed scales).
         return mokapot.Model(net, train_fdr=0.01, max_iter=brew_iters, rng=0)
-    if kind in ("xgb", "xgboost"):
-        # Gradient-boosted trees: nonlinear, captures feature interactions the
-        # linear models miss. Used as the second stage after a cheap prefilter,
-        # where the reduced PSM count keeps it tractable. Hist tree method +
-        # capped depth/estimators for speed on millions of PSMs.
-        from xgboost import XGBClassifier
-
-        net = XGBClassifier(
-            n_estimators=int(os.environ.get("MUMDIA_XGB_TREES", "200")),
-            max_depth=int(os.environ.get("MUMDIA_XGB_DEPTH", "6")),
-            learning_rate=float(os.environ.get("MUMDIA_XGB_LR", "0.1")),
-            subsample=0.8,
-            colsample_bytree=0.8,
-            tree_method="hist",
-            n_jobs=int(os.environ.get("MUMDIA_XGB_JOBS", "0")) or None,
-            eval_metric="logloss",
-            random_state=0,
-        )
-        # scaler=None -> StandardScaler; harmless for trees, keeps the API uniform.
-        return mokapot.Model(net, train_fdr=0.01, max_iter=brew_iters, rng=0)
     if kind != "nn":
         raise ValueError(
-            f"unknown MUMDIA_RESCORE_MODEL={kind!r} (want nn|logreg|xgb|percolator)"
+            f"unknown MUMDIA_RESCORE_MODEL={kind!r} (want nn|logreg|percolator)"
         )
 
     from sklearn.neural_network import MLPClassifier

@@ -1342,10 +1342,10 @@ moves to another function.
 | `MUMDIA_CACHE_MIN_FREE_GB` | engine | computed: 10 (GiB): the free space a library-cache store must leave on the cache's disk, measured before the copy; `0` is no margin (`library_cache.rs` `min_free_after_store`) | `rust/mumdia/crates/mumdia/src/library_cache.rs::min_free_after_store` |
 | `MUMDIA_CHROM_ROW_GROUP_ROWS` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/chromatograms.rs::row_group_rows` |
 | `MUMDIA_CONVERT_THREADS` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/stages/convert.rs::convert_threads` |
-| `MUMDIA_DEEPLC_RAW_OUTPUT` | sidecar | `""` | `scripts/deeplc_finetune.py::quiet_deeplc_progress`, `scripts/deeplc_worker.py::quiet_deeplc_progress` |
+| `MUMDIA_DEEPLC_RAW_OUTPUT` | sidecar | `""` | `scripts/_deeplc_common.py::quiet_deeplc_progress` |
 | `MUMDIA_DEEPLC_THREAD_CAP` | both | `"auto"` | `rust/mumdia/crates/mumdia/src/sched.rs::auto_overlap_threads`, `scripts/deeplc_finetune.py::main`, `scripts/deeplc_worker.py::main` |
 | `MUMDIA_DOCTOR_IMPORT_CHECK` | engine | computed: on when unset: `mumdia doctor` imports each used role's modules for real; `0` skips that import, as `--no-import-check` does (`main.rs` `real_main`) | `rust/mumdia/crates/mumdia/src/main.rs::real_main` |
-| `MUMDIA_ENTRAPMENT_MODEL` | sidecar | `"gbm"` | `scripts/entrapment_worker.py::_new_model` |
+| `MUMDIA_ENTRAPMENT_MODEL` | sidecar | `"gbm"` | `scripts/entrapment_worker.py::main` |
 | `MUMDIA_IM2DEEP_THREAD_CAP` | sidecar | `"auto"` | `scripts/im2deep_worker.py::main` |
 | `MUMDIA_KEEP_HANDOFF` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::keep_handoff` |
 | `MUMDIA_LR_C` | sidecar | `"1.0"` | `scripts/mokapot_worker.py::make_model` |
@@ -1365,11 +1365,9 @@ moves to another function.
 | `MUMDIA_NN_EARLY_STOP_TOL` | sidecar | `0.01` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_EPOCHS` | sidecar | `25` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_FEATURES` | sidecar | `""` | `scripts/nn_rescore_worker.py::main` |
-| `MUMDIA_NN_FINAL_POOL_SCORE` | sidecar | `0` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_FLUSH_DENORMAL` | sidecar | `1` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_FOLDS` | sidecar | `3` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_FOLD_KEYS` | sidecar | `""` | `scripts/nn_rescore_worker.py::main` |
-| `MUMDIA_NN_GATHER` | sidecar | `"torch"` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_HIDDEN` | sidecar | `"128,64"` in nn_rescore_worker.py; `"128,64,64,32"` in mokapot_worker.py | `scripts/mokapot_worker.py::make_model`, `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_INIT_FDR_MAX` | sidecar | `0.05` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_INIT_SAMPLE` | sidecar | `300000` | `scripts/nn_rescore_worker.py::main` |
@@ -1384,14 +1382,11 @@ moves to another function.
 | `MUMDIA_NN_PARALLEL` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_PARALLEL_THREADS` | sidecar | `""` | `scripts/nn_rescore_worker.py::_train_in_processes` |
 | `MUMDIA_NN_PREGATHER_GB` | sidecar | `8` | `scripts/nn_rescore_worker.py::main` |
-| `MUMDIA_NN_PRE_BUFFER` | sidecar | `1` | `scripts/nn_rescore_worker.py::main` |
-| `MUMDIA_NN_READ_AHEAD` | sidecar | `1` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_SCAN_MEM_GB` | sidecar | `1.0` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_SCAN_ROWS_PER_THREAD` | sidecar | `20000` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_SCAN_THREADS` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_SEED` | sidecar | `0` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_SEEDS` | sidecar | `1` | `scripts/nn_rescore_worker.py::main` |
-| `MUMDIA_NN_SELECT` | sidecar | `"window"` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_SOLVER` | sidecar | `"adam"` | `scripts/mokapot_worker.py::make_model` |
 | `MUMDIA_NN_STREAM` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_STREAM_GB` | sidecar | `4` | `scripts/nn_rescore_worker.py::main` |
@@ -1425,10 +1420,6 @@ moves to another function.
 | `MUMDIA_THERMO_PARSER` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs::locate_parser` |
 | `MUMDIA_WIDE_SCAN` | engine | computed: `plain`: the plain reader with its parallel decode for rescore's feature stream and compete's pass-through copy. `rowgroup` decodes the feature stream one row group a batch; `coalesced` reads each row group's projected column chunks in one sequential read (`stages/mod.rs` `WideScan`) | `rust/mumdia/crates/mumdia/src/stages/mod.rs::WideScan::from_env` |
 | `MUMDIA_WINDOW_FEATURES` | engine | computed: on when unset; `0` leaves the fixed-window feature family out (`features.rs` `env_families`) | `rust/mumdia/crates/mumdia/src/stages/features.rs::env_families` |
-| `MUMDIA_XGB_DEPTH` | sidecar | `"6"` | `scripts/mokapot_worker.py::make_model` |
-| `MUMDIA_XGB_JOBS` | sidecar | `"0"` | `scripts/mokapot_worker.py::make_model` |
-| `MUMDIA_XGB_LR` | sidecar | `"0.1"` | `scripts/mokapot_worker.py::make_model` |
-| `MUMDIA_XGB_TREES` | sidecar | `"200"` | `scripts/mokapot_worker.py::make_model` |
 | `OMP_NUM_THREADS` | both | `16` | `rust/mumdia/crates/mumdia/src/main.rs::apply_threads`, `scripts/nn_rescore_worker.py::main` |
 | `OneDrive` | engine | computed: set by the OneDrive client on Windows; a results, cache or temporary directory under it gets a location warning, never a refusal (`storage.rs` `location_notes`) | `rust/mumdia/crates/mumdia/src/storage.rs::onedrive_roots` |
 | `OneDriveCommercial` | engine | computed: set by the OneDrive client for a work or school account; as `OneDrive` (`storage.rs` `location_notes`) | `rust/mumdia/crates/mumdia/src/storage.rs::onedrive_roots` |
@@ -1439,7 +1430,7 @@ moves to another function.
 | `VIRTUAL_ENV` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
 | `XDG_CACHE_HOME` | engine | computed: set by the desktop environment, often unset; an absolute value puts the engine's caches in `$XDG_CACHE_HOME/mumdia` on Linux when MUMDIA_CACHE_DIR is unset (`cache.rs` `root`) | `rust/mumdia/crates/mumdia/src/cache.rs::root` |
 
-107 variables are read: 45 engine-side, 67 sidecar-side, 5 on both sides.
+98 variables are read: 45 engine-side, 58 sidecar-side, 5 on both sides.
 
 ### Variables the code sets
 
@@ -1515,6 +1506,6 @@ instead of looking like an absent field.
 
 ## Coverage
 
-26 structs and 383 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 52 enumerations, 1 named profile(s), 107 environment variables read and 27 set.
+26 structs and 383 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 52 enumerations, 1 named profile(s), 98 environment variables read and 27 set.
 
 42 field(s) carry a gating marker in their doc comment. 60 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.

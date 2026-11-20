@@ -13,22 +13,23 @@ interpreter with torch + pandas + pyarrow.
 Algorithm (per CV fold, so every PSM is scored out-of-fold by a model that never
 trained on it): initialise from the best single feature+sign, then iterate
 {recompute target-decoy q on the training folds -> targets at q<=train_fdr are
-positives, all decoys negatives -> train the MLP from scratch -> rescore} for
-`iters` rounds; score the held-out fold with the final model.
+positives, decoys negatives -> train the MLP (from scratch, or warm-started from the
+previous round under MUMDIA_NN_WARM_START) -> rescore} for `iters` rounds; score the
+held-out fold with the final model.
 
 MEMORY (multi-run / large PINs): two feature backends behind one accessor.
-    - in-memory (default for PINs <= MUMDIA_NN_STREAM_GB, 4 GB): the full standardised
-      feature matrix is held in RAM, and not much else: one n x features float32 block plus
-      one fold's gathered training rows. The load is streamed row group by row group and
-      its transients are returned to the OS before training starts. Mean/std standardisation, the same as the streaming
-      backend: one transform for every backend and every handoff, so a score does not
-      depend on which one ran (docs/31 F5).
-    - streaming memmap (large PINs, or MUMDIA_NN_STREAM=1): the PIN is read ONCE in
-      chunks into a disk-backed float32 memmap (the same mean/std, accumulated in the
-      same pass); training and scoring then draw MINIBATCHES indexed into the
-      memmap, so peak RAM is one batch + per-row metadata, NOT the whole matrix.
-      This is what makes combining many runs into one rescoring tractable: the full
-      PIN never lives in RAM at once.
+    - in-memory (the default, unless the decoded matrix exceeds MUMDIA_NN_STREAM_GB):
+      one n x features float32 block plus one fold's gathered training rows. The load is
+      streamed row group by row group (at most two decoded groups held) and its transients
+      are returned to the OS before training starts. Under MUMDIA_NN_PARALLEL (the
+      default) the block is a disk-backed memmap the training processes share. Mean/std
+      standardisation: one transform for every backend and every handoff, so a score does
+      not depend on which one ran (docs/31 F5).
+    - streaming memmap (large PINs, or MUMDIA_NN_STREAM=1): the matrix is a disk-backed
+      float32 memmap, filled by the in-memory loader from a parquet or raw handoff (a
+      tab-separated PIN is read once in chunks), with the per-row metadata read in
+      batches; training and scoring then draw MINIBATCHES indexed into the memmap, so
+      peak RAM is one batch + per-row metadata, NOT the whole matrix.
 
 Determinism note (docs/14_build_test_deploy_gotchas.md): NN training is only
 approximately reproducible. Set MUMDIA_NN_SEEDS>1 to ensemble seeds and average
@@ -39,7 +40,7 @@ file extension (.parquet / .pq). Parquet avoids serialising the whole feature ma
 measured at 34% of a rescore on a 1.5M-row subset, and worse at full scale where a 30 GB text
 PIN also forced the streaming backend. Column names and semantics are identical either way.
 
-A third form, the raw handoff (`rescore.handoff = raw`, opt-in), is given as a
+A third form, the raw handoff (`rescore.handoff = raw`, the default), is given as a
 `<name>.raw.json` description: the features as one row-major little-endian float32 `.npy`
 matrix (rows x features), the metadata columns (SpecId, Label, ScanNr, ExpMass, CalcMass,
 Peptide, Proteins) in a small parquet beside it, and in the JSON the feature names, the
@@ -49,7 +50,8 @@ worker's matrix with no parquet decode and no column-to-row transpose, and the f
 moments are summed over the same partition as the parquet load, so the matrix, mean, std
 and scores are byte-identical to a parquet handoff of the same rows.
 
-Env knobs (all optional):
+Env knobs (all optional). The engine sets the training knobs from `rescore.*` on every
+run, so the defaults below are those of the worker run by hand:
     MUMDIA_NN_FOLDS       = 3        cross-validation folds
     MUMDIA_NN_ITERS       = 5        semi-supervised self-training iterations
     MUMDIA_NN_EPOCHS      = 25       NN epochs per iteration
@@ -179,11 +181,9 @@ Env knobs (all optional):
                                      are added in the original order, so the matrix, mean and
                                      std are byte-identical. auto = min(8, torch CPU threads);
                                      each thread holds a 32,768 x features float64 buffer.
-                                     0 = the original serial loop (no read-ahead/pre_buffer).
-    MUMDIA_NN_READ_AHEAD  = 1        decode row group r+1 on a reader thread while r is being
-                                     filled (at most two decoded groups resident). 0 = off.
-    MUMDIA_NN_PRE_BUFFER  = 1        open the reader's ParquetFile with pre_buffer=True
-                                     (coalesced column-chunk reads). 0 = off.
+                                     A reader thread decodes row group r+1 while r is filled
+                                     (at most two decoded groups resident), with coalesced
+                                     column-chunk reads (pre_buffer). 1 = one fill thread.
     MUMDIA_NN_SCAN_THREADS = auto    threads for the init feature scan (one column, both
                                      signs, per task; the winner is reduced in the serial
                                      (column, sign) order, so the choice is identical).
@@ -195,20 +195,6 @@ Env knobs (all optional):
                                      together, at about 64 bytes per sample row each. Binds
                                      only when the init sample escalates to millions of
                                      rows (3 tasks at 4.8M rows).
-    MUMDIA_NN_SELECT      = window   how each round selects its positives: window = sort
-                                     only the top rows down to the (floor(fdr * targets)+1)-th
-                                     best decoy, certify that no later row can be accepted,
-                                     else fall back to the full sort; the hybrid/margin decoy
-                                     order uses one uint64 key sort. Both reproduce the stable
-                                     argsort exactly. full = the previous full sort each round.
-    MUMDIA_NN_GATHER      = torch    how `score_idx` gathers a scoring batch on the
-                                     in-memory backend: torch = `torch.index_select` into
-                                     one reused numpy-allocated buffer (multi-threaded);
-                                     numpy = the previous `Xs[idx]` fancy index. Same
-                                     values, same shapes; byte-identical scores where
-                                     checked (Windows x86-64, torch 2.6, CPU and CUDA; the
-                                     tests repeat it on the host that runs them). The
-                                     streaming backend always uses the numpy path.
     MUMDIA_NN_PARALLEL    = auto     trains the (seed, fold) tasks in spawned processes, the
                                      default since 2026-09-27. The matrix is shared through
                                      a read-only memmap next to the output (the in-memory
@@ -225,11 +211,6 @@ Env knobs (all optional):
                                      auto = the serial worker's resolved thread count. Fixed
                                      per process, so the arithmetic of a task does not depend
                                      on how many processes run.
-    MUMDIA_NN_FINAL_POOL_SCORE = 0   1 = also score the training pool after the LAST
-                                     round and log its target count. Those scores feed no
-                                     later selection, so by default the pass is skipped and
-                                     the per-fold log line reports the held-out fold's
-                                     count instead. Scores are identical either way.
 
 Performance notes (measured on a 32-core CPU box, 1.3M-PSM rescore):
     The MLP is tiny (387->128->64->1, ~58k params) but is executed ~160,500 times
@@ -405,8 +386,9 @@ def torch_thread_cap():
     if raw not in ("", "auto"):
         try:
             return max(0, int(float(raw))), "MUMDIA_NN_THREAD_CAP"
-        except ValueError:
-            pass
+        except (ValueError, OverflowError):
+            print("WARNING: MUMDIA_NN_THREAD_CAP=%r is not a number, 0 or auto; "
+                  "using auto" % raw, flush=True)
     p_cores = performance_cores()
     if p_cores:
         return p_cores, f"{p_cores} performance cores on a hybrid CPU"
@@ -610,14 +592,12 @@ def _column_to_numpy(col):
         return col.to_numpy()
 
 
-def _open_parquet(path, pre_buffer):
+def _open_parquet(path):
     """`pq.ParquetFile`, with `pre_buffer` (coalesced column-chunk reads) when available."""
-    if pre_buffer:
-        try:
-            return pq.ParquetFile(path, pre_buffer=True)
-        except TypeError:  # pragma: no cover - pyarrow without the keyword
-            pass
-    return pq.ParquetFile(path)
+    try:
+        return pq.ParquetFile(path, pre_buffer=True)
+    except TypeError:  # pragma: no cover - pyarrow without the keyword
+        return pq.ParquetFile(path)
 
 
 _TLS = threading.local()
@@ -664,15 +644,14 @@ def _block_moments(dst):
     return p1, p2
 
 
-def fill_parquet_matrix(pin_path, feat_cols, n, chunk, out, threads=1, read_ahead=True,
-                        pre_buffer=True, initializer=None):
+def fill_parquet_matrix(pin_path, feat_cols, n, chunk, out, threads=1, initializer=None):
     """Decode the handoff's feature columns into `out` (n x nf float32); return (s1, s2).
 
-    Byte-for-byte the matrix and the float64 column sums of the original loop
-    (`_fill_parquet_matrix_legacy`), produced faster:
-      - `read_ahead`: one reader thread, with its own ParquetFile, decodes row group r+1
-        while row group r is filled, so at most two decoded groups are held;
-      - `pre_buffer`: that ParquetFile coalesces column-chunk reads;
+    Byte-for-byte the matrix and the float64 column sums of the original serial loop (a
+    copy of it is the oracle in tests/python/test_nn_rescore_worker.py), produced faster:
+      - one reader thread, with its own ParquetFile, decodes row group r+1 while row
+        group r is filled, so at most two decoded groups are held, and that ParquetFile
+        coalesces column-chunk reads (`pre_buffer`);
       - `threads`: the moment sub-blocks of a group (see `moment_blocks`) are filled into
         disjoint row ranges of `out` in parallel, straight from the decoded columns, with no
         intermediate block, and their partial sums are added in sub-block order.
@@ -690,27 +669,24 @@ def fill_parquet_matrix(pin_path, feat_cols, n, chunk, out, threads=1, read_ahea
         t0 = time.time()
         pf = state.get("pf")
         if pf is None:
-            pf = state["pf"] = _open_parquet(pin_path, pre_buffer)
+            pf = state["pf"] = _open_parquet(pin_path)
         tbl = pf.read_row_group(rg, columns=feat_cols)
         rows = tbl.num_rows
         arrays = [_column_to_numpy(tbl.column(j)) for j in range(tbl.num_columns)]
         del tbl
         return rows, arrays, time.time() - t0
 
-    reader = ThreadPoolExecutor(max_workers=1, initializer=initializer) if read_ahead else None
+    reader = ThreadPoolExecutor(max_workers=1, initializer=initializer)
     pool = (ThreadPoolExecutor(max_workers=int(threads), initializer=initializer)
             if threads > 1 else None)
     off = 0
     try:
-        pending = reader.submit(read, 0) if (reader is not None and nrg) else None
+        pending = reader.submit(read, 0) if nrg else None
         for rg in range(nrg):
             tw = time.time()
-            if reader is not None:
-                rows, arrays, busy = pending.result()
-                _detail("load: read wait", time.time() - tw)
-                pending = reader.submit(read, rg + 1) if rg + 1 < nrg else None
-            else:
-                rows, arrays, busy = read(rg)
+            rows, arrays, busy = pending.result()
+            _detail("load: read wait", time.time() - tw)
+            pending = reader.submit(read, rg + 1) if rg + 1 < nrg else None
             _detail("load: read", busy)
             tf = time.time()
             if off + rows > n:
@@ -730,8 +706,7 @@ def fill_parquet_matrix(pin_path, feat_cols, n, chunk, out, threads=1, read_ahea
             del arrays, parts
             _detail("load: fill + moments", time.time() - tf)
     finally:
-        if reader is not None:
-            reader.shutdown(wait=True)
+        reader.shutdown(wait=True)
         if pool is not None:
             pool.shutdown(wait=True)
         state.clear()
@@ -739,46 +714,6 @@ def fill_parquet_matrix(pin_path, feat_cols, n, chunk, out, threads=1, read_ahea
         # features float64, 0.1 GB at 387) on the main thread, which lives for the whole
         # run. Pool threads release theirs when they exit.
         vars(_TLS).pop("moments", None)
-    if off != n:
-        raise RuntimeError(f"parquet row mismatch: metadata {n}, features {off}")
-    return s1, s2
-
-
-def _fill_parquet_matrix_legacy(pin_path, feat_cols, n, chunk, out):
-    """The original serial load loop (MUMDIA_NN_LOAD_THREADS=0); returns (s1, s2)."""
-    nf = len(feat_cols)
-    s1 = np.zeros(nf, np.float64)
-    s2 = np.zeros(nf, np.float64)
-    _pf = pq.ParquetFile(pin_path)
-    off = 0
-    _tbl = _b = None
-    # One row group at a time. `iter_batches` reads ahead and decodes groups in
-    # parallel, and its buffered batches grew into a second copy of the matrix:
-    # measured, the worker climbed to 11.2 GB while filling a 4.85 GB `Xs`, then
-    # fell to 6.3 GB the moment the loop ended. Reading a group, slicing it into
-    # CHUNK-row blocks and dropping it bounds the transient to one group, which the
-    # engine writes at 131,072 rows (200 MB at 387 features); a file with parquet's
-    # default 1,048,576-row groups still loads, at 1.6 GB per group.
-    for _rg in range(_pf.num_row_groups):
-        _tr = time.time()
-        _tbl = _pf.read_row_group(_rg, columns=feat_cols)
-        _tf = time.time()
-        _detail("load: read", _tf - _tr)
-        for _s0 in range(0, _tbl.num_rows, chunk):
-            _b = _tbl.slice(_s0, chunk)
-            k = _b.num_rows
-            blk = np.empty((k, nf), np.float32)
-            for j in range(nf):
-                blk[:, j] = _b.column(j).to_numpy(zero_copy_only=False)
-            np.nan_to_num(blk, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-            out[off:off + k] = blk
-            _accumulate_moments(blk, s1, s2)
-            off += k
-            del blk
-        del _tbl, _b
-        _tbl = _b = None
-        _detail("load: fill + moments", time.time() - _tf)
-    del _pf, _tbl, _b
     if off != n:
         raise RuntimeError(f"parquet row mismatch: metadata {n}, features {off}")
     return s1, s2
@@ -1411,9 +1346,6 @@ def _build_trainer(torch, cfg, X, stream, y, fold, feat_cols, keyed_shuffle=Fals
     EARLY_STOP_TOL = cfg.EARLY_STOP_TOL
     PREGATHER_GB = cfg.PREGATHER_GB
     CLAMP_TINY = cfg.CLAMP_TINY
-    FINAL_POOL_SCORE = cfg.FINAL_POOL_SCORE
-    SELECT = cfg.SELECT
-    GATHER = cfg.GATHER
     DEVICE = cfg.DEVICE
     DEBUG_DENORMALS = cfg.DEBUG_DENORMALS
     SCAN_THREADS = cfg.SCAN_THREADS
@@ -1431,7 +1363,7 @@ def _build_trainer(torch, cfg, X, stream, y, fold, feat_cols, keyed_shuffle=Fals
     # A torch view of the in-memory matrix (shared memory, no copy) for `score_idx`. A
     # read-only memmap (a parallel child's) makes torch warn that writes would be
     # undefined; nothing here writes to it.
-    if not stream and GATHER == "torch":
+    if not stream:
         import warnings
 
         with warnings.catch_warnings():
@@ -1617,8 +1549,7 @@ def _build_trainer(torch, cfg, X, stream, y, fold, feat_cols, keyed_shuffle=Fals
         score_tr_current = True
         for it in range(ITERS):
             _tsel = time.time()
-            pos = (select_positives(score_tr, tgt_tr, TRAIN_FDR)
-                   if SELECT == "window" else None)
+            pos = select_positives(score_tr, tgt_tr, TRAIN_FDR)
             if pos is not None and pos.any():
                 SELECT_COUNTS["window"] = SELECT_COUNTS.get("window", 0) + 1
             else:
@@ -1698,8 +1629,7 @@ def _build_trainer(torch, cfg, X, stream, y, fold, feat_cols, keyed_shuffle=Fals
                     neg_i = rs_n.choice(neg_i, size=min(keep_n, len(neg_i)), replace=False)
                 else:
                     s_neg = score_tr[neg]
-                    order = (desc_order(s_neg) if SELECT == "window"
-                             else np.argsort(-s_neg, kind="stable"))
+                    order = desc_order(s_neg)
                     if NEG_SELECT == "margin":
                         take = order[:keep_n]
                     else:
@@ -1773,7 +1703,7 @@ def _build_trainer(torch, cfg, X, stream, y, fold, feat_cols, keyed_shuffle=Fals
                     "adam_moments=%d" % ((seed, f) + _denormal_census(model, _xb, optim)),
                     flush=True,
                 )
-            if it == ITERS - 1 and not FINAL_POOL_SCORE:
+            if it == ITERS - 1:
                 # The last round's pool scores would feed nothing but the log line
                 # below: there is no next selection to make from them. Skipping the
                 # pass leaves every score untouched (it neither trains nor draws from an
@@ -2015,7 +1945,6 @@ def main():
     EARLY_STOP_TOL = env_f("MUMDIA_NN_EARLY_STOP_TOL", 0.01)
     PREGATHER_GB = env_f("MUMDIA_NN_PREGATHER_GB", 8)
     CLAMP_TINY = env_f("MUMDIA_NN_CLAMP_TINY", 1e-20)
-    FINAL_POOL_SCORE = env_i("MUMDIA_NN_FINAL_POOL_SCORE", 0) != 0
     # The (seed, fold) tasks in spawned processes with the epoch shuffle keyed per task, the
     # default since 2026-09-27: "auto" (stored as -1) sizes the process count once the
     # matrix is known (`auto_parallel_processes`), N > 0 fixes it, 0 is the serial loop
@@ -2029,12 +1958,6 @@ def main():
         except ValueError:
             raise ValueError(
                 "MUMDIA_NN_PARALLEL must be auto, 0 or a process count (got %r)" % _par)
-    SELECT = os.environ.get("MUMDIA_NN_SELECT", "window").strip().lower()
-    if SELECT not in ("window", "full"):
-        raise ValueError("MUMDIA_NN_SELECT must be window or full (got %r)" % SELECT)
-    GATHER = os.environ.get("MUMDIA_NN_GATHER", "torch").strip().lower()
-    if GATHER not in ("torch", "numpy"):
-        raise ValueError("MUMDIA_NN_GATHER must be torch or numpy (got %r)" % GATHER)
     # auto (default) uses the GPU when torch can see one; cuda/cpu force it. Forcing is
     # what makes a device-only comparison possible: same environment, same package
     # versions, same data, only the device differs (CUDA_VISIBLE_DEVICES="" does NOT
@@ -2108,18 +2031,15 @@ def main():
 
     _FLUSH["on"] = FLUSH_DENORMAL
 
-    # The parquet in-memory load: threads that fill the matrix (0 = the original serial loop,
-    # with no read-ahead and no pre_buffer), a one-deep row-group read-ahead, and pre_buffer.
-    # auto is at most 8: each fill thread holds a 32,768-row float64 moment buffer (0.1 GB at
-    # 387 features), and the fill is memory-bound well before 8 threads.
+    # The threads that fill the matrix from a parquet or raw handoff and standardise it. auto
+    # is at most 8: each fill thread holds a 32,768-row float64 moment buffer (0.1 GB at 387
+    # features), and the fill is memory-bound well before 8 threads.
     _load_raw = os.environ.get("MUMDIA_NN_LOAD_THREADS", "auto").strip().lower()
     LOAD_THREADS = (
         min(8, torch.get_num_threads())
         if _load_raw in ("", "auto")
-        else max(0, int(float(_load_raw)))
+        else max(1, int(float(_load_raw)))
     )
-    READ_AHEAD = env_i("MUMDIA_NN_READ_AHEAD", 1) != 0
-    PRE_BUFFER = env_i("MUMDIA_NN_PRE_BUFFER", 1) != 0
     # Threads for the worker's own numpy thread pools (the init scan here). Defaults to the
     # torch CPU thread count resolved above, which already carries the cap.
     _scan_raw = os.environ.get("MUMDIA_NN_SCAN_THREADS", "auto").strip().lower()
@@ -2288,16 +2208,14 @@ def main():
         _idx = [_pos[c] for c in feat_cols]
         if _idx != list(range(len(RAW["features"]))):
             raw_idx = np.asarray(_idx, dtype=np.intp)
-    if not stream:
-        # ---- in-memory backend (median/IQR standardisation) ----
-        if IS_PQ or IS_RAW:
-            # ---- Parquet in-memory: one float32 matrix, standardised in place ----
-            # Metadata columns first; they are small as long as they stay Arrow. The
-            # previous `to_pylist()` round trips made a Python string per row out of SpecId
-            # and Peptide (~0.7 GB on a 3M-row pool) that then sat in the allocator's
-            # high-water mark for the whole run. Peptide is only needed when there is no
-            # fold-key table to fold on.
-            _cols = ["SpecId", "Label"] + ([] if fold_keys is not None else ["Peptide"])
+    if IS_PQ or IS_RAW:
+        # ---- Parquet or raw handoff: one float32 matrix, standardised in place ----
+        # Metadata columns first; they are small as long as they stay Arrow. The previous
+        # `to_pylist()` round trips made a Python string per row out of SpecId and Peptide
+        # (~0.7 GB on a 3M-row pool) that then sat in the allocator's high-water mark for
+        # the whole run. Peptide is only needed when there is no fold-key table to fold on.
+        _cols = ["SpecId", "Label"] + ([] if fold_keys is not None else ["Peptide"])
+        if not stream:
             _tb = pq.read_table(meta_path, columns=_cols)
             y = (_tb.column("Label").to_numpy() == 1).astype(np.float32)
             n = len(y)
@@ -2307,85 +2225,90 @@ def main():
             else:
                 fold = _folds(_tb.column("Peptide").to_pylist())
             del _tb
-            if PARALLEL != 0:
-                # The children map this file read-only instead of each copying the matrix.
-                mm_path = os.path.abspath(out_path + ".feat.mm")
-                _LEFTOVERS.append(mm_path)
-                Xs = np.memmap(mm_path, dtype=np.float32, mode="w+", shape=(n, nf))
-            else:
-                Xs = np.empty((n, nf), np.float32)
-            if IS_RAW:
-                s1, s2 = fill_raw_matrix(
-                    RAW["matrix"], raw_idx, n, CHUNK, Xs, int(RAW["row_group_rows"]),
-                    threads=LOAD_THREADS, initializer=_fp_thread_init,
-                )
-            elif LOAD_THREADS == 0:
-                s1, s2 = _fill_parquet_matrix_legacy(pin_path, feat_cols, n, CHUNK, Xs)
-            else:
-                s1, s2 = fill_parquet_matrix(
-                    pin_path, feat_cols, n, CHUNK, Xs, threads=LOAD_THREADS,
-                    read_ahead=READ_AHEAD, pre_buffer=PRE_BUFFER,
-                    initializer=_fp_thread_init,
-                )
-            if IS_RAW:
-                # Copied into `Xs`: the mapping is not read again.
-                RAW.pop("matrix", None)
-            # The decoded Arrow buffers are garbage now; hand them back before training
-            # starts, or they stay in RSS for the whole run.
-            _release_allocator_slack()
-            _ts = time.time()
-            mean, std = moments_to_mean_std(s1, s2, n)
-            standardise_matrix(Xs, mean, std, CHUNK, threads=LOAD_THREADS,
-                               initializer=_fp_thread_init)
-            _detail("load: standardise", time.time() - _ts)
         else:
-            pin = pd.read_csv(pin_path, sep=chr(9))
-        if not (IS_PQ or IS_RAW):
-            y = (pin["Label"].to_numpy() == 1).astype(np.float32)
-            cids = np.array(
-                [int(s.rsplit("_", 1)[-1]) for s in pin["SpecId"].astype(str)], np.int64
-            )
-            fold = _folds(pin["Peptide"].tolist())
-            X = np.nan_to_num(
-                pin[feat_cols].to_numpy(np.float32), nan=0.0, posinf=0.0, neginf=0.0
-            )
-            del pin
-            # Mean/std, the same transform as the parquet and streaming backends.
-            #
-            # This path used median/IQR while the other two used mean/std, so the same PSM
-            # pool produced different scores depending on `rescore.handoff` and on which
-            # side of MUMDIA_NN_STREAM_GB the matrix fell: a 3.99 GB PIN was standardised
-            # one way and a 4.01 GB PIN the other, with nothing in the log to say which
-            # (docs/31 F5). Converging on mean/std leaves the shipped default (parquet)
-            # and every published benchmark unchanged, and only moves this legacy path.
-            mean = X.mean(axis=0, dtype=np.float64).astype(np.float32)
-            std = X.std(axis=0, dtype=np.float64).astype(np.float32)
-            std[std == 0] = 1.0
-            Xs = np.clip((X - mean) / std, -8, 8).astype(np.float32)
-            del X
-            n = len(y)
-            if PARALLEL != 0:
-                mm_path = os.path.abspath(out_path + ".feat.mm")
-                _LEFTOVERS.append(mm_path)
-                _mm = np.memmap(mm_path, dtype=np.float32, mode="w+", shape=Xs.shape)
-                _mm[:] = Xs
-                Xs = _mm
-                del _mm
-    else:
-        # ---- streaming memmap backend (mean/std, one text pass) ----
+            # Streamed only above twice the free memory, so the metadata is read in
+            # CHUNK-row batches as well.
+            n = int(pq.read_metadata(meta_path).num_rows)
+            y = np.empty(n, np.float32)
+            cids = np.empty(n, np.int64)
+            fold = np.empty(n, np.int16)
+            off = 0
+            for _b in pq.ParquetFile(meta_path).iter_batches(batch_size=CHUNK, columns=_cols):
+                k = _b.num_rows
+                y[off:off + k] = _b.column("Label").to_numpy() == 1
+                cids[off:off + k] = _row_ids(_b.column("SpecId"))
+                fold[off:off + k] = _folds(range(k) if fold_keys is not None
+                                           else _b.column("Peptide").to_pylist(), off)
+                off += k
+        if stream or PARALLEL != 0:
+            # On disk: the streaming backend's memmap, and under parallel training the file
+            # the children map read-only instead of each copying the matrix. Resolved
+            # absolutely, so a rescore launched from another directory can create it.
+            mm_path = os.path.abspath(out_path + ".feat.mm")
+            _LEFTOVERS.append(mm_path)
+            Xs = np.memmap(mm_path, dtype=np.float32, mode="w+", shape=(n, nf))
+        else:
+            Xs = np.empty((n, nf), np.float32)
         if IS_RAW:
-            n = int(RAW["rows"])
-        elif IS_PQ:
-            n = int(pq.read_metadata(pin_path).num_rows)
+            s1, s2 = fill_raw_matrix(
+                RAW["matrix"], raw_idx, n, CHUNK, Xs, int(RAW["row_group_rows"]),
+                threads=LOAD_THREADS, initializer=_fp_thread_init,
+            )
+            # Copied into `Xs`: the mapping is not read again.
+            RAW.pop("matrix", None)
         else:
-            with open(pin_path, "rb") as fh:
-                n = sum(1 for _ in fh) - 1
-        # Resolve ABSOLUTELY: this used to be a path relative to the caller's cwd, so a
-        # rescore launched from a different directory failed with a bare
-        # `OSError: [Errno 22]` naming a path it could not create.
+            s1, s2 = fill_parquet_matrix(
+                pin_path, feat_cols, n, CHUNK, Xs, threads=LOAD_THREADS,
+                initializer=_fp_thread_init,
+            )
+        # The decoded Arrow buffers are garbage now; hand them back before training
+        # starts, or they stay in RSS for the whole run.
+        _release_allocator_slack()
+        _ts = time.time()
+        mean, std = moments_to_mean_std(s1, s2, n)
+        standardise_matrix(Xs, mean, std, CHUNK, threads=LOAD_THREADS,
+                           initializer=_fp_thread_init)
+        _detail("load: standardise", time.time() - _ts)
+    elif not stream:
+        # ---- the tab-separated PIN, in memory ----
+        pin = pd.read_csv(pin_path, sep=chr(9))
+        y = (pin["Label"].to_numpy() == 1).astype(np.float32)
+        cids = np.array(
+            [int(s.rsplit("_", 1)[-1]) for s in pin["SpecId"].astype(str)], np.int64
+        )
+        fold = _folds(pin["Peptide"].tolist())
+        X = np.nan_to_num(
+            pin[feat_cols].to_numpy(np.float32), nan=0.0, posinf=0.0, neginf=0.0
+        )
+        del pin
+        # Mean/std, the same transform as the parquet and streaming backends.
+        #
+        # This path used median/IQR while the other two used mean/std, so the same PSM
+        # pool produced different scores depending on `rescore.handoff` and on which
+        # side of MUMDIA_NN_STREAM_GB the matrix fell: a 3.99 GB PIN was standardised
+        # one way and a 4.01 GB PIN the other, with nothing in the log to say which
+        # (docs/31 F5). Converging on mean/std leaves the shipped default (parquet)
+        # and every published benchmark unchanged, and only moves this legacy path.
+        mean = X.mean(axis=0, dtype=np.float64).astype(np.float32)
+        std = X.std(axis=0, dtype=np.float64).astype(np.float32)
+        std[std == 0] = 1.0
+        Xs = np.clip((X - mean) / std, -8, 8).astype(np.float32)
+        del X
+        n = len(y)
+        if PARALLEL != 0:
+            mm_path = os.path.abspath(out_path + ".feat.mm")
+            _LEFTOVERS.append(mm_path)
+            _mm = np.memmap(mm_path, dtype=np.float32, mode="w+", shape=Xs.shape)
+            _mm[:] = Xs
+            Xs = _mm
+            del _mm
+    else:
+        # ---- the tab-separated PIN, streamed into a memmap (mean/std, one text pass) ----
+        with open(pin_path, "rb") as fh:
+            n = sum(1 for _ in fh) - 1
         mm_path = os.path.abspath(out_path + ".feat.mm")
         _LEFTOVERS.append(mm_path)
-        mm = np.memmap(mm_path, dtype=np.float32, mode="w+", shape=(n, nf))
+        Xs = np.memmap(mm_path, dtype=np.float32, mode="w+", shape=(n, nf))
         y = np.empty(n, np.float32)
         cids = np.empty(n, np.int64)
         fold = np.empty(n, np.int16)
@@ -2393,52 +2316,22 @@ def main():
         s2 = np.zeros(nf, np.float64)
         keep = set(["SpecId", "Label", "Peptide"] + feat_cols)
         off = 0
-        def _chunks():
-            "Yield fixed-size frames from either backing format."
-            if IS_RAW:
-                # The metadata parquet in CHUNK-row batches, as `iter_batches` cuts the
-                # parquet handoff (across its row groups), with the same rows of the matrix:
-                # the float32 values the parquet path takes out of its frame.
-                pf = pq.ParquetFile(meta_path)
-                mat = RAW["matrix"]
-                r0 = 0
-                for batch in pf.iter_batches(batch_size=CHUNK,
-                                             columns=["SpecId", "Label", "Peptide"]):
-                    k = batch.num_rows
-                    block = mat[r0:r0 + k] if raw_idx is None else mat[r0:r0 + k][:, raw_idx]
-                    r0 += k
-                    yield batch.to_pandas(), block
-            elif IS_PQ:
-                pf = pq.ParquetFile(pin_path)
-                cols = ["SpecId", "Label", "Peptide"] + feat_cols
-                for batch in pf.iter_batches(batch_size=CHUNK, columns=cols):
-                    yield batch.to_pandas(), None
-            else:
-                for ch in pd.read_csv(pin_path, sep=chr(9),
-                                      usecols=lambda c: c in keep, chunksize=CHUNK):
-                    yield ch, None
-
-        for chunk, block in _chunks():
+        for chunk in pd.read_csv(pin_path, sep=chr(9), usecols=lambda c: c in keep,
+                                 chunksize=CHUNK):
             k = len(chunk)
-            if block is None:
-                block = chunk[feat_cols].to_numpy(np.float32)
-            xf = np.nan_to_num(np.asarray(block, dtype=np.float32), nan=0.0, posinf=0.0,
+            xf = np.nan_to_num(chunk[feat_cols].to_numpy(np.float32), nan=0.0, posinf=0.0,
                                neginf=0.0)
-            mm[off:off + k] = xf
+            Xs[off:off + k] = xf
             _accumulate_moments(xf, s1, s2)
             y[off:off + k] = (chunk["Label"].to_numpy() == 1).astype(np.float32)
             cids[off:off + k] = [int(s.rsplit("_", 1)[-1]) for s in chunk["SpecId"].astype(str)]
             fold[off:off + k] = _folds(chunk["Peptide"].tolist(), off)
             off += k
-        if IS_RAW:
-            RAW.pop("matrix", None)
-        mean = (s1 / n).astype(np.float32)
-        std = np.sqrt(np.maximum(s2 / n - (s1 / n) ** 2, 1e-12)).astype(np.float32)
-        std[std == 0] = 1.0
+        mean, std = moments_to_mean_std(s1, s2, n)
         # standardise the memmap in place, chunked (binary, sequential, low RAM)
         for i in range(0, n, CHUNK):
-            mm[i:i + CHUNK] = np.clip((mm[i:i + CHUNK] - mean) / std, -8, 8)
-        mm.flush()
+            Xs[i:i + CHUNK] = np.clip((Xs[i:i + CHUNK] - mean) / std, -8, 8)
+        Xs.flush()
     _t = _tick("1_pin_read_standardise", _t)
     init_sample_limit = env_i("MUMDIA_NN_INIT_SAMPLE", 300000)
     print(f"nn_rescore_worker: device={DEVICE} backend={'stream' if stream else 'in-memory'} "
@@ -2450,12 +2343,12 @@ def main():
         EPOCHS=EPOCHS, HIDDEN=HIDDEN, DROPOUT=DROPOUT, LR=LR, WD=WD, BATCH=BATCH,
         TRAIN_FDR=TRAIN_FDR, INIT_FDR_MAX=INIT_FDR_MAX, EARLY_STOP=EARLY_STOP,
         EARLY_STOP_TOL=EARLY_STOP_TOL, PREGATHER_GB=PREGATHER_GB, CLAMP_TINY=CLAMP_TINY,
-        FINAL_POOL_SCORE=FINAL_POOL_SCORE, SELECT=SELECT, GATHER=GATHER, DEVICE=DEVICE,
+        DEVICE=DEVICE,
         DEBUG_DENORMALS=DEBUG_DENORMALS, SCAN_THREADS=SCAN_THREADS,
         SCAN_ROWS_PER_THREAD=SCAN_ROWS_PER_THREAD, SCAN_MEM_BYTES=SCAN_MEM_BYTES,
         INIT_SAMPLE=init_sample_limit,
     )
-    X = mm if stream else Xs
+    X = Xs
     side_paths = _LEFTOVERS
     run_fold = None
     try:
@@ -2496,7 +2389,7 @@ def main():
         # Drop every reference to the memmap (the trainer's torch view included) before
         # removing its file: Windows refuses to delete a file that is still mapped. On an
         # error the traceback still references it; `_entry` retries once that is released.
-        mm = Xs = X = run_fold = None
+        Xs = X = run_fold = None
         _remove_leftovers()
     _print_timers()
     print(f"nn_rescore_worker: {n} PSMs rescored (targets+decoys), {N_SEEDS} seed(s), "

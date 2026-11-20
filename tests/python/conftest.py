@@ -139,13 +139,16 @@ def import_module_in_fresh_interpreter(script, timeout=300):
     and pyarrow are already loaded by the time any test runs, so an in-process
     import of a DeepLC worker exercises the wrong order and, on Windows,
     reproduces the very `WinError 1114` the ordering exists to prevent. A fresh
-    subprocess is also exactly how the engine runs the worker.
+    subprocess is also exactly how the engine runs the worker, and like the engine's
+    `python <script>` it puts the script's directory first on `sys.path`, where the
+    shared modules (`_deeplc_common`, `_torch_threads`) are found.
     """
     path = Path(script)
     if not path.is_absolute():
         path = SCRIPTS / script
     code = (
-        "import importlib.util, sys\n"
+        "import importlib.util, os, sys\n"
+        "sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[1])))\n"
         "spec = importlib.util.spec_from_file_location('w', sys.argv[1])\n"
         "m = importlib.util.module_from_spec(spec)\n"
         "spec.loader.exec_module(m)\n"

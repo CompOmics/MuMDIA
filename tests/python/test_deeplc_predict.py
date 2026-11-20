@@ -28,6 +28,12 @@ THREAD_HELPERS = [
 ]
 TORCH_WORKERS = ["deeplc_worker.py", "deeplc_finetune.py", "im2deep_worker.py",
                  "nn_rescore_worker.py"]
+# What `_deeplc_common.py` holds for the DeepLC workers, the IM2Deep worker and the shard
+# recipe, under the names the copies had.
+DEEPLC_COPIES = {"load_base_model", "_DropBlankProgress", "quiet_deeplc_progress",
+                 "_check_deeplc_version", "_version_tuple", "library_bases",
+                 "unique_standard_bases", "_bases", "MOD_RE", "STD_RE", "STD_FULL_RE",
+                 "DECOY_PREFIX_RE", "_MIN_DEEPLC"}
 
 
 def _function_sources(script, names):
@@ -51,6 +57,14 @@ def _thread_helpers():
     return {name: getattr(module, name) for name in THREAD_HELPERS}
 
 
+def _deeplc_common():
+    """`scripts/_deeplc_common.py`, which is pure stdlib at import."""
+    spec = importlib.util.spec_from_file_location("_deeplc_common", SCRIPTS / "_deeplc_common.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _deeplc_cap(helpers):
     return helpers["thread_cap"]("MUMDIA_DEEPLC_THREAD_CAP", "auto")
 
@@ -70,10 +84,10 @@ def test_the_torch_workers_share_one_copy_of_the_thread_helpers():
     """One module holds the thread policy; no worker carries a copy that could drift.
 
     The copies used to be pinned to the same source text by this test, and the rescorer's
-    own copy had already drifted (no pair fallback, no affinity count without sysfs).
-    `load_base_model` is still copied between the two DeepLC workers: `deeplc_worker.py`
-    cannot import `deeplc_finetune.py`, whose module body pins the OpenMP pools and imports
-    psm_utils.
+    own copy had already drifted (no pair fallback, no affinity count without sysfs). The
+    DeepLC helpers went the same way: `deeplc_worker.py` cannot import `deeplc_finetune.py`,
+    whose module body pins the OpenMP pools and imports psm_utils, so they were copied
+    between the two, and the shard recipe and the IM2Deep worker held copies of their own.
     """
     for script in TORCH_WORKERS:
         text = (SCRIPTS / script).read_text(encoding="utf-8")
@@ -82,9 +96,18 @@ def test_the_torch_workers_share_one_copy_of_the_thread_helpers():
         copies = own & (set(THREAD_HELPERS) - {"physical_cores"})
         assert not copies, "{} defines its own {}".format(script, sorted(copies))
         assert "_torch_threads" in text, "{} does not use _torch_threads".format(script)
-    a = _function_sources("deeplc_worker.py", ["load_base_model"])
-    b = _function_sources("deeplc_finetune.py", ["load_base_model"])
-    assert a == b, "load_base_model differs between the two DeepLC workers"
+    for script in DEEPLC_WORKERS + ["im2deep_worker.py", "mh_shard_predict.py"]:
+        text = (SCRIPTS / script).read_text(encoding="utf-8")
+        own = set()
+        for node in ast.parse(text).body:
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                own.add(node.name)
+            elif isinstance(node, ast.Assign):
+                own.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        copies = own & DEEPLC_COPIES
+        assert not copies, "{} defines its own {}".format(script, sorted(copies))
+        assert "from _deeplc_common import" in text, "{} does not use _deeplc_common".format(
+            script)
 
 
 def test_the_model_load_falls_back_on_any_private_api_change(monkeypatch, capsys):
@@ -96,10 +119,7 @@ def test_the_model_load_falls_back_on_any_private_api_change(monkeypatch, capsys
     """
     import types
 
-    source = _function_sources("deeplc_finetune.py", ["load_base_model"])["load_base_model"]
-    namespace = {}
-    exec(compile(source, "deeplc_finetune.py", "exec"), namespace)  # noqa: S102
-    load = namespace["load_base_model"]
+    load = _deeplc_common().load_base_model
 
     def install(model_ops, core):
         pkg = types.ModuleType("deeplc")
@@ -207,13 +227,16 @@ def test_the_physical_core_count_is_plausible():
 
 # ------------------------------------------------ the Arrow unique set and rewrite
 
-ARROW_NAMES = ["STD", "MOD_RE", "strip_mods", "base_pf", "DECOY_PREFIX_RE", "STD_FULL_RE"]
-ARROW_FUNCS = ["is_std", "library_bases", "unique_standard_bases", "rewrite_irt",
-               "rewrite_positions", "union_positions"]
+ARROW_NAMES = ["STD", "strip_mods", "base_pf"]
+ARROW_FUNCS = ["is_std", "rewrite_irt", "rewrite_positions", "union_positions"]
+# What `deeplc_finetune.py` imports from `_deeplc_common.py`.
+ARROW_SHARED = ["MOD_RE", "DECOY_PREFIX_RE", "STD_FULL_RE", "library_bases",
+                "unique_standard_bases"]
 
 
 def _arrow_helpers():
-    """The constants and Arrow helpers of `deeplc_finetune.py`, without importing DeepLC."""
+    """The constants and Arrow helpers of `deeplc_finetune.py`, without importing DeepLC:
+    its own lifted out of the source, the shared ones from `_deeplc_common.py`."""
     import re
 
     np = pytest.importorskip("numpy")
@@ -222,7 +245,9 @@ def _arrow_helpers():
 
     text = (SCRIPTS / "deeplc_finetune.py").read_text(encoding="utf-8")
     tree = ast.parse(text)
-    namespace = {"re": re, "np": np, "pa": pa, "pc": pc}
+    common = _deeplc_common()
+    namespace = {"re": re, "np": np, "pa": pa, "pc": pc,
+                 **{name: getattr(common, name) for name in ARROW_SHARED}}
     for node in tree.body:
         wanted = (
             isinstance(node, ast.Assign)
@@ -231,7 +256,7 @@ def _arrow_helpers():
         if wanted:
             exec(compile(ast.Module(body=[node], type_ignores=[]), "deeplc_finetune.py", "exec"),
                  namespace)  # noqa: S102
-    missing = [n for n in ARROW_NAMES + ARROW_FUNCS if n not in namespace]
+    missing = [n for n in ARROW_NAMES + ARROW_FUNCS + ARROW_SHARED if n not in namespace]
     assert not missing, "deeplc_finetune.py no longer defines {}".format(missing)
     return namespace
 
@@ -434,33 +459,19 @@ def test_the_projection_cache_key_depends_on_the_strings_not_on_the_slicing():
     assert digest(whole) != digest(pa.array(moved, pa.large_string()))
 
 
-def _assigned_constants(script, names):
-    tree = ast.parse((SCRIPTS / script).read_text(encoding="utf-8"))
-    out = {}
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id in names:
-                    out[target.id] = ast.literal_eval(node.value)
-    return out
-
-
 def test_the_recipe_selects_the_sequences_the_worker_predicts(tmp_path):
     """`mh_shard_predict.py uniq` keeps exactly the worker's unique standard set.
 
-    The recipe copies the worker's residue and modification rules, because `uniq` runs
+    The recipe once copied the worker's residue and modification rules, because `uniq` runs
     without DeepLC; it used `+` where the worker uses `*`, so a row whose stripped base is
-    empty was predicted by the worker and left on its imported iRT by the recipe.
+    empty was predicted by the worker and left on its imported iRT by the recipe. Both take
+    them from `_deeplc_common.py` now.
     """
     import subprocess
 
     h = _arrow_helpers()
     np, pa = h["np"], h["pa"]
     import pyarrow.parquet as pq
-
-    worker = _assigned_constants("deeplc_finetune.py", {"STD_FULL_RE", "MOD_RE"})
-    recipe = _assigned_constants("mh_shard_predict.py", {"STD_RE", "MOD_RE"})
-    assert recipe == {"STD_RE": worker["STD_FULL_RE"], "MOD_RE": worker["MOD_RE"]}
 
     pform = _library_peptidoforms(np.random.default_rng(5))
     assert "DECOY_" in pform and "" in pform, "the fixture lost the empty-base rows"

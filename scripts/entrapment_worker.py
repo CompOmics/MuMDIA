@@ -31,34 +31,7 @@ from sklearn.model_selection import GroupKFold
 
 
 def _new_model():
-    # Classifier is env-switchable so the GBM-vs-NN comparison needs no code edit:
-    #   MUMDIA_ENTRAPMENT_MODEL = gbm (default) | nn
-    # Both train on the SAME real-target-vs-entrapment(human) negatives, so the NN
-    # learns from empirically valid negatives (not in-silico decoys) - the regime
-    # where a flexible model actually helps (AUC ~0.97 vs ~0.62 on decoys).
-    kind = os.environ.get("MUMDIA_ENTRAPMENT_MODEL", "gbm").lower()
-    if kind == "nn":
-        from sklearn.neural_network import MLPClassifier
-        from sklearn.pipeline import make_pipeline
-        from sklearn.preprocessing import StandardScaler
-
-        # StandardScaler is fit inside each fold's pipeline (no leakage). The MLP
-        # needs standardized inputs; the 330-feature extended battery is on mixed
-        # scales. predict_proba works through the pipeline.
-        return make_pipeline(
-            StandardScaler(),
-            MLPClassifier(
-                hidden_layer_sizes=(64, 32),
-                activation="relu",
-                solver="adam",
-                alpha=1e-4,
-                max_iter=300,
-                early_stopping=True,
-                n_iter_no_change=10,
-                random_state=0,
-            ),
-        )
-    # Histogram-based GBM (default): fast and scales to hundreds of features (the
+    # Histogram-based GBM: fast and scales to hundreds of features (the
     # extended battery), unlike the exact GradientBoostingClassifier.
     # early_stopping=False removes the random validation split so a fixed
     # random_state is reproducible.
@@ -66,6 +39,12 @@ def _new_model():
 
 
 def main():
+    # The MLP variant of an unrecorded comparison is gone; asking for it must not
+    # silently train the GBM instead.
+    kind = os.environ.get("MUMDIA_ENTRAPMENT_MODEL", "gbm").strip().lower()
+    if kind not in ("", "gbm"):
+        sys.exit(f"MUMDIA_ENTRAPMENT_MODEL={kind!r} is not supported: the entrapment "
+                 "rescorer trains a gradient-boosted classifier (gbm) only")
     inp, outp = sys.argv[1], sys.argv[2]
     folds = int(sys.argv[3]) if len(sys.argv) > 3 else 3
 

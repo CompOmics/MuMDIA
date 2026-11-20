@@ -216,6 +216,33 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **The sidecar workers hold less memory and share one copy of their DeepLC helpers (docs/13).**
+  `ms2pip_worker.py` writes each predicted chunk as it comes instead of keeping every chunk
+  and concatenating them at the end, which held the fragment table twice.
+  `peptdeep_worker.py` no longer parses the whole request into a Python tuple per row before
+  the first prediction: a first pass, chunk by chunk, finds the supported rows and their
+  modifications (both refusals still come before any prediction), and each prediction call
+  parses its own rows, the same rows as before. `deeplc_finetune.py` holds only the
+  `peptidoform` and `predicted_irt` columns through the prediction and reads the whole
+  precursor table again to write it. The version floor, the one-time base-model load, the
+  blank-progress filter and the sequence rules that `deeplc_worker.py` and
+  `deeplc_finetune.py` copied character for character (and `mh_shard_predict.py` and
+  `im2deep_worker.py` in part) live in one stdlib-only module, `scripts/_deeplc_common.py`,
+  which the release bundle checks now require; each worker still imports `deeplc` (or
+  `im2deep`) first. The fine-tune's three shard runners share one helper. The libraries, the
+  predictions and the scores are unchanged (checked on the fleet against main's workers).
+- **The NN rescorer's streaming backend uses the in-memory loader.** For a parquet or raw
+  handoff the streaming memmap is filled by the same threaded row-group loader as the
+  in-memory matrix (the per-row metadata is still read in batches), instead of a second,
+  slower pandas loop with its own copies of the moment and standardisation code. Its float64
+  moments are now summed over the loader's blocks, so a streamed pool can differ from an
+  earlier streamed run in the last bits; it now scores as the in-memory backend does, byte
+  for byte. Only pools above `MUMDIA_NN_STREAM_GB` (twice the free memory unless set) stream.
+- **Worker docstrings and help match the code.** The NN worker's (the raw handoff is the
+  default, the in-memory backend's threshold, warm starts, the training knobs the engine
+  sets), the mokapot worker's (hidden layers `128,64,64,32`, `MUMDIA_BREW_ITERS` 20), the
+  DeepLC workers' floor (4.5.0) and the `--shards` help, which called the automatic count
+  unmeasured.
 - **The engine's shared crates lose code nothing used (docs/02, docs/03).** `mumdia-core`
   drops `ppm_match`, the `AMMONIA` constant and the five candidate-audit reason codes nothing
   produced (`PEPTIDE_NOT_GENERATED`, `MODIFICATION_NOT_ALLOWED`, `CHARGE_OUT_OF_RANGE`,
@@ -422,6 +449,21 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Removed
 
+- **The NN rescorer's switches back to replaced code.** `MUMDIA_NN_FINAL_POOL_SCORE`,
+  `MUMDIA_NN_GATHER`, `MUMDIA_NN_SELECT`, `MUMDIA_NN_READ_AHEAD`, `MUMDIA_NN_PRE_BUFFER` and
+  `MUMDIA_NN_LOAD_THREADS=0` restored code paths that scored byte-identically to the
+  defaults; they existed for one test, and the workers extracted from git at the reference
+  commits cover the same paths. The other five are now ignored when set;
+  `MUMDIA_NN_LOAD_THREADS` stays a thread count, and 0 now means one thread. The original
+  serial loader is kept in the tests as the loader's oracle.
+- **Unmeasured classifier variants of two sidecars.** `MUMDIA_RESCORE_MODEL = xgb` (with
+  `MUMDIA_XGB_*`) in the mokapot worker and `MUMDIA_ENTRAPMENT_MODEL = nn` in the
+  entrapment worker; no configuration reached them and no measurement exists. Both values
+  are refused rather than replaced by another model.
+- **`deeplc_finetune.py --predict-limit` and `--skip-predict`, and the per-shard refit of
+  `mh_shard_predict.py predict`.** The two flags were hand-run smoke-test options nothing
+  passes. `predict` now requires `--calibration`: a refit per shard repeated the fit and
+  could select another head at rank 80.
 - **`MUMDIA_PARQUET_PLAN` (docs/03).** It turned off the float-encoding plan of capped
   writers, for a byte comparison against binaries from before 0.5.0; release checks compare
   decoded tables. A set variable is now ignored.
@@ -481,6 +523,16 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **`MUMDIA_NN_THREAD_CAP=inf` no longer stops the NN rescorer.** The cap was parsed with
+  `int(float(...))` catching only `ValueError`, so `inf` raised `OverflowError` and failed
+  the rescore, and a value such as `eight` was ignored without a word; both now warn and
+  take the automatic cap, as the DeepLC and IM2Deep caps do.
+- **The fresh-interpreter import test of the DeepLC workers ran (tests/python).** It
+  imported each worker with the scripts directory off `sys.path`, so the import of
+  `_torch_threads` failed and the test skipped "for an unrelated reason" in every
+  environment; the import order it exists to check (`import deeplc` before numpy and
+  pyarrow) was never exercised. The subprocess now puts the script's directory first, as
+  `python <script>` does.
 - **Desktop: a diaPASEF search is no longer split into bands (#351).** "Bands: Automatic" (the
   default) planned the search from the machine's memory alone, so a large search space on a timsTOF
   diaPASEF `.d` was given several bands, and the engine stopped it after Start: bands are refused on

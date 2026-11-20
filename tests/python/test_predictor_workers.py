@@ -643,23 +643,27 @@ def test_deeplc_workers_filter_the_blank_progress_lines(script):
     a refactor.
     """
     text = _source(script)
-    assert "class _DropBlankProgress" in text, "the filter itself is gone"
-    assert "quiet_deeplc_progress" in text, "the context manager is gone"
+    assert "from _deeplc_common import" in text and "quiet_deeplc_progress" in text, (
+        "the worker no longer takes the filter from the shared module")
     assert text.count("with quiet_deeplc_progress():") >= 1, "nothing is wrapped in it"
+    shared = _source("_deeplc_common.py")
+    assert "class _DropBlankProgress" in shared, "the filter itself is gone"
     # The escape hatch has to stay too: it is the only way to see raw worker output.
-    assert "MUMDIA_DEEPLC_RAW_OUTPUT" in text
+    assert "MUMDIA_DEEPLC_RAW_OUTPUT" in shared
 
 
 def test_deeplc_progress_filter_keeps_content_and_drops_blanks():
     """The filter drops only what says nothing, and keeps order.
 
-    Exercised on `deeplc_finetune.py`, whose module body does not need DeepLC beyond the
-    version probe; the class is plain stdlib.
+    The class lives in `_deeplc_common.py`, which is plain stdlib, so this runs without
+    DeepLC.
     """
     import io as _io
 
-    importorskip_any("deeplc")
-    module = _load_finetune_worker()
+    spec = importlib.util.spec_from_file_location("mumdia_deeplc_common_filter",
+                                                  SCRIPTS / "_deeplc_common.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
 
     sink = _io.StringIO()
     proxy = module._DropBlankProgress(sink)
@@ -672,15 +676,6 @@ def test_deeplc_progress_filter_keeps_content_and_drops_blanks():
     proxy.close()
 
     assert sink.getvalue() == "real message\nsecond\ntrailing without newline"
-
-
-def _load_finetune_worker():
-    spec = importlib.util.spec_from_file_location(
-        "mumdia_deeplc_finetune_filter", SCRIPTS / "deeplc_finetune.py"
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 # ------------------------------------------------------------------ IM2Deep worker
@@ -878,3 +873,57 @@ def test_ms2pip_worker_passes_the_model_dir_to_predict_batch(model_root, monkeyp
     else:
         assert calls[0]["model_dir"] == str(tmp_path / model_root / "ms2pip")
     assert pq.read_table(out).num_rows == 0
+
+
+def test_ms2pip_worker_writes_the_predictions_chunk_by_chunk(monkeypatch, tmp_path):
+    """The worker writes each chunk's rows as soon as they are predicted: the file holds the
+    flattened predictions in order, a result without predictions adds no rows, and the
+    schema is the one an empty run writes. MS2PIP and psm_utils are stood in for."""
+    import sys
+    import types
+
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    class PSM:
+        def __init__(self, peptidoform, spectrum_id):
+            self.peptidoform = peptidoform
+            self.spectrum_id = spectrum_id
+
+    class PSMList:
+        def __init__(self, psm_list):
+            self.psm_list = psm_list
+
+    class Result:
+        def __init__(self, psm):
+            self.psm = psm
+            n = len(psm.peptidoform.split("/")[0]) - 1
+            self.predicted_intensity = (
+                None if psm.spectrum_id == "1"
+                else {"b": np.linspace(-4.0, 1.0, n), "y": np.full(n, 0.5),
+                      "b2": np.linspace(-9.0, -2.0, n)})
+
+    results = []
+
+    def predict_batch(psms, **kwargs):
+        results.extend(Result(p) for p in psms.psm_list)
+        return results[-len(psms.psm_list):]
+
+    monkeypatch.setitem(sys.modules, "psm_utils",
+                        types.SimpleNamespace(PSM=PSM, PSMList=PSMList))
+    monkeypatch.setitem(sys.modules, "ms2pip",
+                        types.SimpleNamespace(predict_batch=predict_batch))
+    monkeypatch.delenv("MUMDIA_MODEL_DIR", raising=False)
+    inp, out = tmp_path / "in.parquet", tmp_path / "out.parquet"
+    pq.write_table(pa.table({"id": pa.array([0, 1, 2], pa.uint32()),
+                             "peptidoform": ["PEPTIDEK", "PEPTIDE", "ACDEFGHIK"],
+                             "charge": [2, 2, 3]}), inp)
+    module = _load_ms2pip_worker()
+    monkeypatch.setattr(sys, "argv", ["ms2pip_worker.py", str(inp), str(out), "HCDch2", "1"])
+    module.main()
+    got = pq.read_table(out)
+    want = module.to_table(*module.fragment_rows(results))
+    assert got.num_rows == 3 * 7 + 3 * 8
+    assert got.equals(want)
+    assert got.schema.equals(module.to_table(*module.fragment_rows([])).schema)
