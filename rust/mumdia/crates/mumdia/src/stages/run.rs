@@ -126,7 +126,7 @@ fn preflight(p: &RunParams, cfg: &Config) -> Result<()> {
         && cfg.rt_im_train.library_irt == mumdia_core::config::LibraryIrt::Auto
     {
         if let Some(exe) = cfg.predict_frag.deeplc_python.as_deref() {
-            if !std::path::Path::new(exe).exists() {
+            if crate::python::interpreter_missing(exe) {
                 anyhow::bail!(
                     "predict_frag.deeplc_python points at an interpreter that does not \
                      exist: {exe}. An imported library is re-predicted with DeepLC under \
@@ -1327,6 +1327,9 @@ mod tests {
             check(&stale, false).is_ok(),
             "a FASTA run does not re-predict a library"
         );
+        let mut on_path = base.clone();
+        on_path.predict_frag.deeplc_python = Some("python3".into());
+        assert!(check(&on_path, true).is_ok(), "found on PATH by discovery");
         stale.rt_im_train.library_irt = mumdia_core::config::LibraryIrt::Library;
         assert!(
             check(&stale, true).is_ok(),

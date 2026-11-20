@@ -361,6 +361,14 @@ than a number. Both are recorded in every run's `manifest.json`.
   configs/README.md listed the support gate as on for diaPASEF input.
 - **The refusal of `search_seed.q1_deconvolved` together with `count_fragments_once` printed
   runs of spaces in the middle of its message.**
+- **A search whose interpreter was found on PATH no longer stops at the start.** Discovery
+  stores such an interpreter as its bare name (`python3`), and the second, strict resolution
+  in `run` and `run-experiment`, as well as `run-experiment`'s check that every configured
+  interpreter exists, tested that name as a file in the working directory: a required role
+  (`nn_torch`, `mokapot`, the FASTA predictors) or, in `run-experiment`, a DeepLC found only
+  on PATH refused the run with "points at python3, which does not exist". A bare program
+  name now counts as found, and a path must name a file (`python::interpreter_missing`,
+  used by every such check).
 
 ### Security
 

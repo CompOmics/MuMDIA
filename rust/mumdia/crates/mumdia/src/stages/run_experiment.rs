@@ -116,7 +116,7 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
         ("mbr.python", cfg.mbr.python.as_deref()),
     ] {
         if let Some(exe) = path {
-            if !std::path::Path::new(exe).exists() {
+            if crate::python::interpreter_missing(exe) {
                 anyhow::bail!(
                     concat!(
                         "{} points at an interpreter that does not exist: {}. A config ",
