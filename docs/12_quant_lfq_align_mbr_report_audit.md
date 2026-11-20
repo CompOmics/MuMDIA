@@ -1473,10 +1473,12 @@ second pass is a search hit of its own, scored against its own decoys.
    run with the most of them by a monotone binned-median curve: the pairs a run shares with
    the reference, sorted by the run's apex, cut into 80 equal-count bins, the median of each
    side per bin, the reference side made non-decreasing, linear in between and linearly
-   extrapolated past the outer bins. A run sharing fewer than 200 precursors with the
-   reference keeps its own scale (`runs_unaligned` in `empirical_library.json`). The
-   consensus is the median of the mapped apexes; an entry accepted experiment-wide but in
-   no single run takes its winning row's apex.
+   extrapolated past the outer bins, along the slope from the outer bin's median to the
+   median of the first bin at least 20 shared pairs inward (the next bin from 1,600 shared
+   pairs on). A run sharing fewer than 200 precursors with the reference keeps its own scale
+   (`runs_unaligned` in `empirical_library.json`). The consensus is the median of the mapped
+   apexes; an entry accepted experiment-wide but in no single run takes its winning row's
+   apex, mapped by that run's curve.
 4. **Second pass per run** (`second_pass/<run>/`). From the run's converted spectra (not
    converted again): a seed against the empirical library, loaded once for every run; the
    run's own retention-time calibration on that seed; extract, features and compete. The
@@ -1537,12 +1539,12 @@ to both, and retrace records the padded traces as extract does.
   the re-picked value), through the ordered-map join the shadow demotion uses. Every run is
   moved onto the retention-time reference run by its median offset (reference minus run) over
   at least 200 shared precursors, then the entry takes the median. A run sharing fewer keeps
-  its own scale. An entry with no confident run carrying a 1/K0 takes its winning row's; an
-  entry with no finite value keeps the library's `predicted_im`. The decoy takes its
-  target's value, as it takes its retention time, so within every pair the precursor m/z,
-  `predicted_irt` and `predicted_im` are equal. A library without `predicted_im` keeps its
-  schema, with a warning: a 1/K0 window the first pass never had is not introduced here. The
-  offsets go to `empirical_library.json` (`im`).
+  its own scale. An entry with no confident run carrying a 1/K0 takes its winning row's,
+  moved by that run's offset; an entry with no finite value keeps the library's
+  `predicted_im`. The decoy takes its target's value, as it takes its retention time, so
+  within every pair the precursor m/z, `predicted_irt` and `predicted_im` are equal. A
+  library without `predicted_im` keeps its schema, with a warning: a 1/K0 window the first
+  pass never had is not introduced here. The offsets go to `empirical_library.json` (`im`).
 - **1/K0 window floor.** Calibrated against a consensus 1/K0, a run's `w_im` falls far below
   the first pass's, and the 1/K0 gate then rejects reproducible rows. Each run's
   `rt_im_train.im_window_min` is raised to its first-pass `w_im` (from the run's first-pass

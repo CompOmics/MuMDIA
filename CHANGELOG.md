@@ -716,6 +716,22 @@ than a number. Both are recorded in every run's `manifest.json`.
   evaluation sample, the repeat bonus, the scores table or tag retrieval needs them; and window
   membership scans only the windows that can hold the precursor. `prescreen::run` returns
   nothing: no caller read its summary, and the report holds the same cutoff and bypass reason.
+- **The second pass's consensus retention times stay on the reference run's scale (docs/12,
+  "Second pass").** Each run's apexes are mapped onto a reference run by a binned-median curve,
+  which extrapolated past its outer bins along the line through the two outer bin medians
+  only. On a run sharing a few hundred precursors with the reference a bin holds 2 or 3 of
+  them, so that slope can be noise: two near-tied outer bins give a slope of 9.5 and put an
+  apex 100 s before the first bin at -653 s, where an entry seen in that run alone would then
+  be searched in every run. Each extrapolation slope now runs to the first bin at least 20
+  shared pairs inward; from 1,600 shared precursors on that is the next bin, as before. An
+  entry accepted experiment-wide but in no single run took its winning row's apex and 1/K0 on
+  that run's own scale; both are now moved onto the reference by that run's curve and 1/K0
+  offset, as every other entry's are. The empirical library changes only where a run shares
+  fewer than 1,600 precursors with the reference or a winning row comes from another aligned
+  run: on the three-run ProteoBench Astral entrapment set (66,862 to 67,494 shared, no
+  winner-only entry) every table is byte-identical; on eight wells of a single-cell plate (five
+  sharing 388 to 1,289, 17 winner-only entries) 53 of 7,808 entries moved, by at most 6.8 s.
+  `localise.combine_runs` aligns its runs with the same curves.
 - **The native Thermo read ends with its error instead of hanging (`convert.thermo_native`).**
   When the spectra could not be written part-way through a file (a full disk), the reader
   thread blocked for ever on its full queue, and the conversion neither ended nor reported
