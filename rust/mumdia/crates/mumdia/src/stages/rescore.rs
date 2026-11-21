@@ -966,7 +966,8 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
                                 "rescore: using entrapment GBM sidecar scores"
                             );
                             classifier_used = "entrapment_gbm";
-                            model_identity = "entrapment-gbm-sidecar-v1".to_string();
+                            model_identity =
+                                format!("entrapment-{}-sidecar-v1", entrapment_model());
                             qmode = QMode::Entrapment;
                             s
                         }
@@ -4054,6 +4055,15 @@ fn mokapot_brew_iters() -> usize {
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(20)
+}
+
+/// The model `entrapment_worker.py` trains, as it reads `MUMDIA_ENTRAPMENT_MODEL`: `nn` (the
+/// MLP pipeline) or, for any other value or none, `gbm`.
+fn entrapment_model() -> &'static str {
+    match std::env::var("MUMDIA_ENTRAPMENT_MODEL") {
+        Ok(v) if v.to_lowercase() == "nn" => "nn",
+        _ => "gbm",
+    }
 }
 
 /// The `MUMDIA_NN_*` variables in `vars` that the NN worker inherits from this process on

@@ -102,11 +102,15 @@ feature table, and the streaming memmap backend, which must also delete its
 targets outscore decoys (so the scores are aligned to the rows), a single-class
 PIN exits nonzero, and an unknown `MUMDIA_NN_FEATURES` name aborts.
 
-The worker's default-path speed-ups must not move a score. The worker as it was before
-those changes, extracted with `git show` from `REFERENCE_COMMIT` (and
-`SERIAL_REFERENCE_COMMIT` for the serial loop), is run against the current one, for the
-in-memory and TSV paths (skipped when the clone lacks that commit), and the streaming
-backend, which fills its memmap with the in-memory loader, against the in-memory one. The score bytes
+The worker's default-path speed-ups must not move a score. The worker is run with
+every switch back to the replaced code (`MUMDIA_NN_FINAL_POOL_SCORE=1`,
+`MUMDIA_NN_GATHER=numpy`, `MUMDIA_NN_SCAN_THREADS=1`, `MUMDIA_NN_LOAD_THREADS=0`,
+`MUMDIA_NN_SELECT=full`) and with the defaults, for the in-memory and the streaming
+backend; the worker as it was before those changes, extracted with `git show` from
+`REFERENCE_COMMIT` (and `SERIAL_REFERENCE_COMMIT` for the serial loop), is run against
+the current one, for the in-memory and TSV paths (skipped when the clone lacks that
+commit); and the streaming backend, which fills its memmap with the in-memory loader, is
+run against the in-memory one. The score bytes
 must be equal, on a pool with several row groups, non-finite cells, a float64
 overflow column, nulls, ties, a constant column and subnormal cells, and the default
 arm must run the threaded init scan (`MUMDIA_NN_SCAN_ROWS_PER_THREAD=500`). These are

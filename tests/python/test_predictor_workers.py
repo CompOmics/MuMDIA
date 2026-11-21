@@ -38,6 +38,7 @@ from conftest import (
     first_line_matching,
     import_module_in_fresh_interpreter,
     importorskip_any,
+    run_in_imported_worker,
 )
 
 DEEPLC_WORKERS = ["deeplc_worker.py", "deeplc_finetune.py"]
@@ -628,6 +629,18 @@ def test_peptdeep_worker_rejects_a_bad_device_request(tmp_path):
 
 # ---------------------------------------------------- DeepLC progress-line filtering
 
+# Written inside the worker's own `quiet_deeplc_progress` block: a blank progress update,
+# a real line, a whitespace-only update and a line without a newline.
+_PROGRESS_PROBE = (
+    "import _deeplc_common\n"
+    "assert m.quiet_deeplc_progress is _deeplc_common.quiet_deeplc_progress\n"
+    "with m.quiet_deeplc_progress():\n"
+    "    sys.stdout.write('\\r\\n'); print('PROBE_KEPT'); sys.stdout.write('   \\r\\n')\n"
+    "    sys.stdout.write('PROBE_TAIL')\n"
+    "sys.stdout.write('\\n')\n"
+)
+
+
 @pytest.mark.parametrize("script", ["deeplc_worker.py", "deeplc_finetune.py"])
 def test_deeplc_workers_filter_the_blank_progress_lines(script):
     """Both DeepLC workers must route their prediction through the stdout filter.
@@ -638,35 +651,32 @@ def test_deeplc_workers_filter_the_blank_progress_lines(script):
     file, and the desktop application's run log. Measured before the filter: 5,697 blank
     lines from one 2.9M-peptide prediction, and 98-99% of two real run logs.
 
-    A static check because the behaviour is only visible with DeepLC installed and a
-    large enough prediction; what it guards is that the wrapper does not get dropped in
-    a refactor.
+    The worker is imported as the engine runs it, in a fresh interpreter, and the filter
+    it binds is used there: the blank updates are dropped and the content is kept. The
+    prediction itself needs a DeepLC model, so that it is wrapped is checked in the source.
     """
-    text = _source(script)
-    assert "from _deeplc_common import" in text and "quiet_deeplc_progress" in text, (
-        "the worker no longer takes the filter from the shared module")
-    assert text.count("with quiet_deeplc_progress():") >= 1, "nothing is wrapped in it"
-    shared = _source("_deeplc_common.py")
-    assert "class _DropBlankProgress" in shared, "the filter itself is gone"
-    # The escape hatch has to stay too: it is the only way to see raw worker output.
-    assert "MUMDIA_DEEPLC_RAW_OUTPUT" in shared
+    out = run_in_imported_worker(script, _PROGRESS_PROBE, packages=(
+        ("deeplc",) if script == "deeplc_worker.py" else ("deeplc", "torch", "psm_utils")))
+    probe = out[out.index("PROBE_KEPT"):out.index("PROBE_TAIL") + len("PROBE_TAIL")]
+    assert probe.replace("\r\n", "\n") == "PROBE_KEPT\nPROBE_TAIL", repr(probe)
+    assert _source(script).count("with quiet_deeplc_progress():") >= 1, (
+        "nothing is wrapped in the filter")
 
 
 def test_deeplc_progress_filter_keeps_content_and_drops_blanks():
-    """The filter drops only what says nothing, and keeps order.
-
-    The class lives in `_deeplc_common.py`, which is plain stdlib, so this runs without
-    DeepLC.
-    """
+    """The filter drops only what says nothing, and keeps order. It lives in
+    `_deeplc_common.py`, which is plain stdlib, so this runs without DeepLC."""
     import io as _io
+    import sys
 
-    spec = importlib.util.spec_from_file_location("mumdia_deeplc_common_filter",
-                                                  SCRIPTS / "_deeplc_common.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    sys.path.insert(0, str(SCRIPTS))
+    try:
+        from _deeplc_common import _DropBlankProgress
+    finally:
+        sys.path.remove(str(SCRIPTS))
 
     sink = _io.StringIO()
-    proxy = module._DropBlankProgress(sink)
+    proxy = _DropBlankProgress(sink)
     proxy.write("\r")                       # a bare progress update
     proxy.write("\r\n")                     # and another
     proxy.write("real message\n")

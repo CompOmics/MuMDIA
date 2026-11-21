@@ -362,11 +362,24 @@ def test_a_thread_cap_that_is_not_a_number_falls_back_to_auto(monkeypatch, capsy
 
 # ------------------------------------------ default-path speed-ups are score-identical
 
-# Every speed-up on the default path is meant to leave the output scores byte-identical:
-# the current worker must give the bytes of the worker it replaced, extracted from git
-# (the reference commits below), on the same host and seed. A single-seed count is not a
-# measurement (CLAUDE.md), so nothing weaker than exact equality would catch a change that
-# only moves the arithmetic.
+# Every speed-up on the default path is meant to leave the output scores byte-identical,
+# so each one keeps a switch back to the code it replaced. Running the worker once with
+# all of them switched back and once with the defaults, on the same host and seed, must
+# give the same bytes. A single-seed count is not a measurement (CLAUDE.md), so nothing
+# weaker than exact equality would catch a change that only moves the arithmetic.
+LEGACY_ENV = {
+    # W6: score the training pool after the last round as well.
+    "MUMDIA_NN_FINAL_POOL_SCORE": "1",
+    # W1: gather scoring batches with a numpy fancy index.
+    "MUMDIA_NN_GATHER": "numpy",
+    # W5: scan the init features on one thread.
+    "MUMDIA_NN_SCAN_THREADS": "1",
+    # W2/W3: the serial load loop, without read-ahead or pre_buffer.
+    "MUMDIA_NN_LOAD_THREADS": "0",
+    # W4: the full stable sort for every positive selection and decoy order.
+    "MUMDIA_NN_SELECT": "full",
+}
+
 IDENTITY_ENV = dict(
     FAST_ENV,
     MUMDIA_NN_FOLDS="3",
@@ -490,6 +503,21 @@ def _assert_same_scores(ref, new, n, what):
     )
 
 
+@pytest.mark.parametrize("backend", ["in-memory", "stream"])
+def test_default_speedups_leave_scores_byte_identical(torch_available, tmp_path, backend):
+    """The default path must score exactly as the code it replaced, on the same host."""
+    pin, _keys, n, env = _identity_inputs(tmp_path, backend)
+    ref = tmp_path / "legacy.parquet"
+    new = tmp_path / "default.parquet"
+    stdout_ref, _ = run_worker_ok("nn_rescore_worker.py", pin, ref, env=dict(env, **LEGACY_ENV))
+    stdout, _ = run_worker_ok("nn_rescore_worker.py", pin, new, env=env)
+    # The comparison is only as strong as the paths it runs: the default arm must have
+    # threaded its init scan, and the legacy arm must not have.
+    assert "2 scan thread(s)" in stdout, "the default arm did not run the threaded init scan"
+    assert "2 scan thread(s)" not in stdout_ref
+    _assert_same_scores(ref, new, n, "a default-path speed-up")
+
+
 # The worker whose default scores the current default must reproduce. When a later change
 # moves the default scores on purpose, point this at the commit that made it: here the
 # commit that made keyed parallel training (`MUMDIA_NN_PARALLEL=auto`) the default.
@@ -497,8 +525,9 @@ REFERENCE_COMMIT = "84031cd7017d5a9d49db259fde49add764e3ebcf"
 
 # The worker as it was before the default-path speed-ups (W1-W6) and the move of the
 # training loop into `_build_trainer`: origin/main when they were written, and the last
-# default of the serial loop. The serial loop (`MUMDIA_NN_PARALLEL=0`) must still
-# reproduce it.
+# default of the serial loop. The switches in LEGACY_ENV only reach code that kept a switch;
+# comparing against this commit also covers the refactors that have none. The serial loop
+# (`MUMDIA_NN_PARALLEL=0`) must still reproduce it.
 SERIAL_REFERENCE_COMMIT = "6887c41b7ed04ace7eb1d744d750e83bb2c93e9e"
 
 
@@ -884,35 +913,8 @@ def test_single_threaded_load_releases_its_moment_buffer(tmp_path):
     features, _keys, n = _identity_pool(tmp_path)
     names = [c for c in pq.read_schema(str(features)).names if c not in w.NON_FEATURE]
     out = np.empty((n, len(names)), np.float32)
-    w.fill_parquet_matrix(str(features), names, n, 700, out, threads=1)
+    w.fill_parquet_matrix(str(features), names, n, 700, out, threads=1, read_ahead=False)
     assert getattr(w._TLS, "moments", None) is None, "the main thread kept its moment buffer"
-
-
-def _serial_parquet_fill(w, pin_path, feat_cols, n, chunk, out):
-    """The worker's original serial load loop, kept here as the loader's oracle; returns
-    (s1, s2). One row group at a time, sliced into `chunk`-row blocks, each narrowed to
-    float32 with its non-finite cells set to 0.0 and its float64 moments accumulated."""
-    import pyarrow.parquet as pq
-
-    nf = len(feat_cols)
-    s1 = np.zeros(nf, np.float64)
-    s2 = np.zeros(nf, np.float64)
-    pf = pq.ParquetFile(pin_path)
-    off = 0
-    for rg in range(pf.num_row_groups):
-        tbl = pf.read_row_group(rg, columns=feat_cols)
-        for s0 in range(0, tbl.num_rows, chunk):
-            b = tbl.slice(s0, chunk)
-            k = b.num_rows
-            blk = np.empty((k, nf), np.float32)
-            for j in range(nf):
-                blk[:, j] = b.column(j).to_numpy(zero_copy_only=False)
-            np.nan_to_num(blk, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-            out[off:off + k] = blk
-            w._accumulate_moments(blk, s1, s2)
-            off += k
-    assert off == n
-    return s1, s2
 
 
 @pytest.mark.parametrize("chunk", [250000, 700])
@@ -932,20 +934,22 @@ def test_parallel_parquet_load_reproduces_the_serial_matrix_and_moments(tmp_path
     nf = len(names)
 
     ref = np.empty((n, nf), np.float32)
-    r1, r2 = _serial_parquet_fill(w, str(features), names, n, chunk, ref)
+    r1, r2 = w._fill_parquet_matrix_legacy(str(features), names, n, chunk, ref)
     rmean, rstd = w.moments_to_mean_std(r1, r2, n)
     w.standardise_matrix(ref, rmean, rstd, chunk, threads=1)
 
-    for threads in (1, 3, 8):
+    for threads, read_ahead, pre_buffer in [(1, False, False), (1, True, True),
+                                            (3, True, True), (8, False, True)]:
         got = np.empty((n, nf), np.float32)
-        g1, g2 = w.fill_parquet_matrix(str(features), names, n, chunk, got, threads=threads)
+        g1, g2 = w.fill_parquet_matrix(str(features), names, n, chunk, got, threads=threads,
+                                       read_ahead=read_ahead, pre_buffer=pre_buffer)
         assert g1.tobytes() == r1.tobytes() and g2.tobytes() == r2.tobytes(), (
-            "column sums differ at threads=%d" % threads)
+            "column sums differ at threads=%d read_ahead=%s" % (threads, read_ahead))
         gmean, gstd = w.moments_to_mean_std(g1, g2, n)
         w.standardise_matrix(got, gmean, gstd, chunk, threads=threads, block=256)
         assert gmean.tobytes() == rmean.tobytes() and gstd.tobytes() == rstd.tobytes()
         assert got.tobytes() == ref.tobytes(), (
-            "matrix differs at threads=%d" % threads)
+            "matrix differs at threads=%d read_ahead=%s" % (threads, read_ahead))
     assert np.isfinite(ref).all()
 
 
@@ -1082,7 +1086,7 @@ def test_thread_pools_compute_under_the_main_threads_flush_to_zero(torch_availab
         assert w.n_targets_at_many(x, tgt, 0.01, workers=4, initializer=init) == serial
 
         ref = np.empty((n, nf), np.float32)
-        r1, r2 = _serial_parquet_fill(w, str(features), names, n, 700, ref)
+        r1, r2 = w._fill_parquet_matrix_legacy(str(features), names, n, 700, ref)
         j11 = names.index("f11")
         assert not np.any((ref[:, j11] != 0) & (np.abs(ref[:, j11]) < tiny)), (
             "flush-to-zero is not in effect on the main thread")

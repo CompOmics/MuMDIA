@@ -467,17 +467,6 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Removed
 
-- **The NN rescorer's switches back to replaced code.** `MUMDIA_NN_FINAL_POOL_SCORE`,
-  `MUMDIA_NN_GATHER`, `MUMDIA_NN_SELECT`, `MUMDIA_NN_READ_AHEAD`, `MUMDIA_NN_PRE_BUFFER` and
-  `MUMDIA_NN_LOAD_THREADS=0` restored code paths that scored byte-identically to the
-  defaults; they existed for one test, and the workers extracted from git at the reference
-  commits cover the same paths. The other five are now ignored when set;
-  `MUMDIA_NN_LOAD_THREADS` stays a thread count, and 0 now means one thread. The original
-  serial loader is kept in the tests as the loader's oracle.
-- **Unmeasured classifier variants of two sidecars.** `MUMDIA_RESCORE_MODEL = xgb` (with
-  `MUMDIA_XGB_*`) in the mokapot worker and `MUMDIA_ENTRAPMENT_MODEL = nn` in the
-  entrapment worker; no configuration reached them and no measurement exists. Both values
-  are refused rather than replaced by another model.
 - **`deeplc_finetune.py --predict-limit` and `--skip-predict`, and the per-shard refit of
   `mh_shard_predict.py predict`.** The two flags were hand-run smoke-test options nothing
   passes. `predict` now requires `--calibration`: a refit per shard repeated the fit and
@@ -549,6 +538,10 @@ than a number. Both are recorded in every run's `manifest.json`.
   `MUMDIA_BREW_ITERS`, and the report's `num_iter` for a mokapot run now records that count
   instead of `rescore.num_iter`. The `percolator` model is built as `mokapot.brew` builds its
   default, with the configured training FDR.
+- **An entrapment rescore with `MUMDIA_ENTRAPMENT_MODEL=nn` is reported as the MLP it ran.**
+  The engine wrote `model_identity = entrapment-gbm-sidecar-v1` whatever the worker trained;
+  it now reads the variable as the worker does and writes `entrapment-nn-sidecar-v1` for
+  the MLP. `classifier_used` stays `entrapment_gbm`, and the GBM default is unchanged.
 - **`MUMDIA_NN_THREAD_CAP=inf` no longer stops the NN rescorer.** The cap was parsed with
   `int(float(...))` catching only `ValueError`, so `inf` raised `OverflowError` and failed
   the rescore, and a value such as `eight` was ignored without a word; both now warn and

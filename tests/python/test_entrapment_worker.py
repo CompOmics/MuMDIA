@@ -215,14 +215,3 @@ def test_a_single_class_training_fold_is_an_error_not_an_in_sample_fill(sklearn_
     assert rc != 0, "a single-class training fold must fail the worker"
     assert "single" in err and "class" in err, err
     assert not out.exists(), "no output may be written for a refused run"
-
-
-def test_a_model_other_than_gbm_is_refused_not_replaced(sklearn_available, tmp_path):
-    """The MLP variant is gone; asking for it fails instead of training the GBM."""
-    inp, out = tmp_path / "entrapment_in.parquet", tmp_path / "scores.parquet"
-    _build_input(inp)
-    rc, _, err = run_worker("entrapment_worker.py", inp, out,
-                            env={"MUMDIA_ENTRAPMENT_MODEL": "nn"})
-    assert rc != 0 and "MUMDIA_ENTRAPMENT_MODEL" in err, err
-    assert not out.exists()
-    run_worker_ok("entrapment_worker.py", inp, out, env={"MUMDIA_ENTRAPMENT_MODEL": "gbm"})

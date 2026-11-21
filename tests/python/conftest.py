@@ -14,6 +14,7 @@ useful in a minimal environment and skips honestly rather than failing.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
 import subprocess
@@ -132,7 +133,7 @@ def importorskip_any(name, reason=None):
         )
 
 
-def import_module_in_fresh_interpreter(script, timeout=300):
+def import_module_in_fresh_interpreter(script, timeout=300, then=""):
     """Import a worker at module scope in a brand-new interpreter.
 
     The import-order contract can only be tested this way. Inside pytest, numpy
@@ -141,7 +142,8 @@ def import_module_in_fresh_interpreter(script, timeout=300):
     reproduces the very `WinError 1114` the ordering exists to prevent. A fresh
     subprocess is also exactly how the engine runs the worker, and like the engine's
     `python <script>` it puts the script's directory first on `sys.path`, where the
-    shared modules (`_deeplc_common`, `_torch_threads`) are found.
+    shared modules (`_deeplc_common`, `_torch_threads`) are found. `then` is code run
+    after the import, with the worker bound to `m`.
     """
     path = Path(script)
     if not path.is_absolute():
@@ -153,7 +155,8 @@ def import_module_in_fresh_interpreter(script, timeout=300):
         "m = importlib.util.module_from_spec(spec)\n"
         "spec.loader.exec_module(m)\n"
         "assert callable(m.main)\n"
-        "print('MODULE_IMPORT_OK')\n"
+        + then
+        + "print('MODULE_IMPORT_OK')\n"
     )
     proc = subprocess.run(
         [sys.executable, "-c", code, str(path)],
@@ -164,6 +167,25 @@ def import_module_in_fresh_interpreter(script, timeout=300):
         timeout=timeout,
     )
     return proc.returncode, proc.stdout, proc.stderr
+
+
+def run_in_imported_worker(script, then, packages=("deeplc",)):
+    """Run `then` in a fresh interpreter that imported `script` as `m`; return stdout.
+
+    Skips when a package is not installed or the worker does not import here (a DeepLC
+    below the floor, say); a failure of `then` itself fails the test. Gated on presence,
+    because importing DeepLC inside pytest is the broken import order.
+    """
+    for package in packages:
+        if importlib.util.find_spec(package) is None:
+            pytest.skip("{} is not installed".format(package))
+    rc, out, err = import_module_in_fresh_interpreter(
+        script, then="print('WORKER_IMPORTED', flush=True)\n" + then)
+    if "WORKER_IMPORTED" not in out:
+        tail = [ln for ln in err.strip().splitlines() if ln.strip()]
+        pytest.skip("{} does not import here: {}".format(script, tail[-1] if tail else "?"))
+    assert rc == 0 and "MODULE_IMPORT_OK" in out, err
+    return out
 
 
 @pytest.fixture(scope="session")

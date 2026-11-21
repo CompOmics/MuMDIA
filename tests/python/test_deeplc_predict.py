@@ -16,7 +16,12 @@ import sys
 
 import pytest
 
-from conftest import SCRIPTS, run_worker, run_worker_ok
+from conftest import (
+    SCRIPTS,
+    run_in_imported_worker,
+    run_worker,
+    run_worker_ok,
+)
 
 DEEPLC_WORKERS = ["deeplc_worker.py", "deeplc_finetune.py"]
 THREAD_HELPERS = [
@@ -96,7 +101,7 @@ def test_the_torch_workers_share_one_copy_of_the_thread_helpers():
         copies = own & (set(THREAD_HELPERS) - {"physical_cores"})
         assert not copies, "{} defines its own {}".format(script, sorted(copies))
         assert "_torch_threads" in text, "{} does not use _torch_threads".format(script)
-    for script in DEEPLC_WORKERS + ["im2deep_worker.py", "mh_shard_predict.py"]:
+    for script in ["im2deep_worker.py", "mh_shard_predict.py"]:
         text = (SCRIPTS / script).read_text(encoding="utf-8")
         own = set()
         for node in ast.parse(text).body:
@@ -108,6 +113,23 @@ def test_the_torch_workers_share_one_copy_of_the_thread_helpers():
         assert not copies, "{} defines its own {}".format(script, sorted(copies))
         assert "from _deeplc_common import" in text, "{} does not use _deeplc_common".format(
             script)
+
+
+@pytest.mark.parametrize("script", DEEPLC_WORKERS)
+def test_the_deeplc_workers_run_the_shared_helpers(script):
+    """Each DeepLC worker, imported as the engine runs it, binds `_deeplc_common`'s
+    objects, not copies of its own: `load_base_model` and `quiet_deeplc_progress` in
+    both, and the sequence rules in the fine-tune. They used to be copied between the
+    two workers, which a source comparison here pinned (`deeplc_worker.py` cannot import
+    `deeplc_finetune.py`, whose module body pins the OpenMP pools and imports psm_utils).
+    """
+    names = ["load_base_model", "quiet_deeplc_progress", "require_version", "MIN_DEEPLC"]
+    if script == "deeplc_finetune.py":
+        names += ["MOD_RE", "library_bases", "unique_standard_bases"]
+    probe = "import _deeplc_common as c\n" + "".join(
+        "assert getattr(m, %r) is getattr(c, %r), %r\n" % (n, n, n) for n in names)
+    run_in_imported_worker(script, probe, packages=(
+        ("deeplc",) if script == "deeplc_worker.py" else ("deeplc", "torch", "psm_utils")))
 
 
 def test_the_model_load_falls_back_on_any_private_api_change(monkeypatch, capsys):
