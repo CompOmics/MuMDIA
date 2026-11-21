@@ -204,7 +204,7 @@ struct SecondPassOut {
 /// of its competed tables, with the second pass's chromatograms that its candidate ids (the
 /// empirical library's) index; otherwise the first pass, copied up from `first_pass/` under
 /// a second pass that did not apply, whose chromatograms stay the first pass's (`None`).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn second_pass_result(
     cfg: &Config,
     ch: &str,
@@ -434,10 +434,10 @@ fn search_second_pass(
             "run-experiment",
             "the first run's second pass",
             &all,
-            &one,
+            one,
             |p, rest| {
                 *plan = p;
-                p.map_pooled(rest, &one)
+                p.map_pooled(rest, one)
             },
         )?
     } else if plan.is_auto() {
