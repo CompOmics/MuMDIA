@@ -1,8 +1,9 @@
 """Shared pieces of the feature-selection study (docs/28).
 
-Loads a PIN (parquet from `pin2parquet.py`, or the tab-separated original), computes
-target-decoy q-values, and runs a faithful re-implementation of `scripts/nn_rescore_worker.py`
-(same folds, init-feature scan, self-training loop, MLP, early stop) on any column subset,
+Loads a PIN-layout parquet (from `pin2parquet.py`, or the handoff table a run with
+`rescore.handoff = parquet` writes), computes target-decoy q-values, and runs a
+re-implementation of `scripts/nn_rescore_worker.py` (same folds, init-feature scan,
+self-training loop, MLP, early stop; differences in `recipe_metadata`) on any column subset,
 so that a feature subset is judged on the quantity the engine optimises: stripped peptides at
 1% FDR, with the decoy fraction as the validity check.
 
@@ -14,6 +15,7 @@ import hashlib
 import os
 import re
 import subprocess
+import sys
 import time
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -21,6 +23,9 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from make_entrapment_fasta import fdp_estimates  # noqa: E402
 
 NON_FEATURE = {"SpecId", "Label", "ScanNr", "ExpMass", "CalcMass", "Peptide", "Proteins"}
 
@@ -106,7 +111,8 @@ WORKER_DEFAULTS = dict(
     seed_base=0,
     device="cuda",
     score_step=4096 * 4,
-    # --- training-set reduction (all off by default = the shipped behaviour) ---
+    # --- training-set reduction (all off by default: the recipe before 2026-09-05; the
+    # engine now ships train_neg_ratio 2, hybrid, 5 warm epochs) ---
     # neg_ratio: cap TRAINING negatives at this multiple of the positives selected this
     # iteration (0 = every decoy, which is ~19:1 on HYE). neg_select decides WHICH decoys
     # survive the cap: "random" is the worker's existing behaviour, "margin" keeps the
@@ -305,12 +311,11 @@ def n_targets_at_many(X, is_target, fdr, topk=0):
     return best_j, best_sign, best_n
 
 
-# Entrapment defaults matching bench/config.entrap-ecoli-human.json, the August E. coli +
-# 1:1 human spike-in run.
+# Entrapment markers of the August E. coli + 1:1 human spike-in run. The ratio is not here:
+# it belongs to one library, so `evaluate` takes it as an argument.
 ENTRAP_MARKER = "ENTRAP_"
 ENTRAP_EXCLUDE = "REAL_"
 ENTRAP_CONTAMINANTS = ("KRT", "K1C", "K2C", "ALBU", "TRYP")
-ENTRAP_RATIO = 0.560632
 
 
 def classify_entrapment(
@@ -336,18 +341,13 @@ def classify_entrapment(
     return out
 
 
-def entrapment_fdp(n_entrap: int, n_real: int, ratio: float = ENTRAP_RATIO) -> float:
-    """The engine's estimator (fdr.rs::entrapment_q): (ratio * entrapment + 1) / real.
+def evaluate(score: np.ndarray, d: dict, fdr: float = 0.01, ratio: float | None = None) -> dict:
+    """PSMs and picked stripped peptides at `fdr`, plus the decoy fraction among accepted PSMs.
 
-    An empirical null the target-decoy q cannot give: the spike-in peptides are absent from
-    the sample by construction, so any that pass are false, whatever the decoys say. This
-    is the check that catches a model which has learned to separate targets from DECOYS
-    rather than true from false -- exactly the risk when training only on hard decoys."""
-    return (ratio * n_entrap + 1.0) / max(1, n_real)
-
-
-def evaluate(score: np.ndarray, d: dict, fdr: float = 0.01) -> dict:
-    """PSMs and picked stripped peptides at `fdr`, plus the decoy fraction among accepted PSMs."""
+    With an entrapment PIN (`load_pin(entrapment=True)`) it also reports the entrapment FDP
+    estimates of `make_entrapment_fasta.fdp_estimates`, for which `ratio` (the library's
+    `rescore.entrapment_ratio`) is required: an empirical null the target-decoy q cannot give,
+    which catches a model that separates targets from decoys rather than true from false."""
     y = d["y"]
     q = tda_q(score.astype(np.float64), y)
     acc = q <= fdr
@@ -370,15 +370,17 @@ def evaluate(score: np.ndarray, d: dict, fdr: float = 0.01) -> dict:
         n_real = int((acc_t & ~ent).sum())
         out["entrap_psms"] = n_ent
         out["real_psms"] = n_real
-        out["entrap_fdp"] = round(entrapment_fdp(n_ent, n_real), 4)
+        if ratio is None:
+            raise ValueError("an entrapment PIN needs the library's entrapment ratio (ratio=)")
+        for k, v in fdp_estimates(n_real, n_ent, ratio).items():
+            out[f"entrap_fdp_{k}"] = round(v, 4)
         # Peptide level, on the same picked set.
         bidx = best.index.to_numpy()
         bacc = (qp <= fdr) & (best["y"].to_numpy() == 1)
         bent = ent[bidx]
         out["entrap_peptides"] = int((bacc & bent).sum())
-        out["entrap_fdp_pep"] = round(
-            entrapment_fdp(int((bacc & bent).sum()), int((bacc & ~bent).sum())), 4
-        )
+        for k, v in fdp_estimates(int((bacc & ~bent).sum()), int((bacc & bent).sum()), ratio).items():
+            out[f"entrap_fdp_pep_{k}"] = round(v, 4)
     return out
 
 
@@ -388,7 +390,7 @@ def evaluate(score: np.ndarray, d: dict, fdr: float = 0.01) -> dict:
 def run_rescoring(d: dict, cols: list[int] | None = None, cfg: dict | None = None, verbose: bool = False) -> dict:
     """Out-of-fold NN scores for every PSM of `d`, using only the feature columns `cols`.
 
-    Mirrors scripts/nn_rescore_worker.py: md5(stripped peptide) folds, per-fold init feature
+    Follows scripts/nn_rescore_worker.py (differences in `recipe_metadata`): md5(stripped peptide) folds, per-fold init feature
     scan over both signs, Percolator-style self-training on targets at `train_fdr` vs all
     decoys, a fresh MLP per iteration, churn-based early stop, rank-averaged seeds.
     """
@@ -577,9 +579,10 @@ def run_rescoring(d: dict, cols: list[int] | None = None, cfg: dict | None = Non
     )
 
 
-def bench_subset(name: str, d: dict, cols: list[int] | None, cfg: dict | None = None, verbose: bool = False) -> dict:
+def bench_subset(name: str, d: dict, cols: list[int] | None, cfg: dict | None = None, verbose: bool = False,
+                 ratio: float | None = None) -> dict:
     r = run_rescoring(d, cols, cfg, verbose=verbose)
-    m = evaluate(r["score"], d)
+    m = evaluate(r["score"], d, ratio=ratio)
     row = dict(
         variant=name,
         n_features=r["n_features"],

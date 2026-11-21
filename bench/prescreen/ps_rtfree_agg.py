@@ -4,7 +4,8 @@ went to prediction, and how many of OFF's accepted precursors each target would 
 Precursors are matched across arms by (peptidoform, charge): the prescreened library is
 renumbered, so candidate ids differ between OFF and PRE.
 
-usage: ps_rtfree_agg.py ROOT INPUT_TABLE [--entrapment]
+usage: ps_rtfree_agg.py ROOT INPUT_TABLE [--entrapment RATIO]
+  RATIO: the library's rescore.entrapment_ratio (make_entrapment_fasta.py --ratio-library)
   INPUT_TABLE: what the screen read (FASTA mode: ROOT/PRE/peptidoforms.parquet; library mode:
   the imported lib precursors)
 """
@@ -19,10 +20,13 @@ import sys
 import numpy as np
 import pyarrow.parquet as pq
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from make_entrapment_fasta import fdp_estimates  # noqa: E402
+
 ROOT, INPUT = sys.argv[1], sys.argv[2]
 ENTRAP = "--entrapment" in sys.argv
 ENT = {"marker": "ENTRAP_", "exclude": "REAL_", "contaminants": ["KRT", "K1C", "K2C", "ALBU", "TRYP"],
-       "ratio": 0.560632}
+       "ratio": float(sys.argv[sys.argv.index("--entrapment") + 1]) if ENTRAP else None}
 
 
 def is_entrap(p):
@@ -42,7 +46,7 @@ def scored(path):
         pep = tgt.sort_values("peptide_q_value").drop_duplicates("base_peptide_id")
         pep = pep[pep.peptide_q_value <= 0.01]
         e = pep.protein.map(is_entrap)
-        out["fdp"] = 100 * (ENT["ratio"] * int(e.sum()) + 1) / max(int((~e).sum()), 1)
+        out["fdp"] = {k: 100 * v for k, v in fdp_estimates(int((~e).sum()), int(e.sum()), ENT["ratio"]).items()}
     return out
 
 
@@ -115,12 +119,14 @@ off_pep = mean_sd([s["peptides"] for s in res["OFF"]["seeds"]])[0]
 for arm, r in res.items():
     pep = mean_sd([s["peptides"] for s in r["seeds"]])
     prec = mean_sd([s["precursors"] for s in r["seeds"]])
-    fdp = mean_sd([s["fdp"] for s in r["seeds"]]) if ENTRAP else None
+    fdp = {k: mean_sd([s["fdp"][k] for s in r["seeds"]])[0]
+           for k in ("combined", "lower_bound", "real_only")} if ENTRAP else None
     st = r["stages"]
     top = ", ".join(f"{k} {v / 60:.1f}" for k, v in sorted(st.items(), key=lambda x: -x[1])[:7])
     lines.append(
         f"{arm}: peptides {pep[0]:.1f} (sd {pep[1]:.1f}, {100 * (pep[0] / off_pep - 1):+.2f}%), precursors {prec[0]:.1f}"
-        + (f", FDP {fdp[0]:.3f}%" if fdp else "")
+        + (f", FDP combined {fdp['combined']:.3f}%, lower bound {fdp['lower_bound']:.3f}%, "
+           f"real-only {fdp['real_only']:.3f}%" if fdp else "")
         + f"; wall {r['time']['wall_s'] / 60:.1f} min, peak {r['time']['peak_gb']:.1f} GB"
         + (f"; predicted {r['predicted'][0]} of {r['predicted'][1]} peptidoforms" if r["predicted"] else "")
         + (f"; sub-library {r['sublibrary'][0]} of {r['sublibrary'][1]}" if r["sublibrary"] else "")

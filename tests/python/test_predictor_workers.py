@@ -653,16 +653,21 @@ def test_deeplc_workers_filter_the_blank_progress_lines(script):
 def test_deeplc_progress_filter_keeps_content_and_drops_blanks():
     """The filter drops only what says nothing, and keeps order.
 
-    Exercised on `deeplc_finetune.py`, whose module body does not need DeepLC beyond the
-    version probe; the class is plain stdlib.
+    The class is plain stdlib, so it is lifted out of `deeplc_finetune.py` with `ast` and run
+    on its own: importing the worker inside pytest would import DeepLC after numpy and pyarrow
+    (README) and set the OpenMP thread variables of every later worker to 1.
     """
+    import ast
     import io as _io
 
-    importorskip_any("deeplc")
-    module = _load_finetune_worker()
+    text = _source("deeplc_finetune.py")
+    node = next(n for n in ast.parse(text).body
+                if isinstance(n, ast.ClassDef) and n.name == "_DropBlankProgress")
+    namespace = {"io": _io}
+    exec(ast.get_source_segment(text, node), namespace)  # noqa: S102
 
     sink = _io.StringIO()
-    proxy = module._DropBlankProgress(sink)
+    proxy = namespace["_DropBlankProgress"](sink)
     proxy.write("\r")                       # a bare progress update
     proxy.write("\r\n")                     # and another
     proxy.write("real message\n")
@@ -672,15 +677,6 @@ def test_deeplc_progress_filter_keeps_content_and_drops_blanks():
     proxy.close()
 
     assert sink.getvalue() == "real message\nsecond\ntrailing without newline"
-
-
-def _load_finetune_worker():
-    spec = importlib.util.spec_from_file_location(
-        "mumdia_deeplc_finetune_filter", SCRIPTS / "deeplc_finetune.py"
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 # ------------------------------------------------------------------ IM2Deep worker

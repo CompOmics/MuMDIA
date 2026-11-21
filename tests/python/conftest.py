@@ -260,7 +260,7 @@ def read_columns(path, columns=None):
 
 
 def assert_complete_finite_coverage(path, expected_rows, key="candidate_id", sidecar=""):
-    """Mirror of `align_sidecar_scores` (`rescore.rs:1046-1082`).
+    """Mirror of `align_sidecar_scores` (`rescore.rs::align_sidecar_scores`).
 
     The Rust caller bails on a coverage mismatch, a duplicate row id, an
     out-of-range row id or a non-finite score. A sidecar that violates this
@@ -290,8 +290,8 @@ def assert_library_load_invariants(
     """The two hard preconditions of `index.rs load()`, plus the codec contract.
 
     `candidate_id` must be the contiguous row-aligned range `0..ncand`
-    (`index.rs:112-125`) and precursors must ascend by `precursor_mz`
-    (`index.rs:215-231`). Both are hard errors that abort the run, and a broken
+    (`index.rs::check_candidate_ids`) and precursors must ascend by `precursor_mz`
+    (`index.rs::precursor_row_span`). Both are hard errors that abort the run, and a broken
     m/z ordering additionally makes the fragment index's `partition_point`
     search return the wrong candidate window.
     """
@@ -300,17 +300,17 @@ def assert_library_load_invariants(
     cid = [int(x) for x in prec.column("candidate_id").to_pylist()]
     assert cid == list(range(n)), (
         "precursor candidate_id is not the contiguous range 0..ncand "
-        "(index.rs:112-125 bails on the first offending row)"
+        "(index.rs::check_candidate_ids bails on the first offending row)"
     )
     mz = np.asarray(prec.column("precursor_mz").to_pylist(), dtype=np.float64)
     assert np.all(np.diff(mz) >= 0.0), (
-        "precursors are not ascending by precursor_mz (index.rs:215-231)"
+        "precursors are not ascending by precursor_mz (index.rs::precursor_row_span)"
     )
     frag = pq.read_table(str(frag_path))
     fcid = np.asarray(frag.column("candidate_id").to_pylist(), dtype=np.int64)
     assert fcid.size == 0 or (fcid.min() >= 0 and fcid.max() < n), (
         "a fragment references a candidate_id past the precursor count "
-        "(index.rs:133-139)"
+        "(index.rs::count_part)"
     )
     labels = set(prec.column("label").to_pylist())
     if require_both_labels:
@@ -375,7 +375,7 @@ def synthetic_psms(n_targets=600, n_decoys=600, n_features=5, seed=0):
 
 
 def write_pin(path, psms):
-    """Write the tab-separated PIN exactly as `rescore.rs:978-999` does.
+    """Write the tab-separated PIN exactly as `rescore.rs::run_pin_sidecar` does.
 
     Fixed columns, `SpecId = psm_<i>` / `ScanNr = <i>` on the unique flat row
     index (never `candidate_id`, which repeats across runs), `ExpMass` and
@@ -405,7 +405,7 @@ def write_pin(path, psms):
 
 
 def write_features_parquet(path, psms):
-    """Write the `rescore.handoff = parquet` feature table (`rescore.rs:836-862`).
+    """Write the `rescore.handoff = parquet` feature table (`rescore.rs::run_pin_sidecar`).
 
     Same column names and order as the PIN, `Label`/`ScanNr` int32, features
     float32; accepted by `nn_rescore_worker` only.
@@ -437,7 +437,7 @@ def write_scored_table(path, rows, extra_q=None, extra_int=None):
     """Write an experiment-wide scored_combined table for `mbr_worker.py`.
 
     `rows` holds equal-length sequences for the columns MBR reads
-    (`mbr_worker.py:81-82`): candidate_id, source, label, q_value, peptidoform,
+    (`mbr_worker.py::selected_apex_map`): candidate_id, source, label, q_value, peptidoform,
     charge, protein_group. `extra_q` adds further PSM-level q columns
     (`run_psm_q`, `experiment_psm_q`) that the M5 augmentation must also lower;
     `extra_int` adds int32 columns such as `selected_peak_rank`.

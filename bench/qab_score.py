@@ -20,9 +20,13 @@ same quantity computed consistently, which is what an A/B needs.
 - log2 ratio = median(log2 A intensities) - median(log2 B intensities);
 - epsilon = observed log2 ratio - expected (HUMAN 0, YEAST +1, ECOLI -2), per the
   archived AIF module's `module_settings.toml` (A/B 1.0, 2.0, 0.25);
-- CV = within-condition coefficient of variation on the raw intensities, taken per
-  condition and averaged over the two, then reported as a median over features;
+- CV = within-condition coefficient of variation on the raw intensities, one value per
+  (feature, condition), reported as the median over all of them;
 - completeness = features quantified in >= 3 runs and in all 6.
+
+Each arm directory must hold runs named A01, A02, A03, B01, B02, B03. Since 0.10 a
+`run-experiment` names its run folders after the input files, so run the arm with
+`--run-names A01,A02,A03,B01,B02,B03`.
 
 Usage:  python qab_score.py <arm_dir>            # e.g. qab/on
         python qab_score.py <arm_a> <arm_b>      # prints both plus the delta

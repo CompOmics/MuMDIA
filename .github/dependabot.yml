@@ -68,9 +68,10 @@ updates:
   # create a second list that nothing installs and that drifts from the one that
   # does, which is worse than no entry.
   #
-  # What covers the gap meanwhile: the `sidecar-imports` CI job resolves both
-  # environments for real and runs `pip-audit` over them, so a known
-  # vulnerability in a sidecar dependency fails a build. The permanent fix is
+  # What covers the gap meanwhile: the `sidecar-imports` CI job resolves the
+  # sidecar environments (deeplc, rescore, peptdeep) for real and runs
+  # `pip-audit` over them, so a known vulnerability in a sidecar dependency
+  # fails a build. The permanent fix is
   # `scripts/pyproject.toml` (docs/22, WP4), after which a `pip` entry pointing
   # at /scripts belongs here.
   - package-ecosystem: github-actions

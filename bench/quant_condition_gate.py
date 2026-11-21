@@ -5,10 +5,16 @@
 A (precursor, condition) group keeps its values only when at least one run of the
 condition has a first-pass identification of the precursor. Every other value of the
 group is a second-pass identification at the detection limit, and those groups carry
-the most compressed ratios. It is rule F1 of `prov_filter.py`, on the directory layout of
-`run-experiment` and on the engine's own flag. The gate changes no value: it removes values. A score
-obtained with it is a different operating point (fewer quantified ions) and must be
-compared with other results at a matched number of finite ratios.
+the most compressed ratios. It is rule F1 of the August second-pass prototype (the former
+`bench/prov_filter.py`), on the directory layout of `run-experiment` and on the engine's own
+flag. The gate changes no value: it removes values. A score obtained with it is a different
+operating point (fewer quantified ions) and must be compared with other results at a matched
+number of finite ratios.
+
+Measured with the prototype on the ProteoBench Astral set, F1 moved the global median absolute
+epsilon from 0.195 to 0.176 and the species-equalised value from 0.283 to 0.223 while giving up
+6% of features; on the six AIF runs the prototype reproduced the recorded F1 counts exactly
+(69,190 / 71,432 / 66,213 / 60,891 / 63,053 / 60,296 kept).
 
 The flag per value comes from the engine (`peptide_quant` v3 column `first_pass_id`,
 written under `mbr.first_pass_flag`), or, with `--derive-first-pass`, from the

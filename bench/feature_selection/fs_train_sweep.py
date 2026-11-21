@@ -121,14 +121,15 @@ def main():
     ap.add_argument("--features", default=None, help="file with one feature name per line")
     ap.add_argument("--seeds", default="0")
     ap.add_argument("--rows", type=int, default=None)
-    ap.add_argument("--entrapment", action="store_true",
-                    help="classify spike-in targets from the Proteins column and report the empirical FDP")
+    ap.add_argument("--entrapment", type=float, default=None, metavar="RATIO",
+                    help="classify spike-in targets from the Proteins column and report the entrapment "
+                         "FDP estimates; RATIO is the library's rescore.entrapment_ratio")
     ap.add_argument("--grid", default="quick")
     ap.add_argument("--only", default=None)
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
-    d = fs_lib.load_pin(args.pin, entrapment=args.entrapment)
+    d = fs_lib.load_pin(args.pin, entrapment=args.entrapment is not None)
     if args.rows:
         d = fs_lib.subsample(d, args.rows, seed=0)
         print(f"subsampled to {len(d['y'])} rows", flush=True)
@@ -150,7 +151,7 @@ def main():
     for label, over in variants:
         for sd in [int(x) for x in args.seeds.split(",")]:
             t0 = time.time()
-            row, r = fs_lib.bench_subset(label, d, cols, cfg={**over, "seed_base": sd})
+            row, r = fs_lib.bench_subset(label, d, cols, cfg={**over, "seed_base": sd}, ratio=args.entrapment)
             row.update(
                 dataset=args.tag,
                 seed=sd,

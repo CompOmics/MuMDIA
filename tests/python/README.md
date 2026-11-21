@@ -39,13 +39,17 @@ environment therefore reports "sklearn is not usable here: PydanticUserError:
 
 | needs | skips | unlocks |
 |---|---|---|
-| nothing | never | `test_mbr_worker.py`, `test_import_diann_lib.py`, `test_decoy_builders.py`, `test_gen_config_reference.py`, the static half of `test_predictor_workers.py` |
+| nothing | never | `test_import_diann_lib.py`, `test_decoy_builders.py`, `test_gen_config_reference.py`, the static half of `test_predictor_workers.py` (the `im2deep` import-order check included) |
+| git and `MBR_REFERENCE_COMMIT` in the clone | the reference-worker test of `test_mbr_worker.py` (skips on the shallow clone of the bare CI job) | the comparison against the reference worker; the rest of the file never skips |
+| numpy, pyarrow | the table tests of `test_deeplc_predict.py`, `test_check_smoke_columns.py` | the DeepLC thread policy and output plumbing |
 | scikit-learn | `test_entrapment_worker.py` | the entrapment rescorer |
 | mokapot | `test_mokapot_worker.py` | mokapot coverage + model selection |
 | torch | `test_nn_rescore_worker.py` | `nn_torch` coverage, three input paths |
 | deeplc | 2 tests in `test_predictor_workers.py` | the real module import order |
 | psm_utils | 1 of those 2 | `deeplc_finetune.py`'s import order |
 | ms2pip | 1 test in `test_predictor_workers.py` | the MS2PIP output schema |
+| peptdeep | 2 tests in `test_predictor_workers.py` | the AlphaPeptDeep worker end to end (downloads its pretrained models) and its unknown-instrument rule |
+| deeplc >= the floor, torch | the real-DeepLC tests of `test_deeplc_predict.py` | one-process, sharded, band and projection-cache prediction, and the multi-head output-range record |
 
 No test is expected to fail. Three of them assert that the library helpers
 write arrow `utf8` string columns; that assertion was red when this suite was
@@ -209,6 +213,23 @@ lines inserted into every file, and that neither carries a line number. A negati
 makes the Rust and then the Python citation carry the position of the read and asserts
 that the check reports it, so the invariance check cannot pass because the shifting
 became a no-op.
+
+### Other files
+
+The files below follow the same conventions; each module docstring states the contract.
+
+* `test_deeplc_predict.py`: thread policy and prediction plumbing of the two DeepLC workers.
+* `test_lib_io.py`: the shared library writer (`scripts/_lib_io.py`), engine encoding at any size and chunk layout.
+* `test_merge_libraries.py`: `scripts/merge_libraries.py` (empirical plus predicted library).
+* `test_predict_decoys.py`, `test_predict_decoys_mods.py`: `scripts/predict_decoys.py`, including the modifications it declares to the external predictor.
+* `test_remap_library.py`: `scripts/remap_library.py` and `import_diann_lib.py --remap-fasta`.
+* `test_terminal_mods.py`: N-terminal modifications (`[Acetyl]-PEPK`) through the library helpers.
+* `test_unimod_catalogue.py`: the Python modification catalogue equals the engine's JSON.
+* `test_prune_outputs.py`: the retention tiers of `scripts/prune_outputs.py`.
+* `test_quant_condition_gate.py`: `bench/quant_condition_gate.py`, the condition-level first-pass evidence gate.
+* `test_bench_entrapment.py`: `bench/make_entrapment_fasta.py::fdp_estimates`, the entrapment FDP estimates the bench scripts print, pinned on the docs/08 section 4d counts.
+* `test_check_smoke_columns.py`: the column sets `ci/check_smoke.py` checks are the Rust ones.
+* `test_lockfile_versions.py`: the version-tolerant check of the documents generated from the Cargo lockfile.
 
 ## Conventions
 

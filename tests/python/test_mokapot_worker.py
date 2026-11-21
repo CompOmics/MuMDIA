@@ -4,7 +4,7 @@ Skipped without mokapot. Two contracts:
 
 1. Complete out-of-fold coverage. `_oof_scores` merges mokapot's held-out
    target and decoy confidence tables and raises unless they cover the PIN rows
-   exactly once with finite scores (`mokapot_worker.py:136-163`). There is
+   exactly once with finite scores (`mokapot_worker.py::main`). There is
    deliberately no in-sample or fold-averaging fallback, because averaging all
    fold models over all rows is not out-of-fold (two of three folds trained on
    each row) and makes nominal q-values anti-conservative.
@@ -35,7 +35,7 @@ from conftest import (
 )
 
 # mokapot's model is built with a hard-coded train_fdr of 0.01
-# (`mokapot_worker.py:53`), so the pool has to be large enough for the
+# (`mokapot_worker.py::make_model`), so the pool has to be large enough for the
 # semi-supervised step to find positives at 1%.
 FAST_ENV = {
     "MUMDIA_RESCORE_MODEL": "logreg",
@@ -71,7 +71,7 @@ def test_logreg_run_scores_every_pin_row_exactly_once(mokapot_module, psms, tmp_
     """Every PIN row must come back once, finite, from a held-out fold.
 
     The Rust caller validates exact, unique, finite coverage and bails
-    otherwise (`rescore.rs:1046-1082`), so an incomplete confidence table costs
+    otherwise (`rescore.rs::align_sidecar_scores`), so an incomplete confidence table costs
     the whole run under `rescore.strict = true`. The stdout line asserted here
     is the only place the out-of-fold branch announces itself, and there is no
     in-sample fallback behind it by design.

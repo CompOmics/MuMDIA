@@ -1,25 +1,28 @@
-"""Entrapment FDP for the multi-head A/B, computed the way the engine does.
+"""Entrapment FDP estimates for an A/B on the E. coli + human entrapment library.
 
 The E. coli AIF file is searched against an E. coli + 1:1 human entrapment library.
 The human peptides cannot be in the vial, so any that pass at 1% are false by
 construction: the empirical null that target-decoy q cannot provide.
 
-Under `rescore.classifier = entrapment` the engine already writes the entrapment FDP
-into the ordinary `q_value` / `peptide_q_value` columns (`rescore.rs`, `QMode::Entrapment`
--> `fdr::entrapment_q`). This script reports the accepted counts and recomputes the FDP
-at the threshold from the same formula, `(ratio * entrapment + 1) / real`, so the number
-in the write-up does not rest on reading one column correctly.
+It prints three estimates at peptide q 1% (`make_entrapment_fasta.fdp_estimates`): the
+combined estimate and the lower bound for the whole accepted target list, and the estimate for
+the real hits alone, `(ratio * entrapment + 1) / real`. The last is what
+`rescore.classifier = entrapment` cuts on (`fdr::entrapment_q`), so on such a run it restates
+the threshold; only the combined estimate and the lower bound say anything about calibration,
+and only on a run thresholded on decoys.
 
 Classification mirrors `rescore.rs::classify_entrapment`: a target row is a spike-in when
 its protein contains the marker, does not contain the exclude string, and contains none of
 the contaminant markers.
 
-Usage:  python fdp.py <config.json> <arm_label>:<out_dir> [<arm_label>:<out_dir> ...]
+Usage:  python entrapment_fdp.py <config.json> <arm_label>:<out_dir> [<arm_label>:<out_dir> ...]
 """
 import json
 import sys
 
 import pyarrow.parquet as pq
+
+from make_entrapment_fasta import fdp_estimates
 
 SCORED = "psms_scored.parquet"
 
@@ -40,7 +43,10 @@ def arm(label, out_dir, cfg):
     marker = r.get("entrapment_marker")
     exclude = r.get("entrapment_exclude")
     contaminants = r.get("entrapment_contaminant_markers", [])
-    ratio = float(r.get("entrapment_ratio", 1.0))
+    if "entrapment_ratio" not in r:
+        raise SystemExit("the config has no rescore.entrapment_ratio; measure it with "
+                         "make_entrapment_fasta.py --ratio-library and put it there")
+    ratio = float(r["entrapment_ratio"])
 
     t = pq.read_table(
         f"{out_dir}/{SCORED}",
@@ -58,7 +64,7 @@ def arm(label, out_dir, cfg):
     acc = pep[pep["peptide_q_value"] <= 0.01]
     n_real = int((~acc["is_ent"]).sum())
     n_ent = int(acc["is_ent"].sum())
-    fdp = (ratio * n_ent + 1) / max(n_real, 1)
+    est = fdp_estimates(n_real, n_ent, ratio)
 
     # The decoy fraction is reported alongside because a changed FDP means nothing if
     # the decoy-based threshold moved at the same time.
@@ -70,8 +76,9 @@ def arm(label, out_dir, cfg):
         "arm": label,
         "real peptides @1%": n_real,
         "spike-in peptides": n_ent,
-        "FDP": round(fdp, 5),
-        "FDP %": round(100 * fdp, 3),
+        "combined FDP %": round(100 * est["combined"], 3),
+        "lower bound %": round(100 * est["lower_bound"], 3),
+        "real-only FDP %": round(100 * est["real_only"], 3),
         "target PSMs @1%": n_tgt_psm,
         "decoy PSMs @1%": n_dec_psm,
         "decoy fraction": round(n_dec_psm / max(n_tgt_psm, 1), 4),
@@ -99,7 +106,9 @@ def main():
         d = b["real peptides @1%"] - a["real peptides @1%"]
         pct = 100 * d / max(a["real peptides @1%"], 1)
         print()
-        print(f"  peptides {d:+,} ({pct:+.2f}%) | FDP {a['FDP %']:.3f}% -> {b['FDP %']:.3f}%")
+        print(f"  peptides {d:+,} ({pct:+.2f}%) | combined FDP {a['combined FDP %']:.3f}% -> "
+              f"{b['combined FDP %']:.3f}% | real-only {a['real-only FDP %']:.3f}% -> "
+              f"{b['real-only FDP %']:.3f}%")
     return 0
 
 

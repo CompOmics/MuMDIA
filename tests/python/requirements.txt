@@ -21,6 +21,7 @@ numpy>=1.22
 #                    deeplc_worker.py and deeplc_finetune.py
 #   psm_utils     -> same check for deeplc_finetune.py
 #   ms2pip        -> the ms2pip_worker.py output-schema test
+#   peptdeep      -> the peptdeep_worker.py end-to-end and unknown-instrument tests
 #
 # Note on pandas: `DataFrame.to_parquet` chooses the arrow string width itself,
 # and pandas 3 writes `large_string`, which the engine rejects. The library

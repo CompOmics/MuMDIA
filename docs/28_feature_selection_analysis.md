@@ -471,7 +471,8 @@ families (not demix, order_consistency, peak_scans):
 - apex_dispersion (3): frag_apex_rt_std, peak_fwhm_scans, peak_shoulder_score
 - psm_extra (2): cross_charge_intensity_log, n_charge_states
 
-The list is `C:/Users/robbi/mumdia_bench/fs/fs_union75_dedup.txt`, one name per line, in
+The list is `rust/mumdia/crates/mumdia/src/stages/feature_presets/compact.txt` (the
+`compact` preset), one name per line after its comment header, in
 PIN column order, i.e. directly usable as `MUMDIA_NN_FEATURES`.
 
 ### 6.4 The real worker on B01 with the 122-feature union
@@ -660,10 +661,12 @@ AIF file searched against an E. coli + 1:1 human entrapment library gives that n
 peptides are absent from the vial, so any that pass at 1% are false by construction. 41,041 of
 67,304 target rows are spike-ins.
 
-FDP is the engine's own estimator (`fdr.rs::entrapment_q`, `(ratio * entrapment + 1) / real`,
-ratio 0.560632), at the peptide level, two seeds:
+FDP is the engine's entrapment estimate for the real peptides alone (`fdr.rs::entrapment_q`,
+`(ratio * entrapment + 1) / real`, ratio 0.560632), at the peptide level, two seeds. The
+combined estimate for all accepted targets is about 2.6 times higher (baseline 1.46%, lower
+bound 0.94%), so these values compare recipes; they do not show calibration:
 
-| recipe | peptides | decoy fraction | spike-in peptides | FDP |
+| recipe | peptides | decoy fraction | spike-in peptides | real-only FDP |
 |---|---|---|---|---|
 | baseline | 2,831 | 0.97% | 26.5 | 0.57% |
 | neg5 hybrid | 2,808 | 0.95% | 22.0 | 0.48% |
@@ -672,7 +675,7 @@ ratio 0.560632), at the peptide level, two seeds:
 | warm5 + neg3 hybrid | 2,950 | 0.95% | 28.5 | 0.58% |
 | neg1 margin | 2,538 | 0.95% | 24.0 | 0.57% |
 
-FDP moves between 0.48% and 0.62% around a 0.57% baseline, on counts of 22-30 spike-in peptides
+The real-only FDP moves between 0.48% and 0.62% around a 0.57% baseline, on counts of 22-30 spike-in peptides
 where Poisson noise alone is +-0.1 percentage points. There is no evidence that hard-negative
 training buys identifications by exploiting decoy structure: the extra peptides are as real as
 the baseline's.

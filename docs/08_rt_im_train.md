@@ -528,26 +528,41 @@ construction. One binary, two runs, configurations differing only in
 |---|---|---|
 | real peptides at 1% | 7,879 | **8,216** (+4.28%) |
 | spike-in peptides accepted | 138 | 144 |
-| **empirical FDP** | **0.995%** | **0.995%** |
+| entrapment estimate of the real peptides (the cut) | 0.995% | 0.995% |
+| combined entrapment estimate, all accepted targets | 2.686% | 2.688% |
+| lower bound, all accepted targets | 1.721% | 1.722% |
 | target PSMs at 1% | 8,832 | 9,166 |
 | wall clock | 10:19 | 10:55 |
 
-FDP is `(ratio * entrapment + 1) / real` with `entrapment_ratio = 0.560632`, the engine's
-own estimator (`fdr.rs::entrapment_q`), and it is identical to three decimal places. The
-gain is therefore real discoveries, not a loosened threshold: 4.28% more peptides at the
-same measured false-discovery proportion.
+Both arms ran `rescore.classifier = entrapment`, which cuts the list where
+`(ratio * entrapment + 1) / real` (`fdr.rs::entrapment_q`, `ratio = 0.560632` = real /
+entrapment target candidates) reaches 1%. The 0.995% is that cut restated: the estimated
+FDP of the E. coli peptides alone, fixed by construction, not a measurement. The result is
+therefore 4.28% more real peptides at a matched entrapment cut. On these counts the whole
+accepted target list has a combined entrapment estimate,
+`entrapment * (1 + ratio) / (real + entrapment)`, of 2.69% and a lower bound,
+`entrapment / (real + entrapment)`, of 1.72% in both arms
+(`bench/make_entrapment_fasta.py::fdp_estimates`). The arm compares sensitivity against an
+empirical null; it does not show that a reported 1% is calibrated. Measured on main with the
+default `nn_torch` rescore (seeds 1-3, 2026-11-21), the same file at `precursor_q` 1% gives a
+real-only estimate of 1.02%, a combined estimate of 2.77% and a lower bound of 1.78% (at
+`peptide_q_value` 1%: 1.05% / 2.97% / 1.96%). I/L or single-substitution homology to an E. coli
+peptide explains only 17 of about 218 entrapment hits, so the lower bound above 1% is not
+explained by near-isobaric matches. On the E. coli diaPASEF entrapment library (seed 1) the
+combined estimate is 1.02% and the lower bound 0.65%.
 
-This measurement is about five times more sensitive than the entrapment arms in
-`docs/28_feature_selection_analysis.md`, which rest on 22-30 accepted spike-in peptides
-and cannot resolve FDP differences below roughly 0.1 percentage points. With 138 and 144
-it resolves considerably finer, and still sees no difference.
+This measurement rests on more spike-ins than the entrapment arms in
+`docs/28_feature_selection_analysis.md` (22-30 accepted spike-in peptides), but under
+`classifier = entrapment` the FDP is fixed by construction, so it measures sensitivity at a
+matched cut, not an FDP difference.
 
 Two things to read carefully rather than over-read:
 
 - decoys accepted at the entrapment threshold moved 91 to 113 (1.03% to 1.23% of targets).
   Under `classifier = entrapment` the q column is the entrapment FDP, not target-decoy, so
   this is a side diagnostic and not the threshold in use. It is worth watching if the
-  number grows, but the spike-in FDP is the empirical null and it did not move.
+  number grows; the spike-in count, which rose 138 to 144 with the real count, is the
+  empirical null.
 - the 1.06x wall clock here is NOT the cost of the default. This is a single run against a
   library whose baseline arm already pays a DeepLC re-prediction of its own, so multi-head
   displaces work rather than adding it. The 1.4x to 1.7x figures above, from six-run
