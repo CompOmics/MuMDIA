@@ -945,7 +945,7 @@ candidate removed by within-group competition.
 
 ## Stage F: `rescore` (`stages/rescore.rs`)
 
-### psms_scored (schema v3, `scored_schema`)
+### psms_scored (schema v4, `scored_schema`)
 
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
@@ -1221,7 +1221,7 @@ the runs where the first pass accepted it:
 
 ## `localise` (`stages/localise/`, opt-in)
 
-### localisation (schema v1, `localise/mod.rs`, `run`)
+### localisation (schema v2, `localise/mod.rs`, `run`)
 
 Written only under `localise.enabled` or by `mumdia localise`: one row per scored row of one
 run that carries a localised modification, in scored-table order. The column list, the
@@ -1463,14 +1463,29 @@ contract files, not engine artifacts.
 
 ## Schema-version registry
 
-`mumdia-core/src/schema.rs` freezes the `(logical name, version)` pairs. As of
-`schema.rs:7-25`: `psms_scored` and `psms_competed` are v4, and `features`,
-`psms_extracted`, `peptide_quant` and `protein_group_quant` v2; every other
-registered artifact is v1. Artifacts with a 1/K0 variant take their version from a selector
-(`artifact::X(has_im)`) and record v1 or main's version on every 3D run: `spectra_ms1`,
-`spectra_ms2`, `isolation_windows`, `seed_psms` and, with an ion-mobility source,
-`fragment_library_precursors` are v2 on 4D data, `psms_extracted` v4 and `chromatograms` v3
-or v4 (docs/35_diapasef.md). Each artifact stamps its version into its own `report.json`
+`mumdia-core/src/schema.rs` (module `artifact`) freezes the `(logical name, version)`
+pairs. This is the one registry in the guide; docs/02 and docs/03 point here. The
+version a default 3D run writes, and the versions written only under a condition:
+
+| logical name | default 3D run | other versions (condition) |
+|---|---|---|
+| `spectra_ms1`, `isolation_windows`, `seed_psms`, `fragment_library_precursors` | 1 | 2 (1/K0 data) |
+| `spectra_ms2` | 1 | 2 (1/K0 data); 3 (`convert.isolation_half_width`, ZT Scan) |
+| `run_windows` | 1 | 2 (`rt_im_train.run_windows_f32`) |
+| `peptides` | 1 | 2 (a protein-N-terminal modification rule) |
+| `psms_extracted` | 2 | 4 (1/K0 data); 5 to 9 (the scanning-quadrupole and MS1-envelope keys) |
+| `chromatograms` | 2 (`extract.chromatogram_schema = 2`, the default) | 1 (`chromatogram_schema = 1`); 3, 4 (1/K0 data); 5, 6 (`extract.q1_traces`) |
+| `features` | 2 | |
+| `psms_competed`, `psms_scored` | 4 | |
+| `peptide_quant` | 2 | 3 (`mbr.first_pass_flag` after a second pass); 4 (`quant.q1_fragments`) |
+| `protein_group_quant` | 2 | |
+| `fragment_quant` | 1 | 5, 6 (the cross-run export) |
+| `localisation` | 2 | |
+| every other registered artifact | 1 | |
+
+The doc comment on each constant in `schema.rs` defines the condition exactly. An
+artifact with a 1/K0 variant takes its version from a selector (`artifact::X(has_im)`),
+so a 3D run never writes a 4D version (docs/35_diapasef.md). Each artifact stamps its version into its own `report.json`
 (`mumdia-io/src/report.rs:14`) and into `manifest.json`
 (`mumdia-core/src/manifest.rs:15`), so an artifact on disk states its own version
 rather than inheriting the engine's.

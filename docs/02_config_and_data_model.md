@@ -86,28 +86,8 @@ reads them back to validate a downstream read (`Table::read`, `table.rs:317-319`
 does no version check, and `write_table`, `table.rs:166-211`, does not stamp the
 id into the Parquet file itself).
 
-| Constant | Logical name | Version |
-|---|---|---|
-| `SPECTRA_MS1` | `spectra_ms1` | 1 |
-| `SPECTRA_MS2` | `spectra_ms2` | 1 |
-| `ISOLATION_WINDOWS` | `isolation_windows` | 1 |
-| `MS2_TO_MS1` | `ms2_to_ms1` | 1 |
-| `PEPTIDES` | `peptides` | 1 |
-| `PEPTIDES_V2` | `peptides` | 2 (adds `protein_n_term`; written only with a protein-N-terminal modification rule, through `artifact::peptides(flag)`) |
-| `PEPTIDOFORMS` | `peptidoforms` | 1 |
-| `FRAGMENT_LIBRARY_PRECURSORS` | `fragment_library_precursors` | 1 |
-| `FRAGMENT_LIBRARY_FRAGMENTS` | `fragment_library_fragments` | 1 |
-| `SEED_PSMS` | `seed_psms` | 1 |
-| `RUN_WINDOWS` | `run_windows` | 1 |
-| `PSMS_EXTRACTED` | `psms_extracted` | **2** |
-| `CHROMATOGRAMS` | `chromatograms` | 1 |
-| `CHROMATOGRAMS_V2` | `chromatograms` | **2** (only under `extract.chromatogram_schema = 2`) |
-| `FEATURES` | `features` | 1 |
-| `PSMS_COMPETED` | `psms_competed` | **3** |
-| `PSMS_SCORED` | `psms_scored` | **4** |
-| `PEPTIDE_QUANT` | `peptide_quant` | **2** |
-| `PROTEIN_GROUP_QUANT` | `protein_group_quant` | **2** |
-| `FRAGMENT_QUANT` | `fragment_quant` | 1 |
+The current versions, and the conditions under which a stage writes a variant, are
+listed once in docs/15_data_dictionary.md, "Schema-version registry".
 
 `PSMS_SCORED` v3 added the identification apex/bounds so quant can integrate the
 selected peak; v4 added `selected_peak_rank` for top-K peak promotion. The
@@ -122,7 +102,7 @@ chain. The scored column layout is written by the rescore stage
 | `charge` | I32 | precursor charge |
 | `label` | Str | `target` / `decoy` |
 | `protein` | Str | protein accession |
-| `base_peptide_id` | U32 | interned stripped-peptide id; the peptide-level q grouping and also the default `compete.group_by = base_peptide` key |
+| `base_peptide_id` | U32 | interned stripped-peptide id; the peptide-level q grouping and also the `compete.group_by = base_peptide` key (the default is `peptidoform_charge`) |
 | `apex_rt` | F64 | identification apex used by downstream quant |
 | `elution_lo` / `elution_hi` | F64 | identified elution bounds carried through |
 | `score` | F64 | rescorer score |
@@ -308,8 +288,8 @@ oxidation products, acylations, methylations, `GlyGly`, `HexNAc`, `Hex`, `Sulfo`
 `Palmitoyl`, `Biotin` and homocysteinylation (`HCysThiolactone` 117.024835 on K,
 `HCysteinyl` 133.019749 on C). An entry may carry an optional plain-language `label`,
 which the desktop Search tab shows and matches in its filter; the engine ignores it. A unit test recomputes every delta from its elemental
-composition. The desktop Search tab lists the same file. Terminal modifications are not
-implemented. An unknown name is `MassError::UnknownModification`, never a silent zero.
+composition. The desktop Search tab lists the same file. For terminal modifications see
+docs/05, "Terminal modifications". An unknown name is `MassError::UnknownModification`, never a silent zero.
 
 **ProForma-lite parse** (`parse_peptidoform`, `mass.rs:187-249`): optional
 N-terminal `[Mod]-`, residues each optionally followed by `[Mod]`, optional
@@ -412,7 +392,7 @@ listed with its default and effect. Fields marked **default-off**, **inert**, or
 | `MatcherKind` | config.rs:38-42 | `bucketed`, **`fragindex`** | fragment-matcher backend for search-seed + extract |
 | `Enzyme` | config.rs | **`trypsin_p`**, `trypsin`, `lys_c`, `lys_n`, `arg_c`, `asp_n`, `glu_c`, `chymotrypsin`, `non_specific`, `custom` | cleavage preset or a custom rule (docs/05, "Cleavage rules") |
 | `CalibrationMethod` | config.rs:56-61 | **`loess`**, `linear`, `none` | `none` rejected by validate (falls through to linear) |
-| `FeatureSet` | config.rs:65-75 | **`minimal`** (14), `rich` (44), `extended` (387) | superset battery in `stages/features/`; the `feature_sets_sized` test (`features.rs:1724-1738`) asserts 14, 14+30, and `14 + 30 + extended_names().len() + 6`, which currently resolves to 387 (337 deduplicated family names) |
+| `FeatureSet` | config.rs | **`minimal`** (14), `rich` (44), `extended` (426 with the default window families) | superset battery in `stages/features/`; the `feature_sets_sized` test asserts 14, 14+30, and `14 + 30 + extended_names().len() + 6`; docs/10 has the derivation |
 | `RtPredictorKind` | config.rs:79-86 | **`native`**, `deeplc` | DeepLC is a Python sidecar |
 | `FragPredictorKind` | config.rs:90-96 | **`native`**, `ms2pip` | MS2PIP is a Python sidecar |
 | `RescorerKind` | config.rs:100-123 | **`native_tda`**, `mokapot`, `nn_torch`, `entrapment` | see RescoreConfig |
@@ -529,30 +509,29 @@ intended null (M4) is `PermutedRt` (default), transferring real precursors to a
 decoupled wrong expected RT, `ReverseSequence`, transferring reverse/scramble
 decoys at the same expected RT, or `Both`. All require >= 2 runs.
 
-**`CompeteGroupBy`** (894-901). `Precursor` (default) does **not** group by
-precursor. Its full key is `(base_peptide_id, label_code, 0, peak_rank)`
-(compete.rs:88), where `base_peptide_id` is the stripped-sequence id
+**`CompeteGroupBy`**. The default is `PeptidoformCharge` (since 2026-09-06).
+`BasePeptide` (renamed from `precursor`, which is no longer accepted) is the
+explicit peptide-level option and does **not** group by precursor. Its full key is
+`(base_peptide_id, label_code, 0, peak_rank)`, where `base_peptide_id` is the stripped-sequence id
 (`pd.factorize(Stripped.Sequence)` on the imported path,
 import_diann_lib.py:137; the target peptide row id on the native path,
 peptidoforms.rs:216-220), so every charge state and every modification variant of
 one stripped peptide shares a group and `winner_take_all` deletes all but the
 best-scoring member before rescore. `Apex` replaces the constant `0` with a
-rounded apex-RT bucket (`apex_rt_tolerance_s`, compete.rs:89-92).
-`PeptidoformCharge` keys `(pform_id, label_code, charge, peak_rank)`
-(compete.rs:93-98), so each distinct peptidoform+charge is its own group
-(precursor-level, as DIA-NN/Spectronaut report), recovering the sibling forms the
+rounded apex-RT bucket (`apex_rt_tolerance_s`).
+`PeptidoformCharge` keys `(pform_id, label_code, charge, peak_rank)`, so each
+distinct peptidoform+charge is its own group (precursor-level), recovering the sibling forms the
 stripped-peptide grouping collapses. `peak_rank` is in the key in every mode, so a
 promoted alternate peak competes only against other candidates at the same rank.
 
 The difference is large in a modification-rich search. Measured on a
-modification-expanded imported library, the default grouping removed 880,464 of
+modification-expanded imported library, `base_peptide` removed 880,464 of
 1,890,239 extracted candidates (46.6%), while `peptidoform_charge` removed 0 rows,
 left the peptide count unchanged, and raised precursors per peptide from 1.000 to
-1.174 (DIA-NN reports about 1.126 on comparable data). Under the default grouping
+1.174. Under `base_peptide`
 a modified form is deleted whenever an unmodified or otherwise-modified sibling
-scores higher, so `peptidoform_charge` is required for a PTM-oriented search; it
-stays benchmark-gated as a global default because it changes the rescorer training
-and FDR population.
+scores higher, so `peptidoform_charge` is required for a PTM-oriented search. It
+became the default once the entrapment, HYE and AIF benchmarks had run under it.
 
 The label stays in the key in every mode: a
 target never directly competes against its paired decoy in the `compete` stage.
@@ -571,7 +550,7 @@ not shared across runs.
 uses `peptide_q_value`. `PrecursorQ` uses `precursor_q` and is valid only for a
 single-run rescore; after pooled rescoring that grouped q is experiment-wide. It
 is also a precursor-level filter only when compete ran with
-`group_by = peptidoform_charge`; under the default grouping the sibling forms were
+`group_by = peptidoform_charge` (the default); under `base_peptide` the sibling forms were
 already removed, so it selects base peptides.
 `PsmQ` uses pooled `q_value`. `RunPsmQ` uses per-source `run_psm_q` and is the
 run-local choice after an experiment-wide rescore. Quant has no source selector:
@@ -947,8 +926,8 @@ stale.
   struct declaration order), so the same config hashes to the same `config_hash`
   across runs. `manifest.artifacts` and `model_identities` are `BTreeMap`s
   (`manifest.rs:28-30`), so manifest key order is deterministic. Sidecars are the
-  exception: `deeplc_finetune.py` sets no numpy or torch seed, so
-  `finetune_deeplc` is not reproducible byte-for-byte, and the `nn_torch` worker
+  exception: `deeplc_finetune.py` is seeded from `rng_seed` (`--seed`), but
+  kernel nondeterminism means `finetune_deeplc` is not reproducible byte-for-byte, and the `nn_torch` worker
   seeds numpy and torch but its training kernels are not guaranteed
   bit-deterministic either.
 - **Fragment generation drops b1/y1/y2** unconditionally (`mass.rs:111`,

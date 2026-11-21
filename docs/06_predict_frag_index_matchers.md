@@ -935,8 +935,9 @@ Matcher selection (both stages default to `Fragindex`):
   sums `obs_sum` in the caller's fixed peak order and `touched()` is in
   first-touch order, so callers sort before any float reduction
   (`fragindex.rs:346-350`).
-- **DeepLC nondeterminism and unpredicted peptidoforms.** The DeepLC sidecar and
-  fine-tune are not seeded, so iRT values vary run to run. Any peptidoform DeepLC
+- **DeepLC nondeterminism and unpredicted peptidoforms.** The DeepLC fine-tune is
+  seeded from `rng_seed` (`--seed`), but not bit-for-bit reproducible because of
+  kernel nondeterminism, so fine-tuned iRT values can vary run to run. Any peptidoform DeepLC
   does not return is dropped from the library together with its pair (it used to be
   anchored at iRT 0.0); the library report's `candidates_dropped_unpredicted` counts
   them so a large miss is visible rather than silent.

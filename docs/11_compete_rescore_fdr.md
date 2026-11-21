@@ -898,7 +898,7 @@ unless a knob is set.
 | `entrapment_ratio` | `1.0` | `N_real_lib / N_entrap_lib`, scales the entrapment FDR estimate |
 | `strict` | `true` | production default: any sidecar failure / misconfiguration is a hard error; false explicitly enables compatibility fallback |
 | `shadow_min_shared` | `3` | shadow demotion: demote a row with at least this many library fragments shared with a better first-pass-accepted target of its run and isolation window co-eluting within `shadow_rt_s` (see "shadow demotion and its Q1 term"); 0 is off |
-| `shadow_q1` | `false` | the Q1 term of shadow demotion on scanning-quadrupole runs: co-isolation by precursor m/z and each shared fragment counted by where its Q1 signal sits; needs `extract.q1_fragments`. Omitted from the canonical configuration at its default |
+| `shadow_q1` | `"auto"` | on for a ZT Scan search, off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"); the Q1 term of shadow demotion on scanning-quadrupole runs: co-isolation by precursor m/z and each shared fragment counted by where its Q1 signal sits; needs `extract.q1_fragments`. Omitted from the canonical configuration at its default |
 | `handoff` | `raw` | how the feature matrix reaches a sidecar (`Handoff`): `tsv` writes the Percolator PIN, `parquet` writes an f32 Parquet feature table, `raw` (the default since 2026-09-28) a row-major f32 `.npy` matrix with a metadata parquet and a `.raw.json` description. `parquet` and `raw` apply to `nn_torch` only; a mokapot run warns and falls back to `tsv` (`sidecar_paths`) |
 
 ## Invariants, determinism, gotchas

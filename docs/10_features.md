@@ -18,7 +18,9 @@ from the confident seed set). This makes the heavy per-PSM work embarrassingly
 parallel (`rayon`) while keeping byte-identical output to a serial run.
 
 Everything is driven by `FeaturesConfig` (`mumdia-core/src/config.rs:578`). The
-three feature sets are `Minimal` (14), `Rich` (44), and `Extended` (381). The
+three feature sets are `Minimal` (14), `Rich` (44), and `Extended` (426 under the
+defaults; the derivation is in "The three feature sets" below and the
+`feature_sets_sized` test). The
 default is `Minimal`; the tuned `--profile dia` preset and the DIA-NN-library
 recipe use `Extended`.
 
@@ -1037,7 +1039,7 @@ variant no longer exists).
 
 | field | default | effect |
 |---|---|---|
-| `set` | `Minimal` | which set `active_features` returns (Minimal 14 / Rich 44 / Extended 381) |
+| `set` | `Minimal` | which set `active_features` returns (Minimal 14 / Rich 44 / Extended 426 under the defaults) |
 | `coelution_corr_threshold` | 0.9 | threshold for `n_coelution_above` (count of pairwise fragment correlations at or above it) |
 | `prec_tol_ppm` | 20.0 | precursor tolerance carried for feature bookkeeping |
 | `bound_features` | true | restrict trace-based features to the elution peak instead of the whole extracted window; **gates only the Minimal/Rich `fragment_features` path** (the Extended Evidence always peak-bounds, see gotchas) |

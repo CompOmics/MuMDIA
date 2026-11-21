@@ -63,34 +63,8 @@ schema, but no such read-side check is implemented: `schema_version` is only
 ever written into the report and the manifest, never read back and compared.
 They are `pub const` tuples in the `artifact` submodule, referenced as
 `mumdia_core::schema::artifact::PEPTIDES` and so on. The tuples are
-`(name, version)`:
-
-| logical name | version | producing stage |
-|---|---|---|
-| `spectra_ms1` | 1 | convert |
-| `spectra_ms2` | 1 | convert |
-| `isolation_windows` | 1 | convert |
-| `ms2_to_ms1` | 1 | convert |
-| `peptides` | 1 | digest |
-| `peptidoforms` | 1 | peptidoforms |
-| `fragment_library_precursors` | 1 | predict-frag / library-input |
-| `fragment_library_fragments` | 1 | predict-frag / library-input |
-| `seed_psms` | 1 | search-seed |
-| `run_windows` | 1 | rt-im-train |
-| `psms_extracted` | 1 | extract |
-| `chromatograms` | 1 | extract |
-| `chromatograms` | 2 (`CHROMATOGRAMS_V2`, only under `extract.chromatogram_schema = 2`) | extract |
-| `features` | 1 | features |
-| `psms_competed` | 2 | compete |
-| `psms_scored` | 3 | rescore |
-| `peptide_quant` | 2 | quant |
-| `peptide_quant` | 3 (`PEPTIDE_QUANT_V3`, only `run-experiment` after a second pass under `mbr.first_pass_flag`) | quant |
-| `protein_group_quant` | 2 | quant |
-| `fragment_quant` | 1 | quant |
-
-There are 18 registered artifacts. Four have been version-bumped past 1:
-`psms_competed`, `peptide_quant`, and `protein_group_quant` are at version 2, and
-`psms_scored` is at version 3; every other artifact is still version 1. The
+`(name, version)`; the current versions and the conditions that select them are
+in docs/15_data_dictionary.md, "Schema-version registry". The
 version is recorded in the report and the manifest but is not consumed anywhere:
 no stage reads a prior artifact's version back, so there is no schema-mismatch
 gate on read. A reader could compare the recorded version by hand, but the engine
