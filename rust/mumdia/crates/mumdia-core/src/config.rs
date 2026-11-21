@@ -7795,8 +7795,6 @@ impl Config {
     }
 }
 
-/// Which keys of the quantification recipe the JSON configuration `s` sets
-/// ([`QuantConfig::explicit`]). Called on text that already parsed as a [`Config`].
 /// The release that removed the entries of [`RETIRED`].
 const RETIRED_IN: &str = "0.15.0";
 
@@ -7900,6 +7898,8 @@ fn strip_retired(
     Ok(())
 }
 
+/// Which keys of the quantification recipe the JSON configuration `s` sets
+/// ([`QuantConfig::explicit`]). Called on text that already parsed as a [`Config`].
 fn quant_explicit_keys(s: &str) -> QuantExplicit {
     let v: serde_json::Value = serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
     let q = v.get("quant");
