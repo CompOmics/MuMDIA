@@ -1149,18 +1149,14 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     // The candidate audit reads the pooled extracted and competed tables, and only a single
     // `run` (the caller with a manifest) runs it; `run-experiment` says so once.
     let audit = cfg.extract.emit_candidate_audit && keep_records;
-    // The transfer variants of match-between-runs read the pooled competed table; the second
-    // pass reads the scored table and searches again, so it needs none.
-    let competed_readers = audit || cfg.mbr.strategy.transfers();
-    let pool_competed = cfg.groups.pool_competed || !bands_disjoint || competed_readers;
+    let pool_competed = cfg.groups.pool_competed || !bands_disjoint || audit;
     if !cfg.groups.pool_competed {
         if pool_competed {
             info!(
                 bands_disjoint,
                 audit,
-                mbr = ?cfg.mbr.strategy,
                 "groups: groups.pool_competed is off, but the competed table is pooled: the \
-                 bands overlap, or the candidate audit or match-between-runs reads it"
+                 bands overlap, or the candidate audit reads it"
             );
         } else {
             info!(

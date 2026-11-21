@@ -1319,13 +1319,12 @@ Each file selects on a different q column, and its `q_value` column is that one:
 `peptide_q_value` in `peptides.tsv`, `precursor_q` in `precursors.tsv`, `pg_q_value`
 in `proteins.tsv`. Name the file and the column when quoting a count.
 
-**Acceptance rule, every writer.** A row is written when it is a target and either
-its grouped q is at or under the threshold or it is flagged `is_transferred` by
-`mumdia mbr`. The two columns `is_transferred` and `transfer_q` export that basis
-(docs/29 #19): a transferred row keeps its grouped q, which is usually 1.0, and a
-tighter `--q` does not revoke a transfer that already passed `mbr.q_transfer`. A
-transfer is a peptide-level acceptance, not protein-group confidence; a protein group
-admitted through a transferred row carries the flag so the reader can tell.
+**Acceptance rule, every writer.** A row is written when it is a target and its grouped
+q is at or under the threshold. The columns `is_transferred` and `transfer_q` are `false`
+and empty: they exported the basis of the match-between-runs transfer (`mumdia mbr`),
+removed in 0.15.0, and stay so the header does not change. A scored table an older engine
+wrote with transfers is still read: a transferred row is written, keeps its grouped q
+(usually 1.0), and is not revoked by a tighter `--q` (docs/29 #19).
 
 **Protein annotation columns, every writer.** Each file ends with three more columns, after
 every other one so that a reader addressing the existing columns by position is unaffected:
@@ -1361,8 +1360,8 @@ the best q (`report.rs:90,105-108`). Targets only, filtered on
 | `q_value` | `peptide_q_value` | **base-peptide** q, six decimals |
 | `score` | `score` | rescorer score, four decimals |
 | `quantity` | `peptide_quant.parquet` joined on `(peptidoform, charge)` | empty when the precursor was not quantifiable or no `--peptide-quant` was passed (`report.rs:39-45,61-72`) |
-| `is_transferred` | `is_transferred` (`mumdia mbr`), `false` without it | `true` when the row was admitted as a match-between-runs transfer rather than on its q |
-| `transfer_q` | `transfer_q` (`mumdia mbr`) | the transfer q the row was accepted at, six decimals; empty on every other row |
+| `is_transferred` | `is_transferred` of a scored table written before 0.15.0, `false` otherwise | `true` when the row was admitted as a match-between-runs transfer (removed in 0.15.0) rather than on its q |
+| `transfer_q` | `transfer_q` of such a table | the transfer q the row was accepted at, six decimals; empty on every other row |
 | `protein_ids`, `protein_names`, `genes` | `protein_annotations` joined on `protein` | after every other column (the localisation columns included); empty without annotations |
 
 The row unit and the filter column deliberately disagree, and this is the single

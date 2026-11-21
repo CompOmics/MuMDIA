@@ -2306,7 +2306,13 @@ def build_schema(config_text: str) -> dict:
             "source_struct": struct.name,
         }
         if base in enums:
-            entry["choices"] = [enums[base].serde_name(v.name) for v in enums[base].variants]
+            # A variant kept only so old configurations serialise ("Removed in ...") is refused,
+            # so the desktop does not offer it.
+            entry["choices"] = [
+                enums[base].serde_name(v.name)
+                for v in enums[base].variants
+                if not v.doc.startswith("Removed in")
+            ]
         return entry
 
     fields: list[dict] = []

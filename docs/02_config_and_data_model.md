@@ -425,7 +425,7 @@ listed with its default and effect. Fields marked **default-off**, **inert**, or
 | `PeakWindowMode` | config.rs:916-928 | **`per_candidate`** (`consensus` removed in 0.15.0) | quant integration window |
 | `NormalizeMethod` | config.rs:936-949 | `none`, **`median_ratio`**, `median` | cross-run LFQ normalization; `from_token` at 953-960 |
 | `QuantQColumn` | config.rs:971-988 | **`peptide_q`**, `precursor_q`, `psm_q`, `run_psm_q` | which q column quant filters on |
-| `MbrStrategy` | config.rs:1058-1068 | `none`, **`second_pass`**, `rt_transfer` | `empirical_library` and `full`, which behaved as `rt_transfer`, are read as it since 0.15.0; `validate()` warns on `rt_transfer` |
+| `MbrStrategy` | config.rs:1058-1068 | `none`, **`second_pass`** | `rt_transfer` (and `empirical_library`, `full`, read as it) was removed in 0.15.0 and is refused; the variant stays so the type serialises as before |
 | `RtLibraryScope` | config.rs | **`first_run_only`**, `per_run` | `run-experiment` only: how many DeepLC fine-tunes an experiment pays for |
 | `Handoff` | config.rs | `tsv`, `parquet`, **`raw`** | how the feature matrix crosses into a sidecar rescorer; `parquet` and `raw` are nn_torch only (mokapot falls back to `tsv` with a warning) |
 
@@ -514,11 +514,10 @@ else keep it (conservative removal for the low-FDR region). Target/decoy labels
 stay in the competition key in every mode, so a target never competes against its
 own decoy.
 
-**`MbrStrategy`** (1043-1068). `SecondPass` is the default; `RtTransfer` is the
-rescuable-tier transfer, and `validate()` warns when it is selected. The earlier
-`empirical_library` and `full` behaved exactly like `rt_transfer` and are read as it
-since 0.15.0, so a configuration that names them records `rt_transfer`. All require
->= 2 runs.
+**`MbrStrategy`** (1043-1068). `SecondPass` is the default and `None` turns
+match-between-runs off. `RtTransfer`, the rescuable-tier transfer, was removed in 0.15.0:
+`rt_transfer` and its old spellings `empirical_library` and `full` are refused at load and
+by `validate()`. The variant still parses, so the canonical configuration does not move.
 
 **`CompeteGroupBy`** (894-901). `Precursor` (default) does **not** group by
 precursor. Its full key is `(base_peptide_id, label_code, 0, peak_rank)`
@@ -844,10 +843,13 @@ requiring entrapment/target-decoy FDR validation before use.
 
 ### `MbrConfig` (config.rs:1084-1129), partly inert
 
-The MBR stage (D3) is not wired into the run chain. Fields: `strategy` (`none`
-default), `q_anchor` 0.01, `min_anchor_runs` 2, `q_transfer` 0.01,
-`consensus_corr_min` 0.0, `python` `None`. `rt_window_s`, `decoy_transfer` and
-`requant_all` were removed in 0.15.0 because no stage read them. With `strategy = none` the chain is byte-identical to no MBR.
+Read by `run-experiment` only. Fields: `strategy` (`second_pass` default), `q_anchor` 0.01,
+`min_anchor_runs` 2, `q_transfer` 0.01, `consensus_corr_min` 0.0, `python` `None`,
+`second_pass_prefilter_keep_decoys`, `first_pass_flag`. `min_anchor_runs`, `q_transfer`,
+`consensus_corr_min` and `python` configured the rescuable-tier transfer, removed in 0.15.0:
+they still parse, so the configuration hash does not move, and `validate()` warns that they
+do nothing. `rt_window_s`, `decoy_transfer` and `requant_all` were removed in 0.15.0
+because no stage read them.
 
 ### `ExperimentConfig` (config.rs:1247-1272)
 

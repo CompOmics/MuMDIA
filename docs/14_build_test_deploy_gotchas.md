@@ -407,9 +407,8 @@ things in order.
    required, so a native configuration is not failed over a directory it never
    opens. The previous version failed exactly that case, and a missing script
    directory was the most common misconfiguration.
-2. One line per interpreter role, for all four roles (`Role::Rescore`,
-   `DeepLc`, `Ms2pip`, `Mbr`; `python.rs:35`). `mbr.python` was previously never
-   probed. A role that is neither required by the config nor explicitly named
+2. One line per interpreter role (`Role::Rescore`, `DeepLc`, `Ms2pip`, `Peptdeep`,
+   `Im2deep`; `python.rs:35`). A role that is neither required by the config nor explicitly named
    prints `[skip]` and is not probed at all. An `"auto"` field is resolved by
    `python::discover` (`python.rs:245`) exactly as a run would resolve it, and the
    line states the provenance (configured, which environment variable, the
@@ -673,7 +672,7 @@ A pull request is diffed as its merge commit against the first parent (hence
 `fetch-depth: 2` on those checkouts), a push against `github.event.before`; a
 scheduled or dispatched run, or any run whose base cannot be established, does
 everything.
-`CI_SCOPE_FILES=$'docs/04_convert.md\nscripts/mbr_worker.py' bash ci/ci_scope.sh smoke`
+`CI_SCOPE_FILES=$'docs/04_convert.md\nscripts/nn_rescore_worker.py' bash ci/ci_scope.sh smoke`
 prints the decision for a list of paths. A path that belongs to no class is treated as
 the engine, so a new directory costs a full run until it is classified, never a skipped
 check.

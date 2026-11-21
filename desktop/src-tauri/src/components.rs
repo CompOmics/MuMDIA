@@ -439,7 +439,6 @@ pub fn stamp_env(cmd: &mut std::process::Command) {
         for var in [
             "MUMDIA_PYTHON_RESCORE",
             "MUMDIA_PYTHON_DEEPLC",
-            "MUMDIA_PYTHON_MBR",
             "MUMDIA_PYTHON_IM2DEEP",
         ] {
             cmd.env(var, &primary);
@@ -2633,7 +2632,6 @@ mod tests {
             for var in [
                 "MUMDIA_PYTHON_RESCORE",
                 "MUMDIA_PYTHON_DEEPLC",
-                "MUMDIA_PYTHON_MBR",
                 "MUMDIA_PYTHON_IM2DEEP",
             ] {
                 assert!(

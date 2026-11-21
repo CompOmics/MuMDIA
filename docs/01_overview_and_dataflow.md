@@ -399,12 +399,6 @@ Per-subcommand specifics that are easy to miss:
   per-run counts from the per-run split `scored.parquet` on `run_psm_q`.
   `mumdia report --experiment-dir` rewrites the three from the experiment
   manifest.
-- `mbr` (`main.rs:671`) is a wired standalone command, not part of `run`. It
-  hard-errors when `mbr.strategy = none` (`main.rs:680`), when fewer than two
-  `--psms-extracted` are supplied (`main.rs:685`), or when `mbr.python` is unset
-  (`main.rs:688`), then runs the `mbr_worker.py` sidecar with the `mbr.*`
-  thresholds (`main.rs:697`). It transfers identifications across a run set
-  (Stage D3); see the extend section for its stub status inside `run`.
 - `doctor` (`main.rs:313`) probes three interpreters and prints `[ ok ]` /
   `[FAIL]` / `[skip]` per line, exiting nonzero if any fail: `rescore.python`
   (packages depend on the classifier: `torch,numpy,pandas,pyarrow` for `nn_torch`,
@@ -686,8 +680,7 @@ config (`main.rs:607`) before `run`. The fields this overview area touches:
 | `compete.mode` | `winner_take_all` | Within-group competition resolution (`CompetitionMode`). |
 | `rescore.classifier` | `native_tda` | Rescorer; `nn_torch` is the best lever, needs `rescore.python`. |
 | `rescore.python` | `None` | Interpreter for mokapot / nn_torch / entrapment sidecars. |
-| `mbr.strategy` | `none` | MBR mode; `none` makes the standalone `mumdia mbr` command error out (`main.rs:680`). |
-| `mbr.python` | `None` | `mbr_worker.py` interpreter; required when `strategy != none` (`main.rs:688`). |
+| `mbr.strategy` | `second_pass` | Match-between-runs under `run-experiment`: `second_pass` or `none` (`rt_transfer` was removed in 0.15.0). |
 | `quant.q_threshold` | `0.01` (`QuantConfig`) | q-value threshold for the human-readable report. |
 
 The config surface was recently pruned of dead or unwired fields (see
@@ -698,9 +691,8 @@ scan_scale, scan_window_mode}` + `ScanWindowMode`, `digest.decoy.{ratio, source}
 `CompetitionMode::from_token` were removed. Do not reintroduce them. Kept
 deliberately as documented hooks: `DecoyStrategy::DiannShift` (deferred,
 license-checked; rejected by validation), `CalibrationMethod::None` (rejected by
-validation with a clear message), and the whole `mbr` section, which is wired to
-the standalone `mumdia mbr` command (`main.rs:671`, calls `mbr_worker.py`) but is
-not part of the `run` chain and needs >=2 runs.
+validation with a clear message), and the `mbr` section, which `run-experiment`
+reads for its second pass and which is not part of the single-run chain.
 
 ## Invariants, determinism, gotchas
 
@@ -755,8 +747,6 @@ not part of the `run` chain and needs >=2 runs.
 - To wire a new sidecar: follow the positional-CLI file contract
   (`sidecar::resolve_script` + a worker in `scripts/`), gate it behind a config
   field, and check its prerequisites in `preflight` and `doctor`.
-- Stubs and unwired areas to be aware of: `mbr` has a wired standalone command
-  (`mumdia mbr` -> `mbr_worker.py`) but is a partial sidecar (not the full
-  experiment-wide flow) and is not in the `run` chain (needs >=2 runs); ion mobility / 4D (diaPASEF) is
+- Partial areas to be aware of: ion mobility / 4D (diaPASEF) is
   partial and lands in steps (docs/35_diapasef.md says which layers are in the
   tree; IM columns are null on 3D runs). Do not document these as complete.

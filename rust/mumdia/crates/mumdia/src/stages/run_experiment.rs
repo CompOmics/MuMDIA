@@ -1,8 +1,7 @@
 //! Experiment-wide orchestrator `mumdia run-experiment`: run the per-file search
-//! chain over N runs, then a single experiment-wide rescore, optional rescuable
-//! match-between-runs transfer, a by-run split, per-run quantification, and
-//! cross-run LFQ. This reifies the multi-run flow that was previously a manual
-//! script sequence, keeping the rescuable-tier MBR first-class.
+//! chain over N runs, then a single experiment-wide rescore, the match-between-runs
+//! second pass, a by-run split, per-run quantification, and cross-run LFQ. This reifies
+//! the multi-run flow that was previously a manual script sequence.
 //!
 //! The library is built or imported once and shared. Each run gets its own retention-time
 //! calibration, its own extraction (chromatograms kept for quantification), and its own
@@ -114,7 +113,6 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
             cfg.predict_frag.deeplc_python.as_deref(),
         ),
         ("rescore.python", cfg.rescore.python.as_deref()),
-        ("mbr.python", cfg.mbr.python.as_deref()),
     ] {
         if let Some(exe) = path {
             if crate::python::interpreter_missing(exe) {
@@ -2398,71 +2396,9 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         .clone()
         .unwrap_or_else(|| actual_rescorer.clone());
 
-    // --- optional rescuable-tier MBR transfer ---
-    let scored_for_quant = if cfg.mbr.strategy.transfers() {
-        let python = cfg.mbr.python.as_deref().expect("preflight");
-        let script =
-            crate::sidecar::resolve_script(&cfg.predict_frag.sidecar_script_dir, "mbr_worker.py");
-        let transferred = d("mbr_transferred.parquet");
-        let scored_mbr = d("scored_mbr.parquet");
-        // Remove any stale copy BEFORE the worker runs, so that the `exists()` check
-        // afterwards is a statement about THIS run. The worker writes this file only when
-        // it accepts at least one transfer, so without the removal a rerun into the same
-        // --out-dir that accepted transfers last time and none this time would silently
-        // feed the previous experiment's scored table to the split and to every per-run
-        // quant. It joins cleanly, because candidate_id and source are stable across
-        // reruns of the same library, so the failure is plausible numbers from the wrong
-        // data, logged as "MBR transfers applied".
-        if std::path::Path::new(&scored_mbr).exists() {
-            std::fs::remove_file(&scored_mbr).with_context(|| {
-                format!("removing a previous run's {scored_mbr} before running MBR")
-            })?;
-        }
-        // The competed tables carry candidate_id + apex_rt in `source` order, one per run:
-        // match-between-runs keeps a grouped run's competed table pooled (`run_groups`).
-        if !one_table_per_run {
-            anyhow::bail!(
-                "match-between-runs reads one competed table per run, and a grouped run left \
-                 its competed rows per band"
-            );
-        }
-        let mbr_competed: Vec<String> = competed.iter().map(|t| t[0].clone()).collect();
-        crate::sidecar::run_mbr(
-            python,
-            &script,
-            &scored_combined,
-            &mbr_competed,
-            &transferred,
-            Some(&scored_mbr),
-            &[],
-            cfg.mbr.q_anchor,
-            cfg.mbr.min_anchor_runs,
-            cfg.mbr.q_transfer,
-            cfg.mbr.consensus_corr_min,
-            cfg.rng_seed,
-        )?;
-        // The worker writes the augmented scored table only when it accepts at
-        // least one transfer; with none, fall back to the un-augmented combined
-        // table so quantification still runs.
-        //
-        // `exists()` is only a signal because the stale file was removed before the
-        // worker ran (see above). Without that, it could not tell "this run wrote it"
-        // from "a previous run left it": rerunning the same --out-dir with different
-        // mzMLs or a tighter mbr.q_transfer, and finding no transfers this time, made
-        // the split and every per-run quant consume the OLD scored table. It joins
-        // successfully, because candidate_id and source are stable across reruns of the
-        // same library, so the result was plausible quantities from the wrong data while
-        // the log said "MBR transfers applied".
-        if std::path::Path::new(&scored_mbr).exists() {
-            info!("run-experiment: MBR transfers applied");
-            scored_mbr
-        } else {
-            info!("run-experiment: MBR accepted no transfers; using combined scored");
-            scored_combined.clone()
-        }
-    } else {
-        scored_combined.clone()
-    };
+    // The rescuable-tier transfer that could replace this table was removed in 0.15.0;
+    // the manifest keeps `scored_for_quant`, which `mumdia report --experiment-dir` reads.
+    let scored_for_quant = scored_combined.clone();
 
     // --- split by source, per-run quant (psm_q filter), cross-run LFQ ---
     let split_paths: Vec<String> = (0..n_runs)
@@ -3153,18 +3089,6 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             artifact::PROTEIN_ANNOTATIONS,
             a.clone(),
             *producer,
-            None,
-        ));
-    }
-    // Only when MBR actually produced a different table; otherwise
-    // `scored_for_quant` IS `scored_combined` and recording it twice would claim two
-    // artifacts where one file exists.
-    if scored_for_quant != scored_combined {
-        artifacts.push((
-            "scored_for_quant".to_string(),
-            artifact::PSMS_SCORED,
-            scored_for_quant.clone(),
-            "mbr",
             None,
         ));
     }

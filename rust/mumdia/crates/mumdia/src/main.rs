@@ -781,27 +781,6 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = OnOff::Off)]
         ion_mobility: OnOff,
     },
-    /// Match-between-runs identification transfer (Stage D3) -> transferred.parquet.
-    Mbr {
-        /// Experiment-wide scored_combined.parquet (has the `source` column).
-        #[arg(long)]
-        psms_scored: String,
-        /// Per-run psms.parquet in `source` order (one per run).
-        #[arg(long, num_args = 1..)]
-        psms_extracted: Vec<String>,
-        #[arg(long)]
-        out: String,
-        /// Optional augmented scored table: input scored with accepted transfers'
-        /// q_value lowered + is_transferred flag (for quant/report with q_filter=psm_q).
-        #[arg(long)]
-        out_psms_scored: Option<String>,
-        /// Optional per-run fragment_quant.parquet (source order) for the
-        /// fragment-consensus guard (needs mbr.consensus_corr_min > 0).
-        #[arg(long, num_args = 0..)]
-        frag: Vec<String>,
-        #[arg(long)]
-        config: Option<String>,
-    },
     /// Print schema, head sample, and row count for any artifact.
     Inspect { artifact: String },
     /// Peaks per MS2 spectrum for an mzML or a diaPASEF `.d`, as JSON: percentiles plus
@@ -1284,7 +1263,6 @@ fn doctor_report(
             Role::DeepLc => cfg.predict_frag.deeplc_python.clone(),
             Role::Ms2pip => cfg.predict_frag.ms2pip_python.clone(),
             Role::Peptdeep => cfg.predict_frag.peptdeep_python.clone(),
-            Role::Mbr => cfg.mbr.python.clone(),
             Role::Im2deep => cfg.predict_frag.im2deep_python.clone(),
         };
         let required = role.required_by(&cfg);
@@ -2894,53 +2872,6 @@ fn real_main() -> Result<()> {
                 cfg: &cfg.quant,
                 config_hash: &ch,
             })?;
-        }
-        Cmd::Mbr {
-            psms_scored,
-            psms_extracted,
-            out,
-            out_psms_scored,
-            frag,
-            config,
-        } => {
-            let cfg = load_config(&config)?;
-            if !cfg.mbr.strategy.transfers() {
-                anyhow::bail!(
-                    "`mumdia mbr` runs the rescuable-tier transfer, and mbr.strategy is {:?}; set \
-                     rt_transfer to run it. The default second_pass is run by `run-experiment`, \
-                     which searches every run again.",
-                    cfg.mbr.strategy
-                );
-            }
-            if psms_extracted.len() < 2 {
-                anyhow::bail!(
-                    "MBR needs >= 2 runs; got {} psms path(s)",
-                    psms_extracted.len()
-                );
-            }
-            let python = cfg.mbr.python.as_deref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "mbr.python (sidecar interpreter) is required when mbr.strategy != none"
-                )
-            })?;
-            let script = mumdia::sidecar::resolve_script(
-                &cfg.predict_frag.sidecar_script_dir,
-                "mbr_worker.py",
-            );
-            mumdia::sidecar::run_mbr(
-                python,
-                &script,
-                &psms_scored,
-                &psms_extracted,
-                &out,
-                out_psms_scored.as_deref(),
-                &frag,
-                cfg.mbr.q_anchor,
-                cfg.mbr.min_anchor_runs,
-                cfg.mbr.q_transfer,
-                cfg.mbr.consensus_corr_min,
-                cfg.rng_seed,
-            )?;
         }
         Cmd::Inspect { artifact } => {
             print!("{}", mumdia_io::inspect(&artifact)?);

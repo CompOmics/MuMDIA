@@ -548,11 +548,11 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
 | `strategy` | `MbrStrategy` | `second_pass` |  |  |
-| `q_anchor` | `f64` | `0.01` |  | The first-pass cut (validated at 0.01). Under `second_pass`, the experiment-wide `precursor_q` at which a target enters the empirical library, and the `run_psm_q` at which one run's apex counts toward its consensus retention time. Under the transfer variants, the q-value for a precursor to become a cross-run anchor. |
-| `min_anchor_runs` | `usize` | `2` |  | Transfer variants only: minimum number of OTHER runs a precursor must be confident in to transfer. |
-| `q_transfer` | `f64` | `0.01` |  | Transfer variants only: accept threshold for a transfer's q-value. |
-| `consensus_corr_min` | `f64` | `0.0` |  | Minimum correlation of the observed fragment pattern to the empirical consensus for a transfer to be accepted (interference guard; 0 disables). |
-| `python` | `Option<String>` | `null` |  | Python interpreter for the `mbr_worker.py` sidecar (pandas/pyarrow/numpy; e.g. the `py312_mumdia` env). Required by the transfer variants only; `second_pass` and `none` run no sidecar. |
+| `q_anchor` | `f64` | `0.01` |  | The first-pass cut (validated at 0.01). Under `second_pass`, the experiment-wide `precursor_q` at which a target enters the empirical library, and the `run_psm_q` at which one run's apex counts toward its consensus retention time. |
+| `min_anchor_runs` | `usize` | `2` |  | Read by nothing since the transfer was removed in 0.15.0; kept so the canonical configuration does not move. `validate()` warns when it is set. |
+| `q_transfer` | `f64` | `0.01` |  | Read by nothing since 0.15.0, like `min_anchor_runs`. |
+| `consensus_corr_min` | `f64` | `0.0` |  | Read by nothing since 0.15.0, like `min_anchor_runs`. |
+| `python` | `Option<String>` | `null` |  | Read by nothing since 0.15.0, like `min_anchor_runs`. Interpreter resolution still clears an `"auto"` to null. |
 | `second_pass_prefilter_keep_decoys` | `Option<f64>` | `null` |  | Under `strategy = second_pass`: the `rescore.prefilter_keep_decoys` of the second-pass rescore only (0 = no prefilter there). Unset, the second pass uses `rescore.prefilter_keep_decoys` like the first. The first pass pools every candidate of every run (59M and 106M PSMs on 18- and 27-run Astral experiments) and needs the cut for memory; the second-pass pool holds the empirical library's candidates (6.6M and 4.1M PSMs on the same two), where the cut cost 4.2-4.8% of the precursors on a plate of single cells. Must be in [0, 1). Left out of the canonical configuration when unset. |
 | `first_pass_flag` | `bool` | `false` |  | Under `strategy = second_pass`, `run-experiment` only: write a Boolean `first_pass_id` into every run's `peptide_quant` (v3), true where the row's precursor had a first-pass identification in that run (`run_psm_q <= q_anchor`, target), and a `first_pass_<run>` column per run into the experiment-wide `peptides.tsv`. It is evidence for a reporting filter (`bench/quant_condition_gate.py`), not a filter: no identification, quantity or q-value changes. Quantities of conditions where no run has a first-pass identification are the most compressed ones (docs/12, "Second pass"). Off by default; then nothing is written and both tables keep their bytes. Left out of the canonical configuration when off. |
 
@@ -952,13 +952,13 @@ Fragment-matcher backend for search-seed and extract (docs/06_predict_frag_index
 
 (rust/mumdia/crates/mumdia-core/src/config.rs)
 
-Match-between-runs strategy (docs/12_quant_lfq_align_mbr_report_audit.md, "Second pass"). Read by `run-experiment` only; a single-run `run` has no other run to match. `SecondPass` (the default since 2026-10-13) searches every run a second time on an empirical library: the precursors the pooled first pass accepted experiment-wide (`precursor_q <= mbr.q_anchor`), each with its paired library decoy, both given the precursor's cross-run consensus retention time (`stages::second_pass`). The second pass is an ordinary search of that library, with its own seed, retention-time calibration, extraction and one pooled target-decoy rescore, and it is what the experiment reports. Measured against the first pass on four pools (docs/12): \| pool \| per-run IDs at 1% \| null \| \|---\|---\|---\| \| ProteoBench Astral entrapment, 3 runs x 3 NN seeds \| +8.0% \| entrapment FDP 0.95% -> 0.70% \| \| 22 HeLa runs, human + yeast + E. coli library \| +16.9% \| species FDP 1.42% -> 0.80% \| \| 216 single cells + 24 blank wells \| +54% to +57% \| decoys 0.97% -> 0.98%, 0 IDs in blanks \| \| 22-run HYE mixture \| proteins 4,366 -> 5,298 \| E. coli log2 A/B -1.71 -> -1.48 \| The last row is the known gap: quantities of the precursors the second pass adds in runs where they are weak compress the ratios (CV 0.255 -> 0.245, median \|error\| 0.238 -> 0.252). That is a quantification limitation, not a false identification. `RtTransfer` is the earlier rescuable-tier transfer (`scripts/mbr_worker.py`), which needs `mbr.python`. It accepts an already extracted, sub-threshold candidate on retention-time agreement alone. On the same pools its transfers measured 2.3-2.7% entrapment FDP (ProteoBench) and about 4x the false-ID rate of the direct identifications (single cells), so it stays opt-in and `validate()` warns when it is selected.
+Match-between-runs strategy (docs/12_quant_lfq_align_mbr_report_audit.md, "Second pass"). Read by `run-experiment` only; a single-run `run` has no other run to match. `SecondPass` (the default since 2026-10-13) searches every run a second time on an empirical library: the precursors the pooled first pass accepted experiment-wide (`precursor_q <= mbr.q_anchor`), each with its paired library decoy, both given the precursor's cross-run consensus retention time (`stages::second_pass`). The second pass is an ordinary search of that library, with its own seed, retention-time calibration, extraction and one pooled target-decoy rescore, and it is what the experiment reports. Measured against the first pass on four pools (docs/12): \| pool \| per-run IDs at 1% \| null \| \|---\|---\|---\| \| ProteoBench Astral entrapment, 3 runs x 3 NN seeds \| +8.0% \| entrapment FDP 0.95% -> 0.70% \| \| 22 HeLa runs, human + yeast + E. coli library \| +16.9% \| species FDP 1.42% -> 0.80% \| \| 216 single cells + 24 blank wells \| +54% to +57% \| decoys 0.97% -> 0.98%, 0 IDs in blanks \| \| 22-run HYE mixture \| proteins 4,366 -> 5,298 \| E. coli log2 A/B -1.71 -> -1.48 \| The last row is the known gap: quantities of the precursors the second pass adds in runs where they are weak compress the ratios (CV 0.255 -> 0.245, median \|error\| 0.238 -> 0.252). That is a quantification limitation, not a false identification. `RtTransfer` was the earlier rescuable-tier transfer, removed in 0.15.0. It accepted an already extracted, sub-threshold candidate on retention-time agreement alone. On the same pools its transfers measured 2.3-2.7% entrapment FDP (ProteoBench) and about 4x the false-ID rate of the direct identifications (single cells). The variant still parses and serialises, so the canonical configuration does not move, but `RETIRED` and `validate()` refuse it.
 
 | Value | Default | Description |
 |---|---|---|
 | `none` |  | No match-between-runs: the first pass is the result. |
 | `second_pass` | yes | Search every run again on the empirical library of the first pass (default). |
-| `rt_transfer` |  | Rescuable-tier transfer on cross-run expected retention time (`mbr_worker.py`). `empirical_library` and `full`, which behaved the same, are read as this strategy. |
+| `rt_transfer` |  | Removed in 0.15.0 and refused; kept so the type serialises as before. `empirical_library` and `full`, which behaved the same, are read as this strategy. |
 
 ### `ModPosition`
 
@@ -1350,7 +1350,6 @@ moves to another function.
 | `MUMDIA_PYTHON` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
 | `MUMDIA_PYTHON_DEEPLC` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
 | `MUMDIA_PYTHON_IM2DEEP` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
-| `MUMDIA_PYTHON_MBR` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
 | `MUMDIA_PYTHON_MS2PIP` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
 | `MUMDIA_PYTHON_PEPTDEEP` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
 | `MUMDIA_PYTHON_RESCORE` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
@@ -1377,7 +1376,7 @@ moves to another function.
 | `VIRTUAL_ENV` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
 | `XDG_CACHE_HOME` | engine | computed: set by the desktop environment, often unset; an absolute value puts the engine's caches in `$XDG_CACHE_HOME/mumdia` on Linux when MUMDIA_CACHE_DIR is unset (`cache.rs` `root`) | `rust/mumdia/crates/mumdia/src/cache.rs::root` |
 
-105 variables are read: 43 engine-side, 67 sidecar-side, 5 on both sides.
+104 variables are read: 42 engine-side, 67 sidecar-side, 5 on both sides.
 
 ### Variables the code sets
 
@@ -1452,6 +1451,6 @@ instead of looking like an absent field.
 
 ## Coverage
 
-26 structs and 363 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 49 enumerations, 1 named profile(s), 105 environment variables read and 27 set.
+26 structs and 363 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 49 enumerations, 1 named profile(s), 104 environment variables read and 27 set.
 
 30 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.

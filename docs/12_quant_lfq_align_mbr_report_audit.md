@@ -20,8 +20,8 @@ stages that operate across multiple runs.
   to separate tables.
 - **align** (Stage D2, `mumdia align`): removed in 0.15.0. It wrote a cross-run RT map
   (`alignment.parquet`) that no stage read; the second pass builds its own map.
-- **mbr** (Stage D3, `mumdia mbr`): partially wired match-between-runs identification
-  transfer. A Rust CLI + config gate that shells out to `scripts/mbr_worker.py`.
+- **mbr** (Stage D3, `mumdia mbr`): removed in 0.15.0. It ran the rescuable-tier
+  transfer worker; the second pass of `run-experiment` replaces it (see "Second pass").
 - **report** (`mumdia report`): emit human-readable `peptides.tsv`, `precursors.tsv`
   and `proteins.tsv` from the scored PSM table, joined to quant. Invoked by the
   single-run `run` chain, by `run-experiment` (one experiment-wide set at the
@@ -40,9 +40,7 @@ stages that operate across multiple runs.
 | `rust/mumdia/crates/mumdia/src/stages/audit.rs` | candidate identification-loss ladder |
 | `rust/mumdia/crates/mumdia-core/src/rejection.rs` | `RejectionReason` enum + ladder ordering |
 | `rust/mumdia/crates/mumdia-core/src/config.rs` | `QuantConfig`, `MbrConfig`, `RtImTrainConfig`, and the strategy enums |
-| `scripts/mbr_worker.py` | MBR transfer sidecar (rescuable + re-extraction tiers) |
 | `rust/mumdia/crates/mumdia/src/main.rs` | CLI definitions + handlers for all six subcommands |
-| `rust/mumdia/crates/mumdia/src/sidecar.rs` | `run_mbr` (builds argv for `mbr_worker.py`) |
 
 ## Inputs and outputs
 
@@ -199,29 +197,6 @@ empirical library. `experiment_manifest.json` records `experiment.second_pass` (
 pass's scored table, the library summary, the per-run directories) and the first-pass
 table and the library as artifacts.
 
-### mbr
-Consumes an experiment-wide `scored_combined.parquet` (must carry a `source` column)
-and one `psms.parquet` per run in `source` order. Produces `<out>.parquet`, one row
-per accepted transfer (`mbr_worker.py:254`): `candidate_id`, `source`, `peptidoform`,
-`charge`, `protein_group`, `label`, `expected_rt`, `observed_rt`, `rt_delta`,
-`transfer_q` (10 columns). When there are no transfer candidates at all the worker
-short-circuits and writes the same ten columns with zero rows (`write_empty_transfers`),
-and, when `--out-scored` was asked for, the scored table unchanged with `is_transferred`
-false and `transfer_q` NaN on every row (`write_unflagged_scored`), so a downstream stage
-never meets a missing file or a one-column placeholder (docs/30).
-Optionally writes an augmented scored table (`--out-scored`) that lowers each accepted
-transfer's PSM q columns to `min(q, transfer_q)` on the matching `(candidate_id,
-source)` row and adds an `is_transferred` bool plus a `transfer_q` column (the accepted
-q on transferred rows, NaN elsewhere; `mbr_worker.py`); this requires the scored table
-to carry a `source` column. All MBR outputs are written by Python and
-have no `report.json`.
-
-The unreachable re-extraction tier (`--emit-transfer-targets <dir>`) instead writes
-per-run `transfer_targets_<i>.parquet` and `transfer_decoys_<i>.parquet` in
-`run_windows` format (`mbr_worker.py:142`): `candidate_id` (u32), `rt_pred_cal`,
-`rt_lo`, `rt_hi` (f64), plus null `im_pred_cal`/`im_lo`/`im_hi` (f64) columns for the
-3D data model. `run_mbr` never passes this flag, so `mumdia mbr` never produces these.
-
 ### report
 Consumes `psms_scored.parquet` and optionally the two quant tables. The CLI takes
 `--out-dir` and derives `<out-dir>/peptides.tsv` + `<out-dir>/proteins.tsv`
@@ -230,11 +205,10 @@ Consumes `psms_scored.parquet` and optionally the two quant tables. The CLI take
 (`report.rs:95`): `precursor`, `stripped_sequence`, `charge`, `protein`,
 `q_value`, `score`, `quantity`, `is_transferred`, `transfer_q`. `proteins.tsv` header
 (`report.rs:134`): `protein_group`, `q_value`, `quantity`, `is_transferred`,
-`transfer_q`. The last two export the acceptance basis: a row is written when it is a
-target and either its grouped q passes the threshold or it is an accepted
-match-between-runs transfer, and a transferred row keeps its grouped q (usually 1.0)
-next to the transfer q it was accepted at. A tighter threshold does not revoke a
-transfer; a transfer is not protein-group confidence (docs/29 #19). No Parquet or
+`transfer_q`. The last two exported the acceptance basis of the rescuable-tier transfer,
+removed in 0.15.0. They stay in the header, `false` and empty, and the report still reads
+a scored table that an older engine wrote with transfers: such a row is written next to the
+transfer q it was accepted at, and a tighter threshold does not revoke it (docs/29 #19). No Parquet or
 `report.json` is written;
 `report::run` returns `(n_precursors, n_protein_groups)`, and the `mumdia report`
 handler prints a one-line summary (`main.rs:806`).
@@ -505,11 +479,9 @@ table, so every extraction loss carries one reason (see the gotchas). Writes
    interference; see
    [Fragment selection under interference](#fragment-selection-under-interference).
 
-   `passes_quant_filter` also admits a row flagged `is_transferred` by
-   `mbr_worker.py`, whatever `q_filter` selects: MBR lowers only the PSM-level q
-   columns, so a transfer would otherwise fail the default `peptide_q` filter and
-   match-between-runs would appear to have done nothing. A decoy is never quantified,
-   transferred or not.
+   `passes_quant_filter` also admits a row flagged `is_transferred` (written by the
+   transfer worker removed in 0.15.0, so only in an older scored table), whatever
+   `q_filter` selects. A decoy is never quantified, transferred or not.
 
    The applied apex and bounds are written with the row, and they describe the window
    actually integrated -- under a fixed window that is the fixed window, not the
@@ -1576,86 +1548,20 @@ abundance reproduces 46-102% of its gain. It is a reporting operating point with
 quantified ions, to be compared with other results at a matched number of finite ratios,
 not a better quantification. Not yet measured through the engine column.
 
-### mbr (rescuable-tier transfer, opt-in)
+### mbr (rescuable-tier transfer, removed in 0.15.0)
 
-`mbr.strategy = rt_transfer` (`empirical_library` and `full` are read as it) runs the
-transfer worker below after the pooled rescore instead of the second pass. It accepts an
+`mbr.strategy = rt_transfer` (`empirical_library` and `full` were read as it) ran a
+transfer worker after the pooled rescore instead of the second pass. It accepted an
 already extracted, sub-threshold candidate on retention-time agreement alone, against a
 permuted-RT null. Measured on the same pools on 2026-10-13: ProteoBench +3.6% per run, with
 the transfers themselves at 2.3-2.7% combined entrapment FDP and the per-run FDP rising
 from 0.97% to 1.03%; on the single-cell plate +50% per cell with the CAM-modified share of
 the transfers 4.4x that of the direct identifications. Transfers with low support (the
 precursor confident in 2-5 of 240 runs) carry most of the excess, and on ProteoBench those
-with an own `run_psm_q` above 0.5 (33% FDP). It stays available, warns when selected, and
-is the only strategy that needs `mbr.python`.
-
-### mbr (partially wired Stage D3)
-
-The Rust side is a gate, not the algorithm. `Cmd::Mbr` (`main.rs:671`): loads config;
-bails unless `cfg.mbr.strategy` is one of the transfer variants (`MbrStrategy::transfers`); bails if fewer than 2 psms paths
-(`main.rs:685`); requires `cfg.mbr.python` (`main.rs:688`); resolves `mbr_worker.py`
-relative to the binary; calls `sidecar::run_mbr`. `run_mbr` (`sidecar.rs:162`) joins
-the psms paths into a comma-separated `psms_csv` and forwards a fixed set of flags.
-
-**Which `MbrConfig` knobs are forwarded, and which are NOT.** Forwarded to the worker:
-`q_anchor` (`--q-anchor`), `min_anchor_runs` (`--min-anchor-runs`), `q_transfer`
-(`--q-transfer`), `consensus_corr_min` (`--consensus-corr-min`, only together with
-`--frag-csv` and only when `frag` is non-empty and `consensus_corr_min > 0`,
-`sidecar.rs:209`), plus `cfg.rng_seed` as `--seed` and the optional `--out-scored`.
-NOT forwarded (present in `MbrConfig`, `config.rs:873`, but dead in the wired path):
-- `rt_window_s`, `decoy_transfer` and `requant_all` were removed in 0.15.0, because
-  nothing forwarded them: the worker's `--rt-window` (default 20 s) is read only by the
-  `--emit-transfer-targets` tier, which `run_mbr` never invokes, and the worker
-  hardcodes the permuted-RT null.
-
-The worker reads the scored table columns `candidate_id`, `source`, `label`, `q_value`,
-`peptidoform`, `charge`, `protein_group` (`mbr_worker.py:81`) and per-run `apex_rt` from
-each psms path. Run index 0 is the RT reference `REF` (`mbr_worker.py:101`); the
-cross-run RT calibration (`to_ref`/`from_ref`, `mbr_worker.py:102`) uses `binned_map`
-only when a run shares `>= 200` confident anchors with the reference, else the identity
-map. The confident-anchor set uses targets only (a decoy anchor would inject a random
-cross-run RT pair); decoys ride the same transfer test to measure the empirical
-decoy-transfer fraction (`mbr_worker.py:87`).
-
-The worker (`scripts/mbr_worker.py`) implements two tiers:
-- **Rescuable transfer** (default path, `mbr_worker.py:156`): for each precursor
-  confident (`q <= q_anchor`, target) in `>= min_anchor_runs` OTHER runs, sub-threshold
-  in a target run where it WAS extracted (`c in rt_all[i]`), predict its RT in that run
-  from the median of the other runs' binned-median-aligned apex RTs (`expected_rt`,
-  `mbr_worker.py:116`; calibration via `binned_map`, `mbr_worker.py:31`, default 80
-  bins). The false-transfer FDR is a permuted-RT decoy-transfer null: each candidate is
-  given a shuffled candidate's predicted RT (`mbr_worker.py:177`). The transfer q-value
-  is standard target/decoy competition on `rt_delta = |observed - predicted|` (smaller
-  is better), computed as a running min from the tail (`mbr_worker.py:198`). Accept when
-  `q <= q_transfer`. When no transfer candidates exist at all it writes the empty
-  placeholder and returns (`mbr_worker.py:187`).
-- **Fragment-consensus guard** (`mbr_worker.py:209`, M4 enhancement, active only with
-  `--frag-csv` and `--consensus-corr-min > 0`): reject an accepted transfer whose
-  observed fragment pattern in the target run has cosine `< corr_min` with the
-  empirical consensus (per-run L1-normalized, averaged over the confident runs) over its
-  confident runs. A transfer is also rejected if the candidate has no fragment data in
-  the target run or fewer than `min_anchor_runs` confident runs with fragments
-  (`mbr_worker.py:229`). Removes RT-concordant interference.
-- **Re-extraction tier** (`--emit-transfer-targets`, `mbr_worker.py:126`): for the
-  ABSENT set (confident elsewhere, not confident here, and NOT extracted here) emit
-  per-run `run_windows`-format tables (`transfer_targets_<i>.parquet`) at the tight
-  predicted-RT window plus a permuted-RT decoy target file (`transfer_decoys_<i>.parquet`),
-  to feed `extract --restrict-candidates --run-windows`. This tier is fully implemented
-  in the worker but has no Rust CLI plumbing, so it is unreachable from `mumdia mbr`.
-
-The M5 augmented scored output (`--out-scored`, `mbr_worker.py:272`) requires the
-scored table to have a `source` column and matches transfers on `(candidate_id,
-source)`, taking `min(q, transfer_q)` on the PSM q columns and setting `is_transferred`
-and `transfer_q`. The worker
-prints a validation summary: accepted counts per run, how many permuted-RT null draws
-fall inside the accepted RT window, and the window `delta_star` at `q_transfer`. It
-no longer prints a "decoy fraction" among accepted transfers: every transfer candidate
-is a confident target of another run, so that fraction was structurally zero and said
-nothing about calibration (docs/29 #6). The transfer q uses the engine's `+1`
-pseudocount, `(null <= delta + 1) / (targets <= delta)`, so a pool no permuted residual
-undercuts no longer gets q = 0 (docs/29 #7), and the RT residual is measured on the
-peak rescore selected (`selected_peak_rank`) when a competed table carries several
-peaks per candidate (docs/29 #8).
+with an own `run_psm_q` above 0.5 (33% FDP). It was removed in 0.15.0, together with the
+`mumdia mbr` command, `scripts/mbr_worker.py` and `MUMDIA_PYTHON_MBR`. A configuration
+that names the strategy is refused; `mbr.min_anchor_runs`, `mbr.q_transfer`,
+`mbr.consensus_corr_min` and `mbr.python` still parse and do nothing.
 
 ### report (`report.rs:49`, `run`)
 
@@ -1759,10 +1665,6 @@ FDR/reporting); `audit.rs` tests the stages in that order and keeps the first lo
 | `lfq_profile` | quant_lfq.rs:84 | MaxLFQ least-squares per-sample profile |
 | `stats::median_or` | stats.rs | the shared in-place median (a given value for an empty slice) the profile and the size factors call |
 | `solve_fixed` | quant_lfq.rs:28 | dense Laplacian solve, first var fixed at 0 |
-| `run_mbr` | sidecar.rs:162 | build argv and spawn `mbr_worker.py` |
-| `binned_map` | mbr_worker.py:31 | monotone binned-median RT calibration |
-| `expected_rt` | mbr_worker.py:116 | cross-run predicted RT for a candidate in a run |
-| `write_empty_transfers` / `write_unflagged_scored` | mbr_worker.py | full-schema outputs when there are no transfer candidates |
 | `ReportParams` / `report::run` | report.rs:13 / 49 | TSV writer |
 | `base_sequence` | quant_lfq.rs | stripped sequence of a peptidoform, for the peptide-level LFQ groups and the report |
 | `qcell` | report.rs:39 | quantity cell formatting (1 decimal; empty on NaN) |
@@ -1826,25 +1728,21 @@ the canonical configuration at `off`, the other two at their defaults. See
 [Cross-run normalisation](#cross-run-normalisation-quant_normrs-quantnormalisation).
 
 **`MbrConfig`** (`config.rs:873`, defaults at `config.rs:898`): `strategy` (`None`;
-`MbrStrategy` at `config.rs:845`), `q_anchor` (0.01), `min_anchor_runs` (2),
-`q_transfer` (0.01), `consensus_corr_min` (0.0), `python` (None, required when `strategy != None`). See the mbr
-section for exactly which of these reach the worker.
+`MbrStrategy`), `q_anchor` (0.01), and `min_anchor_runs` (2), `q_transfer` (0.01),
+`consensus_corr_min` (0.0) and `python` (None). The last four configured the rescuable-tier
+transfer, removed in 0.15.0; they still parse, so the configuration hash does not move, and
+`validate()` warns that they do nothing.
 
 **report** takes `q_threshold` (`--q`, default 0.01) and optional quant table paths as
 CLI args; no config struct.
 
 **audit** takes `q` (0.01), `run_id` ("run"), `entrapment_substr` ("") as CLI args.
 
-The config was recently pruned of dead fields. The `MbrConfig` knobs noted as
-"unwired" above are intentionally documented as such: they still exist in the struct
-but do not affect the wired `mumdia mbr` path.
-
 ## Invariants, determinism, gotchas
 
 - **Determinism.** quant uses `BTreeMap` for candidate iteration, the RT union axis,
   and f64 summation order; quant-lfq iterates `BTreeMap` keys and sorts medians in
-  place; align iterates via `HashMap` but writes a fixed grid. The `mbr_worker.py`
-  permutation is seeded from `cfg.rng_seed` (`--seed`). The DeepLC fine-tune elsewhere
+  place; align iterates via `HashMap` but writes a fixed grid. The DeepLC fine-tune elsewhere
   is nondeterministic, but none of these stages depend on it.
 - **quant units bug guard.** A collapsed `lo==hi` window would make `trapezoid_window`
   return a raw height (intensity, not intensity*seconds), mixing units against
@@ -1924,12 +1822,10 @@ but do not affect the wired `mumdia mbr` path.
   `RT_PRUNED`, `WRONG_ISOLATION_WINDOW`) have no producer.
 - **report.json coverage is partial.** `quant` writes reports for
   `peptide_quant`, `protein_quant`, and emitted `fragment_quant`; the peak-bounds
-  diagnostic gets none. `quant-lfq` and `mbr` write no `report.json`; `audit` does
+  diagnostic gets none. `quant-lfq` writes no `report.json`; `audit` does
   (as `<out>.metrics.json`). Do not assume every artifact here has a sidecar
   report.
-- **align / mbr need >=2 runs.** align degenerates to identity on one run; `mumdia mbr`
-  hard-bails on `<2` psms paths (`main.rs:685`). Neither is in the single-run `run`
-  chain; from `run`, only `quant` (with fragment export, no peak-bounds,
+- **From the single-run `run` chain**, only `quant` (with fragment export, no peak-bounds,
   `run.rs:445`), `report` (`run.rs:484`), and the optional `audit` stage
   (`run.rs:430`) fire.
 - **quant-lfq single input** reduces to the per-run sum; MaxLFQ/directLFQ have only
@@ -1944,10 +1840,6 @@ but do not affect the wired `mumdia mbr` path.
 - **Quantifiability gate:** filter `summarize_fragment_areas` (`quant.rs:185`) on
   `n_fragments_used` or a minimum window width; emit the reason so `report` can surface
   low-evidence quantities.
-- **Wire the MBR strategy tiers:** thread `cfg.mbr.strategy` past the None gate in
-  `main.rs:680` in `run_mbr` (`sidecar.rs:193`). The re-extraction tier already exists in the worker
-  (`--emit-transfer-targets`); it needs a Rust subcommand that then calls
-  `extract --restrict-candidates --run-windows` and re-scores.
 - **Add an audit reason:** extend `RejectionReason` (`rejection.rs:22`) at its pipeline
   position, with a `code()` arm and a branch in the ladder; an extraction reason needs
   extract to record it per candidate first.

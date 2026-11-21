@@ -4029,11 +4029,12 @@ impl Default for QuantConfig {
 /// where they are weak compress the ratios (CV 0.255 -> 0.245, median |error| 0.238 ->
 /// 0.252). That is a quantification limitation, not a false identification.
 ///
-/// `RtTransfer` is the earlier rescuable-tier transfer (`scripts/mbr_worker.py`), which
-/// needs `mbr.python`. It accepts an already extracted, sub-threshold candidate on retention-time agreement
-/// alone. On the same pools its transfers measured 2.3-2.7% entrapment FDP (ProteoBench) and
-/// about 4x the false-ID rate of the direct identifications (single cells), so it stays
-/// opt-in and `validate()` warns when it is selected.
+/// `RtTransfer` was the earlier rescuable-tier transfer, removed in 0.15.0. It accepted an
+/// already extracted, sub-threshold candidate on retention-time agreement alone. On the same
+/// pools its transfers measured 2.3-2.7% entrapment FDP (ProteoBench) and about 4x the
+/// false-ID rate of the direct identifications (single cells). The variant still parses and
+/// serialises, so the canonical configuration does not move, but [`RETIRED`] and
+/// `validate()` refuse it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MbrStrategy {
@@ -4042,17 +4043,10 @@ pub enum MbrStrategy {
     /// Search every run again on the empirical library of the first pass (default).
     #[default]
     SecondPass,
-    /// Rescuable-tier transfer on cross-run expected retention time (`mbr_worker.py`).
+    /// Removed in 0.15.0 and refused; kept so the type serialises as before.
     /// `empirical_library` and `full`, which behaved the same, are read as this strategy.
     #[serde(alias = "empirical_library", alias = "full")]
     RtTransfer,
-}
-
-impl MbrStrategy {
-    /// The rescuable-tier transfer, which runs the `mbr_worker.py` sidecar.
-    pub fn transfers(self) -> bool {
-        self == MbrStrategy::RtTransfer
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -4061,20 +4055,17 @@ pub struct MbrConfig {
     pub strategy: MbrStrategy,
     /// The first-pass cut (validated at 0.01). Under `second_pass`, the experiment-wide
     /// `precursor_q` at which a target enters the empirical library, and the `run_psm_q` at
-    /// which one run's apex counts toward its consensus retention time. Under the transfer
-    /// variants, the q-value for a precursor to become a cross-run anchor.
+    /// which one run's apex counts toward its consensus retention time.
     pub q_anchor: f64,
-    /// Transfer variants only: minimum number of OTHER runs a precursor must be confident
-    /// in to transfer.
+    /// Read by nothing since the transfer was removed in 0.15.0; kept so the canonical
+    /// configuration does not move. `validate()` warns when it is set.
     pub min_anchor_runs: usize,
-    /// Transfer variants only: accept threshold for a transfer's q-value.
+    /// Read by nothing since 0.15.0, like `min_anchor_runs`.
     pub q_transfer: f64,
-    /// Minimum correlation of the observed fragment pattern to the empirical
-    /// consensus for a transfer to be accepted (interference guard; 0 disables).
+    /// Read by nothing since 0.15.0, like `min_anchor_runs`.
     pub consensus_corr_min: f64,
-    /// Python interpreter for the `mbr_worker.py` sidecar (pandas/pyarrow/numpy;
-    /// e.g. the `py312_mumdia` env). Required by the transfer variants only; `second_pass`
-    /// and `none` run no sidecar.
+    /// Read by nothing since 0.15.0, like `min_anchor_runs`. Interpreter resolution still
+    /// clears an `"auto"` to null.
     pub python: Option<String>,
     /// Under `strategy = second_pass`: the `rescore.prefilter_keep_decoys` of the
     /// second-pass rescore only (0 = no prefilter there). Unset, the second pass uses
@@ -6210,12 +6201,24 @@ impl Config {
                     .into(),
             ));
         }
-        if self.mbr.strategy.transfers() {
+        if self.mbr.strategy == MbrStrategy::RtTransfer {
+            return Err(Invalid(format!(
+                "mbr.strategy = rt_transfer was removed in {RETIRED_IN}: {MBR_TRANSFER_GONE}"
+            )));
+        }
+        let d = MbrConfig::default();
+        if self.mbr.min_anchor_runs != d.min_anchor_runs
+            || self.mbr.q_transfer != d.q_transfer
+            || self.mbr.consensus_corr_min != d.consensus_corr_min
+            || self
+                .mbr
+                .python
+                .as_deref()
+                .is_some_and(|v| !v.eq_ignore_ascii_case("auto"))
+        {
             tracing::warn!(
-                strategy = ?self.mbr.strategy,
-                "mbr.strategy selects the rescuable-tier transfer (rt_transfer): it accepts a transfer on retention-time \
-                 agreement alone, and its transfers measured 2.3-2.7% entrapment FDP at a 1% cut. \
-                 The default second_pass searches every run again instead (docs/12)."
+                "mbr.min_anchor_runs, mbr.q_transfer, mbr.consensus_corr_min and mbr.python \
+                 configured the rescuable-tier transfer, removed in 0.15.0: they do nothing"
             );
         }
         if self.mbr.strategy != MbrStrategy::SecondPass
@@ -7252,6 +7255,9 @@ impl Config {
 /// The release that removed the entries of [`RETIRED`].
 const RETIRED_IN: &str = "0.15.0";
 
+/// Why `mbr.strategy = rt_transfer` (and its aliases `empirical_library` and `full`) went.
+const MBR_TRANSFER_GONE: &str = "mbr.strategy = second_pass, the default, replaces it; the transfers measured 2.3-2.7% entrapment FDP at a 1% cut (docs/12, \"Second pass\")";
+
 /// What [`RETIRED`] removed at a path.
 enum Gone {
     /// The key, whose default was this JSON. That value is dropped; any other is refused.
@@ -7421,6 +7427,21 @@ const RETIRED: &[Retired] = &[
     },
 
     // E: rt_transfer MBR tier
+    Retired {
+        path: "mbr.strategy",
+        gone: Gone::Value("\"rt_transfer\""),
+        why: MBR_TRANSFER_GONE,
+    },
+    Retired {
+        path: "mbr.strategy",
+        gone: Gone::Value("\"empirical_library\""),
+        why: MBR_TRANSFER_GONE,
+    },
+    Retired {
+        path: "mbr.strategy",
+        gone: Gone::Value("\"full\""),
+        why: MBR_TRANSFER_GONE,
+    },
 
     // F: prescreen components
 ];
@@ -8385,17 +8406,19 @@ mod tests {
     }
 
     #[test]
-    fn mbr_defaults_to_the_second_pass_and_only_the_transfers_need_a_sidecar() {
+    fn mbr_defaults_to_the_second_pass_and_the_transfer_is_refused() {
         let d = Config::default();
         assert_eq!(d.mbr.strategy, MbrStrategy::SecondPass);
-        assert!(!d.mbr.strategy.transfers());
-        assert!(!MbrStrategy::None.transfers());
-        assert!(MbrStrategy::RtTransfer.transfers());
         for old in ["empirical_library", "full", "rt_transfer"] {
-            let c: Config =
-                serde_json::from_str(&format!(r#"{{"mbr":{{"strategy":"{old}"}}}}"#)).unwrap();
+            let json = format!(r#"{{"mbr":{{"strategy":"{old}"}}}}"#);
+            // Still parsed and serialised as before, so the canonical configuration holds.
+            let c: Config = serde_json::from_str(&json).unwrap();
             assert_eq!(c.mbr.strategy, MbrStrategy::RtTransfer, "{old}");
             assert!(c.canonical_json().contains(r#""strategy":"rt_transfer""#));
+            // Refused at load and by validate().
+            let e = Config::from_json(&json).unwrap_err().to_string();
+            assert!(e.contains("second_pass, the default, replaces it"), "{e}");
+            assert!(c.validate().is_err(), "{old}");
         }
         let none: Config = serde_json::from_str(r#"{"mbr":{"strategy":"none"}}"#).unwrap();
         assert_eq!(none.mbr.strategy, MbrStrategy::None);

@@ -177,14 +177,11 @@ unchanged identifications (`rust/mumdia/crates/mumdia-core/src/config.rs:34`,
 `rust/mumdia/crates/mumdia/src/matchers/fragindex.rs:1`). Both apply the same
 f32-stored / f64-verify ppm predicate.
 
-**MBR / transfer (match-between-runs)**. A cross-run step (Stage D3) that transfers
-an identification confident in one run to a run where it scored below threshold,
-gaining sensitivity. In MuMDIA it is a stub with config hooks and a Python sidecar
-contract (`mbr_worker.py`); the default is no MBR and it needs at least two runs
-(`rust/mumdia/crates/mumdia/src/sidecar.rs:157`,
-`rust/mumdia/crates/mumdia-core/src/config.rs:845`). A transferred PSM is flagged
-`is_transferred` with its q-value lowered
-(`rust/mumdia/crates/mumdia/src/main.rs:249`).
+**MBR (match-between-runs)**. A cross-run step that identifies in one run a precursor
+confident in others. In MuMDIA it is the second pass of `run-experiment`
+(`mbr.strategy = second_pass`, the default): every run is searched again on an empirical
+library of the first pass (docs/12, "Second pass"). The earlier transfer of sub-threshold
+PSMs (`mumdia mbr`, `mbr_worker.py`) was removed in 0.15.0.
 
 **mokapot**. An opt-in Python rescoring sidecar (`RescorerKind::Mokapot`) run over
 the PIN file with a logistic-regression default; the default `rescore.strict=true`
