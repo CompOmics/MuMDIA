@@ -19,17 +19,17 @@ only the rescore sidecars fall back to a native rescorer, and only when
 strict gate, so a crashed MS2PIP, AlphaPeptDeep, DeepLC, IM2Deep, or DeepLC fine-tune aborts the
 whole run. The matrix in **Failure behavior** below is authoritative.
 
-The 17 scripts split into five groups. Eight are launched by the engine:
+The 16 scripts split into five groups. Eight are launched by the engine:
 **predictors** (`ms2pip_worker`, `peptdeep_worker`, `deeplc_worker`, `deeplc_finetune`,
 `im2deep_worker`) feed the run-independent library; **rescorers** (`mokapot_worker`,
 `nn_rescore_worker`, `entrapment_worker`) score the competed PSMs in Stage F. The MBR
-transfer worker (`mbr_worker`) was removed in 0.15.0. Nine are run by hand:
+transfer worker (`mbr_worker`) was removed in 0.15.0. Eight are run by hand:
 the **DIA-NN recipe** (`import_diann_lib`, `make_reverse_decoys`, `predict_decoys`,
-`remap_library`, `merge_libraries`) is an offline,
+`remap_library`) is an offline,
 one-time toolchain that builds MuMDIA's target+decoy library schema from a user-produced
 DIA-NN library, with `remap_library` mapping any
-library's peptides to the proteins of another FASTA, and `merge_libraries` merging an
-empirical library with a predicted one; the **library-scale recipes**
+library's peptides to the proteins of another FASTA (`merge_libraries`, which merged an
+empirical library with a predicted one, was removed in 0.15.0); the **library-scale recipes**
 (`sort_fragments`, `mz_range_survivors`,
 `mh_shard_predict`) reshape very large tables (docs/32); the **post-run tool**
 (`prune_outputs`) reduces a finished output directory to a retention tier (docs/01, "Output
@@ -98,7 +98,6 @@ For the mapping from each conda environment to the config field that points at i
 | `scripts/make_reverse_decoys.py` | Recipe: reverse-sequence decoys with no-target-overlap invariant; their intensities are copied, so `predict_decoys.py` runs on its output before a search |
 | `scripts/predict_decoys.py` | Recipe (default since 2026-10-09): replace the reverse decoys' copied intensities with DIA-NN's prediction for their sequences |
 | `scripts/remap_library.py` | Recipe: map a library's peptides to the proteins of another FASTA (I/L-aware, cleavage-specific, Met excision and protein N-terminal groups as the digest), decoys following their targets; drops or keeps as `UNASSIGNED` what the FASTA lacks (#319) |
-| `scripts/merge_libraries.py` | Recipe: merge an empirical library with a predicted one (empirical spectrum and RT where both have an entry, RT calibrated onto the predicted scale), then rebuild and predict the decoys of the merged targets (#320) |
 | `scripts/sort_fragments.py` | Recipe: rewrite a fragment table in `candidate_id` order (streaming bucket sort, in place); the writers above do this themselves since the range load, this is for tables written before |
 | `scripts/mz_range_survivors.py` | Recipe: candidate ids inside the run's isolation range, as a prescan-style survivors table (docs/32) |
 | `scripts/prune_outputs.py` | Post-run: reduce a finished output directory to the `results` or `viewer` retention tier (dry run by default, `--apply`, record in `pruned.json`; docs/01) |
@@ -319,35 +318,12 @@ desktop import call its `remap_files`)
   the output that is not the input's is removed. `--summary <json>` writes the counts. A
   0.85M-target library against a 31,470-protein FASTA takes about 30 s.
 
-**merge_libraries** (offline; the desktop's "Spectral library + predicted library" input
-runs it)
-- IN two MuMDIA libraries, `--empirical-precursors/--empirical-fragments` (an empirical
-  library imported with `import_diann_lib`, such as the `report-lib.parquet` a DIA-NN search
-  writes) and `--predicted-precursors/--predicted-fragments` (imported or FASTA-built). Only
-  their targets are read; the decoys are rebuilt for the merged targets.
-- Entries are keyed on `(peptidoform, charge)`. An entry in both takes the spectrum,
-  retention time and 1/K0 of `--precedence` (`empirical`, the default, or `predicted`) and
-  the predicted library's protein; an empirical-only entry is kept (`--empirical-only drop`
-  removes it) with its own protein. `remap_library.py` maps the result to one FASTA when the
-  proteins disagree.
-- `--rt calibrate` (default) maps the empirical iRT onto the predicted scale with the
-  monotone binned-median curve of the second-pass consensus (docs/12), fitted on the shared
-  entries (`--rt-min-shared`, default 50), and reports the median and p95 absolute residual;
-  `--rt keep` leaves it. Under the default `rt_im_train.library_irt = auto` with a DeepLC
-  interpreter the search re-predicts every entry's retention time anyway, so only the
-  spectra differ; `library_irt = library` keeps the merged values.
-- Intensities max-normalised per precursor, `base_peptide_id` from the stripped sequence and
-  `peptidoform_id` from the peptidoform over the merged set, `candidate_id` contiguous in
-  `precursor_mz` order, `n_fragments` and `cardinality` recomputed.
-- Decoys: `--decoys diann --diann <exe>` (default) runs `make_reverse_decoys.py` and
-  `predict_decoys.py build`; there is no copied-intensity path. `--decoy-fragments match`
-  (default) then trims each decoy to its target's fragment count (most intense first), so an
-  empirical target with few observed fragments and its predicted decoy keep equal counts;
-  `all` keeps every predicted decoy fragment. `--decoys none` writes the targets only.
-- Memory: both target tables are held in pandas (fragments included), which is fine for
-  libraries of a few million precursors and not for the 1e8-row libraries of docs/32. The
-  merge of a 12.6k-entry empirical library into the 1.21M-target entrapment library took
-  10.4 min at a 6.9 GB peak, most of it the DIA-NN prediction of the 1.21M decoys.
+**merge_libraries** (removed in 0.15.0)
+- `scripts/merge_libraries.py` merged an empirical library with a predicted one: every
+  predicted entry, with the empirical spectrum and retention time where the empirical library
+  had the entry, and the decoys of the merged targets predicted again. The desktop offered it
+  as the "Spectral library + predicted library" input. It was removed because the merged
+  library made the reported 1% optimistic, with no gain at a matched FDP:
 - Measured 2026-11-16 (single run `LFQ_Orbitrap_AIF_Ecoli_01`, the E. coli + human
   entrapment library `ecoli-human-entrap_tryp_diann-2.7_revpred_mz390-1010` of the benchmark
   collection, NN seeds 0-2, default configuration; empirical library: a DIA-NN search of the
@@ -373,9 +349,7 @@ runs it)
   its 12,618 targets are entrapment peptides) with spectra and retention times observed for
   them, while their decoys are predicted and were never selected; the target-decoy null then
   underestimates the false entries among the empirical ones. The decoy trim does not change
-  this (1.47% without it), and keeping the library retention times makes it worse. The merge
-  is therefore opt-in and not a sensitivity default; compare its counts at a measured FDP,
-  and prefer an empirical library from a stricter search (a lower q) or from other samples.
+  this (1.47% without it), and keeping the library retention times makes it worse.
 
 ## How it works
 

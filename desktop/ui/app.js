@@ -49,8 +49,6 @@ const state = {
     diann_lib: "", diann_lib_out: "",
     // An optional FASTA the converted library's peptides are re-mapped to (#319).
     diann_remap_fasta: "",
-    // An empirical and a predicted library to merge, and the folder the merged pair goes in.
-    merge_emp_p: "", merge_emp_f: "", merge_pred_p: "", merge_pred_f: "", merge_out: "",
     // The condition of each spectra file of an experiment, by path
     // (`quant.normalisation_scope = condition`, `run-experiment --condition`).
     conditions: {},
@@ -347,7 +345,6 @@ async function init() {
   }
   $("diann-import").addEventListener("click", importDiannLibrary);
   $("diann-remap-clear").addEventListener("click", clearRemapFasta);
-  $("merge-libraries").addEventListener("click", mergeLibraries);
   // The built-in path's predictors depend on the preset as well as on the files.
   $("preset").addEventListener("change", scheduleBuiltinPlan);
   for (const b of document.querySelectorAll("[data-pick]")) {
@@ -836,10 +833,9 @@ function isComputersOwn(path) {
 const SETUP_SPEC = [
   { path: "search_space.source", kind: "choice", values: ["fasta", "library"], label: "Search space",
     tabs: true, names: { fasta: "From a FASTA", library: "From a spectral library" } },
-  { path: "search_space.library_input", kind: "choice", values: ["tables", "diann", "merge"],
+  { path: "search_space.library_input", kind: "choice", values: ["tables", "diann"],
     label: "Spectral library input", radio: "libin",
-    names: { tables: "MuMDIA library tables", diann: "a DIA-NN library",
-             merge: "a spectral library + a predicted library" } },
+    names: { tables: "MuMDIA library tables", diann: "a DIA-NN library" } },
   { path: "search_space.library_build", kind: "choice", values: ["diann", "builtin"],
     label: "Library from a FASTA built with", radio: "libsrc",
     names: { diann: "DIA-NN", builtin: "the built-in predictors" } },
@@ -2806,10 +2802,6 @@ const FILTERS = {
   // Parquet (DIA-NN 1.9 and 2.x) or DIA-NN's binary .speclib; a .tsv is not accepted.
   diann_lib: [{ name: "DIA-NN library", extensions: ["parquet", "speclib"] }],
   diann_remap_fasta: [{ name: "FASTA", extensions: ["fasta", "fa", "fas"] }],
-  merge_emp_p: [{ name: "Parquet", extensions: ["parquet"] }],
-  merge_emp_f: [{ name: "Parquet", extensions: ["parquet"] }],
-  merge_pred_p: [{ name: "Parquet", extensions: ["parquet"] }],
-  merge_pred_f: [{ name: "Parquet", extensions: ["parquet"] }],
 };
 const LABEL = {
   mzml: "p-mzml",
@@ -2823,16 +2815,11 @@ const LABEL = {
   diann_lib: "p-diann-lib",
   diann_lib_out: "p-diann-lib-out",
   diann_remap_fasta: "p-diann-remap",
-  merge_emp_p: "p-merge-ep",
-  merge_emp_f: "p-merge-ef",
-  merge_pred_p: "p-merge-pp",
-  merge_pred_f: "p-merge-pf",
-  merge_out: "p-merge-out",
 };
 // Pickers that choose a folder rather than a file.
 // `mzml_dir` is here because Bruker/Agilent `.d` and Waters `.raw` are
 // directories, and a file dialog cannot select one.
-const DIR_PICKS = new Set(["out_dir", "lib_out", "mzml_dir", "diann_lib_out", "merge_out"]);
+const DIR_PICKS = new Set(["out_dir", "lib_out", "mzml_dir", "diann_lib_out"]);
 
 // Render the selected spectra, with the vendor note each one needs.
 //
@@ -3453,7 +3440,6 @@ async function pick(what) {
     banner($("diann-import-error"), "");
   if (what === "diann_remap_fasta") show($("diann-remap-clear"), true);
   if (what === "diann_lib" || what === "diann_lib_out") banner($("diann-import-error"), "");
-  if (what.startsWith("merge_")) banner($("merge-error"), "");
   const el = $(LABEL[what]);
   // Shown right-to-left so the filename stays visible on a long path; the full
   // path is the tooltip.
@@ -4611,13 +4597,11 @@ async function followLibraryBuild(errorEl) {
 // selected under "MuMDIA library tables", ready for the search.
 function selectLibIn(which) {
   state.libIn = which;
-  const r = $(which === "diann" ? "libin-diann" : which === "merge" ? "libin-merge" : "libin-tables");
+  const r = $(which === "diann" ? "libin-diann" : "libin-tables");
   if (r) r.checked = true;
   show($("libin-tables-pane"), which === "tables");
   show($("libin-diann-pane"), which === "diann");
-  show($("libin-merge-pane"), which === "merge");
   if (which === "diann") refreshImportNote();
-  if (which === "merge") refreshMergeNote();
 }
 
 // Say, before Convert is pressed, whether the DIA-NN the conversion needs is there.
@@ -4650,78 +4634,6 @@ function clearRemapFasta() {
   el.title = "";
   el.classList.remove("set");
   show($("diann-remap-clear"), false);
-}
-
-// -- a spectral library + a predicted library ----------------------------------
-// Two MuMDIA libraries, an empirical one and one predicted from a FASTA, merged into one
-// pair of tables by `merge_libraries.py` (`diann::merge`), whose decoys DIA-NN predicts. On
-// success the merged tables are selected under "MuMDIA library tables", as after a
-// conversion.
-async function refreshMergeNote() {
-  const note = $("merge-note");
-  let d;
-  try {
-    d = (await invoke("diann_status")).status;
-  } catch (e) {
-    note.textContent = String(e);
-    return;
-  }
-  note.textContent = !d.runs
-    ? "No working DIA-NN was found: install DIA-NN 2.x and locate it on the Setup screen."
-    : !d.licence_acknowledged
-      ? "Acknowledge the DIA-NN licence on the Setup screen first."
-      : !d.writes_parquet
-        ? `${d.version || "This DIA-NN"} cannot write Parquet; DIA-NN 2.x is needed.`
-        : `Decoys predicted with ${d.version || "DIA-NN"}.`;
-}
-
-async function mergeLibraries() {
-  const err = $("merge-error");
-  banner(err, "");
-  if (state.buildingLibrary) return banner(err, "A library build is already running.");
-  const p = state.picks;
-  for (const [key, what] of [
-    ["merge_emp_p", "the empirical precursor table"],
-    ["merge_emp_f", "the empirical fragment table"],
-    ["merge_pred_p", "the predicted precursor table"],
-    ["merge_pred_f", "the predicted fragment table"],
-    ["merge_out", "an empty folder for the merged library"],
-  ]) {
-    if (!p[key]) return banner(err, `Choose ${what}.`);
-  }
-  const req = {
-    empirical_precursors: p.merge_emp_p,
-    empirical_fragments: p.merge_emp_f,
-    predicted_precursors: p.merge_pred_p,
-    predicted_fragments: p.merge_pred_f,
-    out_dir: p.merge_out,
-    precedence: $("merge-precedence").value || "empirical",
-  };
-  const threads = parseInt($("d-threads").value, 10);
-  if (Number.isFinite(threads) && threads > 0) req.threads = threads;
-  try {
-    await invoke("diann_merge", { req });
-  } catch (e) {
-    banner(err, String(e));
-    return;
-  }
-  enterLibraryPhase("Merging the libraries", "Merging the libraries");
-  const built = await followLibraryBuild(err);
-  screen("input");
-  if (!built) return;
-  for (const [what, path] of [
-    ["lib_precursors", built[0]],
-    ["lib_fragments", built[1]],
-  ]) {
-    state.picks[what] = path;
-    const el = $(LABEL[what]);
-    el.textContent = path;
-    el.title = path;
-    el.classList.add("set");
-  }
-  selectLibIn("tables");
-  scheduleSpace();
-  banner($("start-error"), "");
 }
 
 async function importDiannLibrary() {
@@ -5254,10 +5166,6 @@ async function startSearch() {
       $("start-error"),
       "Convert the DIA-NN library first: the search reads the two tables it writes."
     );
-    return;
-  }
-  if (state.mode === "library" && state.libIn === "merge" && !p.lib_precursors) {
-    banner($("start-error"), "Merge the libraries first: the search reads the two tables it writes.");
     return;
   }
 
