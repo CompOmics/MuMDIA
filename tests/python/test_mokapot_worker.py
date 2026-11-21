@@ -128,10 +128,10 @@ def test_rescore_model_env_selects_logistic_regression(worker_module, mokapot_mo
 
 def test_default_and_percolator_models_are_unchanged(worker_module, mokapot_module):
     """The unset default is logistic regression on every install, `nn` the sklearn MLP,
-    and `percolator` means `model=None`.
+    and `percolator` means mokapot's own `PercolatorModel`.
 
-    `model=None` is how the worker asks mokapot for its own grid-searched
-    linear SVM. Confusing the two would make `classifier = mokapot` mean a
+    `PercolatorModel` is mokapot's own grid-searched linear SVM, built as `brew` builds
+    it for `model=None` but with the engine's training FDR. Confusing the two would make `classifier = mokapot` mean a
     different algorithm than every recorded benchmark used, while
     `psms_scored.parquet.report.json` still reports "mokapot".
     """
@@ -148,7 +148,9 @@ def test_default_and_percolator_models_are_unchanged(worker_module, mokapot_modu
                           MLPClassifier)
         for alias in ("percolator", "linear", "svm"):
             os.environ["MUMDIA_RESCORE_MODEL"] = alias
-            assert worker_module.make_model(mokapot_module) is None
+            model = worker_module.make_model(mokapot_module)
+            assert isinstance(model, mokapot_module.PercolatorModel)
+            assert model.train_fdr == 0.01
     finally:
         if prior is None:
             os.environ.pop("MUMDIA_RESCORE_MODEL", None)

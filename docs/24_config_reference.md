@@ -1336,7 +1336,7 @@ moves to another function.
 | `HOME` | engine | computed: set by the operating system; on Unix and macOS the per-user cache directory under it holds the engine's caches when MUMDIA_CACHE_DIR is unset (`cache.rs` `root`) | `rust/mumdia/crates/mumdia/src/cache.rs::root` |
 | `LOCALAPPDATA` | engine | computed: set by Windows; `%LOCALAPPDATA%\mumdia\cache` holds the engine's caches when MUMDIA_CACHE_DIR is unset (`cache.rs` `root`) | `rust/mumdia/crates/mumdia/src/cache.rs::root` |
 | `MPLCONFIGDIR` | engine | computed: matplotlib's own (`~/.config/matplotlib`); under `--temp-dir` / `MUMDIA_TEMP_DIR` the engine sets it to `<temp>/matplotlib` for its workers unless it is set (`storage.rs` `apply`) | `rust/mumdia/crates/mumdia/src/storage.rs::apply` |
-| `MUMDIA_BREW_ITERS` | sidecar | `"20"` | `scripts/mokapot_worker.py::make_model` |
+| `MUMDIA_BREW_ITERS` | both | `"20"` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::mokapot_brew_iters`, `scripts/mokapot_worker.py::make_model` |
 | `MUMDIA_CACHE_DIR` | engine | computed: the per-user cache directory: `$XDG_CACHE_HOME/mumdia` or `~/.cache/mumdia` (Linux and other Unix), `~/Library/Caches/mumdia` (macOS), `%LOCALAPPDATA%\mumdia\cache` (Windows). A path moves the `"auto"` caches there (`--cache-dir` wins over it; a relative path is made absolute at startup); `off` / `0` / `false` / `none` turns them off (`cache.rs` `root`, `storage.rs` `apply`) | `rust/mumdia/crates/mumdia/src/cache.rs::root`, `rust/mumdia/crates/mumdia/src/storage.rs::apply` |
 | `MUMDIA_CACHE_MAX_GB` | engine | computed: 100 (GiB): the library and DeepLC projection caches together, least recently used entries removed first, none used within the last hour. `0` or `unlimited` is no bound (`cache.rs` `budget`) | `rust/mumdia/crates/mumdia/src/cache.rs::budget` |
 | `MUMDIA_CACHE_MIN_FREE_GB` | engine | computed: 10 (GiB): the free space a library-cache store must leave on the cache's disk, measured before the copy; `0` is no margin (`library_cache.rs` `min_free_after_store`) | `rust/mumdia/crates/mumdia/src/library_cache.rs::min_free_after_store` |
@@ -1366,7 +1366,7 @@ moves to another function.
 | `MUMDIA_NN_EPOCHS` | sidecar | `25` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_FEATURES` | sidecar | `""` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_FLUSH_DENORMAL` | sidecar | `1` | `scripts/nn_rescore_worker.py::main` |
-| `MUMDIA_NN_FOLDS` | sidecar | `3` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_FOLDS` | sidecar | `"3"` in mokapot_worker.py; `3` in nn_rescore_worker.py | `scripts/mokapot_worker.py::main`, `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_FOLD_KEYS` | sidecar | `""` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_HIDDEN` | sidecar | `"128,64"` in nn_rescore_worker.py; `"128,64,64,32"` in mokapot_worker.py | `scripts/mokapot_worker.py::make_model`, `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_INIT_FDR_MAX` | sidecar | `0.05` | `scripts/nn_rescore_worker.py::main` |
@@ -1392,7 +1392,7 @@ moves to another function.
 | `MUMDIA_NN_STREAM_GB` | sidecar | `4` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_THREADS` | both | `16` | `rust/mumdia/crates/mumdia/src/main.rs::apply_threads`, `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_THREAD_CAP` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py::torch_thread_cap` |
-| `MUMDIA_NN_TRAIN_FDR` | sidecar | `0.01` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_TRAIN_FDR` | sidecar | `"0.01"` in mokapot_worker.py; `0.01` in nn_rescore_worker.py | `scripts/mokapot_worker.py::main`, `scripts/mokapot_worker.py::make_model`, `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_TRAIN_SUB` | sidecar | `0.0` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_WARM_EPOCHS` | sidecar | `0` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_WARM_START` | sidecar | `0` | `scripts/nn_rescore_worker.py::main` |
@@ -1430,7 +1430,7 @@ moves to another function.
 | `VIRTUAL_ENV` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
 | `XDG_CACHE_HOME` | engine | computed: set by the desktop environment, often unset; an absolute value puts the engine's caches in `$XDG_CACHE_HOME/mumdia` on Linux when MUMDIA_CACHE_DIR is unset (`cache.rs` `root`) | `rust/mumdia/crates/mumdia/src/cache.rs::root` |
 
-98 variables are read: 45 engine-side, 58 sidecar-side, 5 on both sides.
+98 variables are read: 46 engine-side, 58 sidecar-side, 6 on both sides.
 
 ### Variables the code sets
 

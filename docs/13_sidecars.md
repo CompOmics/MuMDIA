@@ -720,7 +720,10 @@ in `docs/08_rt_im_train.md` section 4d.
 and `HandoffWriter`. Rust concatenates the competed feature tables, writes the
 PIN, spawns the worker, and passes `MUMDIA_NN_FOLDS/ITERS/TRAIN_FDR` from
 `rescore.{folds,num_iter,train_fdr}` as env vars so the
-report's recorded params match what ran; mokapot ignores those three. On success
+report's recorded params match what ran. mokapot reads the folds and the training FDR
+(`brew(folds=..., test_fdr=...)` and the model's `train_fdr`); its semi-supervised
+iterations are `MUMDIA_BREW_ITERS` (20), which the report records as `num_iter` for a
+mokapot run instead of `rescore.num_iter`. On success
 the classifier label and `model_identity` are recorded; on failure the path falls
 back to `native_scores` only when `rescore.strict = false`; strict is the
 production default. The authoritative actual path is recorded in
@@ -735,7 +738,8 @@ none). `MUMDIA_NN_SEED`, `MUMDIA_NN_THREADS` (set from `--threads`) and
   `nn` -> sklearn `MLPClassifier`; `logreg` -> `LogisticRegression`;
   `percolator`/`linear`/`svm` -> mokapot's default, `model=None`; any other value is
   refused),
-  runs `mokapot.brew(..., rng=0, max_workers=MUMDIA_MOKAPOT_WORKERS)`, and uses
+  runs `mokapot.brew(..., folds=rescore.folds, test_fdr=rescore.train_fdr, rng=0,
+  max_workers=MUMDIA_MOKAPOT_WORKERS)`, and uses
   mokapot's **out-of-fold** confidence scores only (each PSM scored by the fold
   that did not train on it, `mokapot_worker.py:128-163`). There is deliberately no
   in-sample fallback: `_oof_scores` raises `RuntimeError` unless the merged

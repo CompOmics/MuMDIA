@@ -531,6 +531,14 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **The mokapot worker uses `rescore.folds` and `rescore.train_fdr`, and the report says how
+  many iterations it ran.** The engine passed `folds`, `num_iter` and `train_fdr` and recorded
+  them in `psms_scored.parquet.report.json`, but the worker ignored all three (3 folds, 0.01
+  and `MUMDIA_BREW_ITERS` 20 whatever the configuration said). It now reads the folds and the
+  training FDR, which changes its output only for non-default values; the iterations stay
+  `MUMDIA_BREW_ITERS`, and the report's `num_iter` for a mokapot run now records that count
+  instead of `rescore.num_iter`. The `percolator` model is built as `mokapot.brew` builds its
+  default, with the configured training FDR.
 - **`MUMDIA_NN_THREAD_CAP=inf` no longer stops the NN rescorer.** The cap was parsed with
   `int(float(...))` catching only `ValueError`, so `inf` raised `OverflowError` and failed
   the rescore, and a value such as `eight` was ignored without a word; both now warn and

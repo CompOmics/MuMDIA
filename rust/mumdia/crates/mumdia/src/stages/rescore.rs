@@ -872,8 +872,8 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
                 Ok(s) => {
                     info!("rescore: using Mokapot scores");
                     classifier_used = "mokapot";
-                    let estimator =
-                        std::env::var("MUMDIA_RESCORE_MODEL").unwrap_or_else(|_| "logreg".to_string());
+                    let estimator = std::env::var("MUMDIA_RESCORE_MODEL")
+                        .unwrap_or_else(|_| "logreg".to_string());
                     model_identity = format!("mokapot-{estimator}");
                     s
                 }
@@ -1270,7 +1270,11 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
         "classifier_requested": format!("{:?}", p.cfg.classifier),
         "strict": p.cfg.strict,
         "folds": p.cfg.folds,
-        "num_iter": p.cfg.num_iter,
+        "num_iter": if classifier_used == "mokapot" {
+            mokapot_brew_iters()
+        } else {
+            p.cfg.num_iter
+        },
         "train_fdr": p.cfg.train_fdr,
         "feature_schema_id": expected_schema.schema_id,
         "train_neg_ratio": p.cfg.train_neg_ratio,
@@ -3941,8 +3945,9 @@ fn run_pin_sidecar(
         // Pass the configured NN hyperparameters so the worker uses them instead
         // of its own defaults, and so the folds/num_iter/train_fdr recorded in the
         // report reflect the values actually used
-        // (docs/18_findings_and_decisions.md). Ignored by mokapot_worker.py,
-        // which shares this PIN contract. `NN_ENV_SET_BY_ENGINE` lists these names.
+        // (docs/18_findings_and_decisions.md). mokapot_worker.py, which shares this PIN
+        // contract, reads the folds and the training FDR; its iterations are
+        // MUMDIA_BREW_ITERS (`mokapot_brew_iters`). `NN_ENV_SET_BY_ENGINE` lists these names.
         .env("MUMDIA_NN_FOLDS", p.cfg.folds.to_string())
         .env("MUMDIA_NN_ITERS", p.cfg.num_iter.to_string())
         .env("MUMDIA_NN_TRAIN_FDR", p.cfg.train_fdr.to_string())
@@ -4041,6 +4046,15 @@ const NN_ENV_SET_BY_ENGINE: [&str; 11] = [
     "MUMDIA_NN_SEEDS",
     "MUMDIA_NN_FOLD_KEYS",
 ];
+
+/// The semi-supervised iterations `mokapot_worker.py` runs: `MUMDIA_BREW_ITERS`, default 20,
+/// as the worker reads it. It does not read `rescore.num_iter`, so the report records this.
+fn mokapot_brew_iters() -> usize {
+    std::env::var("MUMDIA_BREW_ITERS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(20)
+}
 
 /// The `MUMDIA_NN_*` variables in `vars` that the NN worker inherits from this process on
 /// top of the ones `run_pin_sidecar` sets, sorted by name.
