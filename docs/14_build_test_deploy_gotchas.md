@@ -938,11 +938,9 @@ do not reintroduce removed knobs. The fields relevant here:
   (`config.rs:1494`); `mokapot`/`nn_torch` without `rescore.python`
   (`config.rs:1502`); `percolator` (declared but not wired, `config.rs:1512`); and
   `entrapment` without `rescore.entrapment_marker` (`config.rs:1519`).
-- `validate` also warns without failing in four cases (`config.rs:1528-1578`),
-  which is how the inert and mutually-exclusive fields announce themselves rather
-  than silently doing nothing: a non-default `mbr.rt_window_s`,
-  `mbr.decoy_transfer` or `mbr.requant_all` (all three marked NOT YET WIRED at
-  `config.rs:1207,1210,1217`); a non-`none` `mbr.strategy`, whose tiers are not
+- `validate` also warns without failing in three cases (`config.rs:1528-1578`),
+  which is how the mutually-exclusive fields announce themselves rather
+  than silently doing nothing: a non-`none` `mbr.strategy`, whose tiers are not
   distinguished; `quant.fixed_window_s` and `quant.fixed_scan_halfwidth` both set,
   where the seconds form wins; and `quant.baseline_subtract` without a fixed
   window to subtract inside.

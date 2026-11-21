@@ -1605,12 +1605,10 @@ the psms paths into a comma-separated `psms_csv` and forwards a fixed set of fla
 NOT forwarded (present in `MbrConfig`, `config.rs:873`, but dead in the wired path):
 - `strategy` beyond the None/not-None gate: `EmpiricalLibrary`, `RtTransfer`, `Full`
   are indistinguishable to the worker, which always runs the rescuable transfer tier.
-- `rt_window_s` (`config.rs:884`): the worker's `--rt-window` (default 20 s) is only
-  read by the `--emit-transfer-targets` re-extraction tier, which `run_mbr` never
-  invokes, so this knob has no effect on the wired path.
-- `decoy_transfer` (`config.rs:886`): the worker hardcodes the permuted-RT null;
-  `ReverseSequence`/`Both` are not implemented in the worker.
-- `requant_all` (`config.rs:892`): `Full`-only requantification, unused.
+- `rt_window_s`, `decoy_transfer` and `requant_all` were removed in 0.15.0, because
+  nothing forwarded them: the worker's `--rt-window` (default 20 s) is read only by the
+  `--emit-transfer-targets` tier, which `run_mbr` never invokes, and the worker
+  hardcodes the permuted-RT null.
 
 The worker reads the scored table columns `candidate_id`, `source`, `label`, `q_value`,
 `peptidoform`, `charge`, `protein_group` (`mbr_worker.py:81`) and per-run `apex_rt` from
@@ -1831,9 +1829,7 @@ the canonical configuration at `off`, the other two at their defaults. See
 
 **`MbrConfig`** (`config.rs:873`, defaults at `config.rs:898`): `strategy` (`None`;
 `MbrStrategy` at `config.rs:845`), `q_anchor` (0.01), `min_anchor_runs` (2),
-`q_transfer` (0.01), `rt_window_s` (20.0, unwired), `decoy_transfer` (`PermutedRt`,
-`DecoyTransfer` at `config.rs:864`, unwired), `consensus_corr_min` (0.0), `requant_all`
-(false, unwired), `python` (None, required when `strategy != None`). See the mbr
+`q_transfer` (0.01), `consensus_corr_min` (0.0), `python` (None, required when `strategy != None`). See the mbr
 section for exactly which of these reach the worker.
 
 **report** takes `q_threshold` (`--q`, default 0.01) and optional quant table paths as
@@ -1951,11 +1947,9 @@ but do not affect the wired `mumdia mbr` path.
   `n_fragments_used` or a minimum window width; emit the reason so `report` can surface
   low-evidence quantities.
 - **Wire the MBR strategy tiers:** thread `cfg.mbr.strategy` past the None gate in
-  `main.rs:680` and forward `rt_window_s`/`decoy_transfer`/`requant_all` in
-  `run_mbr` (`sidecar.rs:193`). The re-extraction tier already exists in the worker
+  `main.rs:680` in `run_mbr` (`sidecar.rs:193`). The re-extraction tier already exists in the worker
   (`--emit-transfer-targets`); it needs a Rust subcommand that then calls
-  `extract --restrict-candidates --run-windows` and re-scores. Implement the
-  `ReverseSequence`/`Both` nulls in the worker before honoring `decoy_transfer`.
+  `extract --restrict-candidates --run-windows` and re-scores.
 - **Add an audit reason:** extend `RejectionReason` (`rejection.rs:22`) at its pipeline
   position, with a `code()` arm and a branch in the ladder; an extraction reason needs
   extract to record it per candidate first.

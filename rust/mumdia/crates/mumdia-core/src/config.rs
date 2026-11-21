@@ -4061,20 +4061,6 @@ impl MbrStrategy {
     }
 }
 
-/// Decoy-transfer null for the MBR false-transfer FDR (M4). `ReverseSequence`
-/// transfers reverse/scramble decoys at the same expected RT; `PermutedRt` transfers
-/// real precursors to a decoupled (wrong) expected RT; `Both` combines them. The
-/// prototype's shuffled-RT null gave a ~0.6% in-window false rate vs 66.6% true
-/// (113x separation), so the transfer q-value is well-calibrated.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum DecoyTransfer {
-    #[default]
-    PermutedRt,
-    ReverseSequence,
-    Both,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MbrConfig {
@@ -4089,23 +4075,9 @@ pub struct MbrConfig {
     pub min_anchor_runs: usize,
     /// Transfer variants only: accept threshold for a transfer's q-value.
     pub q_transfer: f64,
-    /// NOT YET WIRED. Transfer RT half-window (seconds) around the cross-run-predicted
-    /// RT. The M2 leave-target-out residual was ~17 s at p95, ~15x tighter than the search
-    /// window, which is where this default comes from -- but no code reads this field yet,
-    /// so setting it has no effect. Kept as the recorded design value for the MBR transfer
-    /// tier; `validate()` warns if it is changed from the default. See CLAUDE.md, "MBR
-    /// transfer/re-extraction remains benchmark-gated".
-    pub rt_window_s: f64,
-    /// NOT YET WIRED. Which decoy-transfer null would estimate the false-transfer rate
-    /// (M4). No code reads this field yet; `validate()` warns if it is changed.
-    pub decoy_transfer: DecoyTransfer,
     /// Minimum correlation of the observed fragment pattern to the empirical
     /// consensus for a transfer to be accepted (interference guard; 0 disables).
     pub consensus_corr_min: f64,
-    /// NOT YET WIRED. Would requantify already-identified precursors too (fill the
-    /// matrix), not only transferred ones, under `strategy = Full`. No code reads this
-    /// field yet; `validate()` warns if it is changed.
-    pub requant_all: bool,
     /// Python interpreter for the `mbr_worker.py` sidecar (pandas/pyarrow/numpy;
     /// e.g. the `py312_mumdia` env). Required by the transfer variants only; `second_pass`
     /// and `none` run no sidecar.
@@ -4138,10 +4110,7 @@ impl Default for MbrConfig {
             q_anchor: 0.01,
             min_anchor_runs: 2,
             q_transfer: 0.01,
-            rt_window_s: 20.0, // >= the p95 M2 residual (~17 s)
-            decoy_transfer: DecoyTransfer::PermutedRt,
             consensus_corr_min: 0.0,
-            requant_all: false,
             python: None,
             second_pass_prefilter_keep_decoys: None,
             first_pass_flag: false,
@@ -4203,13 +4172,6 @@ pub struct RescoreConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefilter_features: Option<Vec<String>>,
     pub python: Option<String>,
-    /// Path to an external `percolator` executable.
-    ///
-    /// Parsed and never read: no stage launches percolator, and `RescorerKind` has no
-    /// variant that would. It is the only silently inert config field in the tree, since
-    /// the three MBR ones warn (see `validate`). Kept rather than deleted because the
-    /// external-percolator path is still intended; `validate` now warns when it is set.
-    pub percolator_bin: Option<String>,
     /// Protein-accession substring marking spike-in (entrapment) negatives, e.g.
     /// "_HUMAN". Required when `classifier = entrapment`; PSMs whose protein
     /// contains it are the empirical false population.
@@ -4396,7 +4358,6 @@ impl Default for RescoreConfig {
             prefilter_min_psms: 1_000_000,
             prefilter_features: None,
             python: None,
-            percolator_bin: None,
             entrapment_marker: None,
             entrapment_exclude: None,
             entrapment_contaminant_markers: Vec::new(),
@@ -6275,41 +6236,6 @@ impl Config {
                     .into(),
             ));
         }
-        // MBR fields that are accepted and documented but not yet read by any stage. Setting
-        // them has NO effect, which is worse than rejecting them: the run looks configured.
-        // Warn rather than error so existing configs keep parsing (serde uses
-        // deny_unknown_fields, so deleting the fields outright would break them).
-        {
-            let d = MbrConfig::default();
-            let mut inert: Vec<&str> = Vec::new();
-            if (self.mbr.rt_window_s - d.rt_window_s).abs() > f64::EPSILON {
-                inert.push("mbr.rt_window_s");
-            }
-            if self.mbr.decoy_transfer != d.decoy_transfer {
-                inert.push("mbr.decoy_transfer");
-            }
-            if self.mbr.requant_all != d.requant_all {
-                inert.push("mbr.requant_all");
-            }
-            if !inert.is_empty() {
-                tracing::warn!(
-                    fields = ?inert,
-                    "these MBR config fields are parsed but not read by any stage yet, so \
-                     setting them has no effect on this run"
-                );
-            }
-        }
-        // The fourth inert field, and the only one that used to warn about nothing. Under
-        // `deny_unknown_fields` a user reasonably reads an accepted key as an honoured
-        // one, so silence here means a run that looks configured for external percolator
-        // and is not.
-        if self.rescore.percolator_bin.is_some() {
-            tracing::warn!(
-                "rescore.percolator_bin is parsed but no stage launches percolator, so \
-                 setting it has no effect. Use rescore.classifier = mokapot or nn_torch \
-                 for an external classifier."
-            );
-        }
         if self.mbr.strategy.transfers() {
             tracing::warn!(
                 strategy = ?self.mbr.strategy,
@@ -6840,7 +6766,6 @@ impl Config {
                 self.extract.claim_cues.rt_prior_tau_s,
             ),
             ("extract.peak_claim_margin", self.extract.peak_claim_margin),
-            ("mbr.rt_window_s", self.mbr.rt_window_s),
         ] {
             if !value.is_finite() || value <= 0.0 {
                 return Err(Invalid(format!(
@@ -7487,6 +7412,27 @@ const RETIRED: &[Retired] = &[
     },
 
     // D: MS1 surface, never-read keys and refused choices
+    Retired {
+        path: "mbr.rt_window_s",
+        gone: Gone::Key("20.0"),
+        why: "no stage read it",
+    },
+    Retired {
+        path: "mbr.decoy_transfer",
+        gone: Gone::Key("\"permuted_rt\""),
+        why: "no stage read it",
+    },
+    Retired {
+        path: "mbr.requant_all",
+        gone: Gone::Key("false"),
+        why: "no stage read it",
+    },
+    Retired {
+        path: "rescore.percolator_bin",
+        gone: Gone::Key("null"),
+        why: "no stage launched it; rescore.classifier = mokapot or nn_torch is the external \
+              classifier",
+    },
     Retired {
         path: "extract.ms1_calibrate",
         gone: Gone::Value("\"surface\""),

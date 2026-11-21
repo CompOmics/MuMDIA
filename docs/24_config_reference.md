@@ -68,9 +68,9 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`extract.claim_cues`](#extractclaim_cues) | `ClaimCues` | 7 | [docs/09_extract.md](09_extract.md) |
 | [`features`](#features) | `FeaturesConfig` | 14 | [docs/10_features.md](10_features.md) |
 | [`compete`](#compete) | `CompeteConfig` | 6 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
-| [`rescore`](#rescore) | `RescoreConfig` | 32 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
+| [`rescore`](#rescore) | `RescoreConfig` | 31 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
 | [`quant`](#quant) | `QuantConfig` | 29 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
-| [`mbr`](#mbr) | `MbrConfig` | 11 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
+| [`mbr`](#mbr) | `MbrConfig` | 8 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`experiment`](#experiment) | `ExperimentConfig` | 5 | [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md) |
 | [`groups`](#groups) | `GroupsConfig` | 9 |  |
 | [`retrace`](#retrace) | `RetraceConfig` | 7 | [docs/09_extract.md](09_extract.md) |
@@ -482,7 +482,6 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 | `prefilter_min_psms` | `usize` | `1_000_000` |  | The fewest competed PSMs a pool needs before `prefilter_keep_decoys` cuts it (default 1,000,000); a smaller pool goes to the classifier whole. The prefilter is a speed and memory lever for large pools: on the 27,376-PSM Orbitrap AIF entrapment run it saved 2 s of a 10 s rescore and cost 1.3% of the real precursors at an unchanged FDP, while every pool measured from 1.8 million PSMs up lost nothing (docs/35_diapasef.md section 16). 0 cuts every pool. |
 | `prefilter_features` | `Option<Vec<String>>` | `null` |  | The feature columns the prefilter model reads; unset is a default list of agreement, co-elution, intensity, matched-count, retention-time, MS1 and peak-shape features. Names the competed table does not carry are skipped with a warning. |
 | `python` | `Option<String>` | `null` |  |  |
-| `percolator_bin` | `Option<String>` | `null` |  | Path to an external `percolator` executable. Parsed and never read: no stage launches percolator, and `RescorerKind` has no variant that would. It is the only silently inert config field in the tree, since the three MBR ones warn (see `validate`). Kept rather than deleted because the external-percolator path is still intended; `validate` now warns when it is set. |
 | `entrapment_marker` | `Option<String>` | `null` |  | Protein-accession substring marking spike-in (entrapment) negatives, e.g. "_HUMAN". Required when `classifier = entrapment`; PSMs whose protein contains it are the empirical false population. |
 | `entrapment_exclude` | `Option<String>` | `null` |  | If a protein also contains this substring it is NOT counted as entrapment (the sample's own species, e.g. "_ECOLI"): shared peptides then count as real targets. `None` = the marker alone decides. |
 | `entrapment_contaminant_markers` | `Vec<String>` | `[]` |  | Protein substrings marking genuine contaminants inside the spike-in proteome (e.g. "KRT", "ALBU", keratin/albumin entry-name tokens). A PSM matching `entrapment_marker` but also one of these is treated as a REAL target, not an entrapment negative: such peptides are truly present (handling contaminants) so using them as negatives mislabels real signal and inflates the estimated FDR. Empty = every spike-in hit is a negative. |
@@ -552,10 +551,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 | `q_anchor` | `f64` | `0.01` |  | The first-pass cut (validated at 0.01). Under `second_pass`, the experiment-wide `precursor_q` at which a target enters the empirical library, and the `run_psm_q` at which one run's apex counts toward its consensus retention time. Under the transfer variants, the q-value for a precursor to become a cross-run anchor. |
 | `min_anchor_runs` | `usize` | `2` |  | Transfer variants only: minimum number of OTHER runs a precursor must be confident in to transfer. |
 | `q_transfer` | `f64` | `0.01` |  | Transfer variants only: accept threshold for a transfer's q-value. |
-| `rt_window_s` | `f64` | `20.0` | benchmark-gated, not yet wired | NOT YET WIRED. Transfer RT half-window (seconds) around the cross-run-predicted RT. The M2 leave-target-out residual was ~17 s at p95, ~15x tighter than the search window, which is where this default comes from -- but no code reads this field yet, so setting it has no effect. Kept as the recorded design value for the MBR transfer tier; `validate()` warns if it is changed from the default. See CLAUDE.md, "MBR transfer/re-extraction remains benchmark-gated". |
-| `decoy_transfer` | `DecoyTransfer` | `permuted_rt` | not yet wired | NOT YET WIRED. Which decoy-transfer null would estimate the false-transfer rate (M4). No code reads this field yet; `validate()` warns if it is changed. |
 | `consensus_corr_min` | `f64` | `0.0` |  | Minimum correlation of the observed fragment pattern to the empirical consensus for a transfer to be accepted (interference guard; 0 disables). |
-| `requant_all` | `bool` | `false` | not yet wired | NOT YET WIRED. Would requantify already-identified precursors too (fill the matrix), not only transferred ones, under `strategy = Full`. No code reads this field yet; `validate()` warns if it is changed. |
 | `python` | `Option<String>` | `null` |  | Python interpreter for the `mbr_worker.py` sidecar (pandas/pyarrow/numpy; e.g. the `py312_mumdia` env). Required by the transfer variants only; `second_pass` and `none` run no sidecar. |
 | `second_pass_prefilter_keep_decoys` | `Option<f64>` | `null` |  | Under `strategy = second_pass`: the `rescore.prefilter_keep_decoys` of the second-pass rescore only (0 = no prefilter there). Unset, the second pass uses `rescore.prefilter_keep_decoys` like the first. The first pass pools every candidate of every run (59M and 106M PSMs on 18- and 27-run Astral experiments) and needs the cut for memory; the second-pass pool holds the empirical library's candidates (6.6M and 4.1M PSMs on the same two), where the cut cost 4.2-4.8% of the precursors on a plate of single cells. Must be in [0, 1). Left out of the canonical configuration when unset. |
 | `first_pass_flag` | `bool` | `false` |  | Under `strategy = second_pass`, `run-experiment` only: write a Boolean `first_pass_id` into every run's `peptide_quant` (v3), true where the row's precursor had a first-pass identification in that run (`run_psm_q <= q_anchor`, target), and a `first_pass_<run>` column per run into the experiment-wide `peptides.tsv`. It is evidence for a reporting filter (`bench/quant_condition_gate.py`), not a filter: no identification, quantity or q-value changes. Quantities of conditions where no run has a first-pass identification are the most compressed ones (docs/12, "Second pass"). Off by default; then nothing is written and both tables keep their bytes. Left out of the canonical configuration when off. |
@@ -751,18 +747,6 @@ Cross-run normalisation of precursor quantities. See `QuantConfig::normalisation
 | `scramble` |  | Deterministic seeded shuffle of the interior residues. |
 | `diann_shift` |  | DIA-NN terminal-residue fragment m/z shift. Deferred: license-checked addition (docs/14_build_test_deploy_gotchas.md), not part of MVP. |
 | `none` |  |  |
-
-### `DecoyTransfer`
-
-(rust/mumdia/crates/mumdia-core/src/config.rs)
-
-Decoy-transfer null for the MBR false-transfer FDR (M4). `ReverseSequence` transfers reverse/scramble decoys at the same expected RT; `PermutedRt` transfers real precursors to a decoupled (wrong) expected RT; `Both` combines them. The prototype's shuffled-RT null gave a ~0.6% in-window false rate vs 66.6% true (113x separation), so the transfer q-value is well-calibrated.
-
-| Value | Default | Description |
-|---|---|---|
-| `permuted_rt` | yes |  |
-| `reverse_sequence` |  |  |
-| `both` |  |  |
 
 ### `Enzyme`
 
@@ -1474,6 +1458,6 @@ instead of looking like an absent field.
 
 ## Coverage
 
-26 structs and 369 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 50 enumerations, 1 named profile(s), 106 environment variables read and 27 set.
+26 structs and 365 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 49 enumerations, 1 named profile(s), 106 environment variables read and 27 set.
 
-34 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.
+31 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.

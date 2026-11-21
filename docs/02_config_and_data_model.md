@@ -217,11 +217,10 @@ poor setting is detectable. Defaults always pass.
 10. Entrapment without `rescore.entrapment_marker` -> `Invalid`
     (`config.rs:1396-1404`).
 
-`validate()` also emits two non-fatal warnings (`config.rs:1405-1437`), because
-erroring would break configs that already parse: one when `mbr.rt_window_s`,
-`mbr.decoy_transfer`, or `mbr.requant_all` is moved off its default (no stage
-reads those fields), and one when `mbr.strategy` is any non-`none` variant (only
-`none` vs not-`none` is distinguished in code).
+`validate()` also warns, without failing, when `mbr.strategy` selects the
+rescuable-tier transfer. `mbr.rt_window_s`, `mbr.decoy_transfer`, `mbr.requant_all`
+and `rescore.percolator_bin` were removed in 0.15.0 because no stage read them; a file that sets
+one at its old default still loads.
 
 `canonical_json` (`config.rs:1464-1466`) serializes the fully-resolved config;
 `run` hashes it with `blake3_str` into `config_hash` (`run.rs:89`) and stores the
@@ -427,7 +426,6 @@ listed with its default and effect. Fields marked **default-off**, **inert**, or
 | `NormalizeMethod` | config.rs:936-949 | `none`, **`median_ratio`**, `median` | cross-run LFQ normalization; `from_token` at 953-960 |
 | `QuantQColumn` | config.rs:971-988 | **`peptide_q`**, `precursor_q`, `psm_q`, `run_psm_q` | which q column quant filters on |
 | `MbrStrategy` | config.rs:1058-1068 | **`none`**, `empirical_library`, `rt_transfer`, `full` | only `none` vs not-`none` is distinguished in code; the three non-`none` variants behave identically and `validate()` warns |
-| `DecoyTransfer` | config.rs:1077-1082 | **`permuted_rt`**, `reverse_sequence`, `both` | MBR false-transfer null; **not read by any stage** (`validate()` warns if changed) |
 | `RtLibraryScope` | config.rs | **`first_run_only`**, `per_run` | `run-experiment` only: how many DeepLC fine-tunes an experiment pays for |
 | `Handoff` | config.rs | `tsv`, `parquet`, **`raw`** | how the feature matrix crosses into a sidecar rescorer; `parquet` and `raw` are nn_torch only (mokapot falls back to `tsv` with a warning) |
 
@@ -516,18 +514,15 @@ else keep it (conservative removal for the low-FDR region). Target/decoy labels
 stay in the competition key in every mode, so a target never competes against its
 own decoy.
 
-**`MbrStrategy`** (1043-1068) and **`DecoyTransfer`** (1070-1082) are the recorded
-MBR design ladder, not four (respectively three) distinct behaviors. Only
+**`MbrStrategy`** (1043-1068) is the recorded
+MBR design ladder, not four distinct behaviors. Only
 `strategy == None` vs `!= None` is ever tested in the tree, so `RtTransfer` and
 `Full` behave exactly like `EmpiricalLibrary` today, and `validate()` warns when
-any non-`None` variant is selected. `DecoyTransfer` is read by no stage at all
-and `validate()` warns when it is moved off its default. The intended staging is:
+any non-`None` variant is selected. The intended staging is:
 `None` (default) reproduces the chain byte-for-byte; `EmpiricalLibrary` builds
 the cross-run consensus anchor library only (M1); `RtTransfer` adds cross-run
-expected-RT transfer extraction (M2/M3); `Full` adds requantification (M5). The
-intended null (M4) is `PermutedRt` (default), transferring real precursors to a
-decoupled wrong expected RT, `ReverseSequence`, transferring reverse/scramble
-decoys at the same expected RT, or `Both`. All require >= 2 runs.
+expected-RT transfer extraction (M2/M3); `Full` adds requantification (M5). All
+require >= 2 runs.
 
 **`CompeteGroupBy`** (894-901). `Precursor` (default) does **not** group by
 precursor. Its full key is `(base_peptide_id, label_code, 0, peak_rank)`
@@ -836,7 +831,6 @@ requiring entrapment/target-decoy FDR validation before use.
 | `train_fdr` | 0.01 | positive-selection FDR |
 | `num_iter` | 10 | semi-supervised iterations (native) |
 | `python` | `None` | interpreter for a Python rescorer (mokapot/nn_torch/entrapment) |
-| `percolator_bin` | `None` | percolator.exe path |
 | `entrapment_marker` | `None` | protein substring marking spike-in negatives (required for `entrapment`) |
 | `entrapment_exclude` | `None` | substring that de-marks (own-species) |
 | `entrapment_contaminant_markers` | `[]` | substrings that keep a spike-in hit as a real target |
@@ -855,12 +849,9 @@ requiring entrapment/target-decoy FDR validation before use.
 ### `MbrConfig` (config.rs:1084-1129), partly inert
 
 The MBR stage (D3) is not wired into the run chain. Fields: `strategy` (`none`
-default), `q_anchor` 0.01, `min_anchor_runs` 2, `q_transfer` 0.01, `rt_window_s`
-20.0, `decoy_transfer` `permuted_rt`, `consensus_corr_min` 0.0, `requant_all`
-`false`, `python` `None`. Of these, `rt_window_s`, `decoy_transfer`, and
-`requant_all` are read by no stage at all and `validate()` warns when any is
-moved off its default, because a config that sets them looks configured but
-changes nothing. With `strategy = none` the chain is byte-identical to no MBR.
+default), `q_anchor` 0.01, `min_anchor_runs` 2, `q_transfer` 0.01,
+`consensus_corr_min` 0.0, `python` `None`. `rt_window_s`, `decoy_transfer` and
+`requant_all` were removed in 0.15.0 because no stage read them. With `strategy = none` the chain is byte-identical to no MBR.
 
 ### `ExperimentConfig` (config.rs:1247-1272)
 

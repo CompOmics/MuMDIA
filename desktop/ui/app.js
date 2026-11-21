@@ -793,7 +793,6 @@ const LOCAL_SETTINGS = new Set([
   "predict_frag.sidecar_script_dir",
   "predict_frag.library_cache",
   "rt_im_train.deeplc_projection_cache",
-  "rescore.percolator_bin",
   "rescore.features_file",
   "convert.parallel_conversions",
   "extract.windows_in_flight",

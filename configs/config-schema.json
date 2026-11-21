@@ -3402,19 +3402,6 @@
       "source_struct": "RescoreConfig"
     },
     {
-      "path": "rescore.percolator_bin",
-      "name": "percolator_bin",
-      "section": "rescore",
-      "rust_type": "Option<String>",
-      "kind": "other",
-      "optional": true,
-      "default": "null",
-      "default_text": "null",
-      "help": "Path to an external `percolator` executable. Parsed and never read: no stage launches percolator, and `RescorerKind` has no variant that would. It is the only silently inert config field in the tree, since the three MBR ones warn (see `validate`). Kept rather than deleted because the external-percolator path is still intended; `validate` now warns when it is set.",
-      "gates": [],
-      "source_struct": "RescoreConfig"
-    },
-    {
       "path": "rescore.entrapment_marker",
       "name": "entrapment_marker",
       "section": "rescore",
@@ -4208,42 +4195,6 @@
       "source_struct": "MbrConfig"
     },
     {
-      "path": "mbr.rt_window_s",
-      "name": "rt_window_s",
-      "section": "mbr",
-      "rust_type": "f64",
-      "kind": "float",
-      "optional": false,
-      "default": 20.0,
-      "default_text": "20.0",
-      "help": "NOT YET WIRED. Transfer RT half-window (seconds) around the cross-run-predicted RT. The M2 leave-target-out residual was ~17 s at p95, ~15x tighter than the search window, which is where this default comes from -- but no code reads this field yet, so setting it has no effect. Kept as the recorded design value for the MBR transfer tier; `validate()` warns if it is changed from the default. See CLAUDE.md, \"MBR transfer/re-extraction remains benchmark-gated\".",
-      "gates": [
-        "benchmark-gated",
-        "not yet wired"
-      ],
-      "source_struct": "MbrConfig"
-    },
-    {
-      "path": "mbr.decoy_transfer",
-      "name": "decoy_transfer",
-      "section": "mbr",
-      "rust_type": "DecoyTransfer",
-      "kind": "enum",
-      "optional": false,
-      "default": "permuted_rt",
-      "default_text": "`permuted_rt`",
-      "help": "NOT YET WIRED. Which decoy-transfer null would estimate the false-transfer rate (M4). No code reads this field yet; `validate()` warns if it is changed.",
-      "gates": [
-        "not yet wired"
-      ],
-      "source_struct": "MbrConfig",
-      "choices": [
-        "permuted_rt",
-        "reverse_sequence",
-        "both"
-      ]
-    },
-    {
       "path": "mbr.consensus_corr_min",
       "name": "consensus_corr_min",
       "section": "mbr",
@@ -4254,21 +4205,6 @@
       "default_text": "0.0",
       "help": "Minimum correlation of the observed fragment pattern to the empirical consensus for a transfer to be accepted (interference guard; 0 disables).",
       "gates": [],
-      "source_struct": "MbrConfig"
-    },
-    {
-      "path": "mbr.requant_all",
-      "name": "requant_all",
-      "section": "mbr",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "NOT YET WIRED. Would requantify already-identified precursors too (fill the matrix), not only transferred ones, under `strategy = Full`. No code reads this field yet; `validate()` warns if it is changed.",
-      "gates": [
-        "not yet wired"
-      ],
       "source_struct": "MbrConfig"
     },
     {

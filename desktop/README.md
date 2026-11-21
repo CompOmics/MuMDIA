@@ -1187,7 +1187,7 @@ spectra, the FASTA, the library tables and every folder; the conditions of the f
 Threads and DIA-NN threads counts; and the engine settings that say where programs and
 caches are or how much of the computer a search may take (`LOCAL_SETTINGS` in `app.js`):
 `convert.thermo_raw_parser`, `convert.msconvert`, `predict_frag.sidecar_script_dir`,
-`rescore.percolator_bin`, `rescore.features_file`, the two cache locations
+`rescore.features_file`, the two cache locations
 (`predict_frag.library_cache`, `rt_im_train.deeplc_projection_cache`), the parallelism and
 memory limits (`convert.parallel_conversions`, `extract.windows_in_flight`,
 `extract.max_footprint_gib`, `features.chrom_loaders`, `rescore.max_feature_matrix_gib`,
