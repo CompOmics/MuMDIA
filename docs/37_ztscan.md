@@ -65,7 +65,7 @@ When a key is held off on ZT Scan input the log says which and why. These are th
 recipe (`configs/examples/diann-library.json`) resolved on a ZT Scan run has exactly the
 canonical configuration of `ztscan.json`, and so the same configuration hash and the same
 tables (section 12). What stays opt-in, as before: the classifier's sensitivity settings
-(section 4), `quant.q1_fragments` and the MS1 calibration keys of docs/09 section 11. The Q1 sweep keys (`extract.q1_cycles`, `extract.q1_profile`,
+(section 4), `quant.q1_fragments`. The MS1 calibration keys of docs/09 section 11 and the Q1 sweep keys (`extract.q1_cycles`, `extract.q1_profile`,
 `extract.q1_gate_max_offset`, `features.q1_features`), `features.ms1_envelope` and the separable model of section 15
 (`features.q1_separable`) were removed in 0.15.0, as were the counts of Q1-consistent peaks
 (`extract.q1_deconvolved`, `search_seed.q1_deconvolved`, section 10.3).
@@ -222,7 +222,7 @@ files"). The others stay opt-in.
 | read each step as a window, record the sweep | `convert.isolation_half_width` | docs/04, "SCIEX ZT Scan DIA" | required to read the file at all | yes (1.9; automatically the census's suggestion) |
 | sum a cycle's steps, a Q1-profile family, a gate on it | `extract.q1_cycles`, `extract.q1_profile`, `extract.q1_gate_max_offset`, `features.q1_features` | docs/09, section 10 | summing -13.7%; the profile family +0.4% inside seed noise; the gate cuts targets and decoys alike | removed in 0.15.0 |
 | calibrate the Q1 window from the seed | `rt_im_train.q1_calibrate` | docs/08, section 4h | the target is the window centre; an effective window wider and softer than nominal; changes no identification by itself | yes (the decisions need it) |
-| MS1 error surface and an MS1 tolerance from the seed | `extract.ms1_calibrate = "surface"`, `extract.prec_tol_auto` | docs/09, section 11 | +0.46% precursors, inside seed noise | no |
+| MS1 error surface and an MS1 tolerance from the seed | `extract.ms1_calibrate = "surface"`, `extract.prec_tol_auto` | docs/09, section 11 | +0.46% precursors, inside seed noise | no (removed in 0.15.0) |
 | decide per fragment whether it belongs | `extract.q1_fragments` | docs/09, section 12 | with its features: +1.26% human precursors at the base arm's measured FDP | yes |
 | the decisions as features | `features.q1_fragment_features` | docs/10 | (with the decisions, above) | yes |
 | re-pick the apex in RT x Q1 | `retrace.q1_repick` | docs/09, section 12 | +1.64 points on top, the largest single lever | yes |

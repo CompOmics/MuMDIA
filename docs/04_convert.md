@@ -836,8 +836,8 @@ keys calibrate what the sweep and the MS1 scans measure, before anything decides
   isotope-envelope model to a median of 0.003 steps (MAD 0.16 steps; 0.11 steps early
   before the calibration); the window is wider and softer than 3.8 m/z, whole within 0.57
   m/z of its centre and nothing beyond 4.56 m/z. Written to `cal.json` only.
-- `extract.ms1_calibrate = "surface"` and `extract.prec_tol_auto` (docs/09_extract.md, section
-  11): the ZenoTOF's MS1 error is +2.84 ppm with a robust SD of 2.67 ppm and drifts by about
+- `extract.ms1_calibrate = "surface"` and `extract.prec_tol_auto` (removed in 0.15.0;
+  docs/09_extract.md, section 11): the ZenoTOF's MS1 error is +2.84 ppm with a robust SD of 2.67 ppm and drifts by about
   1 ppm over the gradient; the 3 ppm default tolerance holds two thirds of the anchors' MS1
   peaks, and the rule of three robust SD sets 7.2 ppm.
 
@@ -855,8 +855,8 @@ compared on its own host):
 
 The calibration changes the count by little: +0.46% precursors over four seeds on the human
 library, +0.19% human precursors on the entrapment library at the same combined FDP. Each
-single key moves seed 0 by -0.1% to +0.5%, inside the seed spread. The two MS1 keys stay off
-(benchmark-gated, one acquisition); `q1_calibrate` is automatic for ZT Scan searches since
+single key moves seed 0 by -0.1% to +0.5%, inside the seed spread. The two MS1 keys were
+removed in 0.15.0; `q1_calibrate` is automatic for ZT Scan searches since
 0.12.0, because the per-fragment decisions below decide with it.
 
 The per-fragment Q1 decisions read the recorded sweep (spectra_ms2 v3 is required:

@@ -1082,42 +1082,23 @@ on its target and wider and softer than its nominal 3.8 m/z: whole within 0.57 m
 its centre and nothing beyond 4.56 m/z. The trapezoid of the removed `q1_profile` was the
 nominal one (one step of edge, the half-width as read).
 
-### 11. MS1 mass calibration: the surface and the tolerance (default off)
+### 11. MS1 mass calibration: the surface and the tolerance (removed in 0.15.0)
 
 Before extract, `run` and `run-experiment` learn the MS1 offset from the confident seed
 anchors (`stages::ms1cal`, `extract.ms1_calibrate = true`, the default since 2026-10-08):
 the median signed ppm error of the most intense MS1 peak within 15 ppm of each anchor's
 precursor m/z, in the MS1 scan nearest its observed RT and one either side (section 8 for
 the 4D rule), and every MS1 read of extract is centred on it, `prec_tol_ppm` (3 ppm) wide.
-Two opt-in keys extend that:
 
-- **`extract.ms1_calibrate = "surface"`** fits the anchors' errors as an additive smooth
-  function of precursor m/z and retention time (`ms1cal::fit_surface`): the anchors whose
-  error lies within four robust SD of the median (a peak another ion put in the 15 ppm
-  window is not an MS1 error), at most 40,000 of them (every k-th in seed order), a robust
-  LOESS of m/z and one of retention time (span 0.3, two bisquare iterations), backfitted
-  over three rounds, the retention-time term centred on the anchors, each sampled on a
-  20-point grid over the anchors' range and held flat beyond it (`Ms1Surface`). Every MS1
-  read of extract then takes the offset at its own m/z and retention time
-  (`ExtractConfig::ms1_shift`): the apex isotope intensities at the apex, each point of the
-  three MS1 grid traces at its own retention time (the row's m/z is the one at the apex),
-  and `ms1_apex_im`. The MS1 support of `claim_cues` reads at the library m/z, as it does
-  under the one offset. With fewer than 200 inlier anchors the one offset is used, with a
-  warning. `true` and `false` keep the spelling and the configuration hash they had.
-- **`extract.prec_tol_auto`** sets `prec_tol_ppm` to 3 robust SD (`ms1cal::PREC_TOL_AUTO_K`)
-  of the anchors' residuals after the calibration in use (the surface's, or the one
-  offset's), the SD being 1.4826 MAD refined once over the residuals within four of them,
-  clamped to 1-15 ppm. It needs `ms1_calibrate` on; with too few anchors the configured
-  tolerance stays. On an Orbitrap the rule lands near the 3 ppm default: on the Q Exactive
-  AIF E. coli entrapment run (5,303 anchors) the residuals' robust SD was 0.93 ppm after the
-  one offset and 0.80 ppm after the surface, and the tolerance 2.6 and 2.2 ppm.
-
-Either key records `ms1_calibration` (`ExtractConfig::ms1_cal`: mode, the surface, the
-anchors, the residual median and robust SD as read, after the offset and after the
-surface, and the tolerance), `ms1_ppm_offset` and `prec_tol_ppm` in both extract reports;
-a report without them is unchanged, and so is every read without them (`ms1_shift` is the
-expression every read used before). The standalone `mumdia extract` does not calibrate
-MS1, under either key, as it never did.
+Two opt-in keys extended that and were removed in 0.15.0, because neither moved the counts
+outside the seed spread on the one acquisition measured (docs/04_convert.md, "SCIEX ZT Scan
+DIA"). `extract.ms1_calibrate = "surface"` fitted the anchors' errors as an additive robust
+LOESS of precursor m/z and retention time, and every MS1 read took the offset at its own m/z
+and retention time. `extract.prec_tol_auto` set `prec_tol_ppm` to three robust SD of the
+anchors' residuals after the calibration, clamped to 1-15 ppm. On an Orbitrap that rule landed
+near the 3 ppm default: on the Q Exactive AIF E. coli entrapment run (5,303 anchors) the
+residuals' robust SD was 0.93 ppm after the one offset and 0.80 ppm after the surface, and the
+tolerance 2.6 and 2.2 ppm. The measurements that follow are kept as the record.
 
 **ZenoTOF 8600, ZT Scan REP01** (24,124 of 25,305 confident seed anchors with an MS1 peak
 within 15 ppm; seed decoys 62% of the time, at a robust SD of 11.2 ppm, so a random peak in
@@ -1489,8 +1470,7 @@ declutter" commit: `extract.scan_window_mode` (and the `ScanWindowMode` enum),
 | `fixed_scan_window` | 2 (3 before 2026-10-08) | Minimum co-elution run length (`scan_window` floor); `.max(1)` at `extract.rs:1591` |
 | `frag_tol_ppm` | 20.0 | Fragment match tolerance (overridden by `mass_cal`) |
 | `prec_tol_ppm` | 3.0 (20.0 before 2026-10-08) | MS1 isotope integration tolerance, centred on the offset `ms1_calibrate` learns from the seed |
-| `ms1_calibrate` | `true` | `true`: one MS1 offset learned from the seed; `"surface"`: an offset per m/z and retention time; `false`: none (section 11) |
-| `prec_tol_auto` | false | Set `prec_tol_ppm` to three robust SD of the calibrated MS1 residuals (section 11) |
+| `ms1_calibrate` | `true` | `true`: one MS1 offset learned from the seed; `false`: none (section 11) |
 | `presence_min_matched` | 3 | Tier-b: minimum distinct matched fragments (`extract.rs:1727`) |
 | `presence_min_fragments` | 3 | Acceptance: minimum distinct fragments (`extract.rs:1926`) |
 | `presence_min_coelution` | 2 | Min simultaneously-present fragments to extend a run (`extract.rs:1915`) |
@@ -1570,8 +1550,8 @@ here for one index.
 | `features.q1_separable` (removed in 0.15.0) | psms_extracted v9: 10 `q1s_*` F64 and 5 list columns (section 15) | ZT Scan REP01, four NN seeds: +0.34% / -0.17% (entrapment at matched FDP / human library), inside the seed spread |
 | `extract.q1_deconvolved`, `search_seed.q1_deconvolved` (removed in 0.15.0) | none; only Q1-consistent peaks are counted (section 14) | ZT Scan REP01: -25.6% precursors (extract, learned 1.0-step tolerance), -8.4% at 2 steps, -2.5% (seed), -38% (both); keep off |
 | `rescore.shadow_q1` (automatic for ZT Scan files, needs `extract.q1_fragments`) | none; the shadow test co-isolates by m/z and counts shared fragments by their Q1 centre (docs/11) | ZT Scan REP01: no count change (inside the seed range), fewer entrapment precursors at 1%; with the other three keys +3.02% precursors, +3.17% at a matched FDP, measured FDP at 1% 1.22% against 1.39%, +2.3% in a three-run experiment |
-| `extract.ms1_calibrate = "surface"` (default `true`) | none; MS1 reads at a per-m/z, per-retention-time offset (section 11) | ZT Scan REP01: +0.2% precursors, +0.2% human precursors on an entrapment library at a combined FDP of 1.39% (one seed); with `prec_tol_auto` and `q1_calibrate` +0.46% (four NN seeds), +0.19% at 1.40% against 1.39%; one acquisition |
-| `extract.prec_tol_auto` (default false) | none; sets `prec_tol_ppm` from the calibrated MS1 residuals (section 11) | ZT Scan REP01: 7.1-7.4 ppm, +0.45% precursors, -0.1% human precursors on the entrapment library at 1.37% (one seed); one acquisition |
+| `extract.ms1_calibrate = "surface"` (removed in 0.15.0) | none; MS1 reads at a per-m/z, per-retention-time offset (section 11) | ZT Scan REP01: +0.2% precursors, +0.2% human precursors on an entrapment library at a combined FDP of 1.39% (one seed); with `prec_tol_auto` and `q1_calibrate` +0.46% (four NN seeds), +0.19% at 1.40% against 1.39%; one acquisition |
+| `extract.prec_tol_auto` (removed in 0.15.0) | none; sets `prec_tol_ppm` from the calibrated MS1 residuals (section 11) | ZT Scan REP01: 7.1-7.4 ppm, +0.45% precursors, -0.1% human precursors on the entrapment library at 1.37% (one seed); one acquisition |
 | `compete.mode` (`CompetitionMode`, `config.rs:840`, default `winner_take_all`) | retains more rows in `competed`; optional `<out>.compete_audit.parquet` via `emit_competition_audit` (`config.rs:850`) | not measured; gate pending |
 
 ## Invariants, determinism, gotchas

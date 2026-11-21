@@ -2652,13 +2652,12 @@
       "optional": false,
       "default": "true",
       "default_text": "`true`",
-      "help": "Learn the MS1 precursor mass offset from the confident seed anchors before extract and centre every MS1 isotope read on it (`stages::ms1cal`). On by default since 2026-10-08. `true` (the default) learns one offset, the median signed ppm error of the anchors; `false` reads at the library m/z. `\"surface\"` fits the error as a smooth function of precursor m/z and retention time instead (an additive robust LOESS of the anchors' errors, sampled on grids), and every MS1 read of extract takes the offset at its own m/z and retention time; the residuals before and after are logged and recorded in the extract report. Measured on a ZenoTOF 8600 run: the error drifted by about 1 ppm over the gradient and 0.8 ppm over m/z (docs/09_extract.md, \"MS1 mass calibration\"). `\"surface\"` is opt-in until it is measured on entrapment and a second acquisition. `true` and `false` keep the configuration hash they had.",
+      "help": "Learn the MS1 precursor mass offset from the confident seed anchors before extract and centre every MS1 isotope read on it (`stages::ms1cal`). On by default since 2026-10-08. `true` (the default) learns one offset, the median signed ppm error of the anchors; `false` reads at the library m/z.",
       "gates": [],
       "source_struct": "ExtractConfig",
       "choices": [
         "false",
-        "true",
-        "surface"
+        "true"
       ]
     },
     {
@@ -2672,21 +2671,6 @@
       "default_text": "0.0",
       "help": "MS1 precursor mass offset in ppm (observed - theoretical) applied to every MS1 isotope read. Set by `ms1_calibrate` in `run` / `run-experiment`; 0 by default.",
       "gates": [],
-      "source_struct": "ExtractConfig"
-    },
-    {
-      "path": "extract.prec_tol_auto",
-      "name": "prec_tol_auto",
-      "section": "extract",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "Set `prec_tol_ppm` from the anchors' MS1 errors after the calibration of `ms1_calibrate` (its offset or its surface): `3` times their robust standard deviation (1.4826 times the median absolute deviation, refined once on the residuals within four of them), clamped to 1-15 ppm. The fixed 3 ppm default suits an Orbitrap, whose residuals sit near 1 ppm; a ZenoTOF's are about 2.5 ppm. Needs `ms1_calibrate`; with too few anchors the configured `prec_tol_ppm` stays. Default false. Benchmark-gated. Omitted from the canonical configuration at its default.",
-      "gates": [
-        "benchmark-gated"
-      ],
       "source_struct": "ExtractConfig"
     },
     {

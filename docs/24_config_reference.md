@@ -64,7 +64,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`predict_frag`](#predict_frag) | `PredictFragConfig` | 20 | [docs/06_predict_frag_index_matchers.md](06_predict_frag_index_matchers.md) |
 | [`search_seed`](#search_seed) | `SearchSeedConfig` | 13 | [docs/07_search_seed.md](07_search_seed.md) |
 | [`rt_im_train`](#rt_im_train) | `RtImTrainConfig` | 35 | [docs/08_rt_im_train.md](08_rt_im_train.md) |
-| [`extract`](#extract) | `ExtractConfig` | 49 | [docs/09_extract.md](09_extract.md) |
+| [`extract`](#extract) | `ExtractConfig` | 48 | [docs/09_extract.md](09_extract.md) |
 | [`extract.claim_cues`](#extractclaim_cues) | `ClaimCues` | 7 | [docs/09_extract.md](09_extract.md) |
 | [`features`](#features) | `FeaturesConfig` | 14 | [docs/10_features.md](10_features.md) |
 | [`compete`](#compete) | `CompeteConfig` | 6 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
@@ -401,9 +401,8 @@ Fragment traces over consecutive same-window scans.
 | `ms1_rescue` | `bool` | `false` |  | Rescue a candidate that fails the extraction gate (`gate_min_score`, under any `gate_mode`) when it has at least `presence_min_fragments` distinct matched fragments AND MS1 isotope-pattern support (mono + a plausible +1/mono ratio). Off by default: it relaxes acceptance, so enable it only with target-decoy/entrapment FDR validation. MS1 evidence is now computed before the gate so this can take effect. |
 | `ms1_scan_halfwidth` | `usize` | `1` |  | MS1 scans either side of the nearest one read for a precursor isotope: the apex isotope intensities and every point of the MS1 grid traces take the maximum over the nearest MS1 scan +- this many (default 1 since 2026-10-08). 0 reads the nearest scan only. At low ion counts a mono peak present in both neighbouring MS1 scans is often missing from the one nearest the apex, which then reads as no MS1 signal at all. |
 | `emit_rt_window` | `bool` | `true` |  | Write each candidate's RT window (`rt_lo`, `rt_hi`) into `psms_extracted`, so the features stage can scale the RT error by the window it was searched in (the `rtw_*` family). On by default since 2026-10-08; false keeps the previous schema. |
-| `ms1_calibrate` | `Ms1Calibrate` | `true` |  | Learn the MS1 precursor mass offset from the confident seed anchors before extract and centre every MS1 isotope read on it (`stages::ms1cal`). On by default since 2026-10-08. `true` (the default) learns one offset, the median signed ppm error of the anchors; `false` reads at the library m/z. `"surface"` fits the error as a smooth function of precursor m/z and retention time instead (an additive robust LOESS of the anchors' errors, sampled on grids), and every MS1 read of extract takes the offset at its own m/z and retention time; the residuals before and after are logged and recorded in the extract report. Measured on a ZenoTOF 8600 run: the error drifted by about 1 ppm over the gradient and 0.8 ppm over m/z (docs/09_extract.md, "MS1 mass calibration"). `"surface"` is opt-in until it is measured on entrapment and a second acquisition. `true` and `false` keep the configuration hash they had. |
+| `ms1_calibrate` | `Ms1Calibrate` | `true` |  | Learn the MS1 precursor mass offset from the confident seed anchors before extract and centre every MS1 isotope read on it (`stages::ms1cal`). On by default since 2026-10-08. `true` (the default) learns one offset, the median signed ppm error of the anchors; `false` reads at the library m/z. |
 | `ms1_ppm_offset` | `f64` | `0.0` |  | MS1 precursor mass offset in ppm (observed - theoretical) applied to every MS1 isotope read. Set by `ms1_calibrate` in `run` / `run-experiment`; 0 by default. |
-| `prec_tol_auto` | `bool` | `false` | benchmark-gated | Set `prec_tol_ppm` from the anchors' MS1 errors after the calibration of `ms1_calibrate` (its offset or its surface): `3` times their robust standard deviation (1.4826 times the median absolute deviation, refined once on the residuals within four of them), clamped to 1-15 ppm. The fixed 3 ppm default suits an Orbitrap, whose residuals sit near 1 ppm; a ZenoTOF's are about 2.5 ppm. Needs `ms1_calibrate`; with too few anchors the configured `prec_tol_ppm` stays. Default false. Benchmark-gated. Omitted from the canonical configuration at its default. |
 | `retain_top_peaks` | `usize` | `1` | diagnostic, not currently | Number of chromatographic peak hypotheses to enumerate per candidate. `K>1` writes up to K local maxima to the diagnostic `<out-psms>.peaks.parquet` sidecar. The primary PSM still contains only the selected apex, so these extra hypotheses are not currently rescored or used to improve identifications. K=1 preserves the single-apex behaviour. |
 | `promote_top_peaks` | `usize` | `1` | gated | Number of chromatographic peaks PROMOTED to real feature/rescore rows per candidate (AlphaDIA plan #7, top-K). `1` (default) emits only the selected apex, so the pipeline is byte-identical. `>1` additionally emits the next strongest non-overlapping `enumerate_peaks` groups (each a full re-sliced PSM record carrying `peak_rank`), so the rescorer can pick the correct-but-not-apex peak; the selected apex stays `peak_rank = 0`. Must be `<= retain_top_peaks`. Behaviour-changing and benchmark/entrapment-gated: it changes the extracted row population, and compete/rescore must collapse per candidate so the decoy null is not K-inflated. |
 | `alt_peak_min_area_frac` | `f64` | `0.10` |  | Minimum integrated area of a promoted alternate peak (rank >= 1) as a fraction of the rank-0 peak's area. Suppresses noise-level alternates. Only used when `promote_top_peaks > 1`. |
@@ -999,13 +998,12 @@ The position of a `ResidueMod`.
 
 (rust/mumdia/crates/mumdia-core/src/config.rs)
 
-`extract.ms1_calibrate`: `false`, `true` or `"surface"`. See `ExtractConfig::ms1_calibrate`.
+`extract.ms1_calibrate`: `false` or `true`. See `ExtractConfig::ms1_calibrate`.
 
 | Value | Default | Description |
 |---|---|---|
 | `false` |  | No offset: MS1 is read at the library m/z (`false`). |
 | `true` | yes | One offset, the anchors' median ppm error (`true`, the default). |
-| `surface` |  | A smooth surface of m/z and retention time (`"surface"`). |
 
 ### `MultiheadAnchors`
 
@@ -1476,6 +1474,6 @@ instead of looking like an absent field.
 
 ## Coverage
 
-26 structs and 370 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 50 enumerations, 1 named profile(s), 106 environment variables read and 27 set.
+26 structs and 369 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 50 enumerations, 1 named profile(s), 106 environment variables read and 27 set.
 
-35 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.
+34 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.

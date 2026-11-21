@@ -754,7 +754,7 @@ per arm, one binary and one host per library): with the family, human precursors
 arm's measured entrapment FDP (1.22%) +0.01% (97,236 against 97,225; seed ranges 96,987-97,518
 and 96,992-97,540), precursors on the human library +0.05% (99,855 against 99,804; 99,635-100,068
 and 99,661-100,034), combined FDP at a reported 1% 1.25% against 1.22%; with
-`extract.ms1_calibrate = "surface"` under it -0.26% and +0.19%, the surface alone -0.19% and
+`extract.ms1_calibrate = "surface"` (removed in 0.15.0) under it -0.26% and +0.19%, the surface alone -0.19% and
 -0.33%. Within the seed spread everywhere: the family adds nothing the classifier did not
 have. Among the rows whose untrained `prelim_score` is below the decoys' median, the
 Kolmogorov-Smirnov statistic of decoys against targets is 0.0007-0.0050 for every `ms1e_*`

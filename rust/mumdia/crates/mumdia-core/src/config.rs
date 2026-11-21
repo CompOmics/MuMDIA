@@ -2595,33 +2595,11 @@ pub struct ExtractConfig {
     /// Learn the MS1 precursor mass offset from the confident seed anchors before extract
     /// and centre every MS1 isotope read on it (`stages::ms1cal`). On by default since 2026-10-08.
     /// `true` (the default) learns one offset, the median signed ppm error of the anchors;
-    /// `false` reads at the library m/z. `"surface"` fits the error as a smooth function of
-    /// precursor m/z and retention time instead (an additive robust LOESS of the anchors'
-    /// errors, sampled on grids), and every MS1 read of extract takes the offset at its
-    /// own m/z and retention time; the residuals before and after are logged and recorded in
-    /// the extract report. Measured on a ZenoTOF 8600 run: the error drifted by about 1 ppm
-    /// over the gradient and 0.8 ppm over m/z (docs/09_extract.md, "MS1 mass calibration").
-    /// `"surface"` is opt-in until it is measured on entrapment and a second acquisition.
-    /// `true` and `false` keep the configuration hash they had.
+    /// `false` reads at the library m/z.
     pub ms1_calibrate: Ms1Calibrate,
     /// MS1 precursor mass offset in ppm (observed - theoretical) applied to every MS1
     /// isotope read. Set by `ms1_calibrate` in `run` / `run-experiment`; 0 by default.
     pub ms1_ppm_offset: f64,
-    /// Set `prec_tol_ppm` from the anchors' MS1 errors after the calibration of
-    /// `ms1_calibrate` (its offset or its surface): `3` times their robust standard deviation
-    /// (1.4826 times the median absolute deviation, refined once on the residuals within
-    /// four of them), clamped to 1-15 ppm. The fixed 3 ppm default suits an Orbitrap, whose
-    /// residuals sit near 1 ppm; a ZenoTOF's are about 2.5 ppm. Needs `ms1_calibrate`; with
-    /// too few anchors the configured `prec_tol_ppm` stays. Default false. Benchmark-gated.
-    /// Omitted from the canonical configuration at its default.
-    #[serde(skip_serializing_if = "is_false")]
-    pub prec_tol_auto: bool,
-    /// What `stages::ms1cal` learned under `ms1_calibrate = "surface"` or `prec_tol_auto`:
-    /// the fitted surface and the anchors' residuals, set by `run` / `run-experiment` before
-    /// extract, which reads with the surface and records the rest in its report. Never read
-    /// from a file.
-    #[serde(skip)]
-    pub ms1_cal: Option<Ms1Cal>,
     /// Number of chromatographic peak hypotheses to enumerate per candidate.
     /// `K>1` writes up to K local maxima to the diagnostic
     /// `<out-psms>.peaks.parquet` sidecar. The primary PSM still contains only the
@@ -2798,7 +2776,7 @@ impl ImFeatures {
     }
 }
 
-/// `extract.ms1_calibrate`: `false`, `true` or `"surface"`. See
+/// `extract.ms1_calibrate`: `false` or `true`. See
 /// [`ExtractConfig::ms1_calibrate`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Ms1Calibrate {
@@ -2807,19 +2785,12 @@ pub enum Ms1Calibrate {
     /// One offset, the anchors' median ppm error (`true`, the default).
     #[default]
     Offset,
-    /// A smooth surface of m/z and retention time (`"surface"`).
-    Surface,
 }
 
 impl Ms1Calibrate {
     /// Whether any calibration runs.
     pub fn is_on(self) -> bool {
         self != Self::Off
-    }
-
-    /// `"surface"`.
-    pub fn is_surface(self) -> bool {
-        self == Self::Surface
     }
 }
 
@@ -2828,7 +2799,6 @@ impl Serialize for Ms1Calibrate {
         match self {
             Self::Off => s.serialize_bool(false),
             Self::Offset => s.serialize_bool(true),
-            Self::Surface => s.serialize_str("surface"),
         }
     }
 }
@@ -2839,7 +2809,7 @@ impl<'de> Deserialize<'de> for Ms1Calibrate {
         impl serde::de::Visitor<'_> for V {
             type Value = Ms1Calibrate;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("true, false or \"surface\"")
+                f.write_str("true or false")
             }
             fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
                 Ok(if v {
@@ -2848,49 +2818,9 @@ impl<'de> Deserialize<'de> for Ms1Calibrate {
                     Ms1Calibrate::Off
                 })
             }
-            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                match v {
-                    "surface" => Ok(Ms1Calibrate::Surface),
-                    _ => Err(E::invalid_value(serde::de::Unexpected::Str(v), &self)),
-                }
-            }
         }
         d.deserialize_any(V)
     }
-}
-
-/// The MS1 mass-error surface of `extract.ms1_calibrate = "surface"` (`stages::ms1cal`): an
-/// additive model, ppm(m/z, rt) = m/z term + retention-time term, each sampled on an
-/// ascending grid, linearly interpolated and held constant beyond its ends. An empty
-/// retention-time grid contributes nothing.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct Ms1Surface {
-    pub mz_grid: Vec<f64>,
-    pub mz_ppm: Vec<f64>,
-    pub rt_grid: Vec<f64>,
-    pub rt_ppm: Vec<f64>,
-}
-
-/// The MS1 calibration `stages::ms1cal` hands extract under `extract.ms1_calibrate =
-/// "surface"` or `extract.prec_tol_auto` ([`ExtractConfig::ms1_cal`]): the surface, when one
-/// was fitted, and the anchors' errors before and after, for the extract report.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct Ms1Cal {
-    /// `"offset"` or `"surface"`.
-    pub mode: String,
-    pub surface: Option<Ms1Surface>,
-    /// Anchors with an MS1 peak within the search window.
-    pub n_anchors: usize,
-    /// The anchors' errors (ppm) as read: median and robust standard deviation.
-    pub raw_median_ppm: f64,
-    pub raw_sd_ppm: f64,
-    /// Their robust standard deviation after the one offset (`ms1_ppm_offset`).
-    pub offset_sd_ppm: f64,
-    /// After the surface, when one was fitted.
-    pub surface_sd_ppm: Option<f64>,
-    /// The robust standard deviation `prec_tol_auto` used, and the tolerance it set.
-    pub tol_sd_ppm: Option<f64>,
-    pub prec_tol_ppm: Option<f64>,
 }
 
 /// The calibrated Q1 window and the per-fragment decision tolerances of a scanning-
@@ -2930,16 +2860,10 @@ pub struct Q1FragTolerances {
 }
 
 impl ExtractConfig {
-    /// The factor an MS1 read of library m/z `mz` near retention time `rt` multiplies the
-    /// m/z by: `1 + ppm * 1e-6`, ppm from the fitted surface under `ms1_calibrate =
-    /// "surface"`, else the one `ms1_ppm_offset` (exactly the expression every read used
-    /// before the surface).
+    /// The factor an MS1 read multiplies the library m/z by: `1 + ms1_ppm_offset * 1e-6`.
     #[inline]
-    pub fn ms1_shift(&self, mz: f64, rt: f64) -> f64 {
-        match self.ms1_cal.as_ref().and_then(|c| c.surface.as_ref()) {
-            Some(s) => 1.0 + s.ppm_at(mz, rt) * 1e-6,
-            None => 1.0 + self.ms1_ppm_offset * 1e-6,
-        }
+    pub fn ms1_shift(&self) -> f64 {
+        1.0 + self.ms1_ppm_offset * 1e-6
     }
 
     /// Copy the `features` and `retrace` keys extract reads into their mirror fields
@@ -2958,23 +2882,11 @@ impl ExtractConfig {
             self.q1_repick_peaks = cfg.retrace.q1_repick_peaks;
         }
     }
-
-    /// Whether the MS1 shift depends on m/z and retention time (a fitted surface).
-    pub fn ms1_shift_varies(&self) -> bool {
-        self.ms1_cal.as_ref().is_some_and(|c| c.surface.is_some())
-    }
-}
-
-impl Ms1Surface {
-    /// The calibrated MS1 error (observed - theoretical, ppm) at `mz` and `rt`.
-    pub fn ppm_at(&self, mz: f64, rt: f64) -> f64 {
-        interp_held(&self.mz_grid, &self.mz_ppm, mz) + interp_held(&self.rt_grid, &self.rt_ppm, rt)
-    }
 }
 
 /// `values` linearly interpolated at `x` over the ascending `grid`, held at the first and
-/// last value beyond its ends; 0 on an empty grid. The rule of [`Ms1Surface`] and of the Q1
-/// calibration's offset grids.
+/// last value beyond its ends; 0 on an empty grid. The rule of the Q1 calibration's offset
+/// grids.
 pub fn interp_held(grid: &[f64], values: &[f64], x: f64) -> f64 {
     match grid.len().min(values.len()) {
         0 => 0.0,
@@ -3044,8 +2956,6 @@ impl Default for ExtractConfig {
             emit_rt_window: true,
             ms1_calibrate: Ms1Calibrate::Offset,
             ms1_ppm_offset: 0.0,
-            prec_tol_auto: false,
-            ms1_cal: None,
             retain_top_peaks: 1,            // legacy single-apex behaviour (K=1)
             promote_top_peaks: 1,           // top-K promotion off (only the selected apex is a row)
             alt_peak_min_area_frac: 0.10,   // alternate peak >= 10% of rank-0 area
@@ -6860,14 +6770,6 @@ impl Config {
                     .into(),
             ));
         }
-        if self.extract.prec_tol_auto && !self.extract.ms1_calibrate.is_on() {
-            return Err(Invalid(
-                "extract.prec_tol_auto sets the MS1 tolerance from the residuals of the MS1 \
-                 calibration, and extract.ms1_calibrate = false turns it off. Set \
-                 ms1_calibrate to true or \"surface\"."
-                    .into(),
-            ));
-        }
 
         // `finetune_batch = 0` is the documented automatic batch size (see the field), so
         // only the epoch count has a lower bound. Rejecting the zero batch made simply
@@ -7585,6 +7487,18 @@ const RETIRED: &[Retired] = &[
     },
 
     // D: MS1 surface, never-read keys and refused choices
+    Retired {
+        path: "extract.ms1_calibrate",
+        gone: Gone::Value("\"surface\""),
+        why: "the MS1 error surface measured inside seed noise on one acquisition \
+              (docs/09_extract.md, \"MS1 mass calibration\")",
+    },
+    Retired {
+        path: "extract.prec_tol_auto",
+        gone: Gone::Key("false"),
+        why: "the MS1 tolerance from the anchors' residuals measured inside seed noise on one \
+              acquisition (docs/09_extract.md, \"MS1 mass calibration\")",
+    },
 
     // E: rt_transfer MBR tier
 
@@ -8627,79 +8541,31 @@ mod tests {
         assert!(Config::from_json(r#"{"convert":{"bruker_reader":"native"}}"#).is_err());
     }
 
-    /// `extract.ms1_calibrate` keeps `true` and `false` as they were spelled and hashed, and
-    /// adds `"surface"`; `rt_im_train.q1_calibrate` and `extract.prec_tol_auto` are omitted
-    /// from the canonical configuration at their defaults, and the runtime calibration
-    /// record never reaches it.
+    /// `extract.ms1_calibrate` keeps `true` and `false` as they were spelled and hashed;
+    /// `rt_im_train.q1_calibrate` is omitted from the canonical configuration at its default.
+    /// The MS1 shift is exactly the one-offset expression.
     #[test]
     fn the_calibration_keys_keep_the_config_hash() {
         let canon = Config::default().canonical_json();
         assert!(canon.contains(r#""ms1_calibrate":true"#), "{canon}");
-        for key in ["q1_calibrate", "prec_tol_auto", "ms1_cal\"", "ms1_surface"] {
-            assert!(!canon.contains(key), "{key}: {canon}");
-        }
+        assert!(!canon.contains("q1_calibrate"), "{canon}");
         let off = Config::from_json(r#"{"extract":{"ms1_calibrate":false}}"#).unwrap();
         assert_eq!(off.extract.ms1_calibrate, Ms1Calibrate::Off);
         assert!(off.canonical_json().contains(r#""ms1_calibrate":false"#));
-        let on = Config::from_json(
-            r#"{"extract":{"ms1_calibrate":"surface","prec_tol_auto":true},
-                "rt_im_train":{"q1_calibrate":true}}"#,
-        )
-        .unwrap();
-        assert!(on.extract.ms1_calibrate.is_surface());
-        let c = on.canonical_json();
-        for key in [
-            r#""ms1_calibrate":"surface""#,
-            r#""prec_tol_auto":true"#,
-            r#""q1_calibrate":true"#,
-        ] {
-            assert!(c.contains(key), "{key}: {c}");
-        }
-        let mut with_cal = on.clone();
-        with_cal.extract.ms1_cal = Some(Ms1Cal {
-            mode: "surface".into(),
-            ..Default::default()
-        });
-        assert_eq!(with_cal.canonical_json(), c);
+        let on = Config::from_json(r#"{"rt_im_train":{"q1_calibrate":true}}"#).unwrap();
+        assert!(on.canonical_json().contains(r#""q1_calibrate":true"#));
         for bad in [
             r#"{"extract":{"ms1_calibrate":"grid"}}"#,
-            r#"{"extract":{"ms1_calibrate":false,"prec_tol_auto":true}}"#,
+            r#"{"extract":{"ms1_calibrate":"surface"}}"#,
             r#"{"rt_im_train":{"q1_calibrate":true},"groups":{"window_groups":4}}"#,
         ] {
             assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
         }
-    }
-
-    /// The surface is additive, interpolated and held flat beyond its grids; without a
-    /// surface the shift is exactly the one-offset expression.
-    #[test]
-    fn the_ms1_surface_interpolates_and_holds_at_its_ends() {
-        let s = Ms1Surface {
-            mz_grid: vec![400.0, 600.0, 800.0],
-            mz_ppm: vec![3.0, 2.0, 2.0],
-            rt_grid: vec![1000.0, 2000.0],
-            rt_ppm: vec![0.5, -0.5],
-        };
-        assert!((s.ppm_at(500.0, 1500.0) - 2.5).abs() < 1e-12);
-        assert!((s.ppm_at(100.0, 0.0) - 3.5).abs() < 1e-12);
-        assert!((s.ppm_at(900.0, 3000.0) - 1.5).abs() < 1e-12);
-        assert_eq!(Ms1Surface::default().ppm_at(500.0, 10.0), 0.0);
-        let mut e = ExtractConfig {
+        let e = ExtractConfig {
             ms1_ppm_offset: 2.7,
             ..Default::default()
         };
-        assert_eq!(
-            e.ms1_shift(512.3, 99.0).to_bits(),
-            (1.0 + 2.7 * 1e-6f64).to_bits()
-        );
-        assert!(!e.ms1_shift_varies());
-        e.ms1_cal = Some(Ms1Cal {
-            mode: "surface".into(),
-            surface: Some(s),
-            ..Default::default()
-        });
-        assert!(e.ms1_shift_varies());
-        assert!((e.ms1_shift(500.0, 1500.0) - (1.0 + 2.5e-6)).abs() < 1e-15);
+        assert_eq!(e.ms1_shift().to_bits(), (1.0 + 2.7 * 1e-6f64).to_bits());
     }
 
     /// Refused at the parse, or, for a key whose prerequisite is left automatic, once a
