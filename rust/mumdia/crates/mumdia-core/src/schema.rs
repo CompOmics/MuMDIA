@@ -76,13 +76,13 @@ pub mod artifact {
     /// and meaning are the IM branch's v4; v3 (`apex_im` filled alone) is never written. A
     /// 3D extract writes v2, byte for byte. Readers select columns by name.
     pub const PSMS_EXTRACTED_V4: (&str, u32) = ("psms_extracted", 4);
-    /// v5, written only under `extract.q1_profile` (scanning-quadrupole spectra, which carry
-    /// no 1/K0): v2 plus the Q1-profile evidence `q1_corr`, `q1_offset`, `q1_frag_sd` and
+    /// v5, written only under `extract.q1_profile` until 0.15.0 removed it (scanning-quadrupole
+    /// spectra, which carry no 1/K0): v2 plus the Q1-profile evidence `q1_corr`, `q1_offset`, `q1_frag_sd` and
     /// `q1_bin_frac` (Float64), appended last. Readers select columns by name.
     pub const PSMS_EXTRACTED_V5: (&str, u32) = ("psms_extracted", 5);
     /// v6, written only under `extract.q1_fragments` (scanning-quadrupole spectra, which
-    /// carry no 1/K0): v2 (with v5's Q1-profile columns when `extract.q1_profile` is on as
-    /// well) plus the per-fragment Q1 decision: the row's summary `q1f_*` (Float64) and one
+    /// carry no 1/K0): v2 (before 0.15.0 with v5's Q1-profile columns when
+    /// `extract.q1_profile` was on as well) plus the per-fragment Q1 decision: the row's summary `q1f_*` (Float64) and one
     /// Float32 list per decision, `q1f_frag_class` (0 absent, 1 belongs, 2 interfered),
     /// `q1f_frag_offset` (steps), `q1f_frag_resid` and `q1f_frag_corr2d`, each with one entry
     /// per library fragment in the library's order, appended last. Readers select columns

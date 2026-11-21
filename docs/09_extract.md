@@ -161,7 +161,7 @@ production schema stays byte-identical):
 - `emit_demix_features` -> `deconv_explained_frac`, `deconv_active`,
   `deconv_share`, `deconv_max_collinearity`, `shadow_kept_frac` (all F32,
   `extract.rs:2517`), from the spectrum-centric NNLS demix at the apex scan.
-- `q1_profile` -> v5: `q1_corr`, `q1_offset`, `q1_frag_sd`, `q1_bin_frac` (F64, section 10).
+- v5 (`q1_corr`, `q1_offset`, `q1_frag_sd`, `q1_bin_frac`, F64) was written by `q1_profile`, removed in 0.15.0 (section 10).
 - `q1_fragments` -> v6: the `q1f_*` summary and the `q1f_frag_*` per-fragment lists of the
   Q1 decision (section 12).
 - `features.ms1_envelope` -> v7: the MS1 isotope-envelope evidence, 16 F64 columns
@@ -1017,45 +1017,26 @@ carry the rebuilt and copied row counts, the frames decoded, the readers, the ra
 summed, the fragment grid points without a frame, the MS1 residual and the time of each
 phase.
 
-### 10. Scanning-quadrupole data (SCIEX ZT Scan DIA, default off)
+### 10. Scanning-quadrupole data: the Q1 sweep model (removed in 0.15.0)
 
 A ZT Scan DIA run read with `convert.isolation_half_width` (docs/04_convert.md, "SCIEX ZT
 Scan DIA") has one isolation window per Q1 bin: 663 windows of 3.8 m/z whose targets step
 0.7614 m/z, each sampled once a 1 s cycle, the bins 1.345 ms apart. A precursor falls in
 about five of them, so its candidate's chromatogram grid (the scans of every covering
-window) interleaves five bins a cycle, each at its own transmission. Three keys model the
-sweep instead. All three are off by default and omitted from the canonical configuration,
-so a 3D or 4D search without them is byte-identical; each is refused on any other layout.
+window) interleaves five bins a cycle, each at its own transmission. Four opt-in keys
+modelled the sweep until 0.15.0, which removed them because none gained identifications:
 
-- The layout (`Q1Layout`): the distinct windows in `WindowKey` order, and a cycle per sweep,
-  read off the scans in acquisition order (a new cycle where a bin's target falls back by
-  more than half a step, or where a window repeats). It must have at least 50 windows
-  stepping less than 1.5 m/z and at least 1.5 steps wide, the thresholds of convert's
-  scanning-quadrupole diagnosis; anything else, and spectra with 1/K0, is refused with the
-  layout named. The extract log and reports record the windows, cycles and step.
-- `extract.q1_cycles` sums a candidate's matches in the bins of one cycle into one point
-  (`q1_merge`): every hit moves to the scan of the candidate's anchor bin (the covering
-  window whose target is nearest the precursor m/z) in its own cycle, one fragment's
-  intensities at one point are summed in hit order (in f64, so deterministically), its
-  observed m/z is their intensity-weighted mean, and the chromatogram grid is the anchor
-  bin's scans. Hits in a cycle where the anchor bin has no scan (only at the ends of a
-  regular sweep) are dropped. Every score, gate and trace after it reads the merged hits.
-- `extract.q1_profile` writes each accepted row's Q1-profile evidence (psms_extracted v5,
-  four Float64 columns appended last, `q1_profile_of`). Over the unmerged hits of the five
-  cycles around the apex cycle, the matched intensity in each covering window is compared
-  with the share of the precursor that window transmits: a window of half-width `h` swept
-  over one step `s` during its bin passes a precursor at distance `d` from its target
-  whole while `d <= h - s / 2`, not at all beyond `h + s / 2`, and linearly between.
-  `q1_corr` is their Pearson correlation; `q1_offset` the intensity-weighted centroid of
-  the window targets minus the expected one, in half-widths; `q1_frag_sd` the
-  intensity-weighted spread of each fragment's own centroid around the observed one, in
-  half-widths; `q1_bin_frac` the share of covering windows with signal. A fragment shared
-  with a precursor at another m/z sits in the bins that transmit that one, which pulls
-  its centroid away. Promoted alternative peaks carry their own.
-- `extract.q1_gate_max_offset` rejects a row whose `|q1_offset|` passes it; it needs
-  `q1_profile`. `features.q1_features` appends the four columns, under their own names,
-  after every other column of the `extended` set (`features::Q1_FEATURES`); it needs
-  `extract.q1_profile`, and a table without the columns is an error.
+- `extract.q1_cycles` summed a candidate's matches in the bins of one cycle into one
+  point, at the bin whose target is nearest the precursor m/z.
+- `extract.q1_profile` wrote each accepted row's Q1-profile evidence (psms_extracted v5:
+  `q1_corr`, `q1_offset`, `q1_frag_sd`, `q1_bin_frac`): the matched intensity in each
+  covering window against the share of the precursor that window transmits.
+- `extract.q1_gate_max_offset` rejected a row whose `|q1_offset|` passed it.
+- `features.q1_features` gave the four v5 columns to the classifier.
+
+A configuration that sets one of them at its old default (`false`, or no gate) still loads;
+any other value is refused with this section named. Tables of version 5 written before
+0.15.0 still read: features selects its columns by name.
 
 Measured on the ZenoTOF 8600 K562 REP01 run (`isolation_half_width = 1.9`, imported
 library with predicted decoys, the shipped `nn_torch` recipe; precursors at
@@ -1093,15 +1074,14 @@ centroid offset of 90% of the accepted targets lies within -0.11 to +0.11 half-w
 and `|q1_offset| > 0.3` removes 4.0% of the extracted targets and 4.1% of the decoys
 alike.
 
-All three keys stay off and benchmark-gated: a second ZT Scan acquisition could not be
-converted with its isolation targets for this measurement (docs/04_convert.md, "SCIEX ZT
-Scan DIA"), and CLAUDE.md asks for one before any default changes.
+The keys were removed in 0.15.0: the profile arm stayed inside the seed range, and the
+summed cycles and the gate lost identifications or did nothing.
 
 The Q1 calibration the per-fragment decisions read (section 12; `rt_im_train.q1_calibrate`,
 docs/08_rt_im_train.md, section 4h) found the window centred
 on its target and wider and softer than its nominal 3.8 m/z: whole within 0.57 m/z of
-its centre and nothing beyond 4.56 m/z. The trapezoid of `q1_profile` above is the nominal
-one (one step of edge, the half-width as read).
+its centre and nothing beyond 4.56 m/z. The trapezoid of the removed `q1_profile` was the
+nominal one (one step of edge, the half-width as read).
 
 ### 11. MS1 mass calibration: the surface and the tolerance (default off)
 
@@ -1175,9 +1155,8 @@ decision tolerances the same calibration learns from the confident seed PSMs und
 which `run` and `run-experiment` read from the run's `cal.json` (`mumdia extract` takes it as
 `--q1-cal`), and the sweep spectra_ms2 v3 records (`q1_cycle`, `q1_step`, docs/04): a
 cycle x step grid of the stage's scans (`Q1Grid`; a recorded step that is not the rank of
-its target, or a step twice in a cycle, is refused). Refused with `extract.q1_cycles`, which
-sums the steps this keeps apart, on spectra with 1/K0, and, through `q1_calibrate`, with
-`groups.window_groups > 1`.
+its target, or a step twice in a cycle, is refused). Refused on spectra with 1/K0, and,
+through `q1_calibrate`, with `groups.window_groups > 1`.
 
 **The patch.** For a row with its apex at a scan of cycle `c0`: the cycles `c0 - 3 ..= c0 + 3`
 whose scan at the patch's middle step lies inside the candidate's RT window (the apex cycle
@@ -1435,8 +1414,7 @@ the envelope's), stored per library fragment as its shift from the candidate's c
   `Guard::q1_admits` beside the RT window, so the hits, the presence rules, the apex, the gate
   and the traces see only them (`search_seed.q1_deconvolved` does the same in the seed against
   the precursor's nominal envelope centre within `q1dec::SEED_TOL_STEPS`, docs/07). Needs
-  `rt_im_train.q1_calibrate`; refused with `extract.q1_cycles`, with window groups and on
-  spectra with 1/K0.
+  `rt_im_train.q1_calibrate`; refused with window groups and on spectra with 1/K0.
 - `features.q1_deconvolved` leaves the extraction as it is and reads, at each row's apex scan,
   for every library fragment the nearest peak in every scan of the apex cycle and the two either
   side whose window covers the precursor (`q1dec::row_evidence`): `q1d_n_frag` (fragments with
@@ -1578,7 +1556,6 @@ declutter" commit: `extract.scan_window_mode` (and the `ScanWindowMode` enum),
 | `emit_gate_diagnostics` | false | Adds the four `gate_*` diagnostic columns |
 | `gate_mode` | `ApexPearson` | Which score `gate_min_score` thresholds (`GateMode`, `config.rs:735`) |
 | `gate_coelution_min` | 0.5 | Second threshold for `GateMode::Combined` |
-| `q1_cycles`, `q1_profile`, `q1_gate_max_offset` | off | The scanning-quadrupole sweep model (section 10) |
 | `q1_fragments` | false | The per-fragment Q1 decision of every accepted row (psms_extracted v6); needs `rt_im_train.q1_calibrate` and spectra_ms2 v3 (section 12) |
 | `q1_deconvolved` | false | Count only the peaks whose Q1 centroid sits where the matched fragment is expected, within the tolerance the Q1 calibration learns; needs `rt_im_train.q1_calibrate` and spectra_ms2 v3 (section 14) |
 | `im_gate` | `off` | The 1/K0 gate on fragment peaks (`off`, `fragments`, `auto`; section 8). Inert on 3D data. Omitted from the canonical configuration at its default |
@@ -1614,9 +1591,9 @@ here for one index.
 | `retrace.repick` (default false) | none; patches `apex_rt` / `apex_im` | IM branch: +7.4% peptides E. coli (3 seeds), entrapment +5.4% real peptides at an FDP of 0.37-0.47%, HYE +8.4% (seed 0); main: +8.0% E. coli (one seed); gate pending on main |
 | `extract.im_gate` (default `off`, diaPASEF only) | none; fragment peaks outside the 1/K0 window are not matched (section 8) | IM branch: +5.7% E. coli (3 seeds); main, with `features.im_features`: +5.0% (one seed); gate: paired entrapment and HYE seeds (docs/35 arm T12) |
 | `retrace.apex_features` (default false) | 1 F64 col `imc_ref_w` in `psms_extracted`; the tenth ion-mobility feature | IM branch: +1.3% alone, about 2.7% FDP on the added peptides; gate pending |
-| `extract.q1_cycles` (default false, scanning quadrupole only) | none; a candidate's Q1 bins of one cycle become one chromatogram point (section 10) | ZT Scan REP01: -13.7% precursors (one seed); keep off |
-| `extract.q1_profile` + `features.q1_features` (default false) | psms_extracted v5: 4 F64 cols `q1_corr`, `q1_offset`, `q1_frag_sd`, `q1_bin_frac`; four features | ZT Scan REP01: +0.4% precursors (mean of four NN seeds, inside the seed range), +0.4% in a three-run experiment, +0.1% human precursors on an entrapment library at a combined FDP of 1.32% against 1.39%; one acquisition |
-| `extract.q1_gate_max_offset` (unset) | none; rejects on `q1_offset` | not useful at any threshold measured (section 10) |
+| `extract.q1_cycles` (removed in 0.15.0) | none; a candidate's Q1 bins of one cycle became one chromatogram point (section 10) | ZT Scan REP01: -13.7% precursors (one seed) |
+| `extract.q1_profile` + `features.q1_features` (removed in 0.15.0) | psms_extracted v5: 4 F64 cols `q1_corr`, `q1_offset`, `q1_frag_sd`, `q1_bin_frac`; four features | ZT Scan REP01: +0.4% precursors (mean of four NN seeds, inside the seed range), +0.4% in a three-run experiment, +0.1% human precursors on an entrapment library at a combined FDP of 1.32% against 1.39%; one acquisition |
+| `extract.q1_gate_max_offset` (removed in 0.15.0) | none; rejected on `q1_offset` | not useful at any threshold measured (section 10) |
 | `rt_im_train.q1_calibrate` (automatic for ZT Scan files, scanning quadrupole only) | none; a `q1_calibration` block in `cal.json` (docs/08 section 4h), with `fragment_decision` under `extract.q1_fragments` | diagnostic: every other artifact unchanged (scored table byte-identical on ZT Scan REP01) |
 | `extract.q1_fragments` + `features.q1_fragment_features` (automatic for ZT Scan files, scanning quadrupole only) | psms_extracted v6: the `q1f_*` summary (F64) and four `q1f_frag_*` per-fragment lists; eight features (section 12) | ZT Scan REP01: +1.45% precursors (four NN seeds, beyond the seed range), +1.26% human precursors at a matched entrapment FDP, combined FDP at 1% 1.31% against 1.39%; one acquisition |
 | `retrace.q1_repick` (automatic for ZT Scan files, needs `extract.q1_fragments`) | `q1f_apex_moved_s`; moves the rank-0 apex to the 2D apex of the fragments that belong (section 12) | ZT Scan REP01, on top of the decision: +2.96% precursors, +2.92% human precursors at a matched FDP (four NN seeds); 60% of the accepted targets' apexes move, by one cycle; extract +40-75% |

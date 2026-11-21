@@ -304,15 +304,9 @@ pub const RICH_EXTRA: &[&str] = &[
     "shadow_frac",
 ];
 
-/// The Q1-profile family of scanning-quadrupole spectra (`features.q1_features`): the
-/// psms_extracted v5 columns of the same names (`extract.q1_profile`), appended after every
-/// other column of the `extended` set.
-pub const Q1_FEATURES: &[&str] = &["q1_corr", "q1_offset", "q1_frag_sd", "q1_bin_frac"];
-
 /// The per-fragment Q1 decision family of scanning-quadrupole spectra
 /// (`features.q1_fragment_features`): the psms_extracted v6 columns of the same names
-/// (`extract.q1_fragments`), appended after every other column of the `extended` set (after
-/// [`Q1_FEATURES`] when both are on).
+/// (`extract.q1_fragments`), appended after every other column of the `extended` set.
 pub const Q1F_FEATURES: &[&str] = &[
     "q1f_n_belong",
     "q1f_belong_share",
@@ -368,8 +362,6 @@ pub fn active_features(set: FeatureSet, im: impl Into<ImFamily>) -> Vec<String> 
 /// The switches of the families appended last under `extended`, in their order.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Q1Families {
-    /// `features.q1_features` ([`Q1_FEATURES`]).
-    pub q1: bool,
     /// `features.q1_fragment_features` ([`Q1F_FEATURES`]).
     pub q1f: bool,
     /// `features.ms1_envelope` ([`MS1E_FEATURES`]).
@@ -390,7 +382,6 @@ impl Q1Families {
     /// The switches of a features configuration.
     pub fn of(cfg: &FeaturesConfig) -> Q1Families {
         Q1Families {
-            q1: cfg.q1_features,
             q1f: cfg.q1_fragment_features.on(),
             ms1e: cfg.ms1_envelope,
             q1p: cfg.q1_precursor.on(),
@@ -410,7 +401,6 @@ pub fn active_features_fam(
     fam: Q1Families,
 ) -> Vec<String> {
     let Q1Families {
-        q1,
         q1f,
         ms1e,
         q1p,
@@ -437,9 +427,6 @@ pub fn active_features_fam(
         v.push("n_charge_states".to_string());
         v.push("charge_multi_flag".to_string());
         v.push("cross_charge_intensity_log".to_string());
-        if q1 {
-            v.extend(Q1_FEATURES.iter().map(|s| s.to_string()));
-        }
         if q1f {
             v.extend(Q1F_FEATURES.iter().map(|s| s.to_string()));
         }
@@ -2220,9 +2207,8 @@ macro_rules! col_ix {
             $($field: Option<usize>,)*
             /// One entry per extended-battery feature, in registry order.
             ext: Vec<Option<usize>>,
-            // One entry per name of `Q1_FEATURES`, `Q1F_FEATURES`, `MS1E_FEATURES` and
-            // `Q1C_FEATURES`, in list order: a family's k-th value goes under its k-th name.
-            q1: Vec<Option<usize>>,
+            // One entry per name of `Q1F_FEATURES`, `MS1E_FEATURES` and `Q1C_FEATURES`, in
+            // list order: a family's k-th value goes under its k-th name.
             q1f: Vec<Option<usize>>,
             ms1e: Vec<Option<usize>>,
             q1c: Vec<Option<usize>>,
@@ -2241,7 +2227,6 @@ macro_rules! col_ix {
                 ColIx {
                     $($field: idx.get(stringify!($field)).copied(),)*
                     ext: by_name(ext_names),
-                    q1: by_name(Q1_FEATURES),
                     q1f: by_name(Q1F_FEATURES),
                     ms1e: by_name(MS1E_FEATURES),
                     q1c: by_name(Q1C_FEATURES),
@@ -2252,7 +2237,7 @@ macro_rules! col_ix {
             #[cfg(test)]
             fn named(&self) -> Vec<Option<usize>> {
                 let mut v = vec![$(self.$field,)*];
-                for f in [&self.q1, &self.q1f, &self.ms1e, &self.q1c] {
+                for f in [&self.q1f, &self.ms1e, &self.q1c] {
                     v.extend(f.iter().copied());
                 }
                 v
@@ -3564,13 +3549,6 @@ fn run_chunked(
             })
             .collect()
     };
-    // The Q1-profile family (`features.q1_features`) from psms_extracted v5.
-    let q1_cols = read_on(
-        p.cfg.q1_features,
-        Q1_FEATURES,
-        "features.q1_features",
-        "extract writes the Q1-profile columns under extract.q1_profile",
-    )?;
     // The per-fragment Q1 decision family (`features.q1_fragment_features`) from
     // psms_extracted v6.
     let q1f_cols = read_on(
@@ -4332,7 +4310,6 @@ fn run_chunked(
                         // The families appended last, by name: value k under the k-th
                         // column its list names (none while a family is off).
                         for (cs_ix, vals) in [
-                            (&ix.q1, &q1_cols),
                             (&ix.q1f, &q1f_cols),
                             (&ix.ms1e, &ms1e_cols),
                             (&q1s_ix, &q1s_cols),
@@ -6152,55 +6129,7 @@ mod tests {
 
     // --- the feature -> column permutation ---
 
-    /// The Q1-profile family is the last four columns of the extended set when it is on,
-    /// nowhere otherwise, and every one of its columns is written.
-    #[test]
-    fn the_q1_family_is_appended_last_and_only_when_asked() {
-        let off = active_features(FeatureSet::Extended, false);
-        let on = active_features_fam(
-            FeatureSet::Extended,
-            false,
-            Q1Families {
-                q1: true,
-                ..Default::default()
-            },
-        );
-        assert_eq!(on.len(), off.len() + Q1_FEATURES.len());
-        assert_eq!(&on[..off.len()], &off[..]);
-        assert_eq!(&on[off.len()..], Q1_FEATURES);
-        for set in [FeatureSet::Minimal, FeatureSet::Rich] {
-            assert_eq!(
-                active_features_fam(
-                    set,
-                    false,
-                    Q1Families {
-                        q1: true,
-                        ..Default::default()
-                    }
-                ),
-                active_features(set, false)
-            );
-        }
-        let ix = ColIx::new(&on, &extended_name_refs(false));
-        let mut seen: Vec<usize> = ix
-            .named()
-            .into_iter()
-            .chain(ix.ext.iter().copied())
-            .flatten()
-            .collect();
-        seen.sort_unstable();
-        assert_eq!(seen, (0..on.len()).collect::<Vec<_>>());
-        let mut cfg = FeaturesConfig {
-            set: FeatureSet::Extended,
-            ..FeaturesConfig::default()
-        };
-        assert_eq!(active_features_for(&cfg, false), off);
-        cfg.q1_features = true;
-        assert_eq!(active_features_for(&cfg, false), on);
-    }
-
-    /// The per-fragment Q1 decision family is appended after the Q1-profile family (or
-    /// last on its own) under the extended set only, every column is written, and the
+    /// The per-fragment Q1 decision family is appended last under the extended set only, every column is written, and the
     /// schema id changes only with it on.
     #[test]
     fn the_q1f_family_is_appended_last_and_only_when_asked() {
@@ -6216,17 +6145,6 @@ mod tests {
         assert_eq!(on.len(), off.len() + Q1F_FEATURES.len());
         assert_eq!(&on[..off.len()], &off[..]);
         assert_eq!(&on[off.len()..], Q1F_FEATURES);
-        let both = active_features_fam(
-            FeatureSet::Extended,
-            false,
-            Q1Families {
-                q1: true,
-                q1f: true,
-                ..Default::default()
-            },
-        );
-        assert_eq!(&both[off.len()..off.len() + Q1_FEATURES.len()], Q1_FEATURES);
-        assert_eq!(&both[off.len() + Q1_FEATURES.len()..], Q1F_FEATURES);
         assert_eq!(
             active_features_fam(FeatureSet::Extended, false, Q1Families::default()),
             off
@@ -6237,7 +6155,6 @@ mod tests {
                     set,
                     false,
                     Q1Families {
-                        q1: true,
                         q1f: true,
                         ..Default::default()
                     }
@@ -6245,7 +6162,7 @@ mod tests {
                 active_features(set, false)
             );
         }
-        for cols in [&on, &both] {
+        for cols in [&on] {
             let ix = ColIx::new(cols, &extended_name_refs(false));
             let mut seen: Vec<usize> = ix
                 .named()
@@ -6288,7 +6205,6 @@ mod tests {
             FeatureSet::Extended,
             false,
             Q1Families {
-                q1: false,
                 q1f: true,
                 ms1e: false,
                 q1p: true,
@@ -6302,7 +6218,6 @@ mod tests {
             FeatureSet::Extended,
             false,
             Q1Families {
-                q1: false,
                 q1f: true,
                 ms1e: false,
                 q1p: false,
@@ -6316,7 +6231,6 @@ mod tests {
             FeatureSet::Extended,
             false,
             Q1Families {
-                q1: false,
                 q1f: true,
                 ms1e: false,
                 q1p: true,
@@ -6339,7 +6253,6 @@ mod tests {
                 FeatureSet::Extended,
                 false,
                 Q1Families {
-                    q1: false,
                     q1f: true,
                     ms1e: false,
                     q1p: false,
@@ -6357,7 +6270,6 @@ mod tests {
                     set,
                     false,
                     Q1Families {
-                        q1: false,
                         q1f: true,
                         ms1e: false,
                         q1p: true,
@@ -6410,7 +6322,6 @@ mod tests {
             FeatureSet::Extended,
             false,
             Q1Families {
-                q1: true,
                 q1f: true,
                 ms1e: true,
                 ..Default::default()
@@ -6420,7 +6331,6 @@ mod tests {
             FeatureSet::Extended,
             false,
             Q1Families {
-                q1: true,
                 q1f: true,
                 ..Default::default()
             },
@@ -6433,7 +6343,6 @@ mod tests {
                     set,
                     false,
                     Q1Families {
-                        q1: true,
                         q1f: true,
                         ms1e: true,
                         ..Default::default()
@@ -6485,7 +6394,6 @@ mod tests {
             FeatureSet::Extended,
             false,
             Q1Families {
-                q1: true,
                 q1f: true,
                 ms1e: true,
                 q1c: true,
@@ -6496,7 +6404,6 @@ mod tests {
             FeatureSet::Extended,
             false,
             Q1Families {
-                q1: true,
                 q1f: true,
                 ms1e: true,
                 ..Default::default()
@@ -6510,7 +6417,6 @@ mod tests {
                     set,
                     false,
                     Q1Families {
-                        q1: true,
                         q1f: true,
                         ms1e: true,
                         q1c: true,

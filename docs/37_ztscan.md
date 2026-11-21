@@ -52,8 +52,8 @@ column unless the configuration rules it out, and on every other search it is of
 | key | on a ZT Scan search | held off when |
 |---|---|---|
 | `convert.isolation_half_width` | the census's suggestion: 2.5 steps, rounded to 0.05 m/z (1.9 for the K562 method) | (a value set is kept) |
-| `rt_im_train.q1_calibrate` | on | `groups.window_groups > 1`; nothing reads it (`extract.q1_fragments = false`, or `extract.q1_cycles`, and `extract.q1_deconvolved` off) |
-| `extract.q1_fragments` | on | the calibration is off; `extract.q1_cycles` |
+| `rt_im_train.q1_calibrate` | on | `groups.window_groups > 1`; nothing reads it (`extract.q1_fragments = false` and `extract.q1_deconvolved` off) |
+| `extract.q1_fragments` | on | the calibration is off |
 | `extract.q1_traces` (the cycle-trace table `chromatograms_q1.parquet`, section 15) | on | `extract.q1_fragments` is off |
 | `features.q1_fragment_features`, `q1_precursor`, `q1_multiscale`, `q1_deconvolved`, `q1_consistency` | on | `extract.q1_fragments` is off; `features.set` other than `extended` |
 | `retrace.q1_repick` (`q1_repick_peaks` stays 5) | on | `extract.q1_fragments` is off; `extract.promote_top_peaks > 1`, `extract.apex_refine_intensity` or `retrace.repick` |
@@ -67,8 +67,9 @@ canonical configuration of `ztscan.json`, and so the same configuration hash and
 tables (section 12). What stays opt-in, as before: the classifier's sensitivity settings
 (section 4), the counts of Q1-consistent peaks (`extract.q1_deconvolved`,
 `search_seed.q1_deconvolved`, section 10.3), `features.ms1_envelope`, `quant.q1_fragments`,
-`extract.q1_cycles`, `extract.q1_profile`, `features.q1_features`, the separable model
-(`features.q1_separable`) of section 15, and the MS1 calibration keys of docs/09 section 11.
+the separable model (`features.q1_separable`) of section 15, and the MS1 calibration keys of
+docs/09 section 11. The Q1 sweep keys (`extract.q1_cycles`, `extract.q1_profile`,
+`extract.q1_gate_max_offset`, `features.q1_features`) were removed in 0.15.0.
 
 **Spelling, and the configuration hash.** Each switch takes `"auto"`, `true` or `false`;
 `quant.q1_cycle_halfwidth` a number of cycles (0 is off), `"auto"` or `null`;
@@ -220,7 +221,7 @@ files"). The others stay opt-in.
 | layer | key | canonical section | measured | in the recipe (automatic) |
 |---|---|---|---|---|
 | read each step as a window, record the sweep | `convert.isolation_half_width` | docs/04, "SCIEX ZT Scan DIA" | required to read the file at all | yes (1.9; automatically the census's suggestion) |
-| sum a cycle's steps, a Q1-profile family, a gate on it | `extract.q1_cycles`, `extract.q1_profile`, `extract.q1_gate_max_offset`, `features.q1_features` | docs/09, section 10 | summing -13.7%; the profile family +0.4% inside seed noise; the gate cuts targets and decoys alike | no |
+| sum a cycle's steps, a Q1-profile family, a gate on it | `extract.q1_cycles`, `extract.q1_profile`, `extract.q1_gate_max_offset`, `features.q1_features` | docs/09, section 10 | summing -13.7%; the profile family +0.4% inside seed noise; the gate cuts targets and decoys alike | removed in 0.15.0 |
 | calibrate the Q1 window from the seed | `rt_im_train.q1_calibrate` | docs/08, section 4h | the target is the window centre; an effective window wider and softer than nominal; changes no identification by itself | yes (the decisions need it) |
 | MS1 error surface and an MS1 tolerance from the seed | `extract.ms1_calibrate = "surface"`, `extract.prec_tol_auto` | docs/09, section 11 | +0.46% precursors, inside seed noise | no |
 | decide per fragment whether it belongs | `extract.q1_fragments` | docs/09, section 12 | with its features: +1.26% human precursors at the base arm's measured FDP | yes |
@@ -668,7 +669,7 @@ byte; 2 is the setting to take when extract's time matters more than half a perc
   Scan run read as one all-ion window does (`extract.max_footprint_gib`, docs/09).
 - Every sweep key on a layout that is not a scanning quadrupole, on spectra with 1/K0, and,
   through `rt_im_train.q1_calibrate`, with `groups.window_groups > 1`.
-- `extract.q1_fragments` without `rt_im_train.q1_calibrate`, with `extract.q1_cycles`, and on
+- `extract.q1_fragments` without `rt_im_train.q1_calibrate`, and on
   spectra_ms2 that is not v3 or whose recorded step is not the rank of its target.
 - `features.q1_fragment_features`, `retrace.q1_repick` and `rescore.shadow_q1` without
   `extract.q1_fragments`; `retrace.q1_repick` with `promote_top_peaks > 1`,
@@ -683,8 +684,8 @@ byte; 2 is the setting to take when extract's time matters more than half a perc
 - `extract.q1_traces` set to `true` and `features.q1_separable` on any input that is not a ZT
   Scan run, and either without `extract.q1_fragments`.
 - `features.q1_precursor`, `features.q1_multiscale` and `features.q1_deconvolved` without
-  `extract.q1_fragments`; `extract.q1_deconvolved` without `rt_im_train.q1_calibrate` or with
-  `extract.q1_cycles`; `search_seed.q1_deconvolved` with `count_fragments_once`; both
+  `extract.q1_fragments`; `extract.q1_deconvolved` without `rt_im_train.q1_calibrate`;
+  `search_seed.q1_deconvolved` with `count_fragments_once`; both
   `q1_deconvolved` keys with `groups.window_groups > 1`, on spectra with 1/K0 and on
   spectra_ms2 without the recorded sweep.
 

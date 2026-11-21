@@ -822,9 +822,9 @@ model the quadrupole sweep: each bin is an independent fixed window, and a candi
 chromatogram interleaves the bins that cover its precursor. Since 0.12.0 a ZT Scan search runs
 the analysis below by default (docs/37_ztscan.md, "Automatic for ZT Scan files").
 Search the precursor range the method scanned with a library restricted to it. Three
-opt-in keys model the sweep (`extract.q1_cycles`, `extract.q1_profile`,
-`features.q1_features`; docs/09_extract.md, section 10): summing the bins of a cycle lost
-about 14%, and the Q1-profile features gained 0.4%, so all three stay off.
+opt-in keys that modelled the sweep (`extract.q1_cycles`, `extract.q1_profile`,
+`features.q1_features`; docs/09_extract.md, section 10) were removed in 0.15.0: summing the
+bins of a cycle lost about 14%, and the Q1-profile features gained 0.4%, inside seed noise.
 
 With the key, convert also records the sweep itself (spectra_ms2 v3, `q1_cycle` and
 `q1_step`, section "`spectra_ms2.parquet`" above): on REP01 3,238 cycles of 663 steps, every

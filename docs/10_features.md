@@ -715,18 +715,12 @@ branch's 1/K0 width and peak-shape block (P7) lost 0.9% and is not ported, and a
 shared-Gaussian co-elution fit separated no better than `xcorr_shape` (docs/35 section 12).
 The diaPASEF recipe (`configs/examples/diapasef.json`) sets `im_features = on`.
 
-### q1_profile (4; `features.q1_features`)
+### q1_profile (removed in 0.15.0)
 
-Scanning-quadrupole spectra (SCIEX ZT Scan DIA) only. In the battery only when
-`features.q1_features` is on (`false` by default), which needs `extract.q1_profile`:
-`q1_corr`, `q1_offset`, `q1_frag_sd` and `q1_bin_frac`, read under the same names from
-psms_extracted v5 and appended after every other column of the `extended` set
-(`Q1_FEATURES`); `minimal` and `rich` ignore the switch. They describe how the matched
-intensity of the five apex cycles is spread over the Q1 bins that cover the precursor,
-against the transmission profile its m/z predicts (docs/09_extract.md, section 10). The
-switch comes from the configuration, as the schema id the orchestrators record does, so
-a psms_extracted table without the columns is an error rather than zeros. Nothing reads
-a label. Measured on one ZT Scan run: +0.4% precursors (mean of four NN seeds, inside
+`features.q1_features` appended `q1_corr`, `q1_offset`, `q1_frag_sd` and `q1_bin_frac` from
+psms_extracted v5 (`extract.q1_profile`): how the matched intensity of the five apex cycles
+spread over the Q1 bins that cover the precursor, against the transmission profile its m/z
+predicts (docs/09_extract.md, section 10). 0.15.0 removed it. Measured on one ZT Scan run: +0.4% precursors (mean of four NN seeds, inside
 the seed range), +0.4% in a three-run experiment, +0.1% human precursors on an
 entrapment library at a combined FDP of 1.32% against 1.39%.
 
@@ -736,8 +730,7 @@ Scanning-quadrupole spectra (SCIEX ZT Scan DIA) only. In the battery only when
 `features.q1_fragment_features` is on (`false` by default), which needs
 `extract.q1_fragments`: the per-candidate summary of the per-fragment Q1 decision
 (docs/09_extract.md, section 12), read under the same names from psms_extracted v6 and
-appended after every other column of the `extended` set, after the `q1_profile` family when
-both are on (`Q1F_FEATURES`); `minimal` and `rich` ignore the switch.
+appended after every other column of the `extended` set (`Q1F_FEATURES`); `minimal` and `rich` ignore the switch.
 
 | feature | meaning |
 |---|---|
@@ -1045,8 +1038,7 @@ variant no longer exists).
 | `bound_from_confident` | false | true = learn one global left/right half-width from the confident seed set and apply it to every candidate; false (default since 2026-10-04) = per-candidate detection |
 | `bound_confident_pct` | 50.0 | percentile of the confident-set half-widths taken as the global half-width (50 = median) |
 | `chrom_loaders` | 3 | chromatogram decode threads in the main pass, an upper bound that `--threads` and the chunk count also cap (see "The chunked pass" below); changes time and memory only, never a value or a byte of the features table |
-| `q1_features` | false | the `q1_profile` family of scanning-quadrupole spectra, which needs `extract.q1_profile`; appended last under `extended`. Omitted from the canonical configuration at its default |
-| `q1_fragment_features` | `"auto"` | the `q1_fragments` family (eight `q1f_*` features of the per-fragment Q1 decision), which needs `extract.q1_fragments`; appended last under `extended`, after `q1_profile`; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
+| `q1_fragment_features` | `"auto"` | the `q1_fragments` family (eight `q1f_*` features of the per-fragment Q1 decision), which needs `extract.q1_fragments`; appended last under `extended`; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
 | `ms1_envelope` | false | the `ms1_envelope` family (nine `ms1e_*` features of the MS1 isotope envelope around the apex), whose evidence extract reads under the same key (psms_extracted v7); appended last under `extended`, after the Q1 families. Refused on 1/K0 spectra and grouped runs. Omitted from the canonical configuration at its default |
 | `q1_precursor` | `"auto"` | the `q1_precursor` family (eight `q1p_*` features of the unfragmented precursor in the MS2 steps), whose evidence extract reads under the same key (psms_extracted v8); needs `extract.q1_fragments`; appended after `ms1_envelope`; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
 | `q1_multiscale` | `"auto"` | the `q1_multiscale` family (nine `q1m*` features at 3, 7 and 11 Q1 steps, twelve with `q1_precursor`), psms_extracted v8; needs `extract.q1_fragments`; appended after `q1_precursor`; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
