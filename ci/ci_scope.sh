@@ -95,7 +95,7 @@ classify() {
         env/docker-*.yml | env/mumdia-*.yml) echo python ;;
         ci/check_console_envs.py | ci/check_doc_refs.py | ci/check_workflows.py) echo python ;;
         ci/gen_config_reference.py | ci/gen_third_party_licenses.py | ci/gen_sbom.py) echo python ;;
-        ci/_lockfile_versions.py) echo python ;;
+        ci/_lockfile_versions.py | ci/cargo_audit.sh) echo python ;;
         # The engine's tests include_str! some workers, so a script change still builds
         # and tests the engine once, on Linux.
         scripts/*) echo scripts ;;
@@ -156,6 +156,12 @@ case "$job" in
     # scripts, and the workflow (the `all` class above).
     desktop-windows)
         has desktop msi && decide true "$why" ;;
+    # Not a skip but the audit's strictness: strict when a lockfile or the ignore list
+    # changes, advisory otherwise (the job always scans).
+    audit)
+        printf '%s\n' "$files" \
+            | grep -qxE 'rust/mumdia/Cargo\.lock|desktop/Cargo\.lock|ci/cargo_audit\.sh' \
+            && decide true "$why" ;;
     *)
         echo "::error::ci/ci_scope.sh: unknown job '$job'" >&2
         exit 2 ;;

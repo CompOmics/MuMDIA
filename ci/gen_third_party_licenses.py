@@ -39,6 +39,7 @@ whoever signs off the release.
 Usage:
     python ci/gen_third_party_licenses.py            # write the file
     python ci/gen_third_party_licenses.py --check    # fail if it is stale
+    python ci/gen_third_party_licenses.py --desktop [--check]   # the desktop application's
 """
 
 from __future__ import annotations
@@ -58,9 +59,13 @@ from _lockfile_versions import check
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "rust" / "mumdia" / "Cargo.toml"
 OUT = ROOT / "THIRD_PARTY_LICENSES.md"
+# The desktop application is its own workspace with its own lockfile, and the installers
+# ship its binary beside the engine, so it has its own notice file.
+DESKTOP_MANIFEST = ROOT / "desktop" / "Cargo.toml"
+DESKTOP_OUT = ROOT / "desktop" / "THIRD_PARTY_LICENSES.md"
 
-# Crates in this workspace: our own code, covered by LICENSE, not third-party.
-OURS = {"mumdia", "mumdia-core", "mumdia-io"}
+# Crates in these workspaces: our own code, covered by LICENSE, not third-party.
+OURS = {"mumdia", "mumdia-core", "mumdia-io", "mumdia-console"}
 
 # Licence texts short enough to embed, for the families that are not Apache-2.0
 # (which is already in LICENSE, verbatim, as MuMDIA's own licence).
@@ -156,10 +161,10 @@ def permissive_choice(expr: str) -> str | None:
     return None
 
 
-def collect() -> list[dict]:
+def collect(manifest: Path = MANIFEST) -> list[dict]:
     out = subprocess.run(
         ["cargo", "metadata", "--format-version", "1", "--locked",
-         "--manifest-path", str(MANIFEST)],
+         "--manifest-path", str(manifest)],
         capture_output=True, text=True, check=True,
         # Explicit UTF-8, not the locale codepage. `text=True` decodes with
         # `locale.getpreferredencoding()`, which is cp1252 on Windows, so a crate
@@ -389,17 +394,25 @@ def notices_for(
     return [], []
 
 
-def render(pkgs: list[dict]) -> str:
+def render(pkgs: list[dict], desktop: bool = False) -> str:
     L: list[str] = []
     a = L.append
     a("# Third-party licences")
     a("")
     a("GENERATED FILE. Do not edit. `ci/gen_third_party_licenses.py` writes it from")
-    a("`rust/mumdia/Cargo.lock`, and CI fails when it is stale.")
-    a("")
-    a("MuMDIA's own licence is Apache-2.0; see `LICENSE`. The release binary is")
-    a("statically linked, so it contains the crates listed below and this file")
-    a("accompanies it in every release archive and in the container image.")
+    if desktop:
+        a("`desktop/Cargo.lock` (`--desktop`), and CI fails when it is stale.")
+        a("")
+        a("MuMDIA's own licence is Apache-2.0; see `LICENSE`. The desktop application")
+        a("`mumdia-console` is statically linked, so it contains the crates listed below")
+        a("and this file accompanies it in the desktop installers. The engine the")
+        a("installers bundle beside it has its own list, `THIRD_PARTY_LICENSES.md`.")
+    else:
+        a("`rust/mumdia/Cargo.lock`, and CI fails when it is stale.")
+        a("")
+        a("MuMDIA's own licence is Apache-2.0; see `LICENSE`. The release binary is")
+        a("statically linked, so it contains the crates listed below and this file")
+        a("accompanies it in every release archive and in the container image.")
     a("")
 
     # Obligation summary, which is the part a reader actually needs.
@@ -421,7 +434,23 @@ def render(pkgs: list[dict]) -> str:
         for t in copyleft:
             a(f"- `{t}`")
         a("")
-        a("No crate imposes a copyleft obligation on the distributed binary.")
+        # Crates whose only licence is copyleft: no permissive arm to rely on.
+        sole = [p for p in pkgs
+                if permissive_choice(p["license"]) is None
+                and any("GPL" in t or "MPL" in t for t in spdx_terms(p["license"]))]
+        if not sole:
+            a("No crate imposes a copyleft obligation on the distributed binary.")
+        else:
+            a("Except for these crates, whose only licence is the one named:")
+            a("")
+            for p in sole:
+                a(f"- `{p['name']}` {p['version']} ({p['license']}): {p['repository']}")
+            a("")
+            a("MPL-2.0 is file-level copyleft. MuMDIA uses these crates unmodified, and")
+            a("their Source Code Form (MPL-2.0 section 3.2) is available at exactly the")
+            a("versions listed, from crates.io (`https://crates.io/crates/<name>/<version>`)")
+            a("and from the repositories above. The licence text is at")
+            a("https://mozilla.org/MPL/2.0/.")
     else:
         a("No copyleft identifier appears anywhere in the graph.")
     a("")
@@ -556,6 +585,14 @@ def render(pkgs: list[dict]) -> str:
     a("installed by the user or by the container build from `env/*.yml` and are not")
     a("redistributed inside the binary, so their licences travel with those packages.")
     a("")
+    if desktop:
+        a("## uv")
+        a("")
+        a("The installers also bundle the `uv` executable (Astral Software Inc., dual")
+        a("licensed MIT OR Apache-2.0), which installs those environments. Its licence")
+        a("texts, taken from the uv release the installer bundles, ship beside it as")
+        a("`uv-LICENSE-MIT` and `uv-LICENSE-APACHE`.")
+        a("")
     return "\n".join(L) + "\n"
 
 
@@ -595,20 +632,25 @@ def main() -> int:
     ap.add_argument("--strict", action="store_true",
                     help="with --check, also fail when only crate versions differ "
                          "(the release gate; see ci/_lockfile_versions.py)")
+    ap.add_argument("--desktop", action="store_true",
+                    help="the desktop application's notices, from desktop/Cargo.lock, "
+                         "into desktop/THIRD_PARTY_LICENSES.md")
     args = ap.parse_args()
 
-    text = render(collect())
+    out = DESKTOP_OUT if args.desktop else OUT
+    regen = "python ci/gen_third_party_licenses.py" + (" --desktop" if args.desktop else "")
+    text = render(collect(DESKTOP_MANIFEST if args.desktop else MANIFEST), args.desktop)
     if args.check:
-        current = OUT.read_text(encoding="utf-8") if OUT.exists() else ""
-        code = check(OUT, current.replace("\r\n", "\n"), text,
-                     "python ci/gen_third_party_licenses.py", args.strict, report_stale)
+        current = out.read_text(encoding="utf-8") if out.exists() else ""
+        code = check(out, current.replace("\r\n", "\n"), text,
+                     regen, args.strict, report_stale)
         if code >= 0:
             return code
-        print(f"{OUT} is up to date ({len(text.splitlines())} lines).")
+        print(f"{out} is up to date ({len(text.splitlines())} lines).")
         return 0
 
-    OUT.write_text(text, encoding="utf-8", newline="\n")
-    print(f"wrote {OUT} ({len(text.splitlines())} lines)")
+    out.write_text(text, encoding="utf-8", newline="\n")
+    print(f"wrote {out} ({len(text.splitlines())} lines)")
     return 0
 
 

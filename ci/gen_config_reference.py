@@ -2459,6 +2459,14 @@ def main(argv: list[str] | None = None) -> int:
             "error: COMPUTED_ENV_DEFAULTS names variables no code reads: "
             + ", ".join(stats["stale_computed_env"])
         )
+    if stats["warnings"]:
+        # An unparsed member drops out of both outputs, so the desktop would lose the
+        # setting while --check still compared equal texts.
+        _, _, warnings = parse_config_rs(inputs.config_text)
+        sys.exit(
+            "error: the config source has members this generator cannot parse:\n  "
+            + "\n  ".join(sorted(set(warnings)))
+        )
     out_path = Path(args.out)
     schema = schema_text(inputs.config_text)
     schema_path = Path(args.schema_out)
