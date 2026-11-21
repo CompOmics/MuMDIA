@@ -266,6 +266,20 @@ fn is_leftover(name: &str) -> bool {
             .any(|p| rest.starts_with(p))
 }
 
+/// A name beside `entry` that no other run picks, for a temporary directory derived from it
+/// ([`is_leftover`]): `<entry>.<what>-<process id>-<time in nanoseconds>`.
+pub(crate) fn unique_sibling(entry: &Path, what: &str) -> PathBuf {
+    entry.with_file_name(format!(
+        "{}.{what}-{}-{}",
+        entry.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ))
+}
+
 /// Total size of the files under `dir`.
 fn dir_bytes(dir: &Path) -> u64 {
     let mut total = 0u64;
@@ -366,8 +380,8 @@ pub fn usage(dir: &Path) -> Usage {
 
 /// Remove the leftover temporary directories of `dir` that nothing has written for
 /// [`PROTECT`]: a killed store's, an entry set aside as broken, an eviction that did not
-/// finish. Returns the bytes removed.
-fn remove_stale_leftovers(dir: &Path, now: SystemTime) -> u64 {
+/// finish. Returns the bytes removed. A library store sweeps its directory with it too.
+pub(crate) fn remove_stale_leftovers(dir: &Path, now: SystemTime) -> u64 {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -452,14 +466,7 @@ fn enforce_at(dirs: &[PathBuf], budget: Option<u64>, now: SystemTime) -> Enforce
             }
             // Renamed aside first: a reader that opens the entry after this sees no
             // entry (a miss), never a half-deleted one.
-            let aside = e.path.with_file_name(format!(
-                "{}.evicted-{}-{}",
-                e.path.file_name().unwrap_or_default().to_string_lossy(),
-                std::process::id(),
-                now.duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
-            ));
+            let aside = unique_sibling(&e.path, "evicted");
             if let Err(err) = std::fs::rename(&e.path, &aside) {
                 debug!(entry = %e.path.display(), error = %err, "cache: could not set an entry aside");
                 continue;
@@ -522,14 +529,7 @@ pub fn clear(dirs: &[PathBuf]) -> Cleared {
         for (name, path) in names {
             let bytes = dir_bytes(&path);
             let target = if entry_key(&name).is_some() {
-                let aside = path.with_file_name(format!(
-                    "{name}.evicted-{}-{}",
-                    std::process::id(),
-                    SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .map(|t| t.as_nanos())
-                        .unwrap_or(0)
-                ));
+                let aside = unique_sibling(&path, "evicted");
                 if let Err(e) = std::fs::rename(&path, &aside) {
                     out.failed.push(format!("{}: {e}", path.display()));
                     continue;

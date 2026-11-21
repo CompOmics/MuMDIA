@@ -2341,8 +2341,8 @@ pub struct ExtractConfig {
     pub windows_in_flight: Option<usize>,
     /// Refuse an extraction whose hit store is estimated, before anything is probed, to
     /// hold more than this many GiB at once. Unset (the default) is `auto`: the machine's
-    /// physical memory (the cgroup limit when a container sets a smaller one), checked only
-    /// once the estimate passes 4 GiB, and no check when the memory cannot be read. `0`
+    /// physical memory (the tightest cgroup limit on the process's path when smaller: a
+    /// container's, or a SLURM or systemd job's), checked only once the estimate passes 4 GiB, and no check when the memory cannot be read. `0`
     /// turns the check off; a number is a ceiling of your own. Under `groups.parallel` each
     /// band in flight gets its share of the ceiling.
     ///

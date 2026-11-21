@@ -305,7 +305,8 @@ task keeps beside each until it groups them: 20 bytes a match):
   contested features, the bucketed matcher).
 
 The ceiling is `extract.max_footprint_gib`: unset (`auto`), the machine's physical memory
-(the cgroup limit when a container sets a smaller one, read by `memlog::total_memory`),
+(the tightest cgroup limit on the process's path when smaller: a container's, or a SLURM or
+systemd job's, read by `memlog::total_memory`),
 looked up only once the estimate passes 4 GiB; a number is a ceiling of your own; `0` turns
 the check off. Under `groups.parallel` each band in flight gets its share. The refusal names
 the estimate, the ceiling and, when one window holds more than 100,000 MS2 spectra or every
@@ -1139,8 +1140,10 @@ Either key records `ms1_calibration` (`ExtractConfig::ms1_cal`: mode, the surfac
 anchors, the residual median and robust SD as read, after the offset and after the
 surface, and the tolerance), `ms1_ppm_offset` and `prec_tol_ppm` in both extract reports;
 a report without them is unchanged, and so is every read without them (`ms1_shift` is the
-expression every read used before). The standalone `mumdia extract` does not calibrate
-MS1, under either key, as it never did.
+expression every read used before). The standalone `mumdia extract` calibrates MS1 as
+`run` does when it is given `--ms1` and the seed's `--mass-cal`: the seed table is the one
+`<seed>.masscal.json` is named after. Without that table it warns and reads MS1
+uncalibrated.
 
 **ZenoTOF 8600, ZT Scan REP01** (24,124 of 25,305 confident seed anchors with an MS1 peak
 within 15 ppm; seed decoys 62% of the time, at a robust SD of 11.2 ppm, so a random peak in

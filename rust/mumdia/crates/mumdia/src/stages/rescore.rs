@@ -2148,28 +2148,6 @@ fn run_entrapment_gbm(
     Ok(aligned)
 }
 
-/// Owns a spawned sidecar child and kills it on drop unless it was already awaited.
-/// Without this, a `mumdia` process that dies mid-rescore (Ctrl-C, kill, panic) leaves
-/// the Python worker alive holding its feature memmap, and every later rescore then fails
-/// on a file it cannot delete.
-struct ChildGuard(Option<std::process::Child>);
-
-impl ChildGuard {
-    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        let mut c = self.0.take().expect("child awaited twice");
-        c.wait()
-    }
-}
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if let Some(mut c) = self.0.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-    }
-}
-
 /// The feature matrix, for the paths that read it.
 ///
 /// It is absent in exactly two situations, both of them `rescore.strict` with a PIN
@@ -3355,7 +3333,7 @@ pub fn sidecar_work_dir(default: &str) -> String {
 
 /// Whether `MUMDIA_KEEP_HANDOFF` asks to keep the sidecar files once the scores are read
 /// back (`1`, `true`, `yes` or `on`).
-fn keep_handoff() -> bool {
+pub(crate) fn keep_handoff() -> bool {
     env_flag(std::env::var("MUMDIA_KEEP_HANDOFF").ok().as_deref())
 }
 
@@ -3376,12 +3354,13 @@ fn env_flag(v: Option<&str>) -> bool {
 /// removed only after `align_sidecar_scores` has accepted the worker's output, so a failed
 /// worker still leaves its input behind for a rerun or a look at it; `MUMDIA_KEEP_HANDOFF=1`
 /// keeps them on success too. A file that cannot be removed is reported and does not fail
-/// the stage, which has its scores.
-fn remove_sidecar_files(files: &[&str], keep: bool) -> u64 {
+/// the stage, which has its scores. The predictor workers' request and output tables
+/// (`sidecar.rs`) go the same way once read back.
+pub(crate) fn remove_sidecar_files(files: &[&str], keep: bool) -> u64 {
     if keep {
         info!(
             files = ?files,
-            "rescore: kept the sidecar files (MUMDIA_KEEP_HANDOFF)"
+            "sidecar: kept the worker files (MUMDIA_KEEP_HANDOFF)"
         );
         return 0;
     }
@@ -3391,13 +3370,13 @@ fn remove_sidecar_files(files: &[&str], keep: bool) -> u64 {
         match std::fs::remove_file(f) {
             Ok(()) => freed += bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => warn!(file = %f, error = %e, "rescore: could not remove a sidecar file"),
+            Err(e) => warn!(file = %f, error = %e, "sidecar: could not remove a worker file"),
         }
     }
     info!(
         freed = %human_bytes(freed as f64),
         files = files.len(),
-        "rescore: removed the sidecar files (set MUMDIA_KEEP_HANDOFF=1 to keep them)"
+        "sidecar: removed the worker files (set MUMDIA_KEEP_HANDOFF=1 to keep them)"
     );
     freed
 }
@@ -3929,11 +3908,11 @@ fn run_pin_sidecar(
     }
 
     let script = crate::sidecar::resolve_script(p.script_dir, script_name);
-    // Spawn (not `status()`) so the child handle is owned by a guard that kills it if we
-    // unwind or are dropped: a killed `mumdia` used to leave the Python worker running,
-    // holding its multi-GB memmap open, which made every subsequent rescore fail on a
-    // stale lock with no hint about which PID held it.
-    let child = std::process::Command::new(python)
+    // A killed `mumdia` runs no destructor, so nothing here can stop this worker: Ctrl-C
+    // reaches it through the terminal's process group, and the desktop stops a run's whole
+    // process tree. An orphan cannot break a later rescore, whose files are named apart
+    // (`sidecar_paths`).
+    let mut child = std::process::Command::new(python)
         .arg(&script)
         .arg(pin)
         .arg(outp)
@@ -3979,8 +3958,7 @@ fn run_pin_sidecar(
             anyhow::anyhow!("spawning sidecar failed: {python} {script}: {e}")
         })?;
     let t_worker = Instant::now();
-    let mut guard = ChildGuard(Some(child));
-    let status = guard.wait()?;
+    let status = child.wait()?;
     let remove_files = || {
         let files = paths.files();
         remove_sidecar_files(
