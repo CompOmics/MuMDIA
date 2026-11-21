@@ -505,18 +505,9 @@ which a coalesced scan now uses only when `decode_threads` asks for them: 0.43,
 
 #### Row selections and page skipping
 
-`TableFile::open` parses the footer only. `TableFile::open_with_offset_index`
-also loads the offset index, the location and first row of every data page of
-every column chunk, where the file carries one (the engine's writer writes it;
-pyarrow does not by default, and such a file opens as with `open`). A reader
-built on that footer and given a row selection skips a page that holds no
-selected row without reading or decompressing it. `TableFile::batches_runs`
-takes a selection as `(rows, keep)` runs over the handle's own rows, on a whole
-file or a span, and reuses the handle's footer, so a caller that selects row
-group by row group parses the footer once. It always materialises the selection
-as a queue of selectors (`RowSelectionPolicy::Selectors`): parquet-rs's
-automatic choice may pick a bitmask, which decodes every row of a chunk and
-filters afterwards, and so reads every page.
+`TableFile::open` parses the footer only. `TableFile::batches_selected` takes a
+selection as `(rows, keep)` runs over a whole file and loads the offset index
+for it, so a page that holds no selected row is skipped without being read.
 
 Skipping rows inside a page is not free. parquet-rs steps over the rows of a
 list column one repetition level at a time, which on long lists costs more than
@@ -524,13 +515,14 @@ decoding them: on the AIF chromatograms rewritten in the current layout (90
 points per trace on average, 65,536-row groups) selecting 11% of one group's
 `rt` rows took 101 ms against 78 ms for the whole group, while on a run of the
 six-file Astral LFQ experiment (21 points per trace) selecting 7% took 4.2 ms
-against 12.3 ms. A caller that wants a
-selection to cost no more than a full read therefore cuts it at page boundaries
-(`TableFile::page_starts` gives the rows at which a column's pages begin) and
-reads each column on its own selection, which is what quant does
-(`docs/12_quant_lfq_align_mbr_report_audit.md`). What a skipped page holds is
-never checked, so a corrupt page there goes unnoticed where a full read would
-have refused it.
+against 12.3 ms. What a skipped page holds is never checked, so a corrupt page
+there goes unnoticed where a full read would have refused it.
+
+Quant used to read its chromatogram row groups through a page-aligned selection
+(`MUMDIA_QUANT_SELECTIVE_READ`). On the AIF and Astral HYE tables every list
+page held an accepted row, so nothing was skipped and the read cost what a full
+read did. It was removed in 0.15.0, with `TableFile::open_with_offset_index`,
+`offset_indexed`, `batches_runs` and `page_starts`.
 
 ### Parquet written outside this crate
 
@@ -782,9 +774,7 @@ is a no-op rather than a panic.
 | `TableFile::row_parts` | `table.rs:1868` | cut a handle into at most `max_parts` row-contiguous parts, in order: whole row groups, merged, and page-aligned ranges inside a group that has an offset index (a group without one is never split) |
 | `TableFile::batches` / `batches_dict` | `table.rs:2038` / `:2050` | streaming batch reader over the named columns; `batches_dict` reads the named `Utf8` columns as `Dictionary(Int32, Utf8)`, with the same row values |
 | `TableFile::batches_selected` | `table.rs:2100` | stream only the rows of `(rows, keep)` runs, skipping pages with no kept row where the file has an offset index (whole-file handles only) |
-| `TableFile::open_with_offset_index` / `offset_indexed` | `table.rs` | `open` with the page locations of every column chunk loaded as well (opt-in); whether a handle holds them for every row group it covers |
-| `TableFile::batches_runs` | `table.rs` | stream only the rows of `(rows, keep)` runs of this handle, a whole file or a span, through the footer it already holds, always as a queue of selectors; a page with no kept row is skipped unread on an offset-indexed handle |
-| `TableFile::row_group_parts` / `page_starts` | `table.rs` | a handle cut at the file's row-group boundaries; the handle rows at which a column's data pages begin in every one of its leaves, from the offset index |
+| `TableFile::row_group_parts` | `table.rs` | a handle cut at the file's row-group boundaries |
 | `WriteOptions::metadata` / `TableWriter::with_metadata` / `TableFile::metadata_value` | `table.rs` | record a small fact about the whole table under a key in the footer's key-value metadata, next to the arrow schema; read it back from the footer alone (the overlap loser table names its band tables this way) |
 | `TableFile::str_flat_rows` | `table.rs` | `str_flat` at given rows only: one text arena plus offsets for the picked rows, the same null policy |
 | `TableFile::str_interned` / `str_flat` | `table.rs:2309` / `:2358` | a string column as one id per row plus its distinct values (first appearance), or as one text arena plus offsets; both refuse a NULL with the row |

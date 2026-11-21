@@ -1381,7 +1381,6 @@ moves to another function.
 | `MUMDIA_PYTHON_MS2PIP` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
 | `MUMDIA_PYTHON_PEPTDEEP` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
 | `MUMDIA_PYTHON_RESCORE` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
-| `MUMDIA_QUANT_SELECTIVE_READ` | engine | computed: on (quant skips, unread, the chromatogram data pages that hold no kept row). `0` reads every page of every row group it opens; the outputs are the same (`stages/quant.rs` `selective_read_enabled`) | `rust/mumdia/crates/mumdia/src/stages/quant.rs::selective_read_enabled` |
 | `MUMDIA_REPICK_DUMP` | engine | computed: off. Diagnostic: a path makes `retrace.repick` write every peak it scored there (candidate, order, apex RT, score); the pick is the same either way (`stages/retrace.rs` `repick`) | `rust/mumdia/crates/mumdia/src/stages/retrace.rs::run_hashed` |
 | `MUMDIA_RESCORE_MODEL` | both | `"nn"` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_hashed`, `scripts/mokapot_worker.py::main`, `scripts/mokapot_worker.py::make_model` |
 | `MUMDIA_RTW_FEATURES` | engine | computed: on when unset; `0` leaves the window-scaled RT error family out (`features.rs` `env_families`) | `rust/mumdia/crates/mumdia/src/stages/features.rs::env_families` |
@@ -1406,7 +1405,7 @@ moves to another function.
 | `VIRTUAL_ENV` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
 | `XDG_CACHE_HOME` | engine | computed: set by the desktop environment, often unset; an absolute value puts the engine's caches in `$XDG_CACHE_HOME/mumdia` on Linux when MUMDIA_CACHE_DIR is unset (`cache.rs` `root`) | `rust/mumdia/crates/mumdia/src/cache.rs::root` |
 
-107 variables are read: 45 engine-side, 67 sidecar-side, 5 on both sides.
+106 variables are read: 44 engine-side, 67 sidecar-side, 5 on both sides.
 
 ### Variables the code sets
 
@@ -1482,6 +1481,6 @@ instead of looking like an absent field.
 
 ## Coverage
 
-26 structs and 372 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 50 enumerations, 1 named profile(s), 107 environment variables read and 27 set.
+26 structs and 372 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 50 enumerations, 1 named profile(s), 106 environment variables read and 27 set.
 
 35 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.

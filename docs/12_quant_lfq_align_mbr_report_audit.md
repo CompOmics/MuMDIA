@@ -385,27 +385,15 @@ table, so every extraction loss carries one reason (see the gotchas). Writes
    the table as it always has. The table is read row group by row group
    (`load_chromatograms`). A row group whose `candidate_id` statistics hold no
    accepted id is not opened: its `[min, max]` is tested against the sorted accepted
-   ids, which is sharper than the accepted range as a whole. In an opened group the
-   `candidate_id` column is read first, and then each other column on its own
-   selection, which skips unread every data page of that column that holds no kept
-   row (the offset index gives the page boundaries; `docs/03_io_layer.md`, "Row
-   selections and page skipping"). Rows are never skipped inside a page, which in
-   parquet-rs costs more than decoding them on long traces, and a group with no whole
-   page to skip is read in one pass. The store is the one pass's, field for field, so
-   every output is byte-identical to a full read. How much is skipped depends on how
-   the accepted rows fall against the pages: on the AIF and Astral HYE tables every
-   list page holds an accepted row, so nothing is skipped and the read costs what it
-   did. `MUMDIA_QUANT_SELECTIVE_READ=0` turns the selection off, to time the two reads
-   against each other; the outputs do not change. The ignored test
-   `selective_read_on_a_real_artifact` prints, for a real table and scored table,
-   how many pages hold an accepted row and both load times.
+   ids, which is sharper than the accepted range as a whole. An opened group is read
+   in one pass. A page-selective read of the opened groups
+   (`MUMDIA_QUANT_SELECTIVE_READ`) was removed in 0.15.0: on the AIF and Astral HYE
+   tables every list page held an accepted row, so nothing was skipped and the read
+   cost what it did (`docs/03_io_layer.md`, "Row selections and page skipping").
 
    Both chromatogram layouts are read (docs/15_data_dictionary.md, "Layout v2"). Every
    span quant reads is a whole file or whole row groups, and a v2 span is decoded from
-   its first row by a `chromatograms::Decoder` of its own, in the single pass and in the
-   page-selective read, which reads the four v2 columns (`rt_axis`,
-   `intensity_trimmed`, `trace_offset`, `trace_len`) under the same selection as the
-   other columns. Only kept rows are decoded. That is enough because a
+   its first row by a `chromatograms::Decoder` of its own. Only kept rows are decoded. That is enough because a
    candidate is kept or dropped whole, so a kept candidate's rows in a row group include
    the row that carries its axis. MS1 rows are checked and followed but not rebuilt,
    since quant drops them. The store is the v1 table's, axis ids included, so every

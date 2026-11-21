@@ -1246,11 +1246,6 @@ COMPUTED_ENV_DEFAULTS: dict[str, str] = {
         "min(`--threads`, 8), or min(cores, 8) without `--threads`. `0` or `1` is serial "
         "(`codec.rs` `codec_threads`)"
     ),
-    "MUMDIA_QUANT_SELECTIVE_READ": (
-        "on (quant skips, unread, the chromatogram data pages that hold no kept row). "
-        "`0` reads every page of every row group it opens; the outputs are the same "
-        "(`stages/quant.rs` `selective_read_enabled`)"
-    ),
     "MUMDIA_REPICK_DUMP": (
         "off. Diagnostic: a path makes `retrace.repick` write every peak it scored there "
         "(candidate, order, apex RT, score); the pick is the same either way "
