@@ -7355,7 +7355,7 @@ const RETIRED: &[Retired] = &[
     Retired {
         path: "features.bound_from_confident",
         gone: Gone::Key("false"),
-        why: "one elution half-width learned from the confident anchors measured 2.20% fewer               peptides than per-candidate bounds and cut 20-26% of peaks short (docs/10,               elution-peak bounds)",
+        why: "one elution half-width learned from the confident anchors measured 2.20% fewer peptides than per-candidate bounds and cut 20-26% of peaks short (docs/10, elution-peak bounds)",
     },
     Retired {
         path: "features.bound_confident_pct",
@@ -7365,12 +7365,12 @@ const RETIRED: &[Retired] = &[
     Retired {
         path: "groups.calibration",
         gone: Gone::Value("\"per_group\""),
-        why: "calibrating each band on its own seed was kept only for comparison, and bands               without anchors stopped the run (docs/33_window_groups.md section 4)",
+        why: "calibrating each band on its own seed was kept only for comparison, and bands without anchors stopped the run (docs/33_window_groups.md section 4)",
     },
     Retired {
         path: "groups.rt_adaptation",
         gone: Gone::Value("\"per_band\""),
-        why: "one sidecar per band measured slower than once_per_run with the same peptides               (docs/33_window_groups.md section 4b)",
+        why: "one sidecar per band measured slower than once_per_run with the same peptides (docs/33_window_groups.md section 4b)",
     },
 
     // D: MS1 surface, never-read keys and refused choices
