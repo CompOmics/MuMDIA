@@ -661,7 +661,7 @@ and the pools are sorted.
 
 The classifier reads every column of the competed table's feature list (its `.schema.json`
 companion), so a family the features stage appends (`features.q1_fragment_features`,
-`features.ms1_envelope`, `features.q1_consistency`, ...) reaches it without a rescore change.
+`features.q1_precursor`, `features.q1_consistency`, ...) reaches it without a rescore change.
 The rescore prefilter (`rescore.prefilter_keep_decoys`, on for pools of at least
 `rescore.prefilter_min_psms` PSMs, docs/35_diapasef.md section 16) does not: its logistic
 regression reads `rescore.prefilter_features`, a fixed default list of 32 columns when unset,

@@ -66,10 +66,11 @@ recipe (`configs/examples/diann-library.json`) resolved on a ZT Scan run has exa
 canonical configuration of `ztscan.json`, and so the same configuration hash and the same
 tables (section 12). What stays opt-in, as before: the classifier's sensitivity settings
 (section 4), the counts of Q1-consistent peaks (`extract.q1_deconvolved`,
-`search_seed.q1_deconvolved`, section 10.3), `features.ms1_envelope`, `quant.q1_fragments`,
+`search_seed.q1_deconvolved`, section 10.3), `quant.q1_fragments`,
 the separable model (`features.q1_separable`) of section 15, and the MS1 calibration keys of
 docs/09 section 11. The Q1 sweep keys (`extract.q1_cycles`, `extract.q1_profile`,
-`extract.q1_gate_max_offset`, `features.q1_features`) were removed in 0.15.0.
+`extract.q1_gate_max_offset`, `features.q1_features`) and `features.ms1_envelope` were removed
+in 0.15.0.
 
 **Spelling, and the configuration hash.** Each switch takes `"auto"`, `true` or `false`;
 `quant.q1_cycle_halfwidth` a number of cycles (0 is off), `"auto"` or `null`;
@@ -231,7 +232,7 @@ files"). The others stay opt-in.
 | the Q1 term of shadow demotion | `rescore.shadow_q1` | docs/11, "shadow demotion and its Q1 term" | counts within noise; lowers the entrapment precursors at 1% (the measured FDP at a reported 1%: 1.29% to 1.22%) | yes |
 | quantify from the fragments that belong | `quant.q1_fragments` | docs/12, "Quantification from the fragments that belong" | replicate CV 0.120 against 0.273; restricting to belonging fragments costs precision against the collapse alone; the known-ratio gate is open | no |
 | the quantification window in Q1 cycles | `quant.q1_cycle_halfwidth` | section 6 below | replicate CV 0.102 at 4 cycles against 0.273, the identifications unchanged | yes (4) |
-| an MS1 isotope-envelope family | `features.ms1_envelope` | docs/10 | within noise (+0.01% at matched FDP) | no |
+| an MS1 isotope-envelope family | `features.ms1_envelope` | docs/10 | within noise (+0.01% at matched FDP) | removed in 0.15.0 |
 | the unfragmented precursor's Q1 profile in MS2 | `features.q1_precursor` | docs/09, section 14 | +0.13% precursors, +0.65% human precursors at matched FDP, inside the seed spread; in the three-family set it carries 0.16% | yes |
 | multi-scale Q1 scores (3, 7, 11 steps) | `features.q1_multiscale` | docs/09, section 14 | +0.32% / +0.09%, inside the seed spread; nothing on top of the other two | yes |
 | Q1-deconvolved evidence as features | `features.q1_deconvolved` | docs/09, section 14 | +0.51% precursors, +0.64% at matched FDP, just beyond the seed spread | yes |
@@ -680,7 +681,6 @@ byte; 2 is the setting to take when extract's time matters more than half a perc
   the fixed window; its three companions without it.
 - `quant.q1_cycle_halfwidth` without the scan form of the fixed window or with
   `fixed_scan_halfwidth_scale`; `mumdia quant` with it and no `--spectra-ms2`.
-- `features.ms1_envelope` on spectra with 1/K0 and with window groups.
 - `extract.q1_traces` set to `true` and `features.q1_separable` on any input that is not a ZT
   Scan run, and either without `extract.q1_fragments`.
 - `features.q1_precursor`, `features.q1_multiscale` and `features.q1_deconvolved` without

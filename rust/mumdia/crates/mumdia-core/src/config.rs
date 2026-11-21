@@ -2413,11 +2413,6 @@ pub struct ExtractConfig {
     /// configuration file.
     #[serde(skip)]
     pub q1_repick_peaks: usize,
-    /// `features.ms1_envelope`, handed to extract by the same callers: extract reads the MS1
-    /// isotope-envelope evidence that family derives its features from (psms_extracted v7,
-    /// `stages::ms1env`). Never read from a configuration file.
-    #[serde(skip)]
-    pub ms1_envelope: bool,
     /// Scanning-quadrupole spectra: count a peak for a candidate only when its Q1 centroid
     /// (the intensity-weighted mean step target of its trace along the Q1 axis within one
     /// cycle, `stages::q1dec`) lies within the tolerance the Q1 calibration learns from the
@@ -2981,14 +2976,13 @@ impl ExtractConfig {
     }
 
     /// Copy the `features` and `retrace` keys extract reads into their mirror fields
-    /// (`ms1_envelope`, `q1_precursor`, `q1_multiscale`, `q1_dec_features`, `q1_separable`,
+    /// (`q1_precursor`, `q1_multiscale`, `q1_dec_features`, `q1_separable`,
     /// and `q1_repick` / `q1_repick_peaks` under `q1_fragments`). The orchestrated chain and
     /// the standalone `mumdia extract` both reach it through `q1frag::configure_extract`, so
     /// the two write the same evidence.
     /// `q1_model` and `q1_dec_tol_steps` come from the run's `cal.json` and stay with the
     /// callers.
     pub fn set_search_keys(&mut self, cfg: &Config) {
-        self.ms1_envelope = cfg.features.ms1_envelope;
         self.q1_precursor = cfg.features.q1_precursor.on();
         self.q1_multiscale = cfg.features.q1_multiscale.on();
         self.q1_dec_features = cfg.features.q1_deconvolved.on();
@@ -3047,7 +3041,6 @@ impl Default for ExtractConfig {
             q1_model: None,
             q1_repick: false,
             q1_repick_peaks: Q1_REPICK_PEAKS,
-            ms1_envelope: false,
             q1_deconvolved: false,
             q1_dec_tol_steps: None,
             q1_precursor: false,
@@ -3255,24 +3248,6 @@ pub struct FeaturesConfig {
     /// configuration unless on.
     #[serde(skip_serializing_if = "ZtSwitch::omitted")]
     pub q1_fragment_features: ZtSwitch,
-    /// The MS1 isotope-envelope family (`ms1e_*`): extract reads the precursor's isotopes
-    /// M-1 to M+4 and the half-spacing positions in the MS1 scans around the apex (the
-    /// nearest one and two either side), at the calibrated MS1 m/z (`extract.ms1_calibrate`,
-    /// the surface under `"surface"`) within twice `extract.prec_tol_ppm` (at least 10 ppm),
-    /// and writes the evidence to psms_extracted v7; the features stage derives the envelope's
-    /// agreement with the averagine envelope over five isotopes (`ms1e_env_r2`), the isotopes
-    /// found in a row from M0 (`ms1e_env_n`), the M-1 share (`ms1e_m1_share`), the share at
-    /// the half-spacing positions (`ms1e_half_share`, a species of twice the charge), the
-    /// spacing error of the isotopes found (`ms1e_spacing_ppm`), the monoisotopic m/z error
-    /// after the calibration (`ms1e_mono_ppm`, signed, and `ms1e_mono_ppm_abs`), the observed
-    /// envelope's mean isotope index against averagine (`ms1e_ibar_dev`) and, under
-    /// `extract.q1_fragments`, the fitted Q1 centre against the centre the observed envelope
-    /// predicts (`ms1e_q1_agree`, steps; 0 without the decisions), appended after every other
-    /// column of the `extended` set. Refused on spectra that carry 1/K0. Default false.
-    /// Benchmark-gated (docs/10_features.md). Omitted from the canonical configuration at
-    /// its default.
-    #[serde(skip_serializing_if = "is_false")]
-    pub ms1_envelope: bool,
     /// The unfragmented-precursor family of scanning-quadrupole spectra (`q1p_*`): extract reads
     /// the precursor's own m/z (M0, M+1, M+2, at the calibrated fragment m/z) in every cell of the
     /// per-fragment decision's RT x step patch, where each isotope is transmitted at its own Q1
@@ -3375,7 +3350,6 @@ impl Default for FeaturesConfig {
             chrom_loaders: 3,
             im_features: ImFeatures::Off,
             q1_fragment_features: ZtSwitch::Auto,
-            ms1_envelope: false,
             q1_precursor: ZtSwitch::Auto,
             q1_multiscale: ZtSwitch::Auto,
             q1_deconvolved: ZtSwitch::Auto,
@@ -6950,13 +6924,6 @@ impl Config {
         // What each key of the ZT Scan analysis reads (`validate_ztscan`), checked again
         // once `"auto"` is resolved.
         self.validate_ztscan()?;
-        if self.features.ms1_envelope && self.groups.window_groups > 1 {
-            return Err(Invalid(
-                "features.ms1_envelope reads its evidence in the extract of an ungrouped run; \
-                 it is not supported with groups.window_groups > 1"
-                    .into(),
-            ));
-        }
         if self.search_seed.q1_deconvolved && self.search_seed.count_fragments_once {
             return Err(Invalid(
                 "search_seed.q1_deconvolved counts every matching peak near the candidate's Q1 \
@@ -7762,6 +7729,11 @@ const RETIRED: &[Retired] = &[
         path: "features.q1_features",
         gone: Gone::Key("false"),
         why: "the Q1-profile family measured inside seed noise (docs/09_extract.md section 10)",
+    },
+    Retired {
+        path: "features.ms1_envelope",
+        gone: Gone::Key("false"),
+        why: "the MS1 isotope-envelope family measured inside seed noise (docs/10_features.md, ms1_envelope)",
     },
 
     // B: quantification options
@@ -9071,27 +9043,20 @@ mod tests {
         );
     }
 
-    /// The phase-3 keys of the ZT Scan plan (`quant.q1_*`, `features.ms1_envelope`) are
-    /// omitted at their defaults, part of the identity when set, and refused without what
-    /// they read or with what they cannot combine with; extract's hidden switch never reaches
-    /// the configuration.
+    /// The phase-3 keys of the ZT Scan plan (`quant.q1_*`) are omitted at their defaults,
+    /// part of the identity when set, and refused without what they read or with what they
+    /// cannot combine with.
     #[test]
-    fn the_q1_quant_and_ms1_envelope_keys_leave_the_default_config_hash_alone() {
+    fn the_q1_quant_keys_leave_the_default_config_hash_alone() {
         assert_eq!(QuantConfig::default().q1_min_belonging, Q1_MIN_BELONGING);
         let canon = Config::default().canonical_json();
-        for key in [
-            "q1_min_belonging",
-            "q1_step_weights",
-            "q1_integration",
-            "ms1_envelope",
-        ] {
+        for key in ["q1_min_belonging", "q1_step_weights", "q1_integration"] {
             assert!(!canon.contains(key), "{key}: {canon}");
         }
         let base = r#""rt_im_train":{"q1_calibrate":true},"extract":{"q1_fragments":true}"#;
         let on = Config::from_json(&format!(
             r#"{{{base},"quant":{{"q1_fragments":true,"q1_min_belonging":4,
-                "q1_step_weights":"uniform","q1_integration":"elution_fit"}},
-                "features":{{"ms1_envelope":true}}}}"#
+                "q1_step_weights":"uniform","q1_integration":"elution_fit"}}}}"#
         ))
         .unwrap();
         assert_eq!(on.quant.q1_min_belonging, 4);
@@ -9102,7 +9067,6 @@ mod tests {
             r#""q1_min_belonging":4"#,
             r#""q1_step_weights":"uniform""#,
             r#""q1_integration":"elution_fit""#,
-            r#""ms1_envelope":true"#,
         ] {
             assert!(c.contains(key), "{key}: {c}");
         }
@@ -9111,10 +9075,6 @@ mod tests {
             Config::from_json(&format!(r#"{{{base},"quant":{{"q1_fragments":true}}}}"#)).unwrap();
         let qc = q.canonical_json();
         assert!(!qc.contains("q1_min_belonging") && !qc.contains("q1_integration"));
-        let mut hidden = on.clone();
-        hidden.extract.ms1_envelope = true;
-        assert_eq!(hidden.canonical_json(), c);
-        assert!(Config::from_json(r#"{"features":{"ms1_envelope":true}}"#).is_ok());
         for bad in [
             r#"{"quant":{"q1_fragments":true}}"#.to_string(),
             format!(
@@ -9129,7 +9089,6 @@ mod tests {
             r#"{"quant":{"q1_min_belonging":4}}"#.to_string(),
             r#"{"quant":{"q1_step_weights":"uniform"}}"#.to_string(),
             r#"{"quant":{"q1_integration":"elution_fit"}}"#.to_string(),
-            r#"{"features":{"ms1_envelope":true},"groups":{"window_groups":2}}"#.to_string(),
         ] {
             assert!(refused_standalone(&bad), "{bad} must be refused");
         }

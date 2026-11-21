@@ -13,7 +13,6 @@ pub mod library_build;
 pub mod localise;
 pub mod mobilogram;
 pub mod ms1cal;
-pub mod ms1env;
 pub mod peptidoforms;
 pub mod pool;
 pub mod predict_frag;

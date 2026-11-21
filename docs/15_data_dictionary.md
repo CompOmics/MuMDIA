@@ -459,7 +459,8 @@ and the columns are not written, so the default schema stays byte-identical:
 | `gate_spectral_entropy` | Float32 | no | similarity | apex spectral-entropy similarity (sqrt) |
 
 Conditional columns of v7, appended last only under `features.ms1_envelope` (spectra without
-1/K0; docs/09_extract.md, section 13). The MS1 scan nearest the row's apex and two either side
+1/K0; docs/09_extract.md, section 13), which 0.15.0 removed; tables written before it still
+read. The MS1 scan nearest the row's apex and two either side
 are read at the calibrated MS1 m/z, within twice `extract.prec_tol_ppm` and at least 10 ppm:
 
 | column | Arrow type | nullable | units | meaning |

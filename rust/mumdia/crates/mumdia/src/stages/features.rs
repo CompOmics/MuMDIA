@@ -318,14 +318,9 @@ pub const Q1F_FEATURES: &[&str] = &[
     "q1f_centre",
 ];
 
-/// The MS1 isotope-envelope family (`features.ms1_envelope`, [`super::ms1env`]), derived
-/// from the psms_extracted v7 evidence, appended after every other column of the `extended`
-/// set (after [`Q1F_FEATURES`] when that is on).
-pub const MS1E_FEATURES: &[&str] = super::ms1env::FEATURES;
-
 /// The unfragmented-precursor family (`features.q1_precursor`, [`super::q1score`]): the
 /// psms_extracted v8 columns of the same names, appended after every other column of the
-/// `extended` set (after [`MS1E_FEATURES`] when that is on).
+/// `extended` set (after [`Q1F_FEATURES`] when that is on).
 pub const Q1P_FEATURES: &[&str] = super::q1score::Q1P_COLUMNS;
 
 /// The Q1-deconvolved evidence family (`features.q1_deconvolved`, [`super::q1dec`]): the
@@ -364,8 +359,6 @@ pub fn active_features(set: FeatureSet, im: impl Into<ImFamily>) -> Vec<String> 
 pub struct Q1Families {
     /// `features.q1_fragment_features` ([`Q1F_FEATURES`]).
     pub q1f: bool,
-    /// `features.ms1_envelope` ([`MS1E_FEATURES`]).
-    pub ms1e: bool,
     /// `features.q1_precursor` ([`Q1P_FEATURES`]).
     pub q1p: bool,
     /// `features.q1_multiscale` ([`q1m_features`]).
@@ -383,7 +376,6 @@ impl Q1Families {
     pub fn of(cfg: &FeaturesConfig) -> Q1Families {
         Q1Families {
             q1f: cfg.q1_fragment_features.on(),
-            ms1e: cfg.ms1_envelope,
             q1p: cfg.q1_precursor.on(),
             q1m: cfg.q1_multiscale.on(),
             q1d: cfg.q1_deconvolved.on(),
@@ -402,7 +394,6 @@ pub fn active_features_fam(
 ) -> Vec<String> {
     let Q1Families {
         q1f,
-        ms1e,
         q1p,
         q1m,
         q1d,
@@ -429,9 +420,6 @@ pub fn active_features_fam(
         v.push("cross_charge_intensity_log".to_string());
         if q1f {
             v.extend(Q1F_FEATURES.iter().map(|s| s.to_string()));
-        }
-        if ms1e {
-            v.extend(MS1E_FEATURES.iter().map(|s| s.to_string()));
         }
         if q1p {
             v.extend(Q1P_FEATURES.iter().map(|s| s.to_string()));
@@ -2207,10 +2195,9 @@ macro_rules! col_ix {
             $($field: Option<usize>,)*
             /// One entry per extended-battery feature, in registry order.
             ext: Vec<Option<usize>>,
-            // One entry per name of `Q1F_FEATURES`, `MS1E_FEATURES` and `Q1C_FEATURES`, in
-            // list order: a family's k-th value goes under its k-th name.
+            // One entry per name of `Q1F_FEATURES` and `Q1C_FEATURES`, in list order: a
+            // family's k-th value goes under its k-th name.
             q1f: Vec<Option<usize>>,
-            ms1e: Vec<Option<usize>>,
             q1c: Vec<Option<usize>>,
         }
 
@@ -2228,7 +2215,6 @@ macro_rules! col_ix {
                     $($field: idx.get(stringify!($field)).copied(),)*
                     ext: by_name(ext_names),
                     q1f: by_name(Q1F_FEATURES),
-                    ms1e: by_name(MS1E_FEATURES),
                     q1c: by_name(Q1C_FEATURES),
                 }
             }
@@ -2237,7 +2223,7 @@ macro_rules! col_ix {
             #[cfg(test)]
             fn named(&self) -> Vec<Option<usize>> {
                 let mut v = vec![$(self.$field,)*];
-                for f in [&self.q1f, &self.ms1e, &self.q1c] {
+                for f in [&self.q1f, &self.q1c] {
                     v.extend(f.iter().copied());
                 }
                 v
@@ -3557,33 +3543,6 @@ fn run_chunked(
         "features.q1_fragment_features",
         "extract writes the per-fragment Q1 decision columns under extract.q1_fragments",
     )?;
-    // The MS1 isotope-envelope family (`features.ms1_envelope`): its features per row, from
-    // the psms_extracted v7 evidence and the row's precursor m/z and charge
-    // (`ms1env::values`), one column per feature.
-    let ms1e_cols: Vec<Vec<f64>> = if p.cfg.ms1_envelope {
-        let ev = read_on(
-            true,
-            &super::ms1env::EVIDENCE_COLUMNS[..],
-            "features.ms1_envelope",
-            "extract writes the MS1 isotope-envelope evidence under features.ms1_envelope",
-        )?;
-        let mut cols = vec![Vec::with_capacity(ps.nrows); MS1E_FEATURES.len()];
-        for i in 0..ps.nrows {
-            let mut e = [0.0f64; 16];
-            for (k, x) in e.iter_mut().enumerate() {
-                *x = ev[k][i];
-            }
-            for (col, v) in cols
-                .iter_mut()
-                .zip(super::ms1env::values(&e, mz[i], charge[i]))
-            {
-                col.push(v);
-            }
-        }
-        cols
-    } else {
-        Vec::new()
-    };
     // The unfragmented-precursor and multi-scale Q1 families (`features.q1_precursor`,
     // `features.q1_multiscale`) from psms_extracted v8; empty with every key off.
     let q1s_names = q1s_feature_names(p.cfg);
@@ -4309,11 +4268,7 @@ fn run_chunked(
                         put(ix.cross_charge_intensity_log, f_cross_charge_int[i]);
                         // The families appended last, by name: value k under the k-th
                         // column its list names (none while a family is off).
-                        for (cs_ix, vals) in [
-                            (&ix.q1f, &q1f_cols),
-                            (&ix.ms1e, &ms1e_cols),
-                            (&q1s_ix, &q1s_cols),
-                        ] {
+                        for (cs_ix, vals) in [(&ix.q1f, &q1f_cols), (&q1s_ix, &q1s_cols)] {
                             for (c, col) in cs_ix.iter().zip(vals) {
                                 put(*c, col[i]);
                             }
@@ -6206,7 +6161,6 @@ mod tests {
             false,
             Q1Families {
                 q1f: true,
-                ms1e: false,
                 q1p: true,
                 q1m: false,
                 q1d: false,
@@ -6219,7 +6173,6 @@ mod tests {
             false,
             Q1Families {
                 q1f: true,
-                ms1e: false,
                 q1p: false,
                 q1m: true,
                 q1d: false,
@@ -6232,7 +6185,6 @@ mod tests {
             false,
             Q1Families {
                 q1f: true,
-                ms1e: false,
                 q1p: true,
                 q1m: true,
                 q1d: false,
@@ -6254,7 +6206,6 @@ mod tests {
                 false,
                 Q1Families {
                     q1f: true,
-                    ms1e: false,
                     q1p: false,
                     q1m: false,
                     q1d: false,
@@ -6271,7 +6222,6 @@ mod tests {
                     false,
                     Q1Families {
                         q1f: true,
-                        ms1e: false,
                         q1p: true,
                         q1m: true,
                         q1d: false,
@@ -6301,77 +6251,6 @@ mod tests {
         assert_eq!(q1s_feature_names(&cfg), &pmd[q1f.len()..]);
     }
 
-    /// The MS1 isotope-envelope family is appended last under the extended set only (after
-    /// both Q1 families when they are on), every column is written, and the schema id
-    /// changes only with it on.
-    #[test]
-    fn the_ms1e_family_is_appended_last_and_only_when_asked() {
-        let off = active_features(FeatureSet::Extended, false);
-        let on = active_features_fam(
-            FeatureSet::Extended,
-            false,
-            Q1Families {
-                ms1e: true,
-                ..Default::default()
-            },
-        );
-        assert_eq!(on.len(), off.len() + MS1E_FEATURES.len());
-        assert_eq!(&on[..off.len()], &off[..]);
-        assert_eq!(&on[off.len()..], MS1E_FEATURES);
-        let all = active_features_fam(
-            FeatureSet::Extended,
-            false,
-            Q1Families {
-                q1f: true,
-                ms1e: true,
-                ..Default::default()
-            },
-        );
-        let q1_both = active_features_fam(
-            FeatureSet::Extended,
-            false,
-            Q1Families {
-                q1f: true,
-                ..Default::default()
-            },
-        );
-        assert_eq!(&all[..q1_both.len()], &q1_both[..]);
-        assert_eq!(&all[q1_both.len()..], MS1E_FEATURES);
-        for set in [FeatureSet::Minimal, FeatureSet::Rich] {
-            assert_eq!(
-                active_features_fam(
-                    set,
-                    false,
-                    Q1Families {
-                        q1f: true,
-                        ms1e: true,
-                        ..Default::default()
-                    }
-                ),
-                active_features(set, false)
-            );
-        }
-        for cols in [&on, &all] {
-            let ix = ColIx::new(cols, &extended_name_refs(false));
-            let mut seen: Vec<usize> = ix
-                .named()
-                .into_iter()
-                .chain(ix.ext.iter().copied())
-                .flatten()
-                .collect();
-            seen.sort_unstable();
-            assert_eq!(seen, (0..cols.len()).collect::<Vec<_>>());
-        }
-        let mut cfg = FeaturesConfig {
-            set: FeatureSet::Extended,
-            ..FeaturesConfig::default()
-        };
-        assert_eq!(active_features_for(&cfg, false), off);
-        cfg.ms1_envelope = true;
-        assert_eq!(active_features_for(&cfg, false), on);
-        assert_ne!(feature_schema_id(&on), feature_schema_id(&off));
-    }
-
     /// The Q1-consistency family is appended last under the extended set only (after every
     /// other optional family when they are on), each of its fields resolves to the column of
     /// its own name in `Q1C_FEATURES` order, every column is written, and the schema id
@@ -6395,7 +6274,6 @@ mod tests {
             false,
             Q1Families {
                 q1f: true,
-                ms1e: true,
                 q1c: true,
                 ..Default::default()
             },
@@ -6405,7 +6283,6 @@ mod tests {
             false,
             Q1Families {
                 q1f: true,
-                ms1e: true,
                 ..Default::default()
             },
         );
@@ -6418,7 +6295,6 @@ mod tests {
                     false,
                     Q1Families {
                         q1f: true,
-                        ms1e: true,
                         q1c: true,
                         ..Default::default()
                     }

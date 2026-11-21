@@ -3186,21 +3186,6 @@
       ]
     },
     {
-      "path": "features.ms1_envelope",
-      "name": "ms1_envelope",
-      "section": "features",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "The MS1 isotope-envelope family (`ms1e_*`): extract reads the precursor's isotopes M-1 to M+4 and the half-spacing positions in the MS1 scans around the apex (the nearest one and two either side), at the calibrated MS1 m/z (`extract.ms1_calibrate`, the surface under `\"surface\"`) within twice `extract.prec_tol_ppm` (at least 10 ppm), and writes the evidence to psms_extracted v7; the features stage derives the envelope's agreement with the averagine envelope over five isotopes (`ms1e_env_r2`), the isotopes found in a row from M0 (`ms1e_env_n`), the M-1 share (`ms1e_m1_share`), the share at the half-spacing positions (`ms1e_half_share`, a species of twice the charge), the spacing error of the isotopes found (`ms1e_spacing_ppm`), the monoisotopic m/z error after the calibration (`ms1e_mono_ppm`, signed, and `ms1e_mono_ppm_abs`), the observed envelope's mean isotope index against averagine (`ms1e_ibar_dev`) and, under `extract.q1_fragments`, the fitted Q1 centre against the centre the observed envelope predicts (`ms1e_q1_agree`, steps; 0 without the decisions), appended after every other column of the `extended` set. Refused on spectra that carry 1/K0. Default false. Benchmark-gated (docs/10_features.md). Omitted from the canonical configuration at its default.",
-      "gates": [
-        "benchmark-gated"
-      ],
-      "source_struct": "FeaturesConfig"
-    },
-    {
       "path": "features.q1_precursor",
       "name": "q1_precursor",
       "section": "features",

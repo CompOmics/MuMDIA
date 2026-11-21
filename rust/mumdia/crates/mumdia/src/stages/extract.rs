@@ -3738,8 +3738,6 @@ struct CandOut {
     im: ApexIm,
     /// The per-fragment Q1 decision (psms_extracted v6, `extract.q1_fragments`).
     q1f: Option<q1frag::Q1fRow>,
-    /// The MS1 isotope-envelope evidence (psms_extracted v7, `features.ms1_envelope`).
-    ms1e: Option<crate::stages::ms1env::Ms1Env>,
     /// (cid, frag_name, frag_mz, frag_obs_mz, predicted_intensity, rt, intensity, im)
     chrom: Vec<ChromOutputRow>,
     /// Under `extract.q1_traces`: the same rows on Q1 cycles (`chromatograms_q1.parquet`), and
@@ -3810,8 +3808,6 @@ struct PsmRows {
     deconv_shadow: Vec<f32>,
     /// One per row under `extract.q1_fragments`, empty otherwise.
     q1f: Vec<q1frag::Q1fRow>,
-    /// One per row under `features.ms1_envelope`, empty otherwise.
-    ms1e: Vec<crate::stages::ms1env::Ms1Env>,
 }
 
 impl PsmRows {
@@ -3868,9 +3864,6 @@ impl PsmRows {
         }
         if cfg.q1_fragments.on() {
             self.q1f.push(r.q1f.unwrap_or_default());
-        }
-        if cfg.ms1_envelope {
-            self.ms1e.push(r.ms1e.unwrap_or_default());
         }
     }
 
@@ -4065,17 +4058,6 @@ impl PsmRows {
             cols.push(Col::ListF32("q1f_frag_offset".into(), of));
             cols.push(Col::ListF32("q1f_frag_resid".into(), rs));
             cols.push(Col::ListF32("q1f_frag_corr2d".into(), cr));
-        }
-        // psms_extracted v7: the MS1 isotope-envelope evidence, appended last, only under
-        // `features.ms1_envelope`.
-        if cfg.ms1_envelope {
-            let e = take(&mut self.ms1e);
-            for (k, name) in crate::stages::ms1env::EVIDENCE_COLUMNS.iter().enumerate() {
-                cols.push(Col::F64(
-                    (*name).into(),
-                    e.iter().map(|x| x.columns()[k]).collect(),
-                ));
-            }
         }
         // psms_extracted v8: the unfragmented-precursor evidence and the multi-scale Q1
         // scores, appended last, each only under its key (`stages::q1score`).
@@ -4623,13 +4605,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         }
     }
 
-    // `features.ms1_envelope` reads the MS1 of spectra without 1/K0 only.
-    if p.cfg.ms1_envelope && has_im {
-        anyhow::bail!(
-            "extract: features.ms1_envelope reads the MS1 isotope envelope of spectra without \
-             1/K0, and these carry it (diaPASEF); unset it for them"
-        );
-    }
     // The unfragmented-precursor and multi-scale Q1 scores (`features.q1_precursor`,
     // `features.q1_multiscale`) are read on the per-fragment decision's patches.
     if (p.cfg.q1_precursor || p.cfg.q1_multiscale) && !p.cfg.q1_fragments.on() {
@@ -5610,44 +5585,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             })
         };
         let q1f_0 = q1f_at(apex_rt);
-        // `features.ms1_envelope` (`stages::ms1env`): the MS1 isotope-envelope evidence of a
-        // row with its apex at `rt`, at the calibrated MS1 m/z of each scan read, and under
-        // `extract.q1_fragments` the agreement of the row's fitted Q1 centre (when the row has
-        // a fit) with the centre its observed envelope predicts. `None` with the key off.
-        let ms1e_at =
-            |rt: f64, q1f: Option<&q1frag::Q1fRow>| -> Option<crate::stages::ms1env::Ms1Env> {
-                if !p.cfg.ms1_envelope {
-                    return None;
-                }
-                let tol = crate::stages::ms1env::search_tol(p.cfg.prec_tol_ppm);
-                if ms1_scans.is_empty() {
-                    return Some(crate::stages::ms1env::Ms1Env {
-                        tol_ppm: tol,
-                        ..Default::default()
-                    });
-                }
-                let j = nearest_index(&ms1_rts, rt);
-                let mut e = crate::stages::ms1env::read(
-                    ms1_scans,
-                    j,
-                    c.precursor_mz,
-                    c.charge,
-                    tol,
-                    &|mz, r| p.cfg.ms1_shift(mz, r),
-                );
-                if let (Some(q), Some(x)) = (q1f, q1f_ctx.as_ref()) {
-                    if q.summary.fit_resid < 1.0 {
-                        e.q1_agree = crate::stages::ms1env::q1_agree(
-                            &e,
-                            c.precursor_mz,
-                            c.charge,
-                            q.summary.centre,
-                            x.model.step_mz,
-                        );
-                    }
-                }
-                Some(e)
-            };
         // `retrace.q1_repick`: extract's apex and the next peaks of the count profile (those
         // whose envelope does not hold the apex) are scored by the fragments that belong at
         // each (`q1frag::repick_score`), and the apex moves to the best one's 2D apex: the
@@ -6146,7 +6083,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             deconv_collin: deconv_collin as f32,
             deconv_shadow: deconv_shadow as f32,
             im: im0,
-            ms1e: ms1e_at(row_apex_rt, q1f_out.as_ref()),
             q1f: q1f_out,
             chrom: chrom_rows,
             chrom_q1,
@@ -6207,7 +6143,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             let alt_apex_int: f32 = groups.sum(pk.apex_idx);
             let (a_m1, a_mono, a_i1, a_i2) = ms1_at(alt_apex_rt);
             let a_q1f = q1f_row(q1f_at(alt_apex_rt).as_ref());
-            let a_ms1e = ms1e_at(alt_apex_rt, a_q1f.as_ref());
             out.push(CandOut {
                 cid,
                 peak_rank: rank,
@@ -6246,7 +6181,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 deconv_shadow: 0.0,
                 im: im_at(alt_apex_rt),
                 q1f: a_q1f,
-                ms1e: a_ms1e,
                 chrom: Vec::new(), // shared per-candidate via the rank-0 row
                 chrom_q1: Vec::new(),
                 chrom_q1_class: Vec::new(),
@@ -6757,7 +6691,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 has_im,
                 false,
                 p.cfg.q1_fragments.on(),
-                p.cfg.ms1_envelope,
+                false,
                 p.cfg.q1_fragments.on()
                     && (p.cfg.q1_precursor || p.cfg.q1_multiscale || p.cfg.q1_dec_features),
                 p.cfg.q1_fragments.on() && p.cfg.q1_separable,
@@ -6863,20 +6797,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                         "step_mz": g.dec.step_mz,
                         "valley": crate::stages::q1dec::VALLEY,
                         "evidence_cycles": 2 * crate::stages::q1dec::EVIDENCE_CYCLES + 1,
-                    }),
-                );
-            }
-        }
-        // The MS1 isotope-envelope evidence (`features.ms1_envelope`), only then, so a report
-        // without it is unchanged.
-        if p.cfg.ms1_envelope {
-            if let Some(obj) = params.as_object_mut() {
-                obj.insert(
-                    "ms1_envelope".into(),
-                    json!({
-                        "tol_ppm": crate::stages::ms1env::search_tol(p.cfg.prec_tol_ppm),
-                        "scans_either_side": crate::stages::ms1env::ENV_SCANS,
-                        "isotopes": "M-1 to M+4, and the half-spacing positions above M0 and M+1",
                     }),
                 );
             }
@@ -8497,7 +8417,6 @@ mod psms_stream_tests {
                 im_pred_cal: (!i.is_multiple_of(13)).then_some(1.0 + f * 1e-6),
             },
             q1f: None,
-            ms1e: None,
             chrom: Vec::new(),
             chrom_q1: Vec::new(),
             chrom_q1_class: Vec::new(),

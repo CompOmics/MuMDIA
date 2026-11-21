@@ -88,8 +88,8 @@ pub mod artifact {
     /// per library fragment in the library's order, appended last. Readers select columns
     /// by name.
     pub const PSMS_EXTRACTED_V6: (&str, u32) = ("psms_extracted", 6);
-    /// v7, written only under `features.ms1_envelope` (spectra without 1/K0): the table of
-    /// v2, v5 or v6 plus the MS1 isotope-envelope evidence, appended last: per row the
+    /// v7, written only under `features.ms1_envelope` until 0.15.0 removed it (spectra
+    /// without 1/K0): the table of v2, v5 or v6 plus the MS1 isotope-envelope evidence, appended last: per row the
     /// summed intensity and the intensity-weighted ppm error of the isotopes M-1 to M+4 over
     /// the MS1 scans around the apex (`ms1e_i_m1`, `ms1e_i_0` .. `ms1e_i_4`, `ms1e_ppm_m1`,
     /// `ms1e_ppm_0` .. `ms1e_ppm_4`; NaN error where an isotope is not found), the summed

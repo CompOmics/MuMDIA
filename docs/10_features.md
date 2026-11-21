@@ -752,42 +752,13 @@ Scan run with `extract.q1_fragments`: +1.45% precursors (mean of four NN seeds, 
 seed range), +1.26% human precursors on an entrapment library at the base arm's measured FDP;
 with `retrace.q1_repick` +2.96%.
 
-### ms1_envelope (9; `features.ms1_envelope`)
+### ms1_envelope (removed in 0.15.0)
 
-In the battery only when `features.ms1_envelope` is on (`false` by default), appended after
-every other column of the `extended` set, after both Q1 families when they are on
-(`MS1E_FEATURES`, `stages/ms1env.rs`); `minimal` and `rich` ignore the switch. The `ms1`
-family reads the precursor at the apex alone: three isotopes and M-1, each the summed
-intensity within `extract.prec_tol_ppm` in the nearest MS1 scan, and no m/z, so an
-interfering peak inside the tolerance counts as the precursor's. This family reads, in the
-MS1 scans around the apex (the nearest one and two either side), the peak NEAREST each of the
-isotopes M-1 to M+4 and the half-spacing positions above M0 and M+1, at the calibrated MS1 m/z
-of each scan (`extract.ms1_calibrate`, the per-m/z and per-retention-time surface under
-`"surface"`), within twice `extract.prec_tol_ppm` and at least 10 ppm, so the m/z error is
-measured rather than cut at the tolerance. Extract writes that evidence to psms_extracted v7
-(docs/09_extract.md, section 13; `ExtractConfig::ms1_envelope`, which `run`,
-`run-experiment` and `mumdia extract` set from this key), and the features stage derives:
-
-| feature | meaning |
-|---|---|
-| `ms1e_env_r2` | the share of the observed M0..M+4 envelope (summed over the scans) the averagine envelope explains, `1 - |o - a e|^2 / |o|^2` at the least-squares scale `a >= 0`; 0 without signal |
-| `ms1e_env_n` | isotopes found in a row from M0 (0 to 5) |
-| `ms1e_m1_share` | M-1 against M-1 plus M0: another envelope one spacing below, or a monoisotopic peak assigned too high |
-| `ms1e_half_share` | the half-spacing positions against them plus M0 and M+1: a species of twice the charge, or a charge assigned too low |
-| `ms1e_spacing_ppm` | the intensity-weighted mean of `|ppm(k + 1) - ppm(k)|` over consecutive isotopes found among M0..M+4, the deviation of their spacing from `1.00335 / z` in ppm of the precursor m/z; 10 without a pair |
-| `ms1e_mono_ppm` | the M0 error after the calibration, intensity-weighted over the scans, signed; 0 when M0 is not found |
-| `ms1e_mono_ppm_abs` | its absolute value; 10 when M0 is not found |
-| `ms1e_ibar_dev` | the observed envelope's mean isotope index over M0..M+4 against the averagine one |
-| `ms1e_q1_agree` | under `extract.q1_fragments`, the distance in Q1 steps between the fitted Q1 centre of the candidate's fragments (`q1f_centre`) and the centre its OBSERVED MS1 envelope predicts, `|mu + sp (ibar_averagine - ibar_observed) / step|`; 0 without a fit or without the decisions |
-
-The envelope model is the Poisson averagine envelope (the shared
-`constants::averagine_isotopes`), not the peptide's own composition. No existing feature reads
-an MS1 m/z: `precursor_mass_error_ppm` was left out of `mass_accuracy` for want of one. The
-overlap with the `ms1` family is `ms1e_env_r2` and `ms1e_m1_share` against
-`ms1_isotope_cosine_apex` and `iso_minus_one_fraction`, which this family reads over five scans,
-five isotopes and the nearest peak rather than the apex scan's summed window. Refused on
-spectra with 1/K0 and with `groups.window_groups > 1`. The schema id changes only with the
-family on. Every value is read from the spectra and the library; nothing reads a label.
+`features.ms1_envelope` appended nine `ms1e_*` features derived from the MS1 isotope envelope
+that extract read around the apex (psms_extracted v7, docs/09_extract.md, section 13): the
+envelope's agreement with averagine, the isotopes found, the M-1 and half-spacing shares, the
+spacing and monoisotopic m/z errors, the mean isotope index and, under `extract.q1_fragments`,
+the Q1 centre the envelope predicts. 0.15.0 removed it on this measurement.
 
 Measured on ZT Scan REP01 (ZenoTOF 8600 K562, the phase-2 keys on in every arm, four NN seeds
 per arm, one binary and one host per library): with the family, human precursors at the base
@@ -801,13 +772,13 @@ Kolmogorov-Smirnov statistic of decoys against targets is 0.0007-0.0050 for ever
 feature (0.0005-0.0054 for `n_matched_fragments`, `frag_corr`, `log_apex_intensity`,
 `coelution_mean`, `rt_error_abs`), while the accepted targets differ (`ms1e_env_r2` median 0.60
 against 0.26, `ms1e_mono_ppm_abs` 3.5 against 7.9 ppm, `ms1e_q1_agree` 0.42 against 3.2 steps).
-Extract +0.6% wall on the entrapment library. Off by default.
+Extract +0.6% wall on the entrapment library.
 
 ### q1_precursor (8; `features.q1_precursor`)
 
 Scanning-quadrupole spectra only. In the battery only when `features.q1_precursor` is on
 (`false` by default), which needs `extract.q1_fragments`; appended after every other column of
-the `extended` set, after the `ms1_envelope` family when that is on (`Q1P_FEATURES`). The
+the `extended` set (`Q1P_FEATURES`). The
 unfragmented precursor's isotopes M0, M+1 and M+2 read in the MS2 steps of the per-fragment
 decision's patch, each at its own Q1 position (docs/09_extract.md, section 14), under the same
 names from psms_extracted v8: `q1p_n_iso`, `q1p_share`, `q1p_offset`, `q1p_resid`,
@@ -861,7 +832,7 @@ Scanning-quadrupole spectra (SCIEX ZT Scan DIA) only. In the battery only when
 the per-fragment Q1 decisions of psms_extracted v6 (`q1f_frag_class`, `q1f_frag_offset`,
 `q1f_frag_corr2d`, library order) read against each fragment's EXPECTED Q1 centre rather
 than the centre its candidate's fragments share (`stages/q1consist.rs`), appended after every
-other column of the `extended` set (`Q1C_FEATURES`, after `ms1_envelope`, `q1_precursor`,
+other column of the `extended` set (`Q1C_FEATURES`, after `q1_precursor`,
 `q1_multiscale` and `q1_deconvolved` when they are on);
 `minimal` and `rich` ignore the switch.
 
@@ -1039,11 +1010,10 @@ variant no longer exists).
 | `bound_confident_pct` | 50.0 | percentile of the confident-set half-widths taken as the global half-width (50 = median) |
 | `chrom_loaders` | 3 | chromatogram decode threads in the main pass, an upper bound that `--threads` and the chunk count also cap (see "The chunked pass" below); changes time and memory only, never a value or a byte of the features table |
 | `q1_fragment_features` | `"auto"` | the `q1_fragments` family (eight `q1f_*` features of the per-fragment Q1 decision), which needs `extract.q1_fragments`; appended last under `extended`; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
-| `ms1_envelope` | false | the `ms1_envelope` family (nine `ms1e_*` features of the MS1 isotope envelope around the apex), whose evidence extract reads under the same key (psms_extracted v7); appended last under `extended`, after the Q1 families. Refused on 1/K0 spectra and grouped runs. Omitted from the canonical configuration at its default |
-| `q1_precursor` | `"auto"` | the `q1_precursor` family (eight `q1p_*` features of the unfragmented precursor in the MS2 steps), whose evidence extract reads under the same key (psms_extracted v8); needs `extract.q1_fragments`; appended after `ms1_envelope`; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
+| `q1_precursor` | `"auto"` | the `q1_precursor` family (eight `q1p_*` features of the unfragmented precursor in the MS2 steps), whose evidence extract reads under the same key (psms_extracted v8); needs `extract.q1_fragments`; appended after `q1_fragment_features`; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
 | `q1_multiscale` | `"auto"` | the `q1_multiscale` family (nine `q1m*` features at 3, 7 and 11 Q1 steps, twelve with `q1_precursor`), psms_extracted v8; needs `extract.q1_fragments`; appended after `q1_precursor`; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
 | `q1_deconvolved` | `"auto"` | the `q1_deconvolved` family (five `q1d_*` features of the per-peak Q1 centroids at the apex), psms_extracted v8; needs `extract.q1_fragments`; appended after `q1_multiscale`; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
-| `q1_consistency` | `"auto"` | the `q1_consistency` family (sixteen `q1c_*` features: the per-fragment Q1 decisions read against each fragment's expected Q1 centre), which needs `extract.q1_fragments` and the run's Q1 calibration tolerances (`mumdia features --q1-cal`); appended last under `extended`, after `ms1_envelope` and the other Q1 families; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
+| `q1_consistency` | `"auto"` | the `q1_consistency` family (sixteen `q1c_*` features: the per-fragment Q1 decisions read against each fragment's expected Q1 centre), which needs `extract.q1_fragments` and the run's Q1 calibration tolerances (`mumdia features --q1-cal`); appended last under `extended`, after the other Q1 families; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
 | `im_features` | `off` | the `ion_mobility` family (`off`, `on`, `auto` = on when the spectra carry 1/K0). `run` and `run-experiment` resolve it once (`Config::resolve_im_features`) and hand every stage `on` or `off`; a standalone `mumdia features` resolves `auto` from the reader extract recorded in the chromatograms report. On a 4D run it also makes extract write the chromatograms' per-point 1/K0 (v3/v4). Omitted from the canonical configuration at its default |
 
 Note that the fragment tolerance used inside `mass_accuracy` is a hardcoded
