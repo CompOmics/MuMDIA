@@ -31,8 +31,7 @@ pub struct Disk {
 
 /// Free bytes on the volume holding `path`.
 ///
-/// Shelling out rather than calling the platform API, which would need `unsafe` in a
-/// crate that has none. Both commands are present on a stock system and this runs
+/// Shelling out rather than calling the platform API, which would need `unsafe`. Both commands are present on a stock system and this runs
 /// once per search, not in a loop.
 fn free_bytes(path: &Path) -> Option<u64> {
     #[cfg(windows)]
@@ -51,7 +50,7 @@ fn free_bytes(path: &Path) -> Option<u64> {
         } else {
             s.into_owned()
         };
-        let out = std::process::Command::new("powershell")
+        let out = crate::engine::command(Path::new("powershell"))
             .args([
                 "-NoProfile",
                 "-NonInteractive",

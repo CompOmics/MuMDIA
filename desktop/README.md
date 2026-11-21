@@ -468,47 +468,27 @@ The interface can predict a spectral library from a FASTA using DIA-NN, which is
 worth doing because an imported library identifies far more peptides than digesting
 a FASTA with the built-in predictors.
 
-It gets DIA-NN one of two ways, and neither distributes anything. It **locates** a
-copy the user installed, or it **fetches** the pinned 1.8.1 release from the
-vendor's own URL onto the user's machine. The difference from the Python components
+It **locates** a DIA-NN 2.x the user installed and licensed, and drives it. It never
+downloads, bundles or mirrors DIA-NN. The difference from the Python components
 above is a licence constraint, not a style choice: DeepLC, torch and mokapot are
 open-source PyPI packages whose licences permit redistribution, so `uv` can place
 them anywhere convenient. DIA-NN is closed source, absent from PyPI and Bioconda,
 forbids redistribution from 1.9 onward, and from 1.9.2 requires a licence file to
-activate.
+activate. Earlier versions offered a download of 1.8.1; it was removed because 1.8.x
+writes no Parquet library and every DIA-NN feature here refuses it. The Managed data
+card still lists a `diann-1.8.1` folder such a download left behind, so it can be
+removed.
 
-1.8.1 gets special treatment because it is the last release predating activation.
-It is **not**, however, freely redistributable, despite that being widely repeated:
-its own `LICENSE.txt` bars derivative works and bars renting, leasing, lending and
-sublicensing, permitting only a one-time permanent transfer of all rights. The
-claim traces to community container images, not to the licence text. So MuMDIA does
-not bundle it. It downloads it from the vendor's release URL, on the user's
-machine, which distributes nothing: the vendor distributes, the user obtains, and
-the application automates a download the user could do by hand.
+Three things hold the boundary, enforced in `diann.rs` rather than only in the
+interface:
 
-That is a narrow judgement and not a licence to bundle. A mirror, a vendored copy,
-a `latest` lookup or any other host voids the reasoning that permits it, which is
-what `the_download_is_pinned_to_one_version_from_the_vendors_own_host` exists to
-catch.
-
-Five things hold the boundary, four of them enforced in `diann.rs` rather than only
-in the interface:
-
-- `diann::build` and `diann::install` both refuse until the licence notice is
-  acknowledged, so calling either command directly does not bypass it. The Academia
-  edition is non-profit-only, and that is a restriction a commercial user can
-  breach without ever noticing it exists. Since 2026-10-10 a DIA-NN that is installed
-  and runs counts as acknowledged until the user answers (`effective_licence`):
-  installing it meant accepting its licence from the vendor. The box is shown ticked
-  with a note saying why, an explicit untick is stored and respected, and the download
-  of 1.8.1 still needs an explicit tick, because nothing is installed at that point.
-- The URL and SHA-256 are pinned per platform, and the digest is verified while
-  streaming. A mismatch deletes the file: these bytes are executed or handed to the
-  operating system's installer, and a failed verification must not leave something
-  runnable behind for someone to double-click.
-- On Windows the vendor's **own installer** is launched rather than silently
-  unpacked, so the licence screen the user accepts is DIA-NN's, not a paraphrase of
-  it in our dialog. The interface says so and then gets out of the way.
+- `diann::build` refuses until the licence notice is acknowledged, so calling the
+  command directly does not bypass it. The Academia edition is non-profit-only, and
+  that is a restriction a commercial user can breach without ever noticing it exists.
+  Since 2026-10-10 a DIA-NN that is installed and runs counts as acknowledged until
+  the user answers (`effective_licence`): installing it meant accepting its licence
+  from the vendor. The box is shown ticked with a note saying why, and an explicit
+  untick is stored and respected.
 - Detection reports a binary as usable only after **running** it and reading the
   `DIA-NN ...` banner out of its output. A file that exists but cannot execute -- a
   Linux binary on Windows, a truncated download, a 1.9.2+ build with no licence
@@ -517,21 +497,6 @@ in the interface:
   directories, and if it stops working that is reported rather than silently
   replaced. DIA-NN's version changes the library it predicts, so a silent switch is
   a silent change of results.
-
-### The Linux tarball is flat
-
-`diann_1.8.1.tar.gz` has no enclosing directory: `diann-1.8.1` sits beside
-`libtorch_cpu.so`, `libc10.so`, `libtimsdata.so` and `unimod.obo`. Two consequences,
-both handled and both easy to reintroduce. It must be extracted into a directory of
-its own, or it scatters half a gigabyte of shared libraries into whatever it was
-unpacked in. And the binary cannot find those libraries unless its own directory is
-on the loader path, which is what `diann_command` adds; the Python workers
-deliberately do not go through it, or a virtualenv's `bin` would end up on
-`LD_LIBRARY_PATH` for no reason.
-
-Note the size: 142 MB compressed, about 490 MB extracted, nearly all of it
-`libtorch_cpu.so`. `offer()` reports both figures, because reporting only the
-download would understate the disk cost threefold.
 
 ### Building the library from the search screen
 

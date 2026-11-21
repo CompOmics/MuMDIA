@@ -191,3 +191,15 @@ def test_dia_nns_refusal_to_predict_stops_the_build_with_the_reason(tmp_path, fa
     assert len(calls) == 1, "nothing after the refused prediction runs"
     assert "not given the mass of: UniMod:34, UniMod:37" in err
     assert "--diann-mod UniMod:<id>,<mass>" in err
+
+
+def test_a_retry_does_not_reuse_a_failed_attempts_decoy_library(tmp_path, fake_diann):
+    # A 0-row decoys.parquet left by an earlier attempt must not stand in for this run's
+    # prediction: the re-export still runs, so the stale file was removed first.
+    work = tmp_path / "work"
+    work.mkdir()
+    pq.write_table(pa.table({"Precursor.Id": pa.array(["stale"], pa.string())}),
+                   work / "decoys.parquet")
+    rc, out, err, calls = _build(tmp_path, fake_diann, "empty")
+    assert len(calls) == 2, (out, err)
+    assert "DIA-NN predicted no decoy spectra" in err

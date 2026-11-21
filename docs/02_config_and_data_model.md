@@ -308,8 +308,9 @@ oxidation products, acylations, methylations, `GlyGly`, `HexNAc`, `Hex`, `Sulfo`
 `Palmitoyl`, `Biotin` and homocysteinylation (`HCysThiolactone` 117.024835 on K,
 `HCysteinyl` 133.019749 on C). An entry may carry an optional plain-language `label`,
 which the desktop Search tab shows and matches in its filter; the engine ignores it. A unit test recomputes every delta from its elemental
-composition. The desktop Search tab lists the same file. Terminal modifications are not
-implemented. An unknown name is `MassError::UnknownModification`, never a silent zero.
+composition. The desktop Search tab lists the same file. N-terminal modifications are offered
+where the catalogue lists them (docs/05, "Terminal modifications"); C-terminal ones are
+not supported. An unknown name is `MassError::UnknownModification`, never a silent zero.
 
 **ProForma-lite parse** (`parse_peptidoform`, `mass.rs:187-249`): optional
 N-terminal `[Mod]-`, residues each optionally followed by `[Mod]`, optional

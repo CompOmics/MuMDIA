@@ -184,6 +184,11 @@ function load() {
     "SETUP_SPEC",
     "LOCAL_SETTINGS",
     "INTERPRETER_SETTINGS",
+    "onSettingChanged",
+    "currentValue",
+    "displayValue",
+    "startSearch",
+    "runBatch",
   ];
   const exported = names.map((n) => `${n}: typeof ${n} === "undefined" ? undefined : ${n}`);
   const api = vm.runInContext(`${body}\n;({ ${exported.join(", ")} });`, ctx);
@@ -1549,6 +1554,52 @@ test("a batch searched separately keeps Automatic's bands for its files that are
     p.el("bands").value = mode;
     assert.equal(await p.api.separateRestBands(null), null, mode);
   }
+});
+
+test("every setting's shown default, entered again, leaves no override", async () => {
+  const f = load();
+  const s = f.api.state;
+  s.schema = structuredClone(SCHEMA);
+  s.overrides = {};
+  let checked = 0;
+  for (const field of s.schema.fields) {
+    const v = f.api.currentValue(field);
+    // What the control shows: a select names the value, a text field its displayed form.
+    const shown = field.kind === "bool" || field.kind === "enum" ? String(v) : String(f.api.displayValue(v));
+    if (field.kind === "enum" && field.choices && !field.choices.map(String).includes(shown)) continue;
+    assert.ok(!/^"/.test(shown), `${field.path} shows a JSON-quoted default: ${shown}`);
+    f.api.onSettingChanged({ dataset: { path: field.path }, value: shown });
+    assert.deepEqual(s.overrides, {}, `${field.path}: ${shown}`);
+    checked++;
+  }
+  assert.ok(checked > 100, `only ${checked} settings checked`);
+});
+
+test("Start without a results folder never starts a search", async () => {
+  const f = load();
+  f.api.state.picks.mzml = ["/d/a.mzML", "/d/b.mzML"];
+  f.api.state.picks.out_dir = "";
+  await f.api.startSearch();
+  assert.equal(f.el("start-error").textContent.includes("Choose a results folder."), true);
+  assert.equal(f.calls.some(([n]) => n === "start_run"), false);
+});
+
+test("a separate-files batch can be stopped during each search and shows its position", async () => {
+  const f = load();
+  const seen = [];
+  Object.assign(f.answers, {
+    preflight: () => ({ ok: true, blockers: [] }),
+    start_run: ({ req }) => req.out_dir,
+    run_state: ({ id }) => {
+      seen.push({ id, stop: f.el("stop").disabled });
+      return { status: "done", stages: [], runs: [], root_stages: [], results: {}, elapsed_ms: 0, command: "", log: [] };
+    },
+  });
+  f.el("stop").disabled = true; // as an earlier finished search leaves it
+  await f.api.runBatch({ mzml: ["/d/a.mzML", "/d/b.mzML"], out_dir: "/res" }, null, 0, null);
+  assert.deepEqual(seen.map((x) => x.id), ["/res/01_a", "/res/02_b"]);
+  assert.ok(seen.every((x) => x.stop === false), "Stop is enabled during each search");
+  assert.equal(f.el("nav-results").disabled, false);
 });
 
 let failed = 0;

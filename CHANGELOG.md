@@ -432,6 +432,10 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Removed
 
+- **The desktop application no longer offers to download DIA-NN 1.8.1.** Every DIA-NN feature
+  of the application refuses that version, so the download installed something nothing could
+  use. A copy an earlier version downloaded stays listed under Managed data for one release,
+  so it can be removed.
 - **`MUMDIA_PARQUET_PLAN` (docs/03).** It turned off the float-encoding plan of capped
   writers, for a byte comparison against binaries from before 0.5.0; release checks compare
   decoded tables. A set variable is now ignored.
@@ -491,6 +495,31 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **Desktop: a Python environment whose base interpreter was deleted no longer counts as
+  installed.** On Windows a uv environment starts the Python named in its `pyvenv.cfg`; when
+  that folder was removed, every search failed with "uv trampoline failed to spawn Python"
+  while the Setup screen showed the components as installed. The Setup screen, the
+  pre-flight check, the library conversion and visDIA now say the environment cannot start
+  and ask for Install, which repairs it in place without downloading the packages again.
+  Installations in the user's own folder now take their interpreter from uv's managed
+  Pythons in `<components>/uv-python`, as the program-folder installation already did.
+- **Desktop: a retried library build no longer reuses the outputs of the failed attempt.**
+  `scripts/predict_decoys.py` deletes its own `decoys.*` outputs before DIA-NN runs, and the
+  desktop deletes a stale `lib.parquet` before the prediction. A finished library also no
+  longer keeps its scratch tables, about three times its own size.
+- **Desktop: a batch of separate searches without a results folder is refused** instead of
+  writing each file's folder to the drive root; the engine call refuses a relative results
+  folder as well. Stop works during every search of the batch, and the progress line names
+  the file and its position.
+- **Desktop Settings: text defaults are shown and compared as values,** not as JSON text, so
+  the presets no longer show `predict_frag.sidecar_script_dir` as changed, a string default
+  no longer shows quotes that would then be saved, and clearing an optional setting unsets it.
+- **Desktop: the window no longer waits on DIA-NN, the converters or the engine.** The commands
+  that start processes run off the window thread, and a working ThermoRawFileParser is probed
+  once per installation instead of before every engine call. Closing the window stops a
+  running library build; a second visDIA for the same folder stops the first; on Linux and
+  macOS, Stop reaches DIA-NN under the library helper scripts; the free-space check no longer
+  flashes a console window; "reveal" opens folders only.
 - **`run-experiment` refuses a `quant.normalisation_rank` the run count cannot carry before
   it searches (#358).** The cross-run normalisation needs a rank of at most the number of runs less
   two and checked it only when it ran, after every run's search, rescore and quant, so two
