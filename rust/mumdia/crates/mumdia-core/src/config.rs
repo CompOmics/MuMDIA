@@ -4556,9 +4556,9 @@ pub struct RescoreConfig {
     pub features_file: Option<String>,
     /// Named feature list used when neither `features` nor `features_file` is set. `all`
     /// is every feature the competed table carries. `compact` is the 114-name list of
-    /// docs/28 section 12 (`bench/feature_selection/fs_union75_dedup.txt`, embedded in the
-    /// binary), which with the hard-negative training recipe reproduced the full Extended
-    /// set within seed noise on three pools (HYE A01 +1.2%, AIF -0.2%, entrapment +4.9%,
+    /// docs/28 section 12 (`rust/mumdia/crates/mumdia/src/stages/feature_presets/compact.txt`,
+    /// embedded in the binary), which with the hard-negative training recipe reproduced
+    /// the full Extended set within seed noise on three pools (HYE A01 +1.2%, AIF -0.2%, entrapment +4.9%,
     /// spike-in FDP unchanged) at 3.4x less rescore memory. Preset names the table lacks
     /// are skipped with a log line rather than an error, so a preset tolerates a smaller
     /// `features.set`; the intersection must not be empty. Explicit lists stay strict.

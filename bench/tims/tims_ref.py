@@ -41,22 +41,15 @@ from import_diann_lib import to_proforma  # noqa: E402
 
 # A bracketed or parenthesised modification, in either notation.
 _MOD = re.compile(r"\[[^\]]*\]|\([^)]*\)")
-# The importer drops N-terminal modifications, so its mapping has no terminal form. The
-# reference may still carry an N-terminal acetyl; spell it the ProForma way.
-_NTERM_ACETYL = "(UniMod:1)"
+
+# Reference `Modified.Sequence` (UniMod notation) to the MuMDIA ProForma-lite peptidoform; the
+# importer's mapping already writes a leading modification as `[Name]-`.
+reference_pf = to_proforma
 
 
 def strip(pf: str) -> str:
     """Plain sequence of a MuMDIA or reference peptidoform: no modifications, no `DECOY_`."""
     return _MOD.sub("", str(pf).removeprefix("DECOY_")).replace("-", "").replace(".", "")
-
-
-def reference_pf(modseq: str) -> str:
-    """Reference `Modified.Sequence` (UniMod notation) to the MuMDIA ProForma-lite peptidoform."""
-    s = str(modseq)
-    if s.startswith(_NTERM_ACETYL):
-        s = "[Acetyl]-" + s[len(_NTERM_ACETYL):]
-    return to_proforma(s)
 
 
 def il(seqs) -> set:

@@ -432,6 +432,12 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Removed
 
+- **Retired bench files.** `bench/prov_filter.py` (its rule F1 lives in
+  `bench/quant_condition_gate.py`, which now carries its measurements), the AlphaPeptDeep
+  prescreen harnesses `bench/prescreen/ps_pred.sh`, `ps_entrap_pred.sh` and `ps_entrap_decoy.sh`
+  (copied-intensity decoys, hard-coded paths, no recorded result) and
+  `bench/feature_selection/fs_union75_dedup.txt`, an exact copy of the embedded `compact` preset
+  list, which is now the only copy.
 - **`MUMDIA_PARQUET_PLAN` (docs/03).** It turned off the float-encoding plan of capped
   writers, for a byte comparison against binaries from before 0.5.0; release checks compare
   decoded tables. A set variable is now ignored.
@@ -490,6 +496,27 @@ than a number. Both are recorded in every run's `manifest.json`.
   shared helper, a stale pooled `psms_extracted.parquet` included. Output is unchanged.
 
 ### Fixed
+
+- **Bench entrapment scripts report the combined estimate and the lower bound.**
+  `bench/entrapment_fdp.py`, `fs_lib.evaluate`, `prescreen/ps_agg.py` and `ps_rtfree_agg.py`
+  printed only `(ratio * entrapment + 1) / real`, the estimate for the real hits alone, which is
+  the cut `rescore.classifier = entrapment` applies and about 2.7 times lower than the combined
+  estimate on the Q Exactive AIF library. They now print the combined estimate
+  `entrapment * (1 + ratio) / (real + entrapment)`, the lower bound
+  `entrapment / (real + entrapment)` and the real-only value under that name
+  (`bench/make_entrapment_fasta.py::fdp_estimates`), and require the library's ratio instead of
+  defaulting to 1.0 or a hard-coded 0.560632. docs/08 section 4d, docs/20, docs/28, docs/34 and
+  `bench/README.md` no longer read a calibration result from the entrapment-classifier arms and
+  cite the re-score on main: QE AIF at a reported 1% precursor combined 2.77%, lower bound 1.78%
+  (peptide 2.97% / 1.96%); diaPASEF E. coli combined 1.02%, lower bound 0.65%.
+- **Bench and Python test documentation.** `bench/README.md` no longer states retired behaviour in
+  the present tense and lists every script; `qab_score.py` states that it needs runs named
+  A01..B03 and how its CV is taken; `fs_lib.py` says its training defaults are the recipe before
+  2026-09-05; `tests/python/README.md` lists every test file and the skips that exist, and the
+  test docstrings cite engine functions instead of line numbers that had moved.
+- **CI resolves the AlphaPeptDeep environment.** The `sidecar-imports` matrix gains a `peptdeep`
+  entry (`env/mumdia-peptdeep.yml`), so its two real-model worker tests run and `pip-audit`
+  covers it.
 
 - **`run-experiment` refuses a `quant.normalisation_rank` the run count cannot carry before
   it searches (#358).** The cross-run normalisation needs a rank of at most the number of runs less

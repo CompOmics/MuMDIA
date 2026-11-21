@@ -25,7 +25,9 @@ contaminant marker; real otherwise. Pass the marker, exclude and contaminant set
 run config. The ratio is a property of the library, not of the FASTA alone: a 1:1 protein
 count does not give a 1:1 candidate count, and the digest, the modifications and the charges
 all change it. Put the printed value in the run config and pass the same value to
-bench/entrapment_fdp.py (which reads it from that config) or to `fs_lib.entrapment_fdp`.
+bench/entrapment_fdp.py (which reads it from that config), to `fs_lib.evaluate` (`ratio`) and to
+the `--entrapment RATIO` option of the feature-selection and prescreen scripts. All of them
+report through `fdp_estimates` below.
 """
 import argparse
 import random
@@ -69,6 +71,32 @@ def is_entrapment(protein, marker, exclude, contaminants):
     return (marker in protein
             and (not exclude or exclude not in protein)
             and not any(c in protein for c in contaminants))
+
+
+def fdp_estimates(n_real, n_entrap, ratio):
+    """Entrapment FDP estimates for one accepted target list, as fractions.
+
+    `ratio` is `rescore.entrapment_ratio` (real / entrapment target candidates, so 1/r for an
+    entrapment-to-real size ratio r); there is no default, because it is a property of the
+    library. `n_real` counts the accepted targets that are not entrapment, `n_entrap` the
+    accepted entrapment targets.
+
+    - `combined`: n_entrap * (1 + ratio) / (n_real + n_entrap), the estimate for the whole
+      target list a decoy-thresholded run reports. At or below the threshold it supports
+      calibration.
+    - `lower_bound`: n_entrap / (n_real + n_entrap). Above the threshold it refutes calibration.
+    - `real_only`: (ratio * n_entrap + 1) / n_real, the estimate for the real hits alone. It is
+      what `fdr.rs::entrapment_q` computes and `rescore.classifier = entrapment` cuts on, so on
+      such a run it restates the cut and checks nothing.
+    """
+    if not ratio or ratio <= 0:
+        raise ValueError(f"entrapment ratio must be positive, got {ratio!r}")
+    n = max(1, n_real + n_entrap)
+    return {
+        "combined": n_entrap * (1 + ratio) / n,
+        "lower_bound": n_entrap / n,
+        "real_only": (ratio * n_entrap + 1) / max(1, n_real),
+    }
 
 
 def ratio(library, marker, exclude, contaminants):

@@ -46,15 +46,16 @@ def main():
     ap.add_argument("--only", default=None, help="comma-separated subset names to run")
     ap.add_argument("--seeds", default="0")
     ap.add_argument("--rows", type=int, default=None)
-    ap.add_argument("--entrapment", action="store_true",
-                    help="classify spike-in targets from the Proteins column and report the empirical FDP")
+    ap.add_argument("--entrapment", type=float, default=None, metavar="RATIO",
+                    help="classify spike-in targets from the Proteins column and report the entrapment "
+                         "FDP estimates; RATIO is the library's rescore.entrapment_ratio")
     ap.add_argument("--save-oof", default=None)
     ap.add_argument("--iters", type=int, default=None)
     ap.add_argument("--repo", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
-    d = fs_lib.load_pin(args.pin, entrapment=args.entrapment)
+    d = fs_lib.load_pin(args.pin, entrapment=args.entrapment is not None)
     if args.rows:
         d = fs_lib.subsample(d, args.rows, seed=0)
         print(f"subsampled to {len(d['y'])} rows", flush=True)
@@ -77,7 +78,7 @@ def main():
         cols = [idx_of[n] for n in feats]
         for sd in seeds:
             t0 = time.time()
-            row, r = fs_lib.bench_subset(name, d, cols, cfg={**cfg, "seed_base": sd})
+            row, r = fs_lib.bench_subset(name, d, cols, cfg={**cfg, "seed_base": sd}, ratio=args.entrapment)
             row.update(dataset=args.tag, seed=sd, rows=int(len(d["y"])), when=time.strftime("%Y-%m-%d %H:%M:%S"),
                        recipe=json.dumps(fs_lib.recipe_metadata({**cfg, "seed_base": sd}, len(cols), sd), sort_keys=True))
             pd.DataFrame([row]).to_csv(out_csv, mode="a", header=not os.path.exists(out_csv), index=False)

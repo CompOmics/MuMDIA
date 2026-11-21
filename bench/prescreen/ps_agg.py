@@ -1,6 +1,7 @@
 """Aggregate one prescreen validation campaign (ps_val.sh) into summary.json and summary.txt.
 
-usage: ps_agg.py ROOT [--entrapment]
+usage: ps_agg.py ROOT [--entrapment RATIO]
+  RATIO: the library's rescore.entrapment_ratio (make_entrapment_fasta.py --ratio-library)
 """
 import glob
 import json
@@ -11,10 +12,14 @@ import sys
 
 import pyarrow.parquet as pq
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from make_entrapment_fasta import fdp_estimates  # noqa: E402
+
 ROOT = sys.argv[1]
 ENTRAP = "--entrapment" in sys.argv
 ENT = {"marker": "ENTRAP_", "exclude": "REAL_",
-       "contaminants": ["KRT", "K1C", "K2C", "ALBU", "TRYP"], "ratio": 0.560632}
+       "contaminants": ["KRT", "K1C", "K2C", "ALBU", "TRYP"],
+       "ratio": float(sys.argv[sys.argv.index("--entrapment") + 1]) if ENTRAP else None}
 
 
 def timing(name):
@@ -63,8 +68,9 @@ def scored_stats(path):
         pep = pep[pep["peptide_q_value"] <= 0.01]
         ent = pep["protein"].map(is_entrap)
         n_real, n_ent = int((~ent).sum()), int(ent.sum())
+        est = fdp_estimates(n_real, n_ent, ENT["ratio"])
         out["entrapment"] = {"real": n_real, "spike": n_ent,
-                             "fdp_pct": 100 * (ENT["ratio"] * n_ent + 1) / max(n_real, 1)}
+                             **{f"{k}_fdp_pct": 100 * v for k, v in est.items()}}
     return out
 
 
@@ -137,14 +143,15 @@ for arm, r in res.items():
     seeds = r["seeds"].values()
     pep = mean_sd([v.get("peptides") for v in seeds])
     prec = mean_sd([v.get("precursors") for v in seeds])
-    fdp = mean_sd([v["entrapment"]["fdp_pct"] for v in seeds if "entrapment" in v])
+    fdp = {k: mean_sd([v["entrapment"][f"{k}_fdp_pct"] for v in seeds if "entrapment" in v])
+           for k in ("combined", "lower_bound", "real_only")}
     surv = r.get("survivors")
     st = r.get("screen_stats", {})
     row = {
         "seeds": len(r["seeds"]),
         "peptides_mean": pep[0], "peptides_sd": pep[1],
         "precursors_mean": prec[0], "precursors_sd": prec[1],
-        "fdp_pct_mean": fdp[0], "fdp_pct_sd": fdp[1],
+        **{f"{k}_fdp_pct_{s}": m[i] for k, m in fdp.items() for i, s in enumerate(("mean", "sd"))},
         "survivors": len(surv) if surv is not None else n_lib,
         "reduction": (1 - len(surv) / n_lib) if (surv is not None and n_lib) else 0.0,
         "reporting_reduction": st.get("reporting_reduction"),
@@ -189,7 +196,8 @@ for arm, r in res.items():
         f"weak {fmt(100*row['weak_retention'] if row.get('weak_retention') is not None else None,'%6.2f')}% "
         f"mod {fmt(100*row['modified_retention'] if row.get('modified_retention') is not None else None,'%6.2f')}% "
         f"pep {fmt(pep[0],'%8.1f')} (sd {fmt(pep[1],'%5.1f')}, {fmt(row.get('peptides_delta_pct'),'%+5.2f')}%) "
-        f"prec {fmt(prec[0],'%8.1f')} FDP {fmt(fdp[0],'%5.3f')}% "
+        f"prec {fmt(prec[0],'%8.1f')} FDP combined {fmt(fdp['combined'][0],'%5.3f')}% "
+        f"lower {fmt(fdp['lower_bound'][0],'%5.3f')}% real-only {fmt(fdp['real_only'][0],'%5.3f')}% "
         f"cut {fmt(row['cutoff'],'%.4f')} screen {fmt(sw,'%6.1f')}s/{fmt(sm,'%5.1f')}GB "
         f"extract {fmt(ew,'%6.1f')}s/{fmt(em,'%5.1f')}GB rows {row['extracted_rows']}")
 txt = (f"library candidates {n_lib}; OFF reference precursors (seed union) {len(off_ids)}, "

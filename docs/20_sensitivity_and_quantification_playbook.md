@@ -344,9 +344,17 @@ A sensitivity setting may be promoted only when:
 For an entrapment experiment:
 
 ```text
-empirical FDP = (entrapment_ratio * accepted_entrapments + 1)
-                / max(1, accepted_real_targets)
+combined FDP = accepted_entrapments * (1 + entrapment_ratio)
+               / max(1, accepted_real_targets + accepted_entrapments)
+lower bound  = accepted_entrapments
+               / max(1, accepted_real_targets + accepted_entrapments)
 ```
+
+Read both on a run thresholded on decoys: a combined FDP at or below the threshold supports
+calibration, a lower bound above it refutes it. `(entrapment_ratio * accepted_entrapments + 1)
+/ accepted_real_targets` estimates the FDP of the real hits alone; it is what
+`rescore.classifier = entrapment` cuts on, so it is never a check of that run.
+`bench/make_entrapment_fasta.py::fdp_estimates` computes all three.
 
 Derive `entrapment_ratio` from real/foreign library search-space sizes, and
 declare the protein marker, shared-peptide exclusions, and contaminant markers

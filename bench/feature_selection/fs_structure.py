@@ -24,18 +24,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fs_lib  # noqa: E402
 
 
-def rank_auc(x: np.ndarray, y: np.ndarray) -> float:
-    """AUC of x as a score for y == 1 (targets), via the rank-sum statistic; ties averaged."""
-    from scipy.stats import rankdata
-
-    r = rankdata(x, method="average")
-    n1 = int(y.sum())
-    n0 = len(y) - n1
-    if n1 == 0 or n0 == 0:
-        return float("nan")
-    return float((r[y == 1].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("pin")
@@ -80,7 +68,7 @@ def main():
     rs = np.random.RandomState(0)
     sub = np.sort(rs.choice(n, size=min(n, args.corr_rows), replace=False))
     Xs, ys = X[sub], y[sub]
-    df["auc_target"] = [rank_auc(Xs[:, j], ys) for j in range(nf)]
+    df["auc_target"] = [fs_lib.rank_auc(Xs[ys == 1, j], Xs[ys == 0, j]) for j in range(nf)]
     # the worker's init-scan quantity, on the full pool, both signs
     tgt = y.astype(bool)
     n_pos, n_neg = [], []

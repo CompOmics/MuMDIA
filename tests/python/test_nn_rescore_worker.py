@@ -1,7 +1,7 @@
 """Contract tests for `scripts/nn_rescore_worker.py` (Stage F, `nn_torch`).
 
 Skipped without torch. The contract under test is the one `CLAUDE.md` states
-and `align_sidecar_scores` (`rescore.rs:1046-1082`) enforces: every input row
+and `align_sidecar_scores` (`rescore.rs::align_sidecar_scores`) enforces: every input row
 gets exactly one finite out-of-fold score, the output row count equals the
 input row count, and no row is silently dropped. Under the production default
 `rescore.strict = true` a violation aborts the run; with strict off the
@@ -103,7 +103,7 @@ def test_tsv_pin_scores_every_row_exactly_once(torch_available, psms, tmp_path):
     """Every PIN row must come back with exactly one finite score.
 
     A short, long, duplicated or non-finite output makes the Rust caller bail
-    (`rescore.rs:1046-1082`). Under `rescore.strict = true`, the production
+    (`rescore.rs::align_sidecar_scores`). Under `rescore.strict = true`, the production
     default, that aborts the run after the whole search has already been paid
     for; under strict off it downgrades to `native_tda` and the artifact
     reports a classifier the user did not request.
@@ -119,7 +119,7 @@ def test_tsv_pin_scores_every_row_exactly_once(torch_available, psms, tmp_path):
 def test_parquet_handoff_scores_every_row_exactly_once(torch_available, psms, tmp_path):
     """The `rescore.handoff = parquet` table must satisfy the same contract.
 
-    Parquet is accepted by this worker only (`rescore.rs:943-959`) and is the
+    Parquet is accepted by this worker only (`rescore.rs::sidecar_paths`) and is the
     path used at experiment scale, where a 30 GB text PIN also forced the
     streaming backend. Column names and semantics are identical either way, so
     a divergence here means the two handoffs disagree about which row is which.
@@ -142,7 +142,7 @@ def test_streaming_memmap_backend_scores_every_row_and_cleans_up(
     and it is selected by a size cliff rather than a preference, so it runs
     unattended. A leftover `<out>.feat.mm` is not cosmetic: an orphaned worker
     holding that file made every later rescore fail on a path it did not own
-    (`nn_rescore_worker.py:424-425, 719-722`).
+    (`nn_rescore_worker.py::main`).
     """
     pin = write_pin(tmp_path / "rescore.pin", psms)
     out = tmp_path / "rescore_sidecar_out.parquet"

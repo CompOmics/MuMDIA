@@ -11,13 +11,18 @@ library, and hours of compute. The end-to-end test CI does run is
 
 | file | purpose |
 |---|---|
-| `make_proteobench_submission.py` | Build a ProteoBench "Custom" input TSV from per-run `peptide_quant.parquet`. Expands MuMDIA's protein entry names back to full FASTA identifiers so ProteoBench's own `Cont_` contaminant flag and `_HUMAN`/`_YEAST`/`_ECOLI` species flags apply unchanged. Without options it submits the raw `quantity` unchanged. `--quantity maxlfq` submits the cross-run MaxLFQ precursor table, `--quantity aligned` aligns the replicates within each condition (label-blind; it cannot change composition or the offset between conditions), and `--condition-gate` applies rule F1 of `prov_filter.py` from `first_pass/scored_combined.parquet` of a `run-experiment` tree. The last stderr line gives the ProteoBench ion count and the finite-ratio count per species (pass `--species HUMAN,YEAST` for the Low Input module, whose species mapper has no E. coli). Report both with any gated result, because the gate removes far more finite ratios than ions. |
+| `make_proteobench_submission.py` | Build a ProteoBench "Custom" input TSV from per-run `peptide_quant.parquet`. Expands MuMDIA's protein entry names back to full FASTA identifiers so ProteoBench's own `Cont_` contaminant flag and `_HUMAN`/`_YEAST`/`_ECOLI` species flags apply unchanged. Without options it submits the raw `quantity` unchanged. `--quantity maxlfq` submits the cross-run MaxLFQ precursor table, `--quantity aligned` aligns the replicates within each condition (label-blind; it cannot change composition or the offset between conditions), and `--condition-gate` applies rule F1 (see `quant_condition_gate.py`) from `first_pass/scored_combined.parquet` of a `run-experiment` tree. The last stderr line gives the ProteoBench ion count and the finite-ratio count per species (pass `--species HUMAN,YEAST` for the Low Input module, whose species mapper has no E. coli). Report both with any gated result, because the gate removes far more finite ratios than ions. |
 | `pb_eval.py` | Score a submission offline with ProteoBench's own parser and scoring code. Nothing is uploaded and no token is used. `--module` selects the module, which fixes the run names and the expected ratios; an unknown id is rejected with the available list. |
-| `prov_filter.py` | Condition-evidence filters (F1 to F4) deciding which run values may be reported. Withholding transferred values in a condition with no direct identification is what removes low-abundance ratio compression; see the docstring for the measurements. |
-| `quant_condition_gate.py` | Rule F1 of `prov_filter.py` on a `run-experiment` output tree: given a run-to-condition map, keep a (precursor, condition) group's values only when one of its runs has a first-pass identification. Reads the engine's `first_pass_id` (`peptide_quant` v3, `mbr.first_pass_flag`) or, with `--derive-first-pass`, derives it from `first_pass/scored_combined.parquet` and reports where the two disagree. Writes gated per-run tables that `make_proteobench_submission.py` reads. An ion-count trade: compare at a matched number of finite ratios. |
+| `quant_condition_gate.py` | Rule F1 of the August second-pass prototype on a `run-experiment` output tree (its docstring has the prototype's measurements): given a run-to-condition map, keep a (precursor, condition) group's values only when one of its runs has a first-pass identification. Reads the engine's `first_pass_id` (`peptide_quant` v3, `mbr.first_pass_flag`) or, with `--derive-first-pass`, derives it from `first_pass/scored_combined.parquet` and reports where the two disagree. Writes gated per-run tables that `make_proteobench_submission.py` reads. An ion-count trade: compare at a matched number of finite ratios. |
 | `quant_methods/synth_ref.py` | Reference values for the unit tests of the profile-centred window, the pattern rules and the stable-set normalisation: the quantification study's prototype on two small synthetic cases that the Rust tests rebuild exactly. Needs the study's prototype code (`MUMDIA_QUANT_PROTOTYPE`), which is not in this repository. |
-| `qab_score.py` | Score one arm of a quantification A/B directly from the per-run `peptide_quant.parquet` of a `run-experiment` output tree: features, completeness, median abs epsilon against the HYE expected ratios, and CV. Not ProteoBench's own numbers (see its docstring); the point is that two arms are scored identically. |
-| `make_entrapment_fasta.py` | Build a real + 1:1 foreign entrapment FASTA (`REAL_` / `ENTRAP_` accession prefixes, seeded sample). With `--ratio-library` it prints `rescore.entrapment_ratio` of a built library instead: real over entrapment target candidates, classified as the engine does. See the ratio note below. |
+| `qab_score.py` | Score one arm of a quantification A/B directly from the per-run `peptide_quant.parquet` of a `run-experiment` output tree: features, completeness, median abs epsilon against the HYE expected ratios, and CV. Not ProteoBench's own numbers (see its docstring); the point is that two arms are scored identically. Reads the raw `quantity`, and needs runs named A01..B03 (`run-experiment --run-names A01,A02,A03,B01,B02,B03`). |
+| `make_entrapment_fasta.py` | Build a real + 1:1 foreign entrapment FASTA (`REAL_` / `ENTRAP_` accession prefixes, seeded sample). With `--ratio-library` it prints `rescore.entrapment_ratio` of a built library instead: real over entrapment target candidates, classified as the engine does. See the ratio note below. Its `fdp_estimates` is the one entrapment FDP formula every script here prints. |
+| `entrapment_fdp.py` | Entrapment FDP estimates of one or two arms at peptide q 1%: the combined estimate and lower bound for all accepted targets, and the estimate for the real hits alone. Reads the ratio from the run config and refuses a config without one. |
+| `mem_profile.py` | Peak resident memory of a command's whole process tree (engine plus sidecars), sampled at a fixed interval. |
+| `dhat_top.py` | Rank the allocation sites of a `dhat-heap.json` by bytes held at the global peak. |
+| `apex/apex_offset.py`, `apex/apex_replica.py` | Where the chosen apex sits relative to the summed fragment trace for accepted IDs, and a replica of extract's apex rule from `chromatograms.parquet` with alternative tie-breaks. |
+| `prescreen/` | The prescreen campaign of `docs/34_prescreen.md`: shell harnesses (`ps_*.sh`) and their aggregators (`ps_agg.py`, `ps_rtfree_agg.py`; `--entrapment RATIO` for an entrapment run), evaluators and plots. |
+| `feature_selection/fs_lib.py`, `fs_structure.py`, `fs_importance.py`, `fs_subsets.py`, `fs_objective.py`, `fs_train_sweep.py` | The feature-selection study of `docs/28_feature_selection_analysis.md`: a re-implementation of the NN worker (`fs_lib`; its training defaults are the recipe before 2026-09-05), the structural and importance tables, candidate subsets, and the objective and training-set sweeps (`--entrapment RATIO` for an entrapment PIN). |
 | `tims/tims_compare.py` | Compare one run's `psms_scored.parquet` with a reference identification table of the same run (`--reference`) at one q: precursors, peptides and protein groups, each with its unit named, plus the I/L-merged peptide overlap. |
 | `tims/tims_loss.py` | Classify every reference precursor at q by why MuMDIA misses it: not in the library, not extracted (reference RT or 1/K0 outside the window, or inside both), accepted, right peak but low score, wrong peak inside or outside the RT window. Writes the per-precursor table that `fs_loss_evidence.py` reads. The stage-by-stage ladder of every candidate comes from `mumdia audit` and the stage `report.json` files, not from here. |
 | `tims/tims_im_check.py` | G1 check of ion mobility: median and p95 1/K0 error of the library `predicted_im`, the calibrated `im_pred_cal`, the seed's `observed_im` and the MS1 1/K0 against the reference's observed 1/K0, per charge, and the recall of the 1/K0 window. |
@@ -47,12 +52,29 @@ marker, exclude and contaminant settings. The IM branch's E. coli diaPASEF libra
 `configs/examples/diapasef.json` library 0.574592 (988,128 against 1,719,704);
 `fs_lib.ENTRAP_RATIO` = 0.560632 belongs to the August E. coli AIF library below
 and is wrong for any other. `entrapment_fdp.py` reads the ratio from the run
-config (`rescore.entrapment_ratio`, default 1.0), and `fs_lib.entrapment_fdp`
-takes it as its `ratio` argument; pass the measured value to both.
+config (`rescore.entrapment_ratio`) and refuses a config without it; `fs_lib.evaluate`
+takes it as its `ratio` argument and the prescreen and feature-selection scripts as
+`--entrapment RATIO`. There is no default.
 
-`prov_filter.py` was checked against the pipeline it was extracted from: on the
-six AIF runs it reproduces the recorded F1 counts exactly (69,190 / 71,432 /
-66,213 / 60,891 / 63,053 / 60,296 kept).
+**Which entrapment estimate to read.** Every script prints three numbers
+(`make_entrapment_fasta.py::fdp_estimates`, with `ratio` = real / entrapment target
+candidates):
+
+- combined = `entrapment * (1 + ratio) / (real + entrapment)`, for the whole accepted
+  target list. At or below the threshold it supports calibration;
+- lower bound = `entrapment / (real + entrapment)`. Above the threshold it refutes
+  calibration;
+- real-only = `(ratio * entrapment + 1) / real`, the estimate for the real hits alone.
+  `rescore.classifier = entrapment` cuts on exactly this (`fdr.rs::entrapment_q`), so on
+  such a run it restates the threshold and checks nothing.
+
+Read calibration only on a run thresholded on decoys. On the Q Exactive AIF E. coli + human
+library the real-only value is about 2.7 times lower than the combined one: measured on main
+(`nn_torch`, seeds 1-3) at `precursor_q` 1%, real-only 1.02%, combined 2.77%, lower bound
+1.78%; at `peptide_q_value` 1%, 1.05% / 2.97% / 1.96%. I/L or single-substitution homology to
+E. coli explains only 17 of about 218 entrapment hits there. On the E. coli diaPASEF library
+(seed 1) the combined estimate is 1.02% and the lower bound 0.65%. The real-only value ranks
+arms the same way as the combined one, so comparisons between arms recorded with it hold.
 
 ## Reading a benchmark number
 
@@ -76,8 +98,9 @@ the human ions dominate the pooled figure.
 ## Recorded results
 
 Both taken with MuMDIA at the second-pass workflow described in
-`docs/22_release_plan.md` WP7, which is prototype shell code on the benchmark
-machine and not yet in the engine. DIA-NN 2.2.0 was run library-free with
+`docs/22_release_plan.md` WP7, which was then prototype shell code on the benchmark
+machine; the engine has run a second pass by default since 2026-10-13
+(`mbr.strategy = second_pass`). DIA-NN 2.2.0 was run library-free with
 `--reanalyse` on the same files. All figures are `min_obs = 3` ion-level.
 
 ### Identification, `LFQ_Orbitrap_AIF_Ecoli_01.mzML` (2026-08-28, post-audit engine)
@@ -100,8 +123,9 @@ fine-tune, Extended features, `extract.gate_min_score = 0.2` set explicitly,
 
 Empirical decoy fraction at the 1% threshold: **0.0098**, on every q column. The
 (peptidoform, charge) count equals the stripped-peptide count exactly -- 1.000
-precursors per peptide -- because the default `compete.group_by = base_peptide`
-collapses every charge and modification sibling before FDR. That is not a precursor
+precursors per peptide -- because the default of the time, `compete.group_by =
+base_peptide`, collapsed every charge and modification sibling before FDR (the default
+has been `peptidoform_charge` since 2026-09-06). That is not a precursor
 count; use `peptidoform_charge` if a precursor unit is wanted.
 
 **Two corrections to the record this run forced.** The file is NOT all-ion: it has
@@ -130,7 +154,8 @@ gate 0.2 and 0.0097 at 0.6, so the difference is sensitivity, not a moved thresh
 strength of the `docs/18` gate sweep in which `native_tda` peaked at 0.6 (9,503
 peptides) while `nn_torch` peaked at the loose end -- 0.6 being the apparent match
 for the default classifier. **It measured 4.4% worse for `native_tda` and 4.7% worse
-for `nn_torch`**, and halves what extract accepts. The default is back to 0.2.
+for `nn_torch`**, and halves what extract accepts. The default went back to 0.2 (since
+2026-10-08 it is the window-mean gate at 0.6, a different score).
 
 Two record claims fall with it. `native_tda` is no longer 9,300-9,500 but 10,847,
 so its inverted-U has flattened from below and its optimum has moved to the loose
@@ -267,8 +292,9 @@ unset, because that is the path the defect lived on), 5,828,348 candidates,
 | accepted decoys, `peptide_q_value` <= 0.01 | **0** |
 | accepted decoys, `q_value` <= 0.01 | 15 |
 
-Empirical FDP = `(0.560632 x 12 + 1) / 786` = **0.0098** against a 1% threshold:
-calibrated.
+`(0.560632 x 12 + 1) / 786` = 0.0098, the entrapment estimate for the real hits alone, is
+the cut the entrapment classifier applied: it confirms the cut, not calibration. The whole
+accepted target list has a combined entrapment estimate of 2.35% and a lower bound of 1.50%.
 
 What each number tests:
 
@@ -318,13 +344,16 @@ current fragment selection does not remove.
 ## Reproducing
 
 ```
-# 1. Per-run analysis and pooled rescore produce pepquant_<run>.parquet.
-#    See docs/22_release_plan.md WP7 for the second-pass workflow this used.
+# 1. run-experiment over the six files writes <run>/peptide_quant.parquet (the raw
+#    pattern-fit quantity) and <run>/peptide_quant_normalised.parquet per run.
 
 # 2. Build the submission TSV from the run-experiment tree. Without options the raw
-#    quantity is submitted unchanged. --condition-gate withholds the values of a condition
-#    with no first-pass identification (rule F1 of prov_filter.py, which does the same on
-#    the older scored_src<i> layout); --quantity aligned or maxlfq replaces the raw value.
+#    quantity is submitted unchanged, which is what the recorded submission used. To
+#    score the current default quantification recipe instead, pass the
+#    peptide_quant_normalised.parquet tables with --quantity-column quantity_normalised.
+#    --condition-gate withholds the values of a condition with no first-pass
+#    identification (rule F1, see quant_condition_gate.py); --quantity aligned or maxlfq
+#    replaces the raw value.
 bench/make_proteobench_submission.py --fasta ProteoBenchFASTA_MixedSpecies_HYE.fasta \
     --out submission.tsv --condition-gate --quantity aligned \
     LFQ_Astral_DIA_15min_50ng_Condition_A_REP1=out/LFQ_Astral_DIA_15min_50ng_Condition_A_REP1/peptide_quant.parquet \
@@ -377,10 +406,10 @@ input, a factor of 6.8:
 | everything else | 0.36 GB | |
 
 For RAM, the figure to size from is the pooled rescore's feature matrix:
-`n_psms x n_features x 4` bytes. `MUMDIA_NN_STREAM_GB` (default 4) chooses between
-holding it in memory and a much slower disk-backed memmap, and a matrix marginally
-over the threshold silently takes the slow path, so set it deliberately for a large
-pool.
+`n_psms x n_features x 4` bytes. `MUMDIA_NN_STREAM_GB` chooses between holding it in
+memory and a much slower disk-backed memmap. Unset, the worker takes twice the free
+physical memory, never below 4 GB, and logs a warning when it falls to the memmap; set
+it explicitly on a machine with no page file.
 
 ## When adding a result here
 

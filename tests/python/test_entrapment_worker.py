@@ -1,12 +1,12 @@
 """Contract tests for `scripts/entrapment_worker.py` (Stage F, `entrapment`).
 
 Skipped without scikit-learn. Selecting entrapment flips the engine's internal
-`QMode` from `Decoy` to `Entrapment` (`rescore.rs:145`), so every q level (PSM,
+`QMode` from `Decoy` to `Entrapment` (`rescore.rs::run_hashed`), so every q level (PSM,
 per-run, peptide, protein group, precursor) is then computed against the
 real-target-vs-spike-in null. The scores this worker returns are therefore the
 input to the reported FDR, and the readback is validated with the same
 exact/unique/finite rule as the other sidecars, keyed on `row_id`
-(`rescore.rs:729-732`).
+(`rescore.rs::run_entrapment_gbm`).
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ def sklearn_available():
 
 
 def _build_input(path, with_row_id=True, n_entrap=N_ENTRAP, seed=0):
-    """Write `entrapment_in.parquet` in the layout `rescore.rs:693-714` writes.
+    """Write `entrapment_in.parquet` in the layout `rescore.rs::run_entrapment_gbm` writes.
 
     `candidate_id` deliberately collides (two rows share each value), the way it
     does in a competed multi-run pool where it is the library index. Only
@@ -85,7 +85,7 @@ def _build_input(path, with_row_id=True, n_entrap=N_ENTRAP, seed=0):
 def test_scores_every_row_including_decoys(sklearn_available, tmp_path):
     """Every input row must get exactly one finite score, decoys included.
 
-    Decoys are excluded from training (`entrapment_worker.py:80-83`) but must
+    Decoys are excluded from training (`entrapment_worker.py::main`) but must
     still be SCORED, by the final model fit on all non-decoy PSMs. A NaN or a
     missing decoy row makes the Rust readback bail, and if it did not, the
     decoy population behind the reported q-values would be silently truncated.
@@ -151,7 +151,7 @@ def test_out_of_fold_scores_separate_real_targets_from_spike_ins(
 def test_missing_row_id_falls_back_to_positional_index(sklearn_available, tmp_path):
     """An input without `row_id` must still be scored positionally.
 
-    The worker keeps that fallback (`entrapment_worker.py:75`) so an older
+    The worker keeps that fallback (`entrapment_worker.py::main`) so an older
     feature table remains readable. If the fallback disappeared, the run would
     fail on a KeyError inside the sidecar rather than on anything the caller
     can act on.
@@ -171,7 +171,7 @@ def test_single_class_input_fails_instead_of_scoring(sklearn_available, tmp_path
     worker that returned constants would give the engine a complete, finite
     output that passes every coverage check while `QMode::Entrapment` computes
     q-values against an empty null. The Rust side guards this too
-    (`rescore.rs:218-234`), so both layers must keep refusing.
+    (`rescore.rs::run_hashed`), so both layers must keep refusing.
     """
     spec = _build_input(tmp_path / "targets_only.parquet", n_entrap=0)
     out = tmp_path / "out.parquet"

@@ -3,8 +3,8 @@
 Needs only pandas and pyarrow, so it always runs. The output of this script is
 fed straight into `index.rs load()`, which enforces two hard preconditions and
 bails naming the offending row: `candidate_id` must be the contiguous
-row-aligned range `0..ncand` (`index.rs:112-125`) and precursors must ascend by
-`precursor_mz` (`index.rs:215-231`). Because the importer is run once, offline,
+row-aligned range `0..ncand` (`index.rs::check_candidate_ids`) and precursors must ascend by
+`precursor_mz` (`index.rs::precursor_row_span`). Because the importer is run once, offline,
 by hand, a violation surfaces only when a search is launched hours later.
 
 The modification map is the other risk. Replacement is substring-exact

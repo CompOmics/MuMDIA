@@ -668,7 +668,21 @@ def test_sharded_prediction_writes_the_column_one_process_writes(tmp_path, mode)
     assert sum(p["rows"] for p in s3["shards"]["per_shard"]) == s3["unique_predicted"]
     for key in ("model_load", "predict", "featurisation", "forward", "rewrite", "write"):
         assert key in s1["timings_s"], key
+    if mode == "multihead":
+        # The output-range guard runs once after either prediction path and is recorded.
+        r1, r3 = (_output_range(s) for s in (s1, s3))
+        assert r1["predicted"] == r3["predicted"] and r1["bounds"] == r3["bounds"]
     assert not list(tmp_path.glob("*.shards.*")), "the shard scratch directory was left behind"
+
+
+def _output_range(summary):
+    """The multi-head output-range guard's record in a worker summary, checked for shape."""
+    record = summary["multihead"]["output_range"]
+    assert record["action"] in ("none", "clamped"), record
+    lo, hi = record["bounds"]
+    assert lo < hi and record["predicted"] > 0, record
+    assert (record["action"] == "clamped") == (record["n_out_of_range"] > 0), record
+    return record
 
 
 def test_a_failed_shard_fails_the_stage_and_writes_nothing(tmp_path):
@@ -802,6 +816,8 @@ def test_the_projection_cache_reproduces_the_prediction_and_is_read_back(tmp_pat
     assert s_miss["projection_cache"]["used"] and not s_miss["projection_cache"]["hit"]
     assert s_hit["projection_cache"]["hit"]
     assert s_hit["projection_cache"]["key"] == s_miss["projection_cache"]["key"]
+    if mode == "multihead":
+        assert _output_range(s_miss)["predicted"] == _output_range(s_hit)["predicted"]
     entries = [p for p in cache.iterdir()]
     assert len(entries) == 1 and (entries[0] / "projections.npy").exists(), entries
     assert not [p for p in cache.iterdir() if ".tmp-" in p.name]
@@ -1095,18 +1111,10 @@ def test_the_guard_clamps_absurd_predictions_and_counts_them():
     assert record["bounds"] == [-600.0, 3000.0]
 
 
-def test_every_prediction_path_reaches_the_guard_and_the_summary_records_it():
-    """The guard runs once in `main`, after the one-process, projection-cache and sharded
-    prediction paths have all produced `values`, and before either writer; the recipe guards
-    each shard and `merge` sums the records. Checked on the source, since running it needs
-    DeepLC."""
-    text = (SCRIPTS / "deeplc_finetune.py").read_text(encoding="utf-8")
-    main = text[text.index("def main():"):text.index("def multihead_record(")]
-    guard = main.index("apply_output_range_guard(")
-    for path in ("predict_from_projections(", "predict_values(", "predict_sharded("):
-        assert main.index(path) < guard, path
-    assert guard < main.index("write_bands(") and guard < main.index("rewrite_irt(")
-    assert '"output_range": output_range' in text and '"ridge_alpha"' in text
+def test_the_recipe_guards_each_shard_and_merges_the_records():
+    """`mh_shard_predict.py` guards each shard and `merge` sums the records. Checked on the
+    source, since no test runs the recipe's predict and merge with DeepLC; the worker's own
+    paths are checked on their summaries by the real-DeepLC tests above."""
     recipe = (SCRIPTS / "mh_shard_predict.py").read_text(encoding="utf-8")
     assert "apply_output_range_guard(" in recipe and '".range.json"' in recipe
     assert 'summary["output_range"]' in recipe

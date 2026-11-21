@@ -139,7 +139,11 @@ Astral REP1 (HYE library, 10,881,402 candidates, thestral, 128 cores):
 | tag retrieval, no rescue, 0.54 | 54.0% | 99.21% | 97.47% | 99.13% | 82,258 | -0.92% | 611,786 |
 
 Orbitrap AIF entrapment run (E. coli plus a human entrapment, 5,828,348 candidates, hippogriff,
-128 cores); FDP is the combined entrapment estimate at 1% peptide q (ratio 0.560632):
+128 cores, `nn_torch`); the FDP column is the entrapment estimate for the real peptides alone,
+`(0.560632 x spike-ins + 1) / real peptides` at 1% peptide q (`ps_agg.py`). The combined
+estimate for all accepted targets is about 2.7 times higher (OFF about 2.7%, lower bound about
+1.7%; current main measured 2.97% and 1.96% at `peptide_q_value` 1%, docs/08 section 4d); the
+comparison between arms is what this table supports:
 
 | Arm | Removed | OFF IDs kept | Weak kept | Peptides at 1% | vs OFF | Entrapment FDP |
 |---|---:|---:|---:|---:|---:|---:|

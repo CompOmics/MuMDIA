@@ -452,6 +452,14 @@ jobs:
             import_check: >-
               import mokapot, ms2pip, numpy, pyarrow;
               print('mokapot', mokapot.__version__)
+          # AlphaPeptDeep is in neither image, so without this entry its pinned env is
+          # never resolved and its two real-model worker tests always skip. The
+          # end-to-end test downloads the pretrained models at test time.
+          - env_name: peptdeep
+            env_file: env/mumdia-peptdeep.yml
+            import_check: >-
+              import peptdeep, alphabase, torch, pyarrow;
+              print('torch', torch.__version__)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

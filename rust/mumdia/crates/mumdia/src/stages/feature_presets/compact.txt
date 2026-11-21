@@ -1,8 +1,8 @@
 # rescore.feature_preset = compact: the 114-feature list of docs/28 section 12
-# (bench/feature_selection/fs_union75_dedup.txt, 2026-09-05). Union of the features
+# (2026-09-05; this file is the only copy). Union of the features
 # that carried 75% of the permutation importance on any of the HYE A01, AIF and
-# entrapment pools, minus constant, duplicate and affine columns. Edit the bench list
-# and copy it here; the unit test pins the count.
+# entrapment pools, minus constant, duplicate and affine columns. The unit test pins
+# the count.
 rt_error_abs
 coelution_run
 log_apex_intensity

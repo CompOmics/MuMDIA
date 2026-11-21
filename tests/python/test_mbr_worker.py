@@ -8,7 +8,7 @@ fallback), and a silent contract break wastes an experiment-wide run.
 The headline case is `test_m5_lowers_every_psm_q_column`. Lowering only
 `q_value` left 34,280 of 34,664 accepted transfers unquantified on the HYE
 pooled run, because quant gates on `run_psm_q` rather than `q_value`
-(`mbr_worker.py:269-274`). Every PSM-level q column that `quant.q_filter` can
+(`mbr_worker.py::main`). Every PSM-level q column that `quant.q_filter` can
 select must be lowered on the accepted row, or the transfers are accepted and
 then thrown away.
 
@@ -244,7 +244,7 @@ def test_transferred_table_carries_the_documented_columns(mbr_result):
 def test_worker_is_deterministic_for_a_fixed_seed(mbr_dataset, tmp_path):
     """Two runs at the same `--seed` must produce the same transfers.
 
-    `--seed` receives the engine-wide `rng_seed` (`main.rs:709`) and drives the
+    `--seed` receives the engine-wide `rng_seed` (`main.rs, the `mbr` command`) and drives the
     permuted-RT null. If the null is not reproducible, neither is the accepted
     transfer set, so an MBR-enabled experiment cannot be re-run to the same
     numbers and no A/B comparison against it means anything.
@@ -264,9 +264,9 @@ def test_worker_is_deterministic_for_a_fixed_seed(mbr_dataset, tmp_path):
 def test_looser_q_transfer_only_grows_the_accepted_set(mbr_dataset, tmp_path):
     """The accepted set must be monotone in `--q-transfer`.
 
-    q is a running minimum from the tail (`mbr_worker.py:198`), so a looser
+    q is a running minimum from the tail (`mbr_worker.py::main`), so a looser
     threshold can only add transfers. A non-monotone accepted set means the q
-    mapping back to row order (`mbr_worker.py:199`) is misaligned, which would
+    mapping back to row order (`mbr_worker.py::main`) is misaligned, which would
     attach one candidate's q to another candidate's row.
     """
     tight = _run_mbr(mbr_dataset, tmp_path / "tight", 0.001, seed=7, out_scored=False)
@@ -475,7 +475,7 @@ def test_binned_map_removes_a_systematic_inter_run_rt_offset(
 
     Runs 1 and 2 here are shifted +300 s from run 0. With enough shared anchors
     the predicted RT lands on the observed apex; below the 200-anchor floor
-    (`mbr_worker.py:104,108`) the map silently falls back to the identity and
+    (`mbr_worker.py::main`) the map silently falls back to the identity and
     every prediction is off by the full inter-run offset. That fallback is the
     production trap: a small experiment gets no calibration and MBR then
     rejects every real transfer while looking like it simply found nothing.
@@ -584,7 +584,7 @@ def test_missing_psms_path_fails_loudly(mbr_dataset, tmp_path):
     """A bad `<psms_csv>` entry must exit nonzero, not produce a partial result.
 
     MBR has no fallback: `run_mbr(...)?` propagates and aborts the command
-    (`main.rs:697-710`). A worker that swallowed a missing per-run psms table
+    (`main.rs, the `mbr` command`). A worker that swallowed a missing per-run psms table
     would emit a transfer set built from a subset of the runs, which silently
     changes the anchor support behind `--min-anchor-runs`.
     """

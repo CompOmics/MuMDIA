@@ -40,8 +40,8 @@ unchanged.
 --condition-gate keeps the values of an ion in a condition only if at least one run of that
 condition both quantified the ion and identified it in the first pass (target,
 `run_psm_q <= --gate-q`). The values of a condition that rests only on second-pass (match-
-between-runs) evidence are left empty. This is rule F1 of `prov_filter.py`, read from the
-current `run-experiment` layout. The evidence is a Boolean `first_pass_id` column when every
+between-runs) evidence are left empty. This is rule F1 of `quant_condition_gate.py`, read from
+the current `run-experiment` layout. The evidence is a Boolean `first_pass_id` column when every
 quant table carries one, else `<experiment>/first_pass/scored_combined.parquet`
 (`--first-pass`), whose `source` is the experiment run index. The gate is an ion filter and
 changes no value it keeps. It removes more finite ratios than ProteoBench's ion count shows,
