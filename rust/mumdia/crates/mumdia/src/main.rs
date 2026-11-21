@@ -2346,9 +2346,6 @@ fn real_main() -> Result<()> {
                 out: &out,
                 out_pin: &out_pin,
                 cfg: &cfg.features,
-                // `retrace.apex_features` names the column a retraced psms_extracted
-                // carries; it is read only while the ion-mobility family is on.
-                imc_ref_w: cfg.retrace.apex_features,
                 q1_tolerances,
             })?;
         }

@@ -430,13 +430,9 @@ from the rebuilt fragment traces at the apex; `ms1_mono`, `ms1_iso1` and `ms1_is
 from the rebuilt MS1 traces at the apex, null only where extract had none and the raw trace
 is 0 there. `ms1_isom1`, `apex_im_mad` and `ms1_apex_im` keep extract's values. A row whose
 candidate has no rebuilt rows keeps all of extract's values. The table's report records
-the patch under `params.retrace` (`patched_columns` and the row counts). One optional
-column, read by name and written only under `retrace.apex_features` (as `rt_lo`/`rt_hi`
-are only under `extract.emit_rt_window`):
-
-| column | Arrow type | nullable | units | meaning |
-|---|---|---|---|---|
-| `imc_ref_w` | Float64 | no | correlation | retrace's apex 1/K0 agreement: over the rebuilt fragment rows with signal, the predicted-intensity-weighted mean leave-one-out reference correlation of each fragment's raw 1/K0 profile (`apex_im +/- 0.04`, 40 bins, MS2 frames within 1.5 s of the apex); 0.0 with no such fragment or no rebuilt rows |
+the patch under `params.retrace` (`patched_columns` and the row counts). Before 0.15.0,
+`retrace.apex_features` also appended a column `imc_ref_w`; a table that carries it still
+reads.
 
 Conditional columns, appended only when `extract.emit_contested_features`
 (`extract.rs:1498-1501`):

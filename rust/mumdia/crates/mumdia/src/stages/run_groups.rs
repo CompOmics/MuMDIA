@@ -1074,7 +1074,6 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 out: &feats,
                 out_pin: &pin,
                 cfg: &cfg.features,
-                imc_ref_w: false,
                 q1_tolerances: None,
             })?;
             if keep_records {

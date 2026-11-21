@@ -29,7 +29,7 @@ fn scratch(name: &str) -> std::path::PathBuf {
 /// The z = 1 b/y m/z of `pf` with the localised `name` on `sites`.
 fn ladder_of(pf: &str, name: &str, sites: &[usize]) -> Vec<f64> {
     let s = hypotheses::split(pf, name).unwrap();
-    ions::build(&s, &[sites.to_vec()], 1, None)
+    ions::build(&s, &[sites.to_vec()], 1)
         .ions
         .iter()
         .map(|i| i.mz)
@@ -504,13 +504,12 @@ fn the_elution_bounds_rule_merges_one_peak_and_keeps_two() {
     assert_eq!(best[1], "VTDGNS[Phospho]PEK");
 }
 
-/// Neutral-loss ions and the fitted temperature leave the planted calls standing and are
-/// recorded in the report; the fitted temperature is on the grid.
+/// The fitted temperature leaves the planted calls standing and is recorded in the report;
+/// it is on the grid.
 #[test]
-fn neutral_loss_and_auto_temperature_run_on_the_fixture() {
+fn auto_temperature_runs_on_the_fixture() {
     let f = fixture("nl_auto");
     let cfg: LocaliseConfig = serde_json::from_value(serde_json::json!({
-        "neutral_loss": true,
         "temperature": "auto"
     }))
     .unwrap();
@@ -526,10 +525,8 @@ fn neutral_loss_and_auto_temperature_run_on_the_fixture() {
     let rep: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(format!("{out}.report.json")).unwrap())
             .unwrap();
-    assert_eq!(rep["params"]["neutral_loss"], true);
     assert_eq!(rep["stats"]["temperature"]["mode"], "auto");
     assert_eq!(rep["schema_version"], 2);
-    // the classes of the loss ions have rates of their own
     assert_eq!(
         rep["stats"]["detection_rate_by_class"]
             .as_array()

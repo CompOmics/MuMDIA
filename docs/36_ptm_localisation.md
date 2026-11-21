@@ -76,18 +76,8 @@ consulted.
    hypotheses (1e-4 Th), with the set of hypotheses that predict it. An ion every hypothesis
    predicts is common; one only some predict is site-determining. A position's modification
    count that no hypothesis gives it (b2 carrying the site when neither residue is a candidate)
-   is an impossible variant: never a fragment of the peptide under any placement. With
-   `localise.neutral_loss` (Phospho only), every fragment that carries a phosphoserine or
-   -threonine also gives a loss ion 97.9769 Da lighter (phosphoric acid, the phosphate group
-   plus water), as four classes of their own (`ions::phosphate_loss`); the decoy residue loses
-   it as serine and threonine do, so that its placements stay exchangeable with the real ones,
-   and a phosphotyrosine does not. The loss of a fragment carrying `c` sites falls exactly on the
-   water loss of the same fragment carrying `c - 1`, which a competing placement predicts at
-   every position between two candidate sites; such loss ions would count the competitor's
-   water loss as evidence against it, so only loss ions without that alias are kept (in
-   practice the positions where every placement puts the same number of sites in the fragment,
-   which tell serine and threonine from tyrosine). They have no impossible variants, and take
-   the false-presence rate of the plain class of the same ion type and charge.
+   is an impossible variant: never a fragment of the peptide under any placement.
+   Neutral-loss ions (`localise.neutral_loss`) were removed in 0.15.0 (section 7).
 5. **Evidence.** The spectra are read again (`xic`): the MS2 scans of the isolation windows that
    hold the precursor m/z (on diaPASEF, the slots whose 1/K0 range, widened by 0.02, holds the
    apex 1/K0), pooled in retention-time order, and the `localise.apex_scans` (2) scans either
@@ -549,8 +539,8 @@ What the follow-ups show:
   `site_flr_decoy` there.
 - The fitted temperature needs decoy-residue wins: on small or clean experiments (the
   three-run dilution series: no or one win in the population) it stays at 1.
-- Neutral-loss ions (`localise.neutral_loss`) are implemented for Phospho and off: they did not
-  localise more peaks at a given true false localisation rate on the synthetic set.
+- Neutral-loss ions (`localise.neutral_loss`) were removed in 0.15.0: they did not localise
+  more peaks at a given true false localisation rate on the synthetic set.
 - C-terminal modifications are not localised (the search refuses C-terminal rules); a
   modification carried on a residue or the N-terminus together with another is not localised.
   A modification on the N-terminus and the same one on the first residue give the same

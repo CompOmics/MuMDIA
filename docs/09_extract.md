@@ -971,13 +971,9 @@ the row counts). The schema version stays 4.
 - `ms1_isom1` is not refreshed. There is no `-1` isotope trace to rebuild it from, so it
   stays extract's centroid value, summed over the MS1 scans without a 1/K0 band
   (IM-blind).
-- `imc_ref_w` only under `retrace.apex_features` (a new column, read by name, 0.0 without
-  a record). Over the rebuilt fragment rows, a raw 1/K0 profile per fragment in
-  `apex_im +/- 0.04` (40 bins), summed over the MS2 frames within 1.5 s of the apex, in the
-  quad slots holding the precursor and inside the fragment's TOF window. The score is the
-  predicted-intensity-weighted mean leave-one-out reference correlation of each profile
-  with signal (`stats::loo_ref_corr`, the kernel the co-elution and interference families
-  use). The ion-mobility feature family carries it as its tenth feature (docs/10).
+- `retrace.apex_features`, which wrote an apex 1/K0 agreement `imc_ref_w` as a tenth
+  ion-mobility feature, was removed in 0.15.0: the peptides it added carried about 2.7% FDP
+  (docs/35 section 6).
 
 A rank-0 row whose candidate has no rebuilt rows keeps extract's values, with a warning.
 The other readers of `psms_extracted` see the patched values: the shadow demotion's 1/K0
@@ -1537,7 +1533,7 @@ here for one index.
 | `retrace.enabled` (default false, diaPASEF only) | none; rewrites the chromatogram values from the raw `.d` and patches the `psms_extracted` apex scalars (section 9) | IM branch: +5.9% peptides E. coli (3 seeds), entrapment at an unchanged FDP, HYE +15.0% (seed 0); main: +5.6% E. coli (one seed, docs/35 section 11); gate pending on main (docs/35 section 6) |
 | `retrace.repick` (default false) | none; patches `apex_rt` / `apex_im` | IM branch: +7.4% peptides E. coli (3 seeds), entrapment +5.4% real peptides at an FDP of 0.37-0.47%, HYE +8.4% (seed 0); main: +8.0% E. coli (one seed); gate pending on main |
 | `extract.im_gate` (default `off`, diaPASEF only) | none; fragment peaks outside the 1/K0 window are not matched (section 8) | IM branch: +5.7% E. coli (3 seeds); main, with `features.im_features`: +5.0% (one seed); gate: paired entrapment and HYE seeds (docs/35 arm T12) |
-| `retrace.apex_features` (default false) | 1 F64 col `imc_ref_w` in `psms_extracted`; the tenth ion-mobility feature | IM branch: +1.3% alone, about 2.7% FDP on the added peptides; gate pending |
+| `retrace.apex_features` (removed in 0.15.0) | 1 F64 col `imc_ref_w` in `psms_extracted`; the tenth ion-mobility feature | IM branch: +1.3% alone, about 2.7% FDP on the added peptides; gate pending |
 | `extract.q1_cycles` (removed in 0.15.0) | none; a candidate's Q1 bins of one cycle became one chromatogram point (section 10) | ZT Scan REP01: -13.7% precursors (one seed) |
 | `extract.q1_profile` + `features.q1_features` (removed in 0.15.0) | psms_extracted v5: 4 F64 cols `q1_corr`, `q1_offset`, `q1_frag_sd`, `q1_bin_frac`; four features | ZT Scan REP01: +0.4% precursors (mean of four NN seeds, inside the seed range), +0.4% in a three-run experiment, +0.1% human precursors on an entrapment library at a combined FDP of 1.32% against 1.39%; one acquisition |
 | `extract.q1_gate_max_offset` (removed in 0.15.0) | none; rejected on `q1_offset` | not useful at any threshold measured (section 10) |

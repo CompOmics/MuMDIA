@@ -94,27 +94,15 @@ fn env_families() -> &'static [(&'static [&'static str], FamilyFn)] {
     })
 }
 
-/// The ion-mobility columns of the extended battery: none, the ion-mobility family
-/// (`features/im.rs`), or the family with retrace's `imc_ref_w` as its tenth feature
-/// (`retrace.apex_features`). A plain `bool` converts to `Off` or `On`.
+/// The ion-mobility columns of the extended battery: none or the ion-mobility family
+/// (`features/im.rs`). A plain `bool` converts to `Off` or `On`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImFamily {
     Off,
     On,
-    WithImcRefW,
 }
 
 impl ImFamily {
-    /// The family as `features.im_features` resolved it (`im`), with `imc_ref_w` when
-    /// retrace wrote it (`imc_ref_w`, which the family must be on to carry).
-    pub fn of(im: bool, imc_ref_w: bool) -> ImFamily {
-        match (im, imc_ref_w) {
-            (false, _) => ImFamily::Off,
-            (true, false) => ImFamily::On,
-            (true, true) => ImFamily::WithImcRefW,
-        }
-    }
-
     /// Whether the ion-mobility family is on.
     pub fn on(self) -> bool {
         self != ImFamily::Off
@@ -124,39 +112,33 @@ impl ImFamily {
         match self {
             ImFamily::Off => 0,
             ImFamily::On => 1,
-            ImFamily::WithImcRefW => 2,
         }
     }
 }
 
 impl From<bool> for ImFamily {
     fn from(im: bool) -> ImFamily {
-        ImFamily::of(im, false)
+        if im {
+            ImFamily::On
+        } else {
+            ImFamily::Off
+        }
     }
 }
 
 /// The families of the extended set: [`env_families`], then the ion-mobility family
-/// ([`im`]) when it is on, then `imc_ref_w` ([`im::APEX_NAMES`]) under
-/// [`ImFamily::WithImcRefW`]. The switch is `features.im_features` as the run or
-/// experiment resolved it ([`FeaturesConfig`]) and `retrace.apex_features`, passed down
-/// rather than latched here, so the schema id an orchestrator records, the features stage
+/// ([`im`]) when it is on. The switch is `features.im_features` as the run or
+/// experiment resolved it ([`FeaturesConfig`]), passed down rather than latched here, so the schema id an orchestrator records, the features stage
 /// and the rescore projection read one list. The lists are fixed for the process, so each
 /// is built once.
 fn families(im: impl Into<ImFamily>) -> &'static [(&'static [&'static str], FamilyFn)] {
     type Families = std::sync::OnceLock<Vec<(&'static [&'static str], FamilyFn)>>;
     static WITH_IM: Families = std::sync::OnceLock::new();
-    static WITH_APEX: Families = std::sync::OnceLock::new();
     match im.into() {
         ImFamily::Off => env_families(),
         ImFamily::On => WITH_IM.get_or_init(|| {
             let mut v = env_families().to_vec();
             v.push((im::NAMES, im::values));
-            v
-        }),
-        ImFamily::WithImcRefW => WITH_APEX.get_or_init(|| {
-            let mut v = env_families().to_vec();
-            v.push((im::NAMES, im::values));
-            v.push((im::APEX_NAMES, im::apex_values));
             v
         }),
     }
@@ -202,11 +184,8 @@ pub fn extended_names(im: impl Into<ImFamily>) -> Vec<String> {
 /// names off this plan, keeping names and values in lockstep.
 fn extended_value_plan(im: impl Into<ImFamily>) -> &'static Vec<Vec<usize>> {
     let im = im.into();
-    static PLAN: [std::sync::OnceLock<Vec<Vec<usize>>>; 3] = [
-        std::sync::OnceLock::new(),
-        std::sync::OnceLock::new(),
-        std::sync::OnceLock::new(),
-    ];
+    static PLAN: [std::sync::OnceLock<Vec<Vec<usize>>>; 2] =
+        [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
     PLAN[im.index()].get_or_init(|| {
         let reserved = reserved_names();
         let mut seen = std::collections::HashSet::new();
@@ -341,9 +320,9 @@ pub fn q1m_features(q1p: bool) -> Vec<&'static str> {
 pub const Q1C_FEATURES: &[&str] = super::q1consist::NAMES;
 
 /// The ordered active feature list for the configured set. `im` is the resolved
-/// `features.im_features`, with `imc_ref_w` when `retrace.apex_features` wrote it
-/// ([`ImFamily`]): under `extended` it appends the ion-mobility columns after the other
-/// families (`families`); the smaller sets have no family battery and ignore it.
+/// `features.im_features` ([`ImFamily`]): under `extended` it appends the ion-mobility
+/// columns after the other families (`families`); the smaller sets have no family battery
+/// and ignore it.
 pub fn active_features(set: FeatureSet, im: impl Into<ImFamily>) -> Vec<String> {
     active_features_fam(set, im, Q1Families::default())
 }
@@ -446,15 +425,12 @@ fn q1s_feature_names(cfg: &FeaturesConfig) -> Vec<&'static str> {
 /// The active feature list of a run's search pass, for the schema id an orchestrator
 /// records: [`active_features_fam`] for the configuration, the ion-mobility switch resolved
 /// for spectra that do (`has_im`) or do not carry 1/K0 (an orchestrator resolves it once,
-/// `Config::resolve_im_features`, so `has_im` then changes nothing), with `imc_ref_w` when
-/// `retrace.apex_features` is on (the main pass and the second pass retrace;
-/// `Config::validate` refuses the key without `retrace.enabled` and without the
-/// ion-mobility family).
+/// `Config::resolve_im_features`, so `has_im` then changes nothing).
 pub fn active_features_of(cfg: &mumdia_core::config::Config, has_im: bool) -> Vec<String> {
     let im = cfg.features.im_features.on(has_im);
     active_features_fam(
         cfg.features.set,
-        ImFamily::of(im, cfg.retrace.apex_features),
+        ImFamily::from(im),
         Q1Families::of(&cfg.features),
     )
 }
@@ -945,9 +921,6 @@ pub struct Evidence {
     /// Per-fragment per-point 1/K0 over `axis` (0.0 where a point has none), fragment
     /// order; empty when the chromatograms carry no 1/K0 or it was not read.
     pub im_traces: Vec<Vec<f64>>,
-    /// Retrace's apex 1/K0 agreement of the fragments (`psms_extracted.imc_ref_w`), 0.0
-    /// when it was not written or not read ([`ImFamily::WithImcRefW`]).
-    pub imc_ref_w: f64,
 }
 
 /// Parse a fragment name like `b3`, `y7`, `b3^2` into (is_b, ordinal, charge).
@@ -1385,7 +1358,6 @@ fn evidence_from(
         ms1_apex_im: None,
         im_pred_cal: None,
         im_traces,
-        imc_ref_w: 0.0,
     }
 }
 
@@ -1398,10 +1370,6 @@ pub struct FeaturesParams<'a> {
     pub out: &'a str,
     pub out_pin: &'a str,
     pub cfg: &'a FeaturesConfig,
-    /// Carry retrace's `imc_ref_w` (`psms_extracted`) as the tenth feature of the
-    /// ion-mobility family: `retrace.apex_features` in a pass that retraced. Read only while
-    /// the family is on; the column must then be in `psms`.
-    pub imc_ref_w: bool,
     /// The run's per-fragment Q1 decision tolerances (`cal.json`, `q1frag::read_model`),
     /// which `features.q1_consistency` reads; `None` elsewhere. With the family on and none
     /// given the stage is an error.
@@ -3001,23 +2969,7 @@ fn run_chunked(
         im_col("ms1_apex_im"),
         im_col("im_pred_cal"),
     );
-    // Retrace's `imc_ref_w`, the family's tenth feature, under `retrace.apex_features`
-    // (`FeaturesParams::imc_ref_w`). The switch comes from the configuration, as the schema
-    // id the orchestrator records does, so a table without the column is an error rather
-    // than a silent column of zeros.
-    let im_fam = ImFamily::of(im_on, p.imc_ref_w);
-    let imc_ref_w: Vec<f64> = if im_fam == ImFamily::WithImcRefW {
-        if !ps.has_column("imc_ref_w") {
-            anyhow::bail!(
-                "features: retrace.apex_features is on, but {} has no imc_ref_w column; \
-                 retrace writes it when it runs with retrace.apex_features",
-                p.psms
-            );
-        }
-        ps.f64("imc_ref_w")?
-    } else {
-        Vec::new()
-    };
+    let im_fam = ImFamily::from(im_on);
     if im_on && !matches!(p.cfg.set, FeatureSet::Extended) {
         warn!(
             set = ?p.cfg.set,
@@ -3420,9 +3372,6 @@ fn run_chunked(
                         ev.apex_im_mad = apex_im_mad[i];
                         ev.ms1_apex_im = ms1_apex_im[i];
                         ev.im_pred_cal = im_cal[i];
-                    }
-                    if im_fam == ImFamily::WithImcRefW {
-                        ev.imc_ref_w = imc_ref_w[i];
                     }
                     // Truncating zip, exactly as the name/value zip in the assembly
                     // did: a family that returned fewer values leaves the tail at 0.0.
@@ -4556,64 +4505,6 @@ mod tests {
                 "{n} in the compact preset"
             );
         }
-    }
-
-    /// `imc_ref_w` is the family's tenth column, after the nine, only under
-    /// `retrace.apex_features`; the configuration-level list the orchestrators record
-    /// follows the key, and without it every list is the one before the column existed.
-    #[test]
-    fn imc_ref_w_is_the_tenth_column_of_the_family_only_under_apex_features() {
-        assert_eq!(ImFamily::of(false, true), ImFamily::Off);
-        assert_eq!(ImFamily::from(true), ImFamily::On);
-        let on = active_features(FeatureSet::Extended, ImFamily::On);
-        let apex = active_features(FeatureSet::Extended, ImFamily::WithImcRefW);
-        assert_eq!(apex.len(), on.len() + 1);
-        let at = on
-            .iter()
-            .position(|c| c == im::NAMES[im::NAMES.len() - 1])
-            .unwrap();
-        assert_eq!(apex[at + 1], "imc_ref_w");
-        assert_eq!(apex[..=at], on[..=at]);
-        assert_eq!(apex[at + 2..], on[at + 1..]);
-        // The smaller sets carry no family.
-        for set in [FeatureSet::Minimal, FeatureSet::Rich] {
-            assert_eq!(
-                active_features(set, ImFamily::WithImcRefW),
-                active_features(set, false)
-            );
-        }
-        // The values follow the names, `imc_ref_w` from the Evidence.
-        let axis: Vec<f32> = (0..5).map(|k| 100.0 + k as f32).collect();
-        let tr: Vec<Vec<f32>> = vec![vec![1.0, 4.0, 9.0, 4.0, 1.0], vec![0.5, 2.0, 6.0, 2.0, 0.5]];
-        let rows: Vec<ChromRow> = (0..2)
-            .map(|i| ChromRow {
-                frag_name: ["y3", "y4"][i],
-                frag_mz: 300.0 + i as f64,
-                frag_obs_mz: 300.0 + i as f64,
-                pred_int: [0.8f32, 0.6][i],
-                rt: &axis,
-                inten: &tr[i],
-                im: &[],
-            })
-            .collect();
-        let mut e = build_evidence(&rows, align_traces(&rows), &[], 102.0, 0.5, 1);
-        e.imc_ref_w = 0.625;
-        let vals = extended_values(&e, ImFamily::WithImcRefW);
-        assert_eq!(vals.len(), extended_names(ImFamily::WithImcRefW).len());
-        let ext = extended_names(ImFamily::WithImcRefW);
-        let k = ext.iter().position(|c| c == "imc_ref_w").unwrap();
-        assert_eq!(vals[k], 0.625);
-        // The configuration-level list: the key adds the column, the 3D default does not.
-        let mut cfg = mumdia_core::config::Config::default();
-        cfg.features.set = FeatureSet::Extended;
-        assert_eq!(
-            active_features_of(&cfg, false),
-            active_features_for(&cfg.features, false)
-        );
-        cfg.features.im_features = ImFeatures::On;
-        cfg.retrace.enabled = true;
-        cfg.retrace.apex_features = true;
-        assert_eq!(active_features_of(&cfg, false), apex);
     }
 
     /// The family reads the per-point 1/K0 the Evidence carries on its elution axis, and the
@@ -6089,7 +5980,6 @@ mod tests {
             out: &out,
             out_pin: "",
             cfg: &cfg,
-            imc_ref_w: false,
             q1_tolerances: None,
         })
         .unwrap();
@@ -6304,7 +6194,6 @@ mod tests {
                 out: &out,
                 out_pin: &pin,
                 cfg: &cfg,
-                imc_ref_w: false,
                 q1_tolerances: tolerances,
             })
             .map(|_| out)
@@ -6487,7 +6376,6 @@ mod tests {
                         out,
                         out_pin: pin,
                         cfg: &cfg,
-                        imc_ref_w: false,
                         q1_tolerances: None,
                     },
                     chunk,
@@ -6904,7 +6792,6 @@ mod tests {
                         out,
                         out_pin: "",
                         cfg: &cfg,
-                        imc_ref_w: false,
                         q1_tolerances: None,
                     },
                     300,
@@ -6978,7 +6865,6 @@ mod tests {
                 out,
                 out_pin: "",
                 cfg: &cfg,
-                imc_ref_w: false,
                 q1_tolerances: None,
             })
             .unwrap()
@@ -7112,7 +6998,6 @@ mod tests {
                     out: &out,
                     out_pin: &pin,
                     cfg: &cfg,
-                    imc_ref_w: false,
                     q1_tolerances: None,
                 },
                 chunk_rows,
@@ -7335,7 +7220,6 @@ mod tests {
                         out: &out,
                         out_pin: "",
                         cfg: &cfg,
-                        imc_ref_w: false,
                         q1_tolerances: None,
                     },
                     chunk_rows,
@@ -7389,7 +7273,6 @@ mod tests {
                     out: &out,
                     out_pin: "",
                     cfg: &cfg,
-                    imc_ref_w: false,
                     q1_tolerances: None,
                 },
                 chunk_rows,
@@ -7617,7 +7500,6 @@ mod tests {
                     out,
                     out_pin: "",
                     cfg: &cfg,
-                    imc_ref_w: false,
                     q1_tolerances: None,
                 },
                 100,
@@ -7699,7 +7581,6 @@ mod tests {
                     out: &out,
                     out_pin: &pin,
                     cfg: &cfg,
-                    imc_ref_w: false,
                     q1_tolerances: None,
                 },
                 4,
@@ -7744,7 +7625,6 @@ mod tests {
                     out: &o2,
                     out_pin: &pin2,
                     cfg: &cfg,
-                    imc_ref_w: false,
                     q1_tolerances: None,
                 },
                 4,
@@ -7803,7 +7683,6 @@ mod tests {
             out: &out,
             out_pin: &pin,
             cfg: &cfg,
-            imc_ref_w: false,
             q1_tolerances: None,
         };
 

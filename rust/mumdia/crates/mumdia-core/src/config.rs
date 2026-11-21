@@ -4991,13 +4991,6 @@ pub struct RetraceConfig {
     /// the prototype's +1.6%.
     #[serde(skip_serializing_if = "is_true")]
     pub ms1: bool,
-    /// Write `imc_ref_w` into `psms_extracted`, the agreement of the fragments' raw 1/K0
-    /// profiles at the apex, which the ion-mobility feature family then carries as its
-    /// tenth feature. Needs `enabled` and a `features.im_features` other than `off`.
-    /// Default false. Benchmark-gated: alone it measured +1.3% peptides, and the added
-    /// peptides carried about 2.7% FDP.
-    #[serde(skip_serializing_if = "is_false")]
-    pub apex_features: bool,
     /// The scanning-quadrupole analogue of `repick` (ZT Scan has no raw events beyond its
     /// centroids, so it needs neither `enabled` nor a `.d`): extract re-chooses each
     /// candidate's apex in RT x Q1 among its own apex and the next peaks of its count
@@ -5031,7 +5024,6 @@ impl Default for RetraceConfig {
             q1_repick_peaks: 5, // Q1_REPICK_PEAKS
             im_half_width: 0.015,
             ms1: true,
-            apex_features: false,
         }
     }
 }
@@ -5160,14 +5152,6 @@ pub struct LocaliseConfig {
     #[serde(deserialize_with = "de_localise_temperature")]
     #[serde(skip_serializing_if = "is_default_localise_temperature")]
     pub temperature: f64,
-    /// Neutral-loss ions as evidence: for Phospho, the loss of phosphoric acid (97.9769 Da)
-    /// from every b and y ion that carries a phosphoserine or -threonine (and the decoy
-    /// residue, which stands in for them), scored as four ion classes of their own with
-    /// their own detection and false-presence rates. Other modifications have no neutral
-    /// loss. Default false: on the synthetic phosphopeptides it localised no more peaks at a
-    /// given true false localisation rate (docs/36_ptm_localisation.md section 7).
-    #[serde(skip_serializing_if = "is_default_localise_neutral_loss")]
-    pub neutral_loss: bool,
     /// `run-experiment`: combine the runs into one site probability per consensus peak,
     /// summing the log-likelihoods of the runs whose peak of the same precursor matches it in
     /// aligned retention time, and write `localisation_experiment.parquet` and the
@@ -5200,7 +5184,6 @@ impl Default for LocaliseConfig {
             im_half_width: 0.05,
             prior_strength: 64.0,
             temperature: 0.0, // LOCALISE_TEMPERATURE_AUTO
-            neutral_loss: false,
             combine_runs: true,
             experiment_temperature: 0.0, // LOCALISE_TEMPERATURE_AUTO
         }
@@ -5279,9 +5262,6 @@ fn is_default_localise_peak_rule(v: &LocalisePeakRule) -> bool {
 }
 fn is_default_localise_peak_valley_ratio(v: &f64) -> bool {
     *v == LocaliseConfig::default().peak_valley_ratio
-}
-fn is_default_localise_neutral_loss(v: &bool) -> bool {
-    *v == LocaliseConfig::default().neutral_loss
 }
 fn is_default_localise_combine_runs(v: &bool) -> bool {
     *v == LocaliseConfig::default().combine_runs
@@ -7173,16 +7153,12 @@ impl Config {
             }
         }
         if !r.enabled {
-            for (on, key) in [
-                (r.repick, "retrace.repick"),
-                (r.apex_features, "retrace.apex_features"),
-            ] {
-                if on {
-                    return Err(Invalid(format!(
-                        "{key} needs retrace.enabled: it works on the raw events the retrace \
-                         stage reads"
-                    )));
-                }
+            if r.repick {
+                return Err(Invalid(
+                    "retrace.repick needs retrace.enabled: it works on the raw events the \
+                     retrace stage reads"
+                        .into(),
+                ));
             }
             return Ok(());
         }
@@ -7217,13 +7193,6 @@ impl Config {
                         .into(),
                 ));
             }
-        }
-        if r.apex_features && self.features.im_features.is_off() {
-            return Err(Invalid(
-                "retrace.apex_features writes imc_ref_w, a feature of the ion-mobility family, \
-                 so it needs features.im_features = on or auto"
-                    .into(),
-            ));
         }
         Ok(())
     }
@@ -7406,6 +7375,18 @@ const RETIRED: &[Retired] = &[
 
     // D: MS1 surface, never-read keys and refused choices
     Retired {
+        path: "extract.ms1_calibrate",
+        gone: Gone::Value("\"surface\""),
+        why: "the MS1 error surface measured inside seed noise on one acquisition \
+              (docs/09_extract.md, \"MS1 mass calibration\")",
+    },
+    Retired {
+        path: "extract.prec_tol_auto",
+        gone: Gone::Key("false"),
+        why: "the MS1 tolerance from the anchors' residuals measured inside seed noise on one \
+              acquisition (docs/09_extract.md, \"MS1 mass calibration\")",
+    },
+    Retired {
         path: "mbr.rt_window_s",
         gone: Gone::Key("20.0"),
         why: "no stage read it",
@@ -7427,16 +7408,16 @@ const RETIRED: &[Retired] = &[
               classifier",
     },
     Retired {
-        path: "extract.ms1_calibrate",
-        gone: Gone::Value("\"surface\""),
-        why: "the MS1 error surface measured inside seed noise on one acquisition \
-              (docs/09_extract.md, \"MS1 mass calibration\")",
+        path: "retrace.apex_features",
+        gone: Gone::Key("false"),
+        why: "the apex 1/K0 agreement added peptides at about 2.7% FDP (docs/35_diapasef.md \
+              section 6)",
     },
     Retired {
-        path: "extract.prec_tol_auto",
+        path: "localise.neutral_loss",
         gone: Gone::Key("false"),
-        why: "the MS1 tolerance from the anchors' residuals measured inside seed noise on one \
-              acquisition (docs/09_extract.md, \"MS1 mass calibration\")",
+        why: "neutral-loss ions localised no more peaks at a given false localisation rate \
+              (docs/36_ptm_localisation.md section 7)",
     },
 
     // E: rt_transfer MBR tier
@@ -9634,12 +9615,12 @@ mod tests {
         assert_eq!(fixed.localise.fixed_temperature(), Some(1.5));
         assert_eq!(fixed.localise.fixed_experiment_temperature(), Some(2.0));
         let rules = Config::from_json(
-            r#"{"localise":{"peak_rule":"apex_tolerance","neutral_loss":true,"combine_runs":false,
+            r#"{"localise":{"peak_rule":"apex_tolerance","combine_runs":false,
                 "peak_valley_ratio":0}}"#,
         )
         .unwrap();
         assert_eq!(rules.localise.peak_rule, LocalisePeakRule::ApexTolerance);
-        assert!(rules.localise.neutral_loss && !rules.localise.combine_runs);
+        assert!(!rules.localise.combine_runs);
         let eb = Config::from_json(r#"{"localise":{"peak_rule":"elution_bounds"}}"#).unwrap();
         assert_eq!(eb.localise.peak_rule, LocalisePeakRule::ElutionBounds);
         for bad in [
@@ -9660,7 +9641,7 @@ mod tests {
     fn retrace_keys_leave_the_default_config_hash_alone() {
         let d = Config::default();
         assert!(d.retrace.is_default());
-        assert!(!d.retrace.enabled && !d.retrace.repick && !d.retrace.apex_features);
+        assert!(!d.retrace.enabled && !d.retrace.repick);
         assert!(d.retrace.ms1);
         assert_eq!(d.retrace.im_half_width, 0.015);
         let canon = d.canonical_json();
@@ -9709,7 +9690,6 @@ mod tests {
         };
         // Keys that only act inside the stage need the stage.
         assert!(err(r#"{"retrace":{"repick":true}}"#).contains("retrace.enabled"));
-        assert!(err(r#"{"retrace":{"apex_features":true}}"#).contains("retrace.enabled"));
         assert!(err(r#"{"retrace":{"im_half_width":0.0}}"#).contains("im_half_width"));
         assert!(err(r#"{"retrace":{"im_half_width":-0.01}}"#).contains("im_half_width"));
         // Grouped runs and scored alternative peaks.
@@ -9725,15 +9705,13 @@ mod tests {
         assert!(err(r#"{"retrace":{"enabled":true,"repick":true},
                 "extract":{"retain_top_peaks":5,"apex_refine_intensity":true}}"#)
         .contains("apex_refine_intensity"));
-        // `imc_ref_w` belongs to the ion-mobility family.
-        assert!(err(r#"{"retrace":{"enabled":true,"apex_features":true}}"#).contains("im_features"));
         // The measured recipe passes.
         let ok = Config::from_json(
-            r#"{"retrace":{"enabled":true,"repick":true,"apex_features":true},
+            r#"{"retrace":{"enabled":true,"repick":true},
                 "extract":{"retain_top_peaks":5},"features":{"im_features":"auto"}}"#,
         )
         .unwrap();
-        assert!(ok.retrace.enabled && ok.retrace.repick && ok.retrace.apex_features);
+        assert!(ok.retrace.enabled && ok.retrace.repick);
     }
 
     /// The extraction and feature keys of the diaPASEF work are omitted from the canonical

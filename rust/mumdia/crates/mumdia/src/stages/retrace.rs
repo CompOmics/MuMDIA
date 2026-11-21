@@ -21,8 +21,8 @@
 //!
 //! Retrace then patches `psms_extracted` once, in place: `apex_rt` and `apex_im` of a
 //! re-picked candidate, the apex scalars read from the rebuilt traces (`apex_intensity`,
-//! `n_matched_fragments`, `ms1_mono`, `ms1_iso1`, `ms1_iso2`), and under
-//! `retrace.apex_features` the column `imc_ref_w`. The table keeps its schema version (v4).
+//! `n_matched_fragments`, `ms1_mono`, `ms1_iso1`, `ms1_iso2`). The table keeps its schema
+//! version (v4).
 //!
 //! The frames inside the candidates' RT windows are decoded once and held
 //! (`convert::tims_frames::TofFrame`); the chromatograms are then streamed one row group at
@@ -34,7 +34,6 @@ use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use arrow::array::{Array, ArrayRef, Float32Array, Float64Array, Int32Array, UInt32Array};
-use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use mumdia_core::config::{Config, ExtractConfig, RetraceConfig};
 use mumdia_io::report::{ArtifactReport, Written};
@@ -53,7 +52,6 @@ use crate::stages::convert::tims_frames::{
 };
 use crate::stages::convert::RawTdf;
 use crate::stages::extract::{ms1_neighbours, nearest_index, read_run_windows};
-use crate::stats::{loo_ref_corr, LooRef};
 
 /// The file extract writes its centroid traces to when retrace runs after it, beside
 /// `chromatograms.parquet`. Deleted once retrace has written the rebuilt table.
@@ -91,14 +89,6 @@ pub(crate) fn grow_readers_for_chains(chains: usize) -> Option<crate::sched::Bud
     let add = (READER_EXTRAS * chains).saturating_sub(READER_EXTRAS * READER_CALLS);
     (add > 0).then(|| crate::sched::BudgetGrowth::add(&READER_BUDGET, add))
 }
-
-// `retrace.apex_features` (docs/35_diapasef.md section 6): the apex mobility agreement is
-// scored on each fragment's raw 1/K0 profile over `apex_im +/- APEX_IM_HW`, in APEX_BINS
-// bins, summed over the MS2 frames within APEX_RT_HW_S of the apex.
-const APEX_IM_HW: f64 = 0.04;
-const APEX_BINS: usize = 40;
-const APEX_IM_BIN: f64 = 2.0 * APEX_IM_HW / APEX_BINS as f64;
-const APEX_RT_HW_S: f64 = 1.5;
 
 // `retrace.repick`: the 1/K0 profile of each candidate peak is binned at REPICK_BIN over the
 // run_windows 1/K0 window and scored in bands of 2 * REPICK_BAND_BINS + 1 bins (+/- 0.015),
@@ -393,20 +383,15 @@ struct Apex {
     /// `ms1_mono`, `ms1_iso1`, `ms1_iso2` at the point nearest the apex, from a rebuilt MS1
     /// row; `None` where that row was not rebuilt, and extract's value stays.
     ms1: [Option<f64>; 3],
-    /// (predicted intensity, raw 1/K0 profile) per rebuilt fragment row, under
-    /// `retrace.apex_features`.
-    prof: Vec<(f64, [f64; APEX_BINS])>,
 }
 
-/// A finished candidate: id, the fragment scalars (`None`: not refreshed), the MS1 apex
-/// values and `imc_ref_w`. The profiles are dropped here, so only these stay resident (a
-/// HYE run has ~7M candidates; their profiles are ~28 GB).
+/// A finished candidate: id, the fragment scalars (`None`: not refreshed) and the MS1 apex
+/// values.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ApexRow {
     cid: u32,
     frag: Option<(f32, i32)>,
     ms1: [Option<f64>; 3],
-    imc: f64,
 }
 
 impl Apex {
@@ -417,7 +402,6 @@ impl Apex {
             inten: 0.0,
             n_matched: 0,
             ms1: [None; 3],
-            prof: Vec::new(),
         }
     }
 
@@ -426,7 +410,6 @@ impl Apex {
             cid: self.cid,
             frag: (self.rebuilt > 0).then_some((self.inten as f32, self.n_matched)),
             ms1: self.ms1,
-            imc: self.imc(),
         }
     }
 
@@ -438,33 +421,6 @@ impl Apex {
             if a.is_none() {
                 *a = b;
             }
-        }
-        self.prof.extend(o.prof);
-    }
-
-    /// `imc_ref_w`: over the fragments with signal, the predicted-intensity-weighted mean
-    /// leave-one-out reference correlation of each 1/K0 profile against the weighted sum of
-    /// the others (`stats::loo_ref_corr`). 0 when none has signal.
-    fn imc(&self) -> f64 {
-        let mut tot = [0.0f64; APEX_BINS];
-        for (w, p) in &self.prof {
-            for (t, v) in tot.iter_mut().zip(p) {
-                *t += w * v;
-            }
-        }
-        let profiles: Vec<&[f64]> = self.prof.iter().map(|(_, p)| &p[..]).collect();
-        let weights: Vec<f64> = self.prof.iter().map(|(w, _)| *w).collect();
-        let (mut num, mut den) = (0.0, 0.0);
-        for (f, (w, p)) in self.prof.iter().enumerate() {
-            if p.iter().sum::<f64>() > 0.0 {
-                num += w * loo_ref_corr(&profiles, &weights, f, LooRef::Subtract(&tot));
-                den += w;
-            }
-        }
-        if den > 0.0 {
-            num / den
-        } else {
-            0.0
         }
     }
 }
@@ -898,8 +854,7 @@ fn col<'b, T: 'static>(batch: &'b RecordBatch, name: &str) -> Result<&'b T> {
 /// Patch `psms_extracted` (`input`, written to `output`, which may be `input` itself),
 /// once: `apex_rt` and `apex_im` of the re-picked
 /// candidates (`picks`), the apex scalars of every rank-0 row whose candidate has an apex
-/// record (`apex`), and under `imc` the column `imc_ref_w` (0.0 without a record). Every
-/// other value, the columns' order and the rows' order are kept. A rank-0 row without an
+/// record (`apex`). Every other value, the columns' order and the rows' order are kept. A rank-0 row without an
 /// apex record keeps extract's values (counted, and warned about by the caller).
 ///
 /// The null rule of the MS1 scalars: a value refreshed from a rebuilt row is written, and
@@ -909,7 +864,6 @@ fn patch_psms(
     output: &str,
     picks: &[(u32, f64, f64)],
     apex: &[ApexRow],
-    imc: bool,
 ) -> Result<(Written, PatchStats)> {
     let tf = TableFile::open(input)?;
     let rg = tf
@@ -920,19 +874,9 @@ fn patch_psms(
         .max(1);
     let mut reader = tf.batches(None, 1 << 16)?;
     let schema = reader.schema();
-    let imc_at = schema.index_of("imc_ref_w").ok();
-    let out_schema = match (imc, imc_at) {
-        (true, None) => {
-            let mut fields: Vec<Field> =
-                schema.fields().iter().map(|f| f.as_ref().clone()).collect();
-            fields.push(Field::new("imc_ref_w", DataType::Float64, false));
-            Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
-        }
-        _ => schema.clone(),
-    };
     let mut w = BatchWriter::with_options(
         output,
-        out_schema.clone(),
+        schema.clone(),
         WriteOptions::new().row_group_rows(rg).content_hash(),
     )?;
     let pick_of = |c: u32| -> Option<(f64, f64)> {
@@ -967,7 +911,6 @@ fn patch_psms(
             Vec::with_capacity(n),
         );
         let mut new_ms1: [Vec<Option<f64>>; 3] = Default::default();
-        let mut new_imc: Vec<f64> = Vec::with_capacity(if imc { n } else { 0 });
         for r in 0..n {
             let c = cid.value(r);
             let old_im = im.is_valid(r).then(|| im.value(r));
@@ -978,7 +921,6 @@ fn patch_psms(
             let (mut t, mut m) = (rt.value(r), old_im);
             let (mut a, mut k) = (ai.value(r), nm.value(r));
             let mut v_ms1 = old_ms1.clone();
-            let mut v_imc = 0.0;
             if rank.value(r) == 0 {
                 if let Some((pt, pm)) = pick_of(c) {
                     st.repicked += 1;
@@ -1002,7 +944,6 @@ fn patch_psms(
                             }
                         }
                         st.refreshed_ms1_scalars += any as u64;
-                        v_imc = rec.imc;
                     }
                     None => st.without_record += 1,
                 }
@@ -1013,9 +954,6 @@ fn patch_psms(
             new_nm.push(k);
             for (dst, v) in new_ms1.iter_mut().zip(v_ms1) {
                 dst.push(v);
-            }
-            if imc {
-                new_imc.push(v_imc);
             }
         }
         let mut cols: Vec<ArrayRef> = batch.columns().to_vec();
@@ -1041,14 +979,7 @@ fn patch_psms(
         for (name, v) in ["ms1_mono", "ms1_iso1", "ms1_iso2"].iter().zip(new_ms1) {
             set(&mut cols, name, Arc::new(Float64Array::from(v)))?;
         }
-        if imc {
-            let a: ArrayRef = Arc::new(Float64Array::from(new_imc));
-            match imc_at {
-                Some(i) => cols[i] = a,
-                None => cols.push(a),
-            }
-        }
-        w.write(&RecordBatch::try_new(out_schema.clone(), cols)?)?;
+        w.write(&RecordBatch::try_new(schema.clone(), cols)?)?;
         st.rows += n as u64;
     }
     // Every handle on the input goes before the new file takes its place.
@@ -1285,7 +1216,6 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
     let half1 = p.extract.ms1_scan_halfwidth;
     let prec_tol = p.extract.prec_tol_ppm * 1e-6;
     let ftol = frag_tol * 1e-6;
-    let want_prof = p.cfg.apex_features;
     let (ms1_rt, ms1_fi, ms2_rt, ms2_fi) = (&ms1_rt, &ms1_fi, &ms2_rt, &ms2_fi);
     let (scan_im, raw, mass_off) = (&scan_im, &raw, &mass_off);
     let pmz = &pmz;
@@ -1472,27 +1402,6 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
                     let c0 = s.cid[g0] as usize;
                     let t_apex = apex_rt.get(c0).copied().unwrap_or(f64::NAN);
                     let mut apex = Apex::new(s.cid[g0]);
-                    // MS2 frames within APEX_RT_HW_S of the apex and their quad-slot scans in
-                    // the wider profile band, planned once per candidate.
-                    let apex_frames: Vec<(&TofFrame, Vec<(usize, usize)>)> = if want_prof
-                        && t_apex.is_finite()
-                        && c0 < pmz.len()
-                        && pmz[c0].is_finite()
-                        && centre[c0].is_finite()
-                    {
-                        let band =
-                            scan_band(scan_im, centre[c0] - APEX_IM_HW, centre[c0] + APEX_IM_HW);
-                        let a = ms2_rt.partition_point(|&t| t < t_apex - APEX_RT_HW_S);
-                        let b = ms2_rt.partition_point(|&t| t <= t_apex + APEX_RT_HW_S);
-                        (a..b)
-                            .filter_map(|j| frames[ms2_fi[j]].as_ref())
-                            .map(|f| (f, slot_scans(f.quad(), pmz[c0], band)))
-                            .filter(|(_, sc)| !sc.is_empty())
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    let im_lo = centre.get(c0).copied().unwrap_or(f64::NAN) - APEX_IM_HW;
                     let out: Vec<RowOut> = (g0..g1)
                         .map(|r| {
                             let pts = &s.rt[r][..];
@@ -1583,16 +1492,6 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
                             }
                             let ms1_residual_ppm = (!frag && s.name[r] == "ms1_mono" && sw > 0.0)
                                 .then(|| (raw.mz_of(stof / sw) - s.fmz[r]) / s.fmz[r] * 1e6);
-                            if frag && want_prof && !apex_frames.is_empty() {
-                                let mut pr = [0.0f64; APEX_BINS];
-                                for (f, scans) in &apex_frames {
-                                    f.visit(scans, tof.0, tof.1, scan_im.len(), |sc, _, w| {
-                                        let b = ((scan_im[sc] - im_lo) / APEX_IM_BIN) as isize;
-                                        pr[b.clamp(0, APEX_BINS as isize - 1) as usize] += w;
-                                    });
-                                }
-                                apex.prof.push((s.pint[r] as f64, pr));
-                            }
                             RowOut {
                                 kind,
                                 int: ints,
@@ -1830,7 +1729,8 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
         "im_half_width": hw,
         "ms1": p.cfg.ms1,
         "repick": p.cfg.repick,
-        "apex_features": p.cfg.apex_features,
+        // Removed in 0.15.0; kept so the report of a retraced run stays as it was.
+        "apex_features": false,
         "frag_tol_ppm": frag_tol,
         "prec_tol_ppm": p.extract.prec_tol_ppm,
         "ms1_scan_halfwidth": half1,
@@ -1881,13 +1781,7 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
     report.write_for(p.out)?;
 
     // The one patch of psms_extracted, with its provenance in the table's report.
-    let (psms_written, st) = patch_psms(
-        p.psms_extracted,
-        p.out_psms,
-        &picks,
-        &apex_done,
-        p.cfg.apex_features,
-    )?;
+    let (psms_written, st) = patch_psms(p.psms_extracted, p.out_psms, &picks, &apex_done)?;
     if st.without_record > 0 {
         warn!(
             rows = st.without_record,
@@ -1906,9 +1800,6 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
     }
     if p.cfg.repick {
         patched.extend(["apex_rt", "apex_im"]);
-    }
-    if p.cfg.apex_features {
-        patched.push("imc_ref_w");
     }
     let provenance = json!({
         "stage": "retrace",
@@ -1951,78 +1842,24 @@ mod tests {
     use timsrust::QuadrupoleSettings;
 
     #[test]
-    fn apex_imc_scores_profile_agreement_and_survives_a_span_split() {
-        let bump = |c: usize| {
-            let mut p = [0.0; APEX_BINS];
-            for (k, v) in p.iter_mut().enumerate() {
-                *v = (-((k as f64 - c as f64).powi(2)) / 8.0).exp();
-            }
-            p
-        };
-        let rec = |prof| Apex {
+    fn an_apex_split_over_two_spans_merges_as_the_whole() {
+        let rec = || Apex {
             cid: 7,
             rebuilt: 1,
             inten: 1.0,
             n_matched: 1,
             ms1: [None, Some(2.0), None],
-            prof,
         };
-        // Three fragments on one mobility peak agree fully; an empty one is ignored.
-        let same = rec(vec![
-            (1.0, bump(20)),
-            (2.0, bump(20)),
-            (0.5, bump(20)),
-            (3.0, [0.0; APEX_BINS]),
-        ]);
-        assert!((same.imc() - 1.0).abs() < 1e-12);
-        // One fragment on another ion's peak pulls the score down.
-        let off = rec(vec![(1.0, bump(20)), (1.0, bump(20)), (1.0, bump(5))]);
-        assert!(off.imc() < 0.7);
-        assert_eq!(rec(vec![]).imc(), 0.0);
-        // A candidate split over two spans scores as the whole.
-        let mut a = rec(vec![(1.0, bump(20)), (1.0, bump(20))]);
-        let mut b = rec(vec![(1.0, bump(5))]);
+        let mut a = rec();
+        let mut b = rec();
         b.ms1 = [Some(3.0), Some(9.0), None];
         a.merge(b);
-        assert_eq!(a.imc(), off.imc());
         assert_eq!((a.inten, a.n_matched, a.rebuilt), (2.0, 2, 2));
         assert_eq!(a.ms1, [Some(3.0), Some(2.0), None]);
         // Without a rebuilt fragment row the fragment scalars are not refreshed.
-        let mut none = rec(vec![]);
+        let mut none = rec();
         none.rebuilt = 0;
         assert_eq!(none.finish().frag, None);
-    }
-
-    /// `imc_ref_w` through the shared kernel is the IM branch's formula bit for bit: the
-    /// Pearson of each profile against the weighted total minus its own weighted profile.
-    #[test]
-    fn imc_through_the_shared_kernel_is_the_branch_formula() {
-        let prof: Vec<(f64, [f64; APEX_BINS])> = (0..5)
-            .map(|f| {
-                let mut p = [0.0; APEX_BINS];
-                for (k, v) in p.iter_mut().enumerate() {
-                    *v = ((k * (f + 3)) % 11) as f64 * 1.7 + f as f64;
-                }
-                (0.3 + f as f64, p)
-            })
-            .collect();
-        let mut tot = [0.0f64; APEX_BINS];
-        for (w, p) in &prof {
-            for (t, v) in tot.iter_mut().zip(p) {
-                *t += w * v;
-            }
-        }
-        let (mut num, mut den) = (0.0, 0.0);
-        for (w, p) in &prof {
-            let other: Vec<f64> = tot.iter().zip(p).map(|(t, v)| t - w * v).collect();
-            num += w * crate::stats::pearson(p, &other);
-            den += w;
-        }
-        let a = Apex {
-            prof,
-            ..Apex::new(1)
-        };
-        assert_eq!(a.imc().to_bits(), (num / den).to_bits());
     }
 
     #[test]
@@ -2202,8 +2039,7 @@ mod tests {
     }
 
     /// The one patch of psms_extracted: re-picked apexes, refreshed scalars under the null
-    /// rule, extract's values kept without a record, `imc_ref_w` appended (and replaced, not
-    /// appended again, on a second patch), every other column and the row order kept.
+    /// rule, extract's values kept without a record, every column and the row order kept.
     #[test]
     fn the_psms_patch_writes_each_rule_once() {
         let dir = std::env::temp_dir().join(format!("mumdia_retrace_patch_{}", std::process::id()));
@@ -2245,16 +2081,14 @@ mod tests {
                 // A refreshed zero stays null where extract had none, and becomes 0.0 where
                 // it had a value.
                 ms1: [Some(0.0), Some(4.0), Some(0.0)],
-                imc: 0.5,
             },
             ApexRow {
                 cid: 5,
                 frag: None,
                 ms1: [None, None, None],
-                imc: -0.25,
             },
         ];
-        let (w, st) = patch_psms(&path, &out, &picks, &apex, true).unwrap();
+        let (w, st) = patch_psms(&path, &out, &picks, &apex).unwrap();
         assert_eq!(w.rows, 4);
         assert_eq!(
             (st.repicked, st.moved, st.without_record),
@@ -2266,11 +2100,9 @@ mod tests {
             (1, 1)
         );
         let t = TableFile::open(&out).unwrap();
-        let names = t.column_names();
-        assert_eq!(names.last().map(String::as_str), Some("imc_ref_w"));
         assert_eq!(
-            names[..names.len() - 1],
-            TableFile::open(&path).unwrap().column_names()[..]
+            t.column_names(),
+            TableFile::open(&path).unwrap().column_names()
         );
         assert_eq!(t.f64("apex_rt").unwrap(), vec![10.0, 22.5, 30.0, 31.0]);
         assert_eq!(
@@ -2288,27 +2120,11 @@ mod tests {
             vec![Some(4.0), None, Some(2.0), None]
         );
         assert_eq!(t.opt_f64("ms1_iso2").unwrap(), vec![None, None, None, None]);
-        assert_eq!(t.f64("imc_ref_w").unwrap(), vec![0.5, -0.25, 0.0, 0.0]);
         assert_eq!(
             t.str("label").unwrap(),
             vec!["target", "decoy", "target", "target"]
         );
-        // A second patch, in place, replaces the column instead of adding another.
         drop(t);
-        let (w2, _) = patch_psms(&out, &out, &[], &apex, true).unwrap();
-        assert_eq!(w2.rows, 4);
-        let t2 = TableFile::open(&out).unwrap();
-        assert_eq!(
-            t2.column_names()
-                .iter()
-                .filter(|c| *c == "imc_ref_w")
-                .count(),
-            1
-        );
-        // Without `retrace.apex_features` no column is added.
-        let plain = dir.join("psms_plain.parquet").to_str().unwrap().to_string();
-        patch_psms(&path, &plain, &picks, &apex, false).unwrap();
-        assert!(!TableFile::open(&plain).unwrap().has_column("imc_ref_w"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

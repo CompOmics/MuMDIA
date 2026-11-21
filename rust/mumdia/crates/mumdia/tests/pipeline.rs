@@ -283,7 +283,6 @@ fn features_compete_rescore_run_on_crafted_input() {
         out: &feats,
         out_pin: &pin,
         cfg: &cfg.features,
-        imc_ref_w: false,
         q1_tolerances: None,
     })
     .unwrap();
@@ -432,7 +431,6 @@ fn search_stages_return_the_hashes_of_the_files_they_wrote() {
         out: &feats,
         out_pin: &tmp("hashed.pin"),
         cfg: &cfg.features,
-        imc_ref_w: false,
         q1_tolerances: None,
     })
     .unwrap();
@@ -497,7 +495,6 @@ fn downstream_bytes(psms: &str, chrom: &str, cfg: &Config, tag: &str) -> Vec<Vec
         out: &feats,
         out_pin: "",
         cfg: &cfg.features,
-        imc_ref_w: false,
         q1_tolerances: None,
     })
     .unwrap();
@@ -776,7 +773,6 @@ fn features_chunking_is_value_preserving() {
                 out: &feats,
                 out_pin: &pin,
                 cfg: &cfg.features,
-                imc_ref_w: false,
                 q1_tolerances: None,
             },
             chunk_rows,
@@ -2830,7 +2826,6 @@ fn a_trace_pad_widens_the_traces_and_nothing_the_scores_read() {
             out: &out,
             out_pin: "",
             cfg: &cfg.features,
-            imc_ref_w: false,
             q1_tolerances: None,
         })
         .unwrap();

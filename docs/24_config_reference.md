@@ -73,8 +73,8 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`mbr`](#mbr) | `MbrConfig` | 8 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`experiment`](#experiment) | `ExperimentConfig` | 5 | [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md) |
 | [`groups`](#groups) | `GroupsConfig` | 9 |  |
-| [`retrace`](#retrace) | `RetraceConfig` | 7 | [docs/09_extract.md](09_extract.md) |
-| [`localise`](#localise) | `LocaliseConfig` | 16 | [docs/36_ptm_localisation.md](36_ptm_localisation.md) |
+| [`retrace`](#retrace) | `RetraceConfig` | 6 | [docs/09_extract.md](09_extract.md) |
+| [`localise`](#localise) | `LocaliseConfig` | 15 | [docs/36_ptm_localisation.md](36_ptm_localisation.md) |
 | [`output`](#output) | `OutputConfig` | 1 |  |
 | [`peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]`](#peptidoformsfixed_mods--peptidoformsvariable_mods) | `ResidueMod` | 3 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 
@@ -600,7 +600,6 @@ Chromatogram traces rebuilt from the raw timsTOF events (the `retrace` stage, be
 | `repick` | `bool` | `false` | benchmark-gated | Re-choose each candidate's apex retention time and 1/K0 centre on the raw events before the traces are rebuilt, among extract's apex and the peaks of the `extract.retain_top_peaks` sidecar. Needs `retain_top_peaks >= 2` and `promote_top_peaks = 1`, and is refused with `extract.apex_refine_intensity`. It overrides the apex that `apex_evidence_rank` chose, by design. Default false. Benchmark-gated. |
 | `im_half_width` | `f64` | `0.015` |  | Half-width in 1/K0 of the band around the candidate's `apex_im` (`im_pred_cal` when that is null) inside which raw events are summed, for the fragment and the MS1 traces alike. Measured flat from 0.012 to 0.020 on one diaPASEF run. Default 0.015. |
 | `ms1` | `bool` | `true` |  | Also rebuild the MS1 isotope traces (`ms1_mono`, `ms1_iso1`, `ms1_iso2`) and their apex scalars. False copies the centroid MS1 rows and keeps extract's MS1 scalars. Default true; kept as a switch until an engine ablation of the raw MS1 band confirms the prototype's +1.6%. |
-| `apex_features` | `bool` | `false` | benchmark-gated | Write `imc_ref_w` into `psms_extracted`, the agreement of the fragments' raw 1/K0 profiles at the apex, which the ion-mobility feature family then carries as its tenth feature. Needs `enabled` and a `features.im_features` other than `off`. Default false. Benchmark-gated: alone it measured +1.3% peptides, and the added peptides carried about 2.7% FDP. |
 | `q1_repick` | `ZtSwitch` | `auto` |  | The scanning-quadrupole analogue of `repick` (ZT Scan has no raw events beyond its centroids, so it needs neither `enabled` nor a `.d`): extract re-chooses each candidate's apex in RT x Q1 among its own apex and the next peaks of its count profile, by the agreement of the fragments that belong (`extract.q1_fragments`, which it needs) with the library, and moves it to that peak's 2D apex: the cycle where the fragments that belong peak, at the step nearest their fitted Q1 centre. The apex scalars are read again there. Refused with `extract.promote_top_peaks > 1`, `extract.apex_refine_intensity` and `repick` (docs/09_extract.md, "Per-fragment Q1 decisions"). `"auto"` (the default since 0.12.0): on for a ZT Scan search with `extract.q1_fragments` on and none of those three, off for every other search (`ZtSwitch`, docs/37_ztscan.md). Omitted from the canonical configuration unless on. |
 | `q1_repick_peaks` | `usize` | `5` |  | `q1_repick`: how many peaks of the candidate's count profile it enumerates to compare with the apex, strongest first by area (the apex's own peak among them is skipped). Each alternative costs a full per-fragment decision, which is what makes the re-pick expensive. 0 compares none: the apex then only moves to its own peak's 2D apex, the cycle where its fragments that belong peak. Default 5 (`Q1_REPICK_PEAKS`, the setting `repick` was measured with). Needs `q1_repick`. Omitted from the canonical configuration at its default (docs/37_ztscan.md, section 8). |
 
@@ -625,7 +624,6 @@ Site localisation of modifications on the identified peptidoforms (the `localise
 | `im_half_width` | `f64` | `0.05` |  | Half-width in 1/K0 of the band around the apex 1/K0 a fragment peak must fall in, on spectra that carry ion mobility. Ignored on 3D spectra. Default 0.05. |
 | `prior_strength` | `f64` | `64.0` |  | Pseudo-count weight of the run-wide detection and false-presence rates against a peak's own. Default 64: against 8 it localised more peaks at a lower false localisation rate on both validation sets (docs/36_ptm_localisation.md section 7). |
 | `temperature` | `f64` | `0.0` |  | Divisor of the log-likelihoods before the softmax: a number, or `"auto"` (also written `0`), which fits it to the data. 1 is the likelihood as fitted; above 1 flattens the posterior. `"auto"` chooses the temperature at which the model's expected wrong calls match the decoy residue's estimate of them at 0.75, over the quarter of the run's (in `run-experiment`, the pooled runs') peaks with a choice of site that see the largest share of their site-determining ions, pulled towards 1 by a prior so that few decoy-residue wins leave it near 1 (docs/36_ptm_localisation.md section 3); the fitted value is in the report. Default `"auto"`. |
-| `neutral_loss` | `bool` | `false` |  | Neutral-loss ions as evidence: for Phospho, the loss of phosphoric acid (97.9769 Da) from every b and y ion that carries a phosphoserine or -threonine (and the decoy residue, which stands in for them), scored as four ion classes of their own with their own detection and false-presence rates. Other modifications have no neutral loss. Default false: on the synthetic phosphopeptides it localised no more peaks at a given true false localisation rate (docs/36_ptm_localisation.md section 7). |
 | `combine_runs` | `bool` | `true` |  | `run-experiment`: combine the runs into one site probability per consensus peak, summing the log-likelihoods of the runs whose peak of the same precursor matches it in aligned retention time, and write `localisation_experiment.parquet` and the experiment-level columns of `peptides.tsv` and `sites.tsv`. The per-run tables are the same either way. Default true. |
 | `experiment_temperature` | `f64` | `0.0` |  | The temperature of the combined posterior: a number, or `"auto"` (also written `0`), fitted on the consensus peaks as `temperature` is on the run peaks, with its prior centred on the run temperature times the square root of the mean number of runs summed. Above the run temperature it discounts the evidence of runs that repeat each other's interferences. Default `"auto"`. |
 
@@ -1434,7 +1432,7 @@ instead of looking like an absent field.
 - `peptidoforms.fixed_mods[].name` (`String`)
 - `peptidoforms.fixed_mods[].residue` (`char`)
 
-17 environment read(s) whose name is not a literal. Reads with the same function, access and argument share one entry, which gives their number when there is more than one:
+16 environment read(s) whose name is not a literal. Reads with the same function, access and argument share one entry, which gives their number when there is more than one:
 
 - `rust/mumdia/crates/mumdia-core/src/config.rs::Config::resolve_ztscan_on: env read via closure of `*k``
 - `rust/mumdia/crates/mumdia-core/src/config.rs::Config::resolve_ztscan_on: env read via closure of `self.extract.q1_fragments``
@@ -1447,7 +1445,6 @@ instead of looking like an absent field.
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::flush_below: env read via closure of `chunk.slices_mut()``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::flush_below: env read via closure of `runs[r].span_mut(m)``
 - `rust/mumdia/crates/mumdia/src/stages/localise/ions.rs::build: env read via closure of `mz_of(base, c, 0.0, z)``
-- `rust/mumdia/crates/mumdia/src/stages/localise/ions.rs::build: env read via closure of `mz_of(base, c, l.mass, z)``
 - `rust/mumdia/crates/mumdia/src/stages/localise/mod.rs::Spectra::valley: env read via closure of `&self``
 - `rust/mumdia/crates/mumdia/src/stages/prescreen/tags.rs::discover: env read via closure of `alpha.key(alpha.canonical(a, b, c), z, false)``
 - `rust/mumdia/crates/mumdia/src/stages/prescreen/tags.rs::discover: env read via closure of `alpha.key(alpha.canonical(la as u16, p.1, p.2), z, true)``
@@ -1456,6 +1453,6 @@ instead of looking like an absent field.
 
 ## Coverage
 
-26 structs and 365 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 49 enumerations, 1 named profile(s), 106 environment variables read and 27 set.
+26 structs and 363 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 49 enumerations, 1 named profile(s), 106 environment variables read and 27 set.
 
-31 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.
+30 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.
