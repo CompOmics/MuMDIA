@@ -4150,9 +4150,7 @@
       "choices": [
         "none",
         "second_pass",
-        "empirical_library",
-        "rt_transfer",
-        "full"
+        "rt_transfer"
       ]
     },
     {

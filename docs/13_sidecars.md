@@ -1028,7 +1028,7 @@ configured.
 | `rescore.entrapment_exclude` | `None` | substring that un-marks the sample's own species |
 | `rescore.entrapment_contaminant_markers` | `[]` | substrings for genuine contaminants (kept as real targets) |
 | `rescore.entrapment_ratio` | `1.0` | `N_real_lib / N_entrap_lib` scaling of the entrapment FDR |
-| `mbr.strategy` | `none` | `empirical_library`/`rt_transfer`/`full` engage `mbr_worker.py` |
+| `mbr.strategy` | `none` | `rt_transfer` (and its old spellings `empirical_library`, `full`) engages `mbr_worker.py` |
 | `mbr.python` | `None` | interpreter for MBR (required when `strategy != none`) |
 | `mbr.q_anchor` / `min_anchor_runs` / `q_transfer` | `0.01` / `2` / `0.01` | `--q-anchor` / `--min-anchor-runs` / `--q-transfer` (anchor/transfer FDR + min supporting runs) |
 | `mbr.consensus_corr_min` | `0.0` | `--consensus-corr-min` fragment-consensus guard threshold (0 = off; only passed when `frag` paths are also supplied, `sidecar.rs:209`) |

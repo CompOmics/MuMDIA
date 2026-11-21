@@ -4029,9 +4029,8 @@ impl Default for QuantConfig {
 /// where they are weak compress the ratios (CV 0.255 -> 0.245, median |error| 0.238 ->
 /// 0.252). That is a quantification limitation, not a false identification.
 ///
-/// `EmpiricalLibrary`, `RtTransfer` and `Full` are the earlier rescuable-tier transfer
-/// (`scripts/mbr_worker.py`), which needs `mbr.python`. No code distinguishes the three:
-/// each accepts an already extracted, sub-threshold candidate on retention-time agreement
+/// `RtTransfer` is the earlier rescuable-tier transfer (`scripts/mbr_worker.py`), which
+/// needs `mbr.python`. It accepts an already extracted, sub-threshold candidate on retention-time agreement
 /// alone. On the same pools its transfers measured 2.3-2.7% entrapment FDP (ProteoBench) and
 /// about 4x the false-ID rate of the direct identifications (single cells), so it stays
 /// opt-in and `validate()` warns when it is selected.
@@ -4043,21 +4042,16 @@ pub enum MbrStrategy {
     /// Search every run again on the empirical library of the first pass (default).
     #[default]
     SecondPass,
-    /// Rescuable-tier transfer; behaves as `RtTransfer`.
-    EmpiricalLibrary,
     /// Rescuable-tier transfer on cross-run expected retention time (`mbr_worker.py`).
+    /// `empirical_library` and `full`, which behaved the same, are read as this strategy.
+    #[serde(alias = "empirical_library", alias = "full")]
     RtTransfer,
-    /// Rescuable-tier transfer; behaves as `RtTransfer`.
-    Full,
 }
 
 impl MbrStrategy {
-    /// One of the rescuable-tier transfer variants, which run the `mbr_worker.py` sidecar.
+    /// The rescuable-tier transfer, which runs the `mbr_worker.py` sidecar.
     pub fn transfers(self) -> bool {
-        matches!(
-            self,
-            MbrStrategy::EmpiricalLibrary | MbrStrategy::RtTransfer | MbrStrategy::Full
-        )
+        self == MbrStrategy::RtTransfer
     }
 }
 
@@ -6239,8 +6233,7 @@ impl Config {
         if self.mbr.strategy.transfers() {
             tracing::warn!(
                 strategy = ?self.mbr.strategy,
-                "mbr.strategy selects the rescuable-tier transfer (empirical_library, \
-                 rt_transfer and full behave identically): it accepts a transfer on retention-time \
+                "mbr.strategy selects the rescuable-tier transfer (rt_transfer): it accepts a transfer on retention-time \
                  agreement alone, and its transfers measured 2.3-2.7% entrapment FDP at a 1% cut. \
                  The default second_pass searches every run again instead (docs/12)."
             );
@@ -8416,12 +8409,12 @@ mod tests {
         assert_eq!(d.mbr.strategy, MbrStrategy::SecondPass);
         assert!(!d.mbr.strategy.transfers());
         assert!(!MbrStrategy::None.transfers());
-        for s in [
-            MbrStrategy::EmpiricalLibrary,
-            MbrStrategy::RtTransfer,
-            MbrStrategy::Full,
-        ] {
-            assert!(s.transfers(), "{s:?}");
+        assert!(MbrStrategy::RtTransfer.transfers());
+        for old in ["empirical_library", "full", "rt_transfer"] {
+            let c: Config =
+                serde_json::from_str(&format!(r#"{{"mbr":{{"strategy":"{old}"}}}}"#)).unwrap();
+            assert_eq!(c.mbr.strategy, MbrStrategy::RtTransfer, "{old}");
+            assert!(c.canonical_json().contains(r#""strategy":"rt_transfer""#));
         }
         let none: Config = serde_json::from_str(r#"{"mbr":{"strategy":"none"}}"#).unwrap();
         assert_eq!(none.mbr.strategy, MbrStrategy::None);

@@ -1578,7 +1578,7 @@ not a better quantification. Not yet measured through the engine column.
 
 ### mbr (rescuable-tier transfer, opt-in)
 
-`mbr.strategy = rt_transfer` (`empirical_library` and `full` behave the same) runs the
+`mbr.strategy = rt_transfer` (`empirical_library` and `full` are read as it) runs the
 transfer worker below after the pooled rescore instead of the second pass. It accepts an
 already extracted, sub-threshold candidate on retention-time agreement alone, against a
 permuted-RT null. Measured on the same pools on 2026-10-13: ProteoBench +3.6% per run, with
@@ -1603,8 +1603,6 @@ the psms paths into a comma-separated `psms_csv` and forwards a fixed set of fla
 `--frag-csv` and only when `frag` is non-empty and `consensus_corr_min > 0`,
 `sidecar.rs:209`), plus `cfg.rng_seed` as `--seed` and the optional `--out-scored`.
 NOT forwarded (present in `MbrConfig`, `config.rs:873`, but dead in the wired path):
-- `strategy` beyond the None/not-None gate: `EmpiricalLibrary`, `RtTransfer`, `Full`
-  are indistinguishable to the worker, which always runs the rescuable transfer tier.
 - `rt_window_s`, `decoy_transfer` and `requant_all` were removed in 0.15.0, because
   nothing forwarded them: the worker's `--rt-window` (default 20 s) is read only by the
   `--emit-transfer-targets` tier, which `run_mbr` never invokes, and the worker
