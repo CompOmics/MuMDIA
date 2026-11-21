@@ -21,6 +21,7 @@ use anyhow::{Context, Result};
 use mumdia_io::table::TableFile;
 
 use crate::protein_annotations::ProteinAnnotations;
+use crate::quant_lfq::base_sequence;
 
 pub struct ReportParams<'a> {
     pub scored: &'a str,
@@ -80,31 +81,41 @@ struct GroupQ {
     protein_group: HashMap<String, f64>,
 }
 
+/// The target rows whose `col` is below 1.0 (the winners of their groups), with that q.
+fn winner_rows(t: &TableFile, target: &[bool], col: &str) -> Result<(Vec<usize>, Vec<f64>)> {
+    let (mut rows, mut qs) = (Vec::new(), Vec::new());
+    t.visit_f64(col, |first, v| {
+        for (k, &q) in v.iter().enumerate() {
+            let i = first + k;
+            if q < 1.0 && target.get(i).copied().unwrap_or(false) {
+                rows.push(i);
+                qs.push(q);
+            }
+        }
+        Ok(())
+    })?;
+    Ok((rows, qs))
+}
+
+/// The peptide half of `GroupQ`: each base peptide's `peptide_q_value`, read from its
+/// winning target row; a base peptide that is not in the map has q 1.0. The candidate
+/// audit gates on it too.
+pub(crate) fn peptide_winner_q(t: &TableFile, target: &[bool]) -> Result<HashMap<u32, f64>> {
+    let (rows, qs) = winner_rows(t, target, "peptide_q_value")?;
+    let base = t.u32_rows("base_peptide_id", &rows)?;
+    let mut peptide: HashMap<u32, f64> = HashMap::new();
+    for (b, q) in base.into_iter().zip(qs) {
+        let e = peptide.entry(b).or_insert(q);
+        *e = e.min(q);
+    }
+    Ok(peptide)
+}
+
 impl GroupQ {
     fn read(t: &TableFile) -> Result<GroupQ> {
         let target = t.str_eq("label", "target")?;
-        let winners = |col: &str| -> Result<(Vec<usize>, Vec<f64>)> {
-            let (mut rows, mut qs) = (Vec::new(), Vec::new());
-            t.visit_f64(col, |first, v| {
-                for (k, &q) in v.iter().enumerate() {
-                    let i = first + k;
-                    if q < 1.0 && target.get(i).copied().unwrap_or(false) {
-                        rows.push(i);
-                        qs.push(q);
-                    }
-                }
-                Ok(())
-            })?;
-            Ok((rows, qs))
-        };
-        let (rows, qs) = winners("peptide_q_value")?;
-        let base = t.u32_rows("base_peptide_id", &rows)?;
-        let mut peptide: HashMap<u32, f64> = HashMap::new();
-        for (b, q) in base.into_iter().zip(qs) {
-            let e = peptide.entry(b).or_insert(q);
-            *e = e.min(q);
-        }
-        let (rows, qs) = winners("pg_q_value")?;
+        let peptide = peptide_winner_q(t, &target)?;
+        let (rows, qs) = winner_rows(t, &target, "pg_q_value")?;
         let pg = t.str_rows("protein_group", &rows)?;
         let mut protein_group: HashMap<String, f64> = HashMap::new();
         for (g, q) in pg.into_iter().zip(qs) {
@@ -197,7 +208,7 @@ fn precursor_head_cells(
     write!(
         w,
         "{pf}\t{}\t{charge}\t{}\t{protein}\t{pg}\t{prec_q:.6}\t{pep_q:.6}\t{pg_q:.6}\t{score:.4}",
-        strip(pf),
+        base_sequence(pf),
         precursor_mz_cell(pf, charge),
     )?;
     Ok(())
@@ -227,23 +238,6 @@ fn annotation_cells(
         None => write!(w, "\t\t\t")?,
     }
     Ok(())
-}
-
-/// Stripped amino-acid sequence: drop a DECOY_ prefix and any bracketed/
-/// parenthesized modification blocks, keep the residue letters.
-fn strip(pf: &str) -> String {
-    let s = pf.strip_prefix("DECOY_").unwrap_or(pf);
-    let mut out = String::new();
-    let mut depth = 0i32;
-    for c in s.chars() {
-        match c {
-            '[' | '(' => depth += 1,
-            ']' | ')' => depth = (depth - 1).max(0),
-            c if depth == 0 && c.is_ascii_alphabetic() => out.push(c),
-            _ => {}
-        }
-    }
-    out
 }
 
 fn qcell(q: f64) -> String {
@@ -333,28 +327,59 @@ fn printable_rows(
     Ok((rows, flags))
 }
 
-/// Write peptides.tsv + proteins.tsv from a scored PSM table. Returns
-/// (n_peptides, n_protein_groups) at the FDR threshold.
+/// The `is_transferred` and `transfer_q` cells of printable row `j`. The acceptance basis is
+/// exported with every row because the acceptance rule is otherwise invisible in the TSV: a
+/// transferred row keeps its grouped q, usually 1.0, and a tighter threshold does not revoke a
+/// transfer that already passed `mbr.q_transfer` (docs/29 #19). A transfer is a peptide-level
+/// acceptance and not protein-group confidence; a group admitted through one carries the flag
+/// so a reader can tell.
+fn transfer_cells(is_transferred: &[bool], transfer_q: &[f64], j: usize) -> String {
+    if is_transferred[j] {
+        let q = if transfer_q[j].is_nan() {
+            String::new()
+        } else {
+            format!("{:.6}", transfer_q[j])
+        };
+        format!("\ttrue\t{q}")
+    } else {
+        "\tfalse\t".to_string()
+    }
+}
+
+/// Write the TSV at `path` through a temporary file published once `body` has written it,
+/// like every parquet and json artifact. A truncated parquet fails to open because its footer
+/// is missing; a short TSV parses perfectly and simply has fewer rows, a plausible wrong
+/// answer, so an interruption must never leave one under the final name.
+fn write_tsv(
+    path: &str,
+    body: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> Result<()>,
+) -> Result<()> {
+    let target = mumdia_io::table::AtomicPath::new(path)?;
+    let mut w = std::io::BufWriter::new(std::fs::File::create(target.tmp())?);
+    body(&mut w)?;
+    w.flush()?;
+    drop(w);
+    target.publish()
+}
+
+/// Write peptides.tsv + proteins.tsv from a scored PSM table. Returns the row counts at
+/// the FDR threshold.
 ///
 /// Two passes (`printable_rows`): the rows that can be printed first, then their printed
 /// columns only. The loops below run over those rows in file order, and `sort_by` is
 /// stable, so sorting them by q gives exactly their order in the stable sort of all rows
 /// that the one-pass report did; the rows it skipped were never written, so both TSVs
 /// are byte-identical to its output.
-pub fn run(p: ReportParams) -> Result<(u64, u64)> {
-    let c = run_localised(p, None)?;
-    Ok((c.peptide_rows, c.protein_groups))
-}
-
-/// [`run`], with the `localise` stage's tables: three more `peptides.tsv` columns
-/// (`site_probability`, `localised`, `best_site_peptidoform`) and `sites.tsv`. `None` writes
-/// exactly what [`run`] writes.
+///
+/// `loc`, the `localise` stage's tables, adds three `peptides.tsv` columns
+/// (`site_probability`, `localised`, `best_site_peptidoform`) and `sites.tsv`; `None`
+/// writes neither.
 ///
 /// With `out_precursors`, also `precursors.tsv`. Its rows are added to the printable set
 /// of pass 1 (`precursor_q` joins the q columns), which leaves both other files
 /// byte-identical: every loop below filters on its own q before it prints or dedups, and
 /// the stable sorts keep the relative order of the rows each one prints.
-pub fn run_localised(p: ReportParams, loc: Option<&Localisation>) -> Result<ReportCounts> {
+pub fn run(p: ReportParams, loc: Option<&Localisation>) -> Result<ReportCounts> {
     let t = TableFile::open(p.scored)?;
     let ann = load_annotations(p.protein_annotations)?;
     let with_precursors = precursors_writable(&t, p.out_precursors, p.scored);
@@ -385,24 +410,6 @@ pub fn run_localised(p: ReportParams, loc: Option<&Localisation>) -> Result<Repo
     // Every printable row is a target (pass 1), so this is the one-pass rule
     // `label == "target" && (is_transferred || q <= threshold)` on them.
     let accepted = |j: usize, q: &[f64]| is_transferred[j] || q[j] <= p.q_threshold;
-    // The acceptance basis is exported with every row (`is_transferred`, `transfer_q`),
-    // because the rule above is otherwise invisible in the TSV: a transferred row keeps
-    // its grouped q, usually 1.0, and a tighter threshold does not revoke a transfer that
-    // already passed `mbr.q_transfer` (docs/29 #19). A transfer is a peptide-level
-    // acceptance and not protein-group confidence; a group admitted through one carries
-    // the flag so a reader can tell.
-    let transfer_cells = |j: usize| -> String {
-        if is_transferred[j] {
-            let q = if transfer_q[j].is_nan() {
-                String::new()
-            } else {
-                format!("{:.6}", transfer_q[j])
-            };
-            format!("\ttrue\t{q}")
-        } else {
-            "\tfalse\t".to_string()
-        }
-    };
 
     let pep_quant: HashMap<(String, i32), f64> = match p.peptide_quant {
         Some(path) => {
@@ -431,100 +438,90 @@ pub fn run_localised(p: ReportParams, loc: Option<&Localisation>) -> Result<Repo
     order.sort_by(|&a, &b| pep_q[a].total_cmp(&pep_q[b]));
     let mut seen: HashSet<(String, i32)> = HashSet::new();
     let mut seen_strip: HashSet<String> = HashSet::new();
-    // Atomic, like every parquet and json artifact. These two TSVs were the only
-    // outputs still written straight to their final path, so an interruption left a
-    // truncated `peptides.tsv` under the canonical name -- and unlike a truncated
-    // parquet, which fails to open because its footer is missing, a short TSV parses
-    // perfectly and simply has fewer peptides in it. That is the worst failure shape
-    // available: a plausible wrong answer.
-    let pep_target = mumdia_io::table::AtomicPath::new(p.out_peptides)?;
-    let mut w = std::io::BufWriter::new(std::fs::File::create(pep_target.tmp())?);
-    // The row unit here is the precursor (peptidoform + charge), NOT the stripped
-    // sequence; the header and the returned count reflect that.
     let site_cells = match loc {
         Some(l) => Some(l.lookup(false)?),
         None => None,
     };
-    write!(
-        w,
-        "precursor\tstripped_sequence\tcharge\tprotein\tq_value\tscore\tquantity\t\
-         is_transferred\ttransfer_q"
-    )?;
-    if let Some(c) = &site_cells {
-        write!(w, "{}", c.header())?;
-    }
-    annotation_header(&mut w)?;
-    writeln!(w)?;
     let mut npep = 0u64;
-    for &j in &order {
-        if !accepted(j, &pep_q) {
-            continue;
-        }
-        seen_strip.insert(strip(&pform[j]));
-        let key = (pform[j].clone(), charge[j]);
-        if !seen.insert(key.clone()) {
-            continue;
-        }
-        let qv = pep_quant.get(&key).copied().unwrap_or(f64::NAN);
+    write_tsv(p.out_peptides, |w| {
+        // The row unit here is the precursor (peptidoform + charge), NOT the stripped
+        // sequence; the header and the returned count reflect that.
         write!(
             w,
-            "{}\t{}\t{}\t{}\t{:.6}\t{:.4}\t{}{}",
-            pform[j],
-            strip(&pform[j]),
-            charge[j],
-            protein[j],
-            pep_q[j],
-            score[j],
-            qcell(qv),
-            transfer_cells(j)
+            "precursor\tstripped_sequence\tcharge\tprotein\tq_value\tscore\tquantity\t\
+             is_transferred\ttransfer_q"
         )?;
-        if let Some(cells) = &site_cells {
-            write!(w, "{}", cells.cells(0, &pform[j], charge[j]))?;
+        if let Some(c) = &site_cells {
+            write!(w, "{}", c.header())?;
         }
-        annotation_cells(&mut w, &ann, &protein[j])?;
+        annotation_header(w)?;
         writeln!(w)?;
-        npep += 1;
-    }
-    w.flush()?;
-    drop(w);
-    pep_target.publish()?;
+        for &j in &order {
+            if !accepted(j, &pep_q) {
+                continue;
+            }
+            seen_strip.insert(base_sequence(&pform[j]));
+            let key = (pform[j].clone(), charge[j]);
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            let qv = pep_quant.get(&key).copied().unwrap_or(f64::NAN);
+            write!(
+                w,
+                "{}\t{}\t{}\t{}\t{:.6}\t{:.4}\t{}{}",
+                pform[j],
+                base_sequence(&pform[j]),
+                charge[j],
+                protein[j],
+                pep_q[j],
+                score[j],
+                qcell(qv),
+                transfer_cells(&is_transferred, &transfer_q, j)
+            )?;
+            if let Some(cells) = &site_cells {
+                write!(w, "{}", cells.cells(0, &pform[j], charge[j]))?;
+            }
+            annotation_cells(w, &ann, &protein[j])?;
+            writeln!(w)?;
+            npep += 1;
+        }
+        Ok(())
+    })?;
 
     // Protein groups, best q first, unique.
     let mut porder: Vec<usize> = (0..m).collect();
     porder.sort_by(|&a, &b| pg_q[a].total_cmp(&pg_q[b]));
     let mut pseen: HashSet<String> = HashSet::new();
-    let prot_target = mumdia_io::table::AtomicPath::new(p.out_proteins)?;
-    let mut w2 = std::io::BufWriter::new(std::fs::File::create(prot_target.tmp())?);
-    write!(
-        w2,
-        "protein_group\tq_value\tquantity\tis_transferred\ttransfer_q"
-    )?;
-    annotation_header(&mut w2)?;
-    writeln!(w2)?;
     let mut nprot = 0u64;
-    for &j in &porder {
-        if !accepted(j, &pg_q) || pg[j].is_empty() {
-            continue;
-        }
-        if !pseen.insert(pg[j].clone()) {
-            continue;
-        }
-        let qv = prot_quant.get(&pg[j]).copied().unwrap_or(f64::NAN);
+    write_tsv(p.out_proteins, |w2| {
         write!(
             w2,
-            "{}\t{:.6}\t{}{}",
-            pg[j],
-            pg_q[j],
-            qcell(qv),
-            transfer_cells(j)
+            "protein_group\tq_value\tquantity\tis_transferred\ttransfer_q"
         )?;
-        annotation_cells(&mut w2, &ann, &pg[j])?;
+        annotation_header(w2)?;
         writeln!(w2)?;
-        nprot += 1;
-    }
-    w2.flush()?;
-    drop(w2);
-    prot_target.publish()?;
+        for &j in &porder {
+            if !accepted(j, &pg_q) || pg[j].is_empty() {
+                continue;
+            }
+            if !pseen.insert(pg[j].clone()) {
+                continue;
+            }
+            let qv = prot_quant.get(&pg[j]).copied().unwrap_or(f64::NAN);
+            write!(
+                w2,
+                "{}\t{:.6}\t{}{}",
+                pg[j],
+                pg_q[j],
+                qcell(qv),
+                transfer_cells(&is_transferred, &transfer_q, j)
+            )?;
+            annotation_cells(w2, &ann, &pg[j])?;
+            writeln!(w2)?;
+            nprot += 1;
+        }
+        Ok(())
+    })?;
 
     // Precursors: every accepted (peptidoform, charge) on `precursor_q`, with the q of
     // its base peptide and protein group read from their winning rows.
@@ -536,48 +533,51 @@ pub fn run_localised(p: ReportParams, loc: Option<&Localisation>) -> Result<Repo
             vec![f64::NAN; m]
         };
         let order = precursor_order(&pform, &charge, &pc.prec_q, &is_transferred, p.q_threshold);
-        let target = mumdia_io::table::AtomicPath::new(out)?;
-        let mut w3 = std::io::BufWriter::new(std::fs::File::create(target.tmp())?);
-        write!(
-            w3,
-            "{PRECURSOR_HEADER_HEAD}\tapex_rt\tquantity\tis_transferred\ttransfer_q"
-        )?;
-        if let Some(c) = &site_cells {
-            write!(w3, "{}", c.header())?;
-        }
-        annotation_header(&mut w3)?;
-        writeln!(w3)?;
-        for &j in &order {
-            precursor_head_cells(
-                &mut w3,
-                &pform[j],
-                charge[j],
-                &protein[j],
-                &pg[j],
-                pc.prec_q[j],
-                pc.groups.peptide(pc.base[j]),
-                pc.groups.protein_group(&pg[j]),
-                score[j],
+        write_tsv(out, |w3| {
+            write!(
+                w3,
+                "{PRECURSOR_HEADER_HEAD}\tapex_rt\tquantity\tis_transferred\ttransfer_q"
             )?;
-            let rt = if apex_rt[j].is_finite() {
-                format!("{:.2}", apex_rt[j])
-            } else {
-                String::new()
-            };
-            let qv = pep_quant
-                .get(&(pform[j].clone(), charge[j]))
-                .copied()
-                .unwrap_or(f64::NAN);
-            write!(w3, "\t{rt}\t{}{}", qcell(qv), transfer_cells(j))?;
-            if let Some(cells) = &site_cells {
-                write!(w3, "{}", cells.cells(0, &pform[j], charge[j]))?;
+            if let Some(c) = &site_cells {
+                write!(w3, "{}", c.header())?;
             }
-            annotation_cells(&mut w3, &ann, &protein[j])?;
+            annotation_header(w3)?;
             writeln!(w3)?;
-        }
-        w3.flush()?;
-        drop(w3);
-        target.publish()?;
+            for &j in &order {
+                precursor_head_cells(
+                    w3,
+                    &pform[j],
+                    charge[j],
+                    &protein[j],
+                    &pg[j],
+                    pc.prec_q[j],
+                    pc.groups.peptide(pc.base[j]),
+                    pc.groups.protein_group(&pg[j]),
+                    score[j],
+                )?;
+                let rt = if apex_rt[j].is_finite() {
+                    format!("{:.2}", apex_rt[j])
+                } else {
+                    String::new()
+                };
+                let qv = pep_quant
+                    .get(&(pform[j].clone(), charge[j]))
+                    .copied()
+                    .unwrap_or(f64::NAN);
+                write!(
+                    w3,
+                    "\t{rt}\t{}{}",
+                    qcell(qv),
+                    transfer_cells(&is_transferred, &transfer_q, j)
+                )?;
+                if let Some(cells) = &site_cells {
+                    write!(w3, "{}", cells.cells(0, &pform[j], charge[j]))?;
+                }
+                annotation_cells(w3, &ann, &protein[j])?;
+                writeln!(w3)?;
+            }
+            Ok(())
+        })?;
         nprec = Some(order.len() as u64);
     }
 
@@ -642,24 +642,19 @@ pub struct ExperimentReportParams<'a> {
 /// number of runs in which the precursor (protein group) has an accepted target PSM
 /// on its own `run_psm_q`, and one quantity column per run: `quantity_<run>` for
 /// precursors (each run's own quant), `lfq_<run>` for protein groups (the cross-run
-/// MaxLFQ matrix). Returns (n_precursors, n_protein_groups) at the threshold.
+/// MaxLFQ matrix). Returns the row counts at the threshold.
 ///
 /// Read in two passes, as [`run`] is, with byte-identical output.
-pub fn run_experiment(p: ExperimentReportParams) -> Result<(u64, u64)> {
-    let c = run_experiment_localised(p, None)?;
-    Ok((c.peptide_rows, c.protein_groups))
-}
-
-/// [`run_experiment`], with each run's `localise` table: the three localisation columns of
-/// `peptides.tsv` come from the run of the row the precursor is reported on (its
-/// experiment-wide winner), and `sites.tsv` pools the runs. `None` writes exactly what
-/// [`run_experiment`] writes.
+///
+/// `loc`, each run's `localise` table: the three localisation columns of `peptides.tsv`
+/// come from the run of the row the precursor is reported on (its experiment-wide winner),
+/// and `sites.tsv` pools the runs; `None` writes neither.
 ///
 /// With `out_precursors`, also the experiment-wide `precursors.tsv`: rows selected on the
 /// experiment-wide `precursor_q`, which `rescore` writes to the single winning row of each
 /// precursor across all runs, so the table has one row per precursor. Both other files
-/// keep their bytes (see [`run_localised`]).
-pub fn run_experiment_localised(
+/// keep their bytes (see [`run`]).
+pub fn run_experiment(
     p: ExperimentReportParams,
     loc: Option<&Localisation>,
 ) -> Result<ReportCounts> {
@@ -699,24 +694,6 @@ pub fn run_experiment_localised(
     let m = rows.len();
     // Every printable row is a target, so this is the one-pass rule on them.
     let accepted = |j: usize, q: &[f64]| is_transferred[j] || q[j] <= p.q_threshold;
-    // The acceptance basis is exported with every row (`is_transferred`, `transfer_q`),
-    // because the rule above is otherwise invisible in the TSV: a transferred row keeps
-    // its grouped q, usually 1.0, and a tighter threshold does not revoke a transfer that
-    // already passed `mbr.q_transfer` (docs/29 #19). A transfer is a peptide-level
-    // acceptance and not protein-group confidence; a group admitted through one carries
-    // the flag so a reader can tell.
-    let transfer_cells = |j: usize| -> String {
-        if is_transferred[j] {
-            let q = if transfer_q[j].is_nan() {
-                String::new()
-            } else {
-                format!("{:.6}", transfer_q[j])
-            };
-            format!("\ttrue\t{q}")
-        } else {
-            "\tfalse\t".to_string()
-        }
-    };
 
     // Runs in which each precursor / protein group was identified on its own per-run FDR.
     let mut pep_runs: HashMap<(String, i32), Vec<bool>> = HashMap::new();
@@ -805,125 +782,121 @@ pub fn run_experiment_localised(
     order.sort_by(|&a, &b| pep_q[a].total_cmp(&pep_q[b]));
     let mut seen: HashSet<(String, i32)> = HashSet::new();
     let mut seen_strip: HashSet<String> = HashSet::new();
-    let pep_target = mumdia_io::table::AtomicPath::new(p.out_peptides)?;
-    let mut w = std::io::BufWriter::new(std::fs::File::create(pep_target.tmp())?);
-    write!(
-        w,
-        "precursor\tstripped_sequence\tcharge\tprotein\tq_value\tscore\tn_runs"
-    )?;
-    if !pep_quant.is_empty() {
-        for name in p.run_names {
-            write!(w, "\tquantity_{name}")?;
-        }
-    }
-    for name in p.run_names.iter().take(pep_first.len()) {
-        write!(w, "\tfirst_pass_{name}")?;
-    }
-    write!(w, "\tis_transferred\ttransfer_q")?;
     let site_cells = match loc {
         Some(l) => Some(l.lookup(true)?),
         None => None,
     };
-    if let Some(c) = &site_cells {
-        write!(w, "{}", c.header())?;
-    }
-    annotation_header(&mut w)?;
-    writeln!(w)?;
     let mut npep = 0u64;
-    for &j in &order {
-        if !accepted(j, &pep_q) {
-            continue;
-        }
-        seen_strip.insert(strip(&pform[j]));
-        let key = (pform[j].clone(), charge[j]);
-        if !seen.insert(key.clone()) {
-            continue;
-        }
+    write_tsv(p.out_peptides, |w| {
         write!(
             w,
-            "{}\t{}\t{}\t{}\t{:.6}\t{:.4}\t{}",
-            pform[j],
-            strip(&pform[j]),
-            charge[j],
-            protein[j],
-            pep_q[j],
-            score[j],
-            count(pep_runs.get(&key))
+            "precursor\tstripped_sequence\tcharge\tprotein\tq_value\tscore\tn_runs"
         )?;
-        for quant in &pep_quant {
-            write!(
-                w,
-                "\t{}",
-                qcell(quant.get(&key).copied().unwrap_or(f64::NAN))
-            )?;
-        }
-        // Empty where the run has no quant row for the precursor, as its quantity cell is.
-        for flags in &pep_first {
-            match flags.get(&key) {
-                Some(true) => write!(w, "\ttrue")?,
-                Some(false) => write!(w, "\tfalse")?,
-                None => write!(w, "\t")?,
+        if !pep_quant.is_empty() {
+            for name in p.run_names {
+                write!(w, "\tquantity_{name}")?;
             }
         }
-        write!(w, "{}", transfer_cells(j))?;
-        if let Some(cells) = &site_cells {
-            write!(w, "{}", cells.cells(source[j], &pform[j], charge[j]))?;
+        for name in p.run_names.iter().take(pep_first.len()) {
+            write!(w, "\tfirst_pass_{name}")?;
         }
-        annotation_cells(&mut w, &ann, &protein[j])?;
+        write!(w, "\tis_transferred\ttransfer_q")?;
+        if let Some(c) = &site_cells {
+            write!(w, "{}", c.header())?;
+        }
+        annotation_header(w)?;
         writeln!(w)?;
-        npep += 1;
-    }
-    w.flush()?;
-    drop(w);
-    pep_target.publish()?;
+        for &j in &order {
+            if !accepted(j, &pep_q) {
+                continue;
+            }
+            seen_strip.insert(base_sequence(&pform[j]));
+            let key = (pform[j].clone(), charge[j]);
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            write!(
+                w,
+                "{}\t{}\t{}\t{}\t{:.6}\t{:.4}\t{}",
+                pform[j],
+                base_sequence(&pform[j]),
+                charge[j],
+                protein[j],
+                pep_q[j],
+                score[j],
+                count(pep_runs.get(&key))
+            )?;
+            for quant in &pep_quant {
+                write!(
+                    w,
+                    "\t{}",
+                    qcell(quant.get(&key).copied().unwrap_or(f64::NAN))
+                )?;
+            }
+            // Empty where the run has no quant row for the precursor, as its quantity cell is.
+            for flags in &pep_first {
+                match flags.get(&key) {
+                    Some(true) => write!(w, "\ttrue")?,
+                    Some(false) => write!(w, "\tfalse")?,
+                    None => write!(w, "\t")?,
+                }
+            }
+            write!(w, "{}", transfer_cells(&is_transferred, &transfer_q, j))?;
+            if let Some(cells) = &site_cells {
+                write!(w, "{}", cells.cells(source[j], &pform[j], charge[j]))?;
+            }
+            annotation_cells(w, &ann, &protein[j])?;
+            writeln!(w)?;
+            npep += 1;
+        }
+        Ok(())
+    })?;
 
     // Protein groups: best experiment-wide q first, unique.
     let mut porder: Vec<usize> = (0..m).collect();
     porder.sort_by(|&a, &b| pg_q[a].total_cmp(&pg_q[b]));
     let mut pseen: HashSet<String> = HashSet::new();
-    let prot_target = mumdia_io::table::AtomicPath::new(p.out_proteins)?;
-    let mut w2 = std::io::BufWriter::new(std::fs::File::create(prot_target.tmp())?);
-    write!(w2, "protein_group\tq_value\tn_runs")?;
-    if p.protein_lfq.is_some() {
-        for name in p.run_names {
-            write!(w2, "\tlfq_{name}")?;
-        }
-    }
-    write!(w2, "\tis_transferred\ttransfer_q")?;
-    annotation_header(&mut w2)?;
-    writeln!(w2)?;
     let mut nprot = 0u64;
-    for &j in &porder {
-        if !accepted(j, &pg_q) || pg[j].is_empty() {
-            continue;
-        }
-        if !pseen.insert(pg[j].clone()) {
-            continue;
-        }
-        write!(
-            w2,
-            "{}\t{:.6}\t{}",
-            pg[j],
-            pg_q[j],
-            count(pg_runs.get(&pg[j]))
-        )?;
+    write_tsv(p.out_proteins, |w2| {
+        write!(w2, "protein_group\tq_value\tn_runs")?;
         if p.protein_lfq.is_some() {
-            let none = vec![f64::NAN; n_runs];
-            // 0 in the matrix is a run in which the group has no feature: a missing value,
-            // printed empty as in precursors.tsv, not an abundance of zero.
-            for &x in prot_lfq.get(&pg[j]).unwrap_or(&none) {
-                let x = if x > 0.0 { x } else { f64::NAN };
-                write!(w2, "\t{}", qcell(x))?;
+            for name in p.run_names {
+                write!(w2, "\tlfq_{name}")?;
             }
         }
-        write!(w2, "{}", transfer_cells(j))?;
-        annotation_cells(&mut w2, &ann, &pg[j])?;
+        write!(w2, "\tis_transferred\ttransfer_q")?;
+        annotation_header(w2)?;
         writeln!(w2)?;
-        nprot += 1;
-    }
-    w2.flush()?;
-    drop(w2);
-    prot_target.publish()?;
+        for &j in &porder {
+            if !accepted(j, &pg_q) || pg[j].is_empty() {
+                continue;
+            }
+            if !pseen.insert(pg[j].clone()) {
+                continue;
+            }
+            write!(
+                w2,
+                "{}\t{:.6}\t{}",
+                pg[j],
+                pg_q[j],
+                count(pg_runs.get(&pg[j]))
+            )?;
+            if p.protein_lfq.is_some() {
+                let none = vec![f64::NAN; n_runs];
+                // 0 in the matrix is a run in which the group has no feature: a missing value,
+                // printed empty as in precursors.tsv, not an abundance of zero.
+                for &x in prot_lfq.get(&pg[j]).unwrap_or(&none) {
+                    let x = if x > 0.0 { x } else { f64::NAN };
+                    write!(w2, "\t{}", qcell(x))?;
+                }
+            }
+            write!(w2, "{}", transfer_cells(&is_transferred, &transfer_q, j))?;
+            annotation_cells(w2, &ann, &pg[j])?;
+            writeln!(w2)?;
+            nprot += 1;
+        }
+        Ok(())
+    })?;
 
     // Precursors: every accepted (peptidoform, charge) on the experiment-wide
     // `precursor_q`, one row each (its winning row across the runs), with `n_runs` on
@@ -948,76 +921,74 @@ pub fn run_experiment_localised(
             }
         }
         let order = precursor_order(&pform, &charge, &pc.prec_q, &is_transferred, p.q_threshold);
-        let target = mumdia_io::table::AtomicPath::new(out)?;
-        let mut w3 = std::io::BufWriter::new(std::fs::File::create(target.tmp())?);
-        write!(w3, "{PRECURSOR_HEADER_HEAD}\tn_runs")?;
-        if !pep_quant.is_empty() {
-            for name in p.run_names {
-                write!(w3, "\tquantity_{name}")?;
-            }
-        }
-        if p.precursor_lfq.is_some() {
-            for name in p.run_names {
-                write!(w3, "\tnormalised_{name}")?;
-            }
-        }
-        for name in p.run_names.iter().take(pep_first.len()) {
-            write!(w3, "\tfirst_pass_{name}")?;
-        }
-        write!(w3, "\tis_transferred\ttransfer_q")?;
-        if let Some(c) = &site_cells {
-            write!(w3, "{}", c.header())?;
-        }
-        annotation_header(&mut w3)?;
-        writeln!(w3)?;
-        let none = vec![f64::NAN; n_runs];
-        for &j in &order {
-            precursor_head_cells(
-                &mut w3,
-                &pform[j],
-                charge[j],
-                &protein[j],
-                &pg[j],
-                pc.prec_q[j],
-                pc.groups.peptide(pc.base[j]),
-                pc.groups.protein_group(&pg[j]),
-                score[j],
-            )?;
-            let key = (pform[j].clone(), charge[j]);
-            write!(w3, "\t{}", count(pep_runs.get(&key)))?;
-            for quant in &pep_quant {
-                write!(
-                    w3,
-                    "\t{}",
-                    qcell(quant.get(&key).copied().unwrap_or(f64::NAN))
-                )?;
+        write_tsv(out, |w3| {
+            write!(w3, "{PRECURSOR_HEADER_HEAD}\tn_runs")?;
+            if !pep_quant.is_empty() {
+                for name in p.run_names {
+                    write!(w3, "\tquantity_{name}")?;
+                }
             }
             if p.precursor_lfq.is_some() {
-                // The matrix stores 0 for a run in which the precursor has no quantity;
-                // that is a missing value, not an abundance of zero, so it prints empty,
-                // as an unquantified `quantity_<run>` does.
-                for &x in prec_lfq.get(&key).unwrap_or(&none) {
-                    let x = if x > 0.0 { x } else { f64::NAN };
-                    write!(w3, "\t{}", qcell(x))?;
+                for name in p.run_names {
+                    write!(w3, "\tnormalised_{name}")?;
                 }
             }
-            for flags in &pep_first {
-                match flags.get(&key) {
-                    Some(true) => write!(w3, "\ttrue")?,
-                    Some(false) => write!(w3, "\tfalse")?,
-                    None => write!(w3, "\t")?,
-                }
+            for name in p.run_names.iter().take(pep_first.len()) {
+                write!(w3, "\tfirst_pass_{name}")?;
             }
-            write!(w3, "{}", transfer_cells(j))?;
-            if let Some(cells) = &site_cells {
-                write!(w3, "{}", cells.cells(source[j], &pform[j], charge[j]))?;
+            write!(w3, "\tis_transferred\ttransfer_q")?;
+            if let Some(c) = &site_cells {
+                write!(w3, "{}", c.header())?;
             }
-            annotation_cells(&mut w3, &ann, &protein[j])?;
+            annotation_header(w3)?;
             writeln!(w3)?;
-        }
-        w3.flush()?;
-        drop(w3);
-        target.publish()?;
+            let none = vec![f64::NAN; n_runs];
+            for &j in &order {
+                precursor_head_cells(
+                    w3,
+                    &pform[j],
+                    charge[j],
+                    &protein[j],
+                    &pg[j],
+                    pc.prec_q[j],
+                    pc.groups.peptide(pc.base[j]),
+                    pc.groups.protein_group(&pg[j]),
+                    score[j],
+                )?;
+                let key = (pform[j].clone(), charge[j]);
+                write!(w3, "\t{}", count(pep_runs.get(&key)))?;
+                for quant in &pep_quant {
+                    write!(
+                        w3,
+                        "\t{}",
+                        qcell(quant.get(&key).copied().unwrap_or(f64::NAN))
+                    )?;
+                }
+                if p.precursor_lfq.is_some() {
+                    // The matrix stores 0 for a run in which the precursor has no quantity;
+                    // that is a missing value, not an abundance of zero, so it prints empty,
+                    // as an unquantified `quantity_<run>` does.
+                    for &x in prec_lfq.get(&key).unwrap_or(&none) {
+                        let x = if x > 0.0 { x } else { f64::NAN };
+                        write!(w3, "\t{}", qcell(x))?;
+                    }
+                }
+                for flags in &pep_first {
+                    match flags.get(&key) {
+                        Some(true) => write!(w3, "\ttrue")?,
+                        Some(false) => write!(w3, "\tfalse")?,
+                        None => write!(w3, "\t")?,
+                    }
+                }
+                write!(w3, "{}", transfer_cells(&is_transferred, &transfer_q, j))?;
+                if let Some(cells) = &site_cells {
+                    write!(w3, "{}", cells.cells(source[j], &pform[j], charge[j]))?;
+                }
+                annotation_cells(w3, &ann, &protein[j])?;
+                writeln!(w3)?;
+            }
+            Ok(())
+        })?;
         nprec = Some(order.len() as u64);
     }
 
@@ -1340,69 +1311,67 @@ impl Localisation<'_> {
                 }
             }
         }
-        let target = mumdia_io::table::AtomicPath::new(self.out_sites)?;
-        let mut w = std::io::BufWriter::new(std::fs::File::create(target.tmp())?);
-        write!(
-            w,
-            "protein\tprotein_position\tresidue\tmodification\tpeptide\tpeptide_position\t\
-             site_probability\tsite_flr_model\tsite_flr_decoy\tbest_site_peptidoform\tn_runs"
-        )?;
-        if self.experiment.is_some() {
+        write_tsv(self.out_sites, |w| {
             write!(
                 w,
-                "\texperiment_site_probability\texperiment_site_flr_model\t\
-                 experiment_site_flr_decoy\texperiment_best_site_peptidoform\texperiment_n_runs"
-            )?;
-        }
-        writeln!(w)?;
-        let opt = |v: Option<f64>| v.map(|x| format!("{x:.4}")).unwrap_or_default();
-        for ((acc, ppos, pep, pepos, res, m), r) in &sites {
-            // the placement that names the peptide: the per-run best, else the experiment's
-            let named = if r.sources.is_empty() {
-                r.experiment.as_ref().map_or("", |x| x.3.as_str())
-            } else {
-                r.best.as_str()
-            };
-            let (pep_cell, pos_cell) = if ppos.is_some() {
-                // numbered on the protein: name the peptide of the best placement
-                let pep = strip(named);
-                let pos = ppos
-                    .and_then(|p| proteins.get(acc).and_then(|s| s.find(&pep)).map(|s| p - s))
-                    .unwrap_or(0);
-                (pep, pos.to_string())
-            } else {
-                (pep.clone(), pepos.to_string())
-            };
-            let run_cells = if r.sources.is_empty() {
-                "\t\t\t\t0".to_string()
-            } else {
-                format!(
-                    "{:.4}\t{}\t{}\t{}\t{}",
-                    r.prob,
-                    opt(r.flr_model),
-                    opt(r.flr_decoy),
-                    r.best,
-                    r.sources.len()
-                )
-            };
-            write!(
-                w,
-                "{acc}\t{}\t{res}\t{m}\t{pep_cell}\t{pos_cell}\t{run_cells}",
-                ppos.map(|p| p.to_string()).unwrap_or_default(),
+                "protein\tprotein_position\tresidue\tmodification\tpeptide\tpeptide_position\t\
+                 site_probability\tsite_flr_model\tsite_flr_decoy\tbest_site_peptidoform\tn_runs"
             )?;
             if self.experiment.is_some() {
-                match &r.experiment {
-                    Some((p, fm, fd, b, n)) => {
-                        write!(w, "\t{p:.4}\t{}\t{}\t{b}\t{n}", opt(*fm), opt(*fd))?
-                    }
-                    None => write!(w, "\t\t\t\t\t")?,
-                }
+                write!(
+                    w,
+                    "\texperiment_site_probability\texperiment_site_flr_model\t\
+                     experiment_site_flr_decoy\texperiment_best_site_peptidoform\texperiment_n_runs"
+                )?;
             }
             writeln!(w)?;
-        }
-        w.flush()?;
-        drop(w);
-        target.publish()?;
+            let opt = |v: Option<f64>| v.map(|x| format!("{x:.4}")).unwrap_or_default();
+            for ((acc, ppos, pep, pepos, res, m), r) in &sites {
+                // the placement that names the peptide: the per-run best, else the experiment's
+                let named = if r.sources.is_empty() {
+                    r.experiment.as_ref().map_or("", |x| x.3.as_str())
+                } else {
+                    r.best.as_str()
+                };
+                let (pep_cell, pos_cell) = if ppos.is_some() {
+                    // numbered on the protein: name the peptide of the best placement
+                    let pep = base_sequence(named);
+                    let pos = ppos
+                        .and_then(|p| proteins.get(acc).and_then(|s| s.find(&pep)).map(|s| p - s))
+                        .unwrap_or(0);
+                    (pep, pos.to_string())
+                } else {
+                    (pep.clone(), pepos.to_string())
+                };
+                let run_cells = if r.sources.is_empty() {
+                    "\t\t\t\t0".to_string()
+                } else {
+                    format!(
+                        "{:.4}\t{}\t{}\t{}\t{}",
+                        r.prob,
+                        opt(r.flr_model),
+                        opt(r.flr_decoy),
+                        r.best,
+                        r.sources.len()
+                    )
+                };
+                write!(
+                    w,
+                    "{acc}\t{}\t{res}\t{m}\t{pep_cell}\t{pos_cell}\t{run_cells}",
+                    ppos.map(|p| p.to_string()).unwrap_or_default(),
+                )?;
+                if self.experiment.is_some() {
+                    match &r.experiment {
+                        Some((p, fm, fd, b, n)) => {
+                            write!(w, "\t{p:.4}\t{}\t{}\t{b}\t{n}", opt(*fm), opt(*fd))?
+                        }
+                        None => write!(w, "\t\t\t\t\t")?,
+                    }
+                }
+                writeln!(w)?;
+            }
+            Ok(())
+        })?;
         tracing::info!(
             sites = sites.len(),
             out = self.out_sites,
@@ -1542,7 +1511,7 @@ mod tests {
             if !accepted(i, &pep_q) {
                 continue;
             }
-            seen_strip.insert(strip(&pform[i]));
+            seen_strip.insert(base_sequence(&pform[i]));
             let key = (pform[i].clone(), charge[i]);
             if !seen.insert(key.clone()) {
                 continue;
@@ -1552,7 +1521,7 @@ mod tests {
                 w,
                 "{}\t{}\t{}\t{}\t{:.6}\t{:.4}\t{}{}",
                 pform[i],
-                strip(&pform[i]),
+                base_sequence(&pform[i]),
                 charge[i],
                 protein[i],
                 pep_q[i],
@@ -1746,7 +1715,7 @@ mod tests {
             if !accepted(i, &pep_q) {
                 continue;
             }
-            seen_strip.insert(strip(&pform[i]));
+            seen_strip.insert(base_sequence(&pform[i]));
             let key = (pform[i].clone(), charge[i]);
             if !seen.insert(key.clone()) {
                 continue;
@@ -1755,7 +1724,7 @@ mod tests {
                 w,
                 "{}\t{}\t{}\t{}\t{:.6}\t{:.4}\t{}",
                 pform[i],
-                strip(&pform[i]),
+                base_sequence(&pform[i]),
                 charge[i],
                 protein[i],
                 pep_q[i],
@@ -1929,21 +1898,28 @@ mod tests {
         let names = vec!["a".to_string(), "b".to_string()];
         let quants = [qa, qb];
         let report = || {
-            run_experiment(ExperimentReportParams {
-                scored: &scored,
-                run_names: &names,
-                peptide_quants: &quants,
-                protein_lfq: Some(&lfq),
-                precursor_lfq: None,
-                out_peptides: &peptides,
-                out_proteins: &proteins,
-                out_precursors: None,
-                q_threshold: 0.01,
-                protein_annotations: None,
-            })
+            run_experiment(
+                ExperimentReportParams {
+                    scored: &scored,
+                    run_names: &names,
+                    peptide_quants: &quants,
+                    protein_lfq: Some(&lfq),
+                    precursor_lfq: None,
+                    out_peptides: &peptides,
+                    out_proteins: &proteins,
+                    out_precursors: None,
+                    q_threshold: 0.01,
+                    protein_annotations: None,
+                },
+                None,
+            )
             .unwrap()
         };
-        let (n_pep, n_prot) = report();
+        let ReportCounts {
+            peptide_rows: n_pep,
+            protein_groups: n_prot,
+            ..
+        } = report();
         assert_eq!((n_pep, n_prot), (2, 1));
 
         let text = std::fs::read_to_string(&peptides).unwrap();
@@ -2076,18 +2052,21 @@ mod tests {
         let report = |tables: &[String], tag: &str| -> Vec<String> {
             let peptides = tmp(&format!("fp_{tag}_peptides.tsv"));
             let proteins = tmp(&format!("fp_{tag}_proteins.tsv"));
-            run_experiment(ExperimentReportParams {
-                scored: &scored,
-                run_names: &names,
-                peptide_quants: tables,
-                protein_lfq: None,
-                precursor_lfq: None,
-                out_peptides: &peptides,
-                out_proteins: &proteins,
-                out_precursors: None,
-                q_threshold: 0.01,
-                protein_annotations: None,
-            })
+            run_experiment(
+                ExperimentReportParams {
+                    scored: &scored,
+                    run_names: &names,
+                    peptide_quants: tables,
+                    protein_lfq: None,
+                    precursor_lfq: None,
+                    out_peptides: &peptides,
+                    out_proteins: &proteins,
+                    out_precursors: None,
+                    q_threshold: 0.01,
+                    protein_annotations: None,
+                },
+                None,
+            )
             .unwrap();
             std::fs::read_to_string(&peptides)
                 .unwrap()
@@ -2120,13 +2099,6 @@ mod tests {
             "precursor\tstripped_sequence\tcharge\tprotein\tq_value\tscore\tn_runs\tquantity_a\t\
              quantity_b\tis_transferred\ttransfer_q\tprotein_ids\tprotein_names\tgenes"
         );
-    }
-
-    #[test]
-    fn strip_mods_and_decoy() {
-        assert_eq!(strip("PEPTIDEK"), "PEPTIDEK");
-        assert_eq!(strip("M[Oxidation]EGC[Carbamidomethyl]VDGHK"), "MEGCVDGHK");
-        assert_eq!(strip("DECOY_VAVGDGVAK"), "VAVGDGVAK");
     }
 
     fn tmp(name: &str) -> String {
@@ -2264,10 +2236,7 @@ mod tests {
             q_threshold: 0.01,
             protein_annotations: None,
         };
-        run(params()).unwrap();
-        let plain = std::fs::read_to_string(&pep).unwrap();
-        run_localised(params(), None).unwrap();
-        assert_eq!(std::fs::read_to_string(&pep).unwrap(), plain);
+        run(params(), None).unwrap();
         assert!(!std::path::Path::new(&sites).exists());
 
         let tables = vec![loc.clone()];
@@ -2277,7 +2246,7 @@ mod tests {
             fasta: Some(&fasta),
             out_sites: &sites,
         };
-        run_localised(params(), Some(&l)).unwrap();
+        run(params(), Some(&l)).unwrap();
         let text = std::fs::read_to_string(&pep).unwrap();
         let mut lines = text.lines();
         assert!(lines.next().unwrap().ends_with(
@@ -2478,16 +2447,23 @@ mod tests {
         std::fs::create_dir_all(&out).unwrap();
         let peptides = format!("{out}/peptides.tsv");
         let proteins = format!("{out}/proteins.tsv");
-        let (n_pep, n_prot) = run(ReportParams {
-            scored: &scored,
-            peptide_quant: None,
-            protein_quant: None,
-            out_peptides: &peptides,
-            out_proteins: &proteins,
-            out_precursors: None,
-            q_threshold: 0.01,
-            protein_annotations: None,
-        })
+        let ReportCounts {
+            peptide_rows: n_pep,
+            protein_groups: n_prot,
+            ..
+        } = run(
+            ReportParams {
+                scored: &scored,
+                peptide_quant: None,
+                protein_quant: None,
+                out_peptides: &peptides,
+                out_proteins: &proteins,
+                out_precursors: None,
+                q_threshold: 0.01,
+                protein_annotations: None,
+            },
+            None,
+        )
         .unwrap();
 
         // Two targets pass; the decoy has the best q and the best score and must
@@ -2600,16 +2576,19 @@ mod tests {
         .unwrap();
         let out = tmp("report_badflag");
         std::fs::create_dir_all(&out).unwrap();
-        let e = run(ReportParams {
-            scored: &path,
-            peptide_quant: None,
-            protein_quant: None,
-            out_peptides: &format!("{out}/peptides.tsv"),
-            out_proteins: &format!("{out}/proteins.tsv"),
-            out_precursors: None,
-            q_threshold: 0.01,
-            protein_annotations: None,
-        })
+        let e = run(
+            ReportParams {
+                scored: &path,
+                peptide_quant: None,
+                protein_quant: None,
+                out_peptides: &format!("{out}/peptides.tsv"),
+                out_proteins: &format!("{out}/proteins.tsv"),
+                out_precursors: None,
+                q_threshold: 0.01,
+                protein_annotations: None,
+            },
+            None,
+        )
         .unwrap_err()
         .to_string();
         assert!(e.contains("is_transferred"), "{e}");
@@ -2622,16 +2601,22 @@ mod tests {
         let scored = scored_table();
         let out = tmp("report_nombr");
         std::fs::create_dir_all(&out).unwrap();
-        let (n_pep, _) = run(ReportParams {
-            scored: &scored,
-            peptide_quant: None,
-            protein_quant: None,
-            out_peptides: &format!("{out}/peptides.tsv"),
-            out_proteins: &format!("{out}/proteins.tsv"),
-            out_precursors: None,
-            q_threshold: 0.01,
-            protein_annotations: None,
-        })
+        let ReportCounts {
+            peptide_rows: n_pep,
+            ..
+        } = run(
+            ReportParams {
+                scored: &scored,
+                peptide_quant: None,
+                protein_quant: None,
+                out_peptides: &format!("{out}/peptides.tsv"),
+                out_proteins: &format!("{out}/proteins.tsv"),
+                out_precursors: None,
+                q_threshold: 0.01,
+                protein_annotations: None,
+            },
+            None,
+        )
         .unwrap();
         assert_eq!(n_pep, 2);
         let text = std::fs::read_to_string(format!("{out}/peptides.tsv")).unwrap();
@@ -2652,20 +2637,23 @@ mod tests {
         let peptides = format!("{out}/peptides.tsv");
         let proteins = format!("{out}/proteins.tsv");
         let report = |q: f64| {
-            run(ReportParams {
-                scored: &scored,
-                peptide_quant: None,
-                protein_quant: None,
-                out_peptides: &peptides,
-                out_proteins: &proteins,
-                out_precursors: None,
-                q_threshold: q,
-                protein_annotations: None,
-            })
+            run(
+                ReportParams {
+                    scored: &scored,
+                    peptide_quant: None,
+                    protein_quant: None,
+                    out_peptides: &peptides,
+                    out_proteins: &proteins,
+                    out_precursors: None,
+                    q_threshold: q,
+                    protein_annotations: None,
+                },
+                None,
+            )
             .unwrap()
         };
 
-        let (n_pep, _) = report(0.01);
+        let n_pep = report(0.01).peptide_rows;
         assert_eq!(n_pep, 3, "two confident targets plus the transfer");
         let text = std::fs::read_to_string(&peptides).unwrap();
         let header = text.lines().next().unwrap();
@@ -2705,7 +2693,7 @@ mod tests {
 
         // Tighter threshold: the 0.005 target drops, the transfer stays. This is the
         // rule the columns exist to make visible, not a new one.
-        let (n_pep, _) = report(0.001);
+        let n_pep = report(0.001).peptide_rows;
         assert_eq!(n_pep, 2);
         let text = std::fs::read_to_string(&peptides).unwrap();
         assert!(text.contains("LATEPEPTIDEK\t"), "{text}");
@@ -2723,16 +2711,23 @@ mod tests {
         std::fs::create_dir_all(&out).unwrap();
         let peptides = format!("{out}/peptides.tsv");
         let proteins = format!("{out}/proteins.tsv");
-        let (n_pep, n_prot) = run(ReportParams {
-            scored: &scored,
-            peptide_quant: None,
-            protein_quant: None,
-            out_peptides: &peptides,
-            out_proteins: &proteins,
-            out_precursors: None,
-            q_threshold: 0.0,
-            protein_annotations: None,
-        })
+        let ReportCounts {
+            peptide_rows: n_pep,
+            protein_groups: n_prot,
+            ..
+        } = run(
+            ReportParams {
+                scored: &scored,
+                peptide_quant: None,
+                protein_quant: None,
+                out_peptides: &peptides,
+                out_proteins: &proteins,
+                out_precursors: None,
+                q_threshold: 0.0,
+                protein_annotations: None,
+            },
+            None,
+        )
         .unwrap();
         assert_eq!((n_pep, n_prot), (0, 0));
         for path in [&peptides, &proteins] {
@@ -2760,16 +2755,19 @@ mod tests {
         std::fs::create_dir_all(&out).unwrap();
         let peptides = format!("{out}/peptides.tsv");
         let proteins = format!("{out}/proteins.tsv");
-        run(ReportParams {
-            scored: &scored,
-            peptide_quant: Some(&quant),
-            protein_quant: None,
-            out_peptides: &peptides,
-            out_proteins: &proteins,
-            out_precursors: None,
-            q_threshold: 0.01,
-            protein_annotations: None,
-        })
+        run(
+            ReportParams {
+                scored: &scored,
+                peptide_quant: Some(&quant),
+                protein_quant: None,
+                out_peptides: &peptides,
+                out_proteins: &proteins,
+                out_precursors: None,
+                q_threshold: 0.01,
+                protein_annotations: None,
+            },
+            None,
+        )
         .unwrap();
         let text = std::fs::read_to_string(&peptides).unwrap();
         let mut quantified = 0;
@@ -2926,16 +2924,19 @@ mod tests {
                 let out = tmp("two_pass");
                 std::fs::create_dir_all(&out).unwrap();
                 let f = |n: &str| format!("{out}/{n}");
-                let got = run(ReportParams {
-                    scored: &scored,
-                    peptide_quant: Some(&quants[0]),
-                    protein_quant: None,
-                    out_peptides: &f("p1.tsv"),
-                    out_proteins: &f("g1.tsv"),
-                    out_precursors: Some(&f("c1.tsv")),
-                    q_threshold,
-                    protein_annotations: None,
-                })
+                let got = run(
+                    ReportParams {
+                        scored: &scored,
+                        peptide_quant: Some(&quants[0]),
+                        protein_quant: None,
+                        out_peptides: &f("p1.tsv"),
+                        out_proteins: &f("g1.tsv"),
+                        out_precursors: Some(&f("c1.tsv")),
+                        q_threshold,
+                        protein_annotations: None,
+                    },
+                    None,
+                )
                 .unwrap();
                 let want = legacy_run(ReportParams {
                     scored: &scored,
@@ -2948,19 +2949,26 @@ mod tests {
                     protein_annotations: None,
                 })
                 .unwrap();
-                assert_eq!(got, want, "single run, mbr {mbr}, threshold {q_threshold}");
-                let got_e = run_experiment(ExperimentReportParams {
-                    scored: &scored,
-                    run_names: &names,
-                    peptide_quants: &quants,
-                    protein_lfq: Some(&lfq),
-                    precursor_lfq: None,
-                    out_peptides: &f("pe.tsv"),
-                    out_proteins: &f("ge.tsv"),
-                    out_precursors: Some(&f("ce.tsv")),
-                    q_threshold,
-                    protein_annotations: None,
-                })
+                assert_eq!(
+                    (got.peptide_rows, got.protein_groups),
+                    want,
+                    "single run, mbr {mbr}, threshold {q_threshold}"
+                );
+                let got_e = run_experiment(
+                    ExperimentReportParams {
+                        scored: &scored,
+                        run_names: &names,
+                        peptide_quants: &quants,
+                        protein_lfq: Some(&lfq),
+                        precursor_lfq: None,
+                        out_peptides: &f("pe.tsv"),
+                        out_proteins: &f("ge.tsv"),
+                        out_precursors: Some(&f("ce.tsv")),
+                        q_threshold,
+                        protein_annotations: None,
+                    },
+                    None,
+                )
                 .unwrap();
                 let want_e = legacy_run_experiment(ExperimentReportParams {
                     scored: &scored,
@@ -2976,7 +2984,8 @@ mod tests {
                 })
                 .unwrap();
                 assert_eq!(
-                    got_e, want_e,
+                    (got_e.peptide_rows, got_e.protein_groups),
+                    want_e,
                     "experiment, mbr {mbr}, threshold {q_threshold}"
                 );
                 for (a, b) in [
@@ -3006,7 +3015,10 @@ mod tests {
                     );
                 }
                 if q_threshold == 0.01 {
-                    assert!(got.0 > 0 && got.1 > 0 && got_e.0 > 0, "rows are printed");
+                    assert!(
+                        got.peptide_rows > 0 && got.protein_groups > 0 && got_e.peptide_rows > 0,
+                        "rows are printed"
+                    );
                 }
                 // precursors.tsv holds exactly the distinct accepted (peptidoform, charge)
                 // of the targets on precursor_q, recomputed here from the whole table.
@@ -3047,18 +3059,21 @@ mod tests {
         }
         // A source outside the run names is still refused, at the same row.
         let scored = random_scored(1_000, 4, false);
-        let e_new = run_experiment(ExperimentReportParams {
-            scored: &scored,
-            run_names: &names,
-            peptide_quants: &[],
-            protein_lfq: None,
-            precursor_lfq: None,
-            out_peptides: &tmp("x1.tsv"),
-            out_proteins: &tmp("x2.tsv"),
-            out_precursors: None,
-            q_threshold: 0.01,
-            protein_annotations: None,
-        })
+        let e_new = run_experiment(
+            ExperimentReportParams {
+                scored: &scored,
+                run_names: &names,
+                peptide_quants: &[],
+                protein_lfq: None,
+                precursor_lfq: None,
+                out_peptides: &tmp("x1.tsv"),
+                out_proteins: &tmp("x2.tsv"),
+                out_precursors: None,
+                q_threshold: 0.01,
+                protein_annotations: None,
+            },
+            None,
+        )
         .unwrap_err()
         .to_string();
         let e_old = legacy_run_experiment(ExperimentReportParams {
@@ -3190,7 +3205,7 @@ mod tests {
         let out = tmp("prec_single");
         std::fs::create_dir_all(&out).unwrap();
         let f = |n: &str| format!("{out}/{n}");
-        let c = run_localised(
+        let c = run(
             ReportParams {
                 scored: &scored,
                 peptide_quant: Some(&quant),
@@ -3282,7 +3297,7 @@ mod tests {
         let names = vec!["a".to_string(), "b".to_string()];
         for with_lfq in [true, false] {
             let dst = if with_lfq { "p_lfq.tsv" } else { "p_plain.tsv" };
-            let c = run_experiment_localised(
+            let c = run_experiment(
                 ExperimentReportParams {
                     scored: &scored,
                     run_names: &names,
@@ -3350,7 +3365,7 @@ mod tests {
         let out = tmp("old_out");
         std::fs::create_dir_all(&out).unwrap();
         let f = |n: &str| format!("{out}/{n}");
-        let c = run_localised(
+        let c = run(
             ReportParams {
                 scored: &old,
                 peptide_quant: None,
@@ -3497,16 +3512,19 @@ mod tests {
             .zip([None, Some(ann.as_str()), Some(lib.as_str())])
         {
             std::fs::create_dir_all(d).unwrap();
-            run(ReportParams {
-                scored: &scored,
-                peptide_quant: None,
-                protein_quant: None,
-                out_peptides: &format!("{d}/peptides.tsv"),
-                out_proteins: &format!("{d}/proteins.tsv"),
-                out_precursors: Some(&format!("{d}/precursors.tsv")),
-                q_threshold: 0.01,
-                protein_annotations: a,
-            })
+            run(
+                ReportParams {
+                    scored: &scored,
+                    peptide_quant: None,
+                    protein_quant: None,
+                    out_peptides: &format!("{d}/peptides.tsv"),
+                    out_proteins: &format!("{d}/proteins.tsv"),
+                    out_precursors: Some(&format!("{d}/precursors.tsv")),
+                    q_threshold: 0.01,
+                    protein_annotations: a,
+                },
+                None,
+            )
             .unwrap();
         }
         check(&dirs[0], &dirs[1]);
@@ -3517,18 +3535,21 @@ mod tests {
             .zip([None, Some(ann.as_str()), Some(lib.as_str())])
         {
             std::fs::create_dir_all(d).unwrap();
-            run_experiment(ExperimentReportParams {
-                scored: &scored,
-                run_names: &names,
-                peptide_quants: &[],
-                protein_lfq: None,
-                precursor_lfq: None,
-                out_peptides: &format!("{d}/peptides.tsv"),
-                out_proteins: &format!("{d}/proteins.tsv"),
-                out_precursors: Some(&format!("{d}/precursors.tsv")),
-                q_threshold: 0.01,
-                protein_annotations: a,
-            })
+            run_experiment(
+                ExperimentReportParams {
+                    scored: &scored,
+                    run_names: &names,
+                    peptide_quants: &[],
+                    protein_lfq: None,
+                    precursor_lfq: None,
+                    out_peptides: &format!("{d}/peptides.tsv"),
+                    out_proteins: &format!("{d}/proteins.tsv"),
+                    out_precursors: Some(&format!("{d}/precursors.tsv")),
+                    q_threshold: 0.01,
+                    protein_annotations: a,
+                },
+                None,
+            )
             .unwrap();
         }
         check(&dirs[0], &dirs[1]);

@@ -29,8 +29,8 @@
 //! a FASTA-built library keeps it beside its precursor table, as before.
 //!
 //! Whatever the source, the search leaves a side table in its output directory so a later
-//! `mumdia report` finds it there ([`publish`]): a side table byte for byte, a library's
-//! columns as the side table they amount to.
+//! `mumdia report` finds it there ([`publish_recorded`]): a side table byte for byte, a
+//! library's columns as the side table they amount to.
 //!
 //! The join: a key that is in the table gives its row; a key that is not (a protein string
 //! of several FASTA proteins, one per shared peptide) is split on `;` and the rows of its
@@ -580,7 +580,7 @@ pub fn search_source(
     }
 }
 
-/// Publish a search's annotations into its output directory ([`publish`]) and record them
+/// Publish a search's annotations into its output directory (`publish_from`) and record them
 /// in the manifest. Returns the table's path and its producer: `digest` (a FASTA search),
 /// `library-input` (copied from a side table) or `library-columns` (read from a library's
 /// columns).
@@ -620,13 +620,8 @@ fn same_file(a: &Path, b: &Path) -> bool {
 /// Write the annotations at `src` to `<out_dir>/protein_annotations.parquet`: a side table
 /// is validated and copied byte for byte (nothing to copy when it is that file already); a
 /// library precursor table's [`LIBRARY_COLUMNS`] are written as the side table they amount
-/// to ([`from_library`], [`write()`]). Returns the table's path and row count.
-pub fn publish(src: &str, out_dir: &str) -> Result<(String, u64)> {
-    let (dst, n, _) = publish_from(src, out_dir)?;
-    Ok((dst, n))
-}
-
-/// [`publish`], and whether `src` was a library precursor table.
+/// to ([`from_library`], [`write()`]). Returns the table's path, its row count and whether
+/// `src` was a library precursor table.
 fn publish_from(src: &str, out_dir: &str) -> Result<(String, u64, bool)> {
     let dst = Path::new(out_dir).join(FILE_NAME);
     let dst_s = dst.display().to_string();
@@ -809,16 +804,16 @@ mod tests {
         assert_eq!(found.hashed_input(), Some(found.path()));
 
         let out = tmp("find_out");
-        let (copy, n) = publish(found.path(), &out).unwrap();
+        let (copy, n, _) = publish_from(found.path(), &out).unwrap();
         assert_eq!(n, 1);
         assert_eq!(
             std::fs::read(&copy).unwrap(),
             std::fs::read(found.path()).unwrap()
         );
         // Publishing the copy into its own directory is a no-op.
-        assert_eq!(publish(&copy, &out).unwrap().0, copy);
+        assert_eq!(publish_from(&copy, &out).unwrap().0, copy);
         assert!(
-            publish(&bad, &out).is_err(),
+            publish_from(&bad, &out).is_err(),
             "a malformed table is refused before it is copied"
         );
     }
@@ -902,7 +897,7 @@ mod tests {
 
         // Published as the side table they amount to, which loads to the same join.
         let out = tmp("library_out");
-        let (table, n) = publish(&lib, &out).unwrap();
+        let (table, n, _) = publish_from(&lib, &out).unwrap();
         assert_eq!(n, 3);
         let side = ProteinAnnotations::load(&table).unwrap();
         for key in ["ALBU_HUMAN", "A_HUMAN;B_HUMAN", "TMED2_HUMAN", "UNASSIGNED"] {

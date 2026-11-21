@@ -35,7 +35,7 @@ stages that operate across multiple runs.
 |---|---|
 | `rust/mumdia/crates/mumdia/src/stages/quant.rs` | `quant` stage, its chromatogram reader and the cross-run fit (`fit_cross_run`) |
 | `rust/mumdia/crates/mumdia/src/stages/quant_norm.rs` | cross-run normalisation (`quant-normalise`, `quant.normalisation`, default `stable_set`) |
-| `rust/mumdia/crates/mumdia/src/quant_lfq.rs` | MaxLFQ/directLFQ ratio-alignment core (`lfq_profile`, `maxlfq`, `directlfq`) and the `quant-lfq` combine with its size factors (`run_lfq_combine_grouped`) |
+| `rust/mumdia/crates/mumdia/src/quant_lfq.rs` | MaxLFQ/directLFQ ratio-alignment core (`lfq_profile`) and the `quant-lfq` combine with its size factors (`run_lfq_combine_grouped`) |
 | `rust/mumdia/crates/mumdia/src/stages/align.rs` | Stage D2 cross-run RT alignment |
 | `rust/mumdia/crates/mumdia/src/stages/report.rs` | `peptides.tsv` + `precursors.tsv` + `proteins.tsv` writer |
 | `rust/mumdia/crates/mumdia/src/stages/audit.rs` | candidate identification-loss ladder |
@@ -307,13 +307,11 @@ library, or an imported library's side table, given to `mumdia report --experime
 
 ### audit
 Consumes `library_precursors.parquet` (the full search space) plus `psms`
-(extract), `competed` (compete), `scored` (rescore). It also attempts to read
-`<psms>.audit.parquet` (`load_extract_reasons`, `audit.rs:51`) for extract-reason
-refinement, but no stage in the current chain writes that file (see the gotchas), so
-the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
-(16 columns, `audit.rs:180`) and `<out>.metrics.json` (`audit.rs:216`).
+(extract), `competed` (compete), `scored` (rescore). Extract writes no per-candidate
+table, so every extraction loss carries one reason (see the gotchas). Writes
+`candidate_audit.parquet` (16 columns) and `<out>.metrics.json`.
 
-`candidate_audit.parquet` schema (`audit.rs:180`):
+`candidate_audit.parquet` schema:
 
 | column | type | meaning |
 |---|---|---|
@@ -323,18 +321,18 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
 | `charge` | i32 | precursor charge |
 | `target_decoy_label` | str | `target`/`decoy` from the library |
 | `entrapment_label` | bool | `protein` contains `entrapment_substr` (empty substr = always false) |
-| `candidate_generated` | bool | always true (in the search space by construction, `audit.rs:168`) |
+| `candidate_generated` | bool | always true (in the search space by construction) |
 | `traces_extracted` | bool | present in `psms` (extract produced an accepted peak) |
-| `peak_generated` | bool | equals `traces_extracted` (artifact resolution, `audit.rs:170`) |
+| `peak_generated` | bool | equals `traces_extracted` (artifact resolution) |
 | `peak_selected` | bool | equals `traces_extracted` |
 | `variant_selected` | bool | present in `competed` |
 | `target_decoy_winner` | bool | present in `scored` (survived to rescore) |
-| `passed_precursor_fdr` | bool | scored `q_value <= q_threshold` |
-| `passed_peptide_fdr` | bool | `passed_pep && passed_prec` (`audit.rs:175`) |
-| `reported` | bool | equals `passed_precursor_fdr` (`audit.rs:176`) |
+| `passed_precursor_fdr` | bool | scored `precursor_q <= q_threshold` (the PSM `q_value` on an older table without `precursor_q`, recorded as `q_unit`) |
+| `passed_peptide_fdr` | bool | the precursor gate and the peptide gate: a target's base peptide q, read from the peptide's winning row as in `precursors.tsv`; a decoy's own `peptide_q_value`; the precursor gate alone when the table has no peptide q |
+| `reported` | bool | `rejection_reason == REPORTED`: a target that passed both gates |
 | `rejection_reason` | str | earliest-loss `RejectionReason::code()` |
 
-`<out>.metrics.json` (`audit.rs:206`) records `run_id`, `q_threshold`,
+`<out>.metrics.json` records `run_id`, `q_threshold`, `q_unit`,
 `search_space`, `extracted`, `competed`, `reported`, `trace_recall`
 (`extracted / max(1, search_space)`), and the per-reason `waterfall` map (as a sorted
 `BTreeMap`).
@@ -1380,7 +1378,8 @@ log2 quantity `y` in a run; duplicate rows of one ion in a run keep the largest 
    `y`, less the 5% with the largest `|D|`, gives the principal components of the run space.
    Every composition effect of a design with `G` sample groups lies in a `G - 1`
    dimensional subspace of it. The dimension `k` is the number of eigenvalues above 3
-   times their median (at least 1, at most `n_runs - 2`), or `normalisation_rank`. In that
+   times their median (at least 1, at most `n_runs - 2`), or `normalisation_rank`, which
+   `run-experiment` checks against the same bound before it searches. In that
    subspace, a mean shift from the coordinate median finds the largest population: a
    Gaussian kernel of bandwidth `sigma` (the per-element residual SD outside the
    subspace), cut at 4 bandwidths, 200 steps at most. The stable ions are the complete ions
@@ -1757,36 +1756,40 @@ presentation value rounded to one decimal.
 ### audit (`audit.rs:64`, `run`)
 
 The search space is every library precursor (`candidate_id`, `peptidoform`, `charge`,
-`label`, `protein`). Survivor sets are built as `HashSet<u32>` of `candidate_id` from
-`psms` (extracted), `competed`, and `scored`; scored also yields `q_by_cid`, read from
-`precursor_q` (the unit the `passed_precursor_fdr` label names; the PSM `q_value` only
-on an older table without that column, recorded as `q_unit` in the metrics JSON;
-docs/29 #16) and optional `pepq_by_cid` (peptide-level q, only present in some scored
-schemas). A scored table with more than one `source` is refused: the audit keys on
-`candidate_id`, so a pooled table would attribute one run's fate to every run; audit
-the per-run split tables. `load_extract_reasons` (`audit.rs:51`) tries to read a
-`<psms>.audit.parquet` sidecar to refine the extract-stage bucket, but nothing in the
-current chain writes that file (see the gotchas), so the map is empty and every
-extract-stage loss buckets to `DID_NOT_SURVIVE_EXTRACTION`. For each candidate the earliest
-rejection reason is assigned along the ladder (`audit.rs:136`):
-- not in `extracted` -> refined from the sidecar
-  (`NO_FRAGMENT_TRACES`/`NO_VALID_FRAGMENTS`/`PEAK_NOT_SELECTED`/`RT_PRUNED`/
-  `WRONG_ISOLATION_WINDOW`, `audit.rs:139`) or the generic `DID_NOT_SURVIVE_EXTRACTION` when no
-  sidecar (the only outcome today);
+`label`, and `protein` when an entrapment substring is given). Survivor sets are built as
+`HashSet<u32>` of `candidate_id` from `psms` (extracted), `competed`, and `scored`; scored
+also yields `q_by_cid`, read from `precursor_q` (the unit the `passed_precursor_fdr` label
+names; the PSM `q_value` only on an older table without that column, recorded as `q_unit`
+in the metrics JSON; docs/29 #16) and, when the table has `peptide_q_value` (a present
+column of the wrong type is an error), `pepq_by_cid`. `rescore` writes the peptide q to
+each base peptide's winning row only and 1.0 to its other charge states and modforms, so a
+target reads the q of its base peptide's winning target row (`report::peptide_winner_q`,
+the rule `precursors.tsv` uses) and a decoy keeps its own cell. A scored table with more
+than one `source` is refused: the audit keys on `candidate_id`, so a pooled table would
+attribute one run's fate to every run. A `run-experiment` split table is no substitute:
+its grouped q columns are experiment-wide, on one winning row across all runs (the per-run
+unit there is `run_psm_q`), so a precursor accepted in every run would fail the gates in
+all runs but its winner's. The audit is valid on a single-file `run` output. Extract
+writes no per-candidate table, so every extract-stage loss is
+`DID_NOT_SURVIVE_EXTRACTION`. For each candidate the earliest rejection reason is assigned
+along the ladder:
+- not in `extracted` -> `DID_NOT_SURVIVE_EXTRACTION`;
 - extracted but not in `competed` -> `OUTCOMPETED_BY_DECOY` (decoy) or
   `OUTCOMPETED_BY_TARGET` (target);
 - competed but `q > q_threshold` -> `FAILED_PRECURSOR_FDR`;
-- passes precursor but fails peptide q -> `FAILED_PEPTIDE_FDR` (peptide q falls back to
-  the precursor gate when absent, `audit.rs:133`);
-- else `REPORTED`.
+- passes precursor but fails peptide q -> `FAILED_PEPTIDE_FDR` (the precursor gate stands
+  in when the table has no peptide q);
+- else `REPORTED` for a target and `REMOVED_DURING_REPORTING` for a decoy, which the report
+  never writes.
 
 The waterfall counts per reason and is logged sorted by descending count
 (`audit.rs:220`); `<out>.metrics.json` records the fields listed under
 `## Inputs and outputs`. This stage never re-runs compute and never mutates a pipeline
 output, so it is safe to run after any search. In the `run` orchestrator the stage is
-invoked only when `extract.emit_candidate_audit` is set (`run.rs:428`), with
-`q_threshold = 0.01`, `run_id = out_dir`, and no entrapment substring; standalone,
-`mumdia audit` takes those as CLI args.
+invoked only when `extract.emit_candidate_audit` is set, with the report's
+`quant.q_threshold` (so `reported` agrees with the TSVs of the same run), `run_id = out_dir`,
+and no entrapment substring; standalone, `mumdia audit` takes those as CLI args (`--q`
+0.01 by default). `run-experiment` runs no audit and warns when the key is set.
 
 `RejectionReason` (`rejection.rs:22`) is a 12-variant enum with a stable
 SCREAMING_SNAKE_CASE `code()` (`rejection.rs:50`). The variants are declared in pipeline
@@ -1808,11 +1811,9 @@ FDR/reporting); `audit.rs` tests the stages in that order and keeps the first lo
 | `quant::run` | quant.rs:259 | full quant stage |
 | `run_lfq_combine_grouped` | quant_lfq.rs | build the protein-by-run matrix for `quant-lfq` |
 | `size_factors` | quant.rs:753 | per-run normalization factors (MedianRatio/Median/None) |
-| `median_sorted` | quant.rs:818 | in-place median helper (empty = 0.0; assumes finite, no NaN) |
 | `lfq_profile` | quant_lfq.rs:84 | MaxLFQ least-squares per-sample profile |
-| `median` | quant_lfq.rs:12 | private in-place median (duplicate of `median_sorted`, local to `quant_lfq`) |
+| `stats::median_or` | stats.rs | the shared in-place median (a given value for an empty slice) the profile and the size factors call |
 | `solve_fixed` | quant_lfq.rs:28 | dense Laplacian solve, first var fixed at 0 |
-| `maxlfq` / `directlfq` | quant_lfq.rs:191 / 198 | granularity-specific wrappers over `lfq_profile` |
 | `AlignParams` | align.rs:22 | seeds + q_train + grid_n |
 | `confident_rts` | align.rs:32 | best observed RT per confident target base peptide |
 | `align::run` | align.rs:53 | reference LOESS RT map per run |
@@ -1821,10 +1822,9 @@ FDR/reporting); `audit.rs` tests the stages in that order and keeps the first lo
 | `expected_rt` | mbr_worker.py:116 | cross-run predicted RT for a candidate in a run |
 | `write_empty_transfers` / `write_unflagged_scored` | mbr_worker.py | full-schema outputs when there are no transfer candidates |
 | `ReportParams` / `report::run` | report.rs:13 / 49 | TSV writer |
-| `strip` | report.rs:24 | stripped sequence from a peptidoform |
+| `base_sequence` | quant_lfq.rs | stripped sequence of a peptidoform, for the peptide-level LFQ groups and the report |
 | `qcell` | report.rs:39 | quantity cell formatting (1 decimal; empty on NaN) |
 | `AuditParams` / `audit::run` | audit.rs:28 / 64 | candidate loss ladder |
-| `load_extract_reasons` | audit.rs:51 | optional `<psms>.audit.parquet` refinement (no producer yet) |
 | `RejectionReason` | rejection.rs:22 | earliest-loss category enum (`code`) |
 | `resolve_script` | sidecar.rs:20 | locate a worker script relative to CWD or the binary |
 | `run_worker` | sidecar.rs:217 | spawn `python <script> <args>`; error on non-zero exit |
@@ -1963,17 +1963,14 @@ but do not affect the wired `mumdia mbr` path.
   stripped sequences, but selection is by `peptide_q_value`, not `precursor_q`.
   `precursors.tsv` is the table selected by `precursor_q`. A separate stripped-sequence
   count is only logged. TSV quantity is rounded; use Parquet for quantitative work.
-- **`<psms>.audit.parquet` has no producer.** `emit_candidate_audit` (`config.rs:483`)
-  documents that extraction "writes `<out-psms>.audit.parquet`", but no stage in the
-  current tree writes it (grep: only `compete` writes `<out>.compete_audit.parquet` and
-  the `audit` stage writes `candidate_audit.parquet`). What `emit_candidate_audit`
-  actually does in `run` is gate whether the `audit` STAGE is invoked at all
-  (`run.rs:428`), not emit an in-extract per-candidate sidecar. So `load_extract_reasons`
-  always reads nothing and the refined extract reasons are unreachable today.
+- **extract records no rejection reason.** `emit_candidate_audit` gates the `audit` stage
+  of a single-file `run`; extract writes no per-candidate table, so the audit cannot split
+  an extraction loss: `DID_NOT_SURVIVE_EXTRACTION` covers presence failures,
+  matched-fraction failures and every gate rejection alike.
 - **audit artifact resolution.** `peak_generated`, `peak_selected`, and
   `traces_extracted` are all set from the same `traces` flag (`audit.rs:170`) because
-  the artifacts only record presence in `psms`; the (not-yet-written) in-extract sidecar
-  would be the only way to split "no traces" from "traces but no accepted peak".
+  the artifacts only record presence in `psms`; only a per-candidate table written by
+  extract could split "no traces" from "traces but no accepted peak".
 - **audit `reported` and `REPORTED` agree.** The `reported` bool is `rejection_reason ==
   REPORTED`: a target that passed the precursor and the peptide gate. A decoy that passes
   both is `REMOVED_DURING_REPORTING`, because the report never writes a decoy. The two
@@ -1982,14 +1979,12 @@ but do not affect the wired `mumdia mbr` path.
   `reported=true` next to `FAILED_PEPTIDE_FDR`, and a decoy could be `REPORTED`. A present
   `precursor_q` column of the wrong type is an error; only an absent column falls back to
   the PSM `q_value` (recorded as `q_unit`).
-- **audit reason coverage.** In the current chain `audit.rs` can only ever emit
+- **audit reason coverage.** `audit.rs` emits
   `DID_NOT_SURVIVE_EXTRACTION`, `OUTCOMPETED_BY_TARGET`/`OUTCOMPETED_BY_DECOY`, `FAILED_PRECURSOR_FDR`,
   `FAILED_PEPTIDE_FDR`, `REMOVED_DURING_REPORTING` (a decoy that passes every gate, which
-  the report never writes), and `REPORTED`. The five refined extract codes
-  (`NO_FRAGMENT_TRACES`, `NO_VALID_FRAGMENTS`, `PEAK_NOT_SELECTED`, `RT_PRUNED`,
-  `WRONG_ISOLATION_WINDOW`) are matched by `load_extract_reasons` (`audit.rs:139`) but
-  need the absent sidecar to fire; any other sidecar string falls to the
-  `_ => DidNotSurviveExtraction` arm (`audit.rs:145`).
+  the report never writes), and `REPORTED`. The five finer extract codes of
+  `RejectionReason` (`NO_FRAGMENT_TRACES`, `NO_VALID_FRAGMENTS`, `PEAK_NOT_SELECTED`,
+  `RT_PRUNED`, `WRONG_ISOLATION_WINDOW`) have no producer.
 - **report.json coverage is partial.** `quant` writes reports for
   `peptide_quant`, `protein_quant`, and emitted `fragment_quant`; the peak-bounds
   diagnostic gets none. `quant-lfq` and `mbr` write no `report.json`; `align` and `audit` do
@@ -2002,9 +1997,6 @@ but do not affect the wired `mumdia mbr` path.
   (`run.rs:430`) fire.
 - **quant-lfq single input** reduces to the per-run sum; MaxLFQ/directLFQ have only
   synthetic-matrix unit tests, no real multi-run validation.
-- **two median helpers.** `quant::median_sorted` (`quant.rs:818`) and
-  `quant_lfq::median` (`quant_lfq.rs:12`) are independent in-place median functions with
-  the same semantics; they are not the shared stats kernel and are easy to drift apart.
 
 ## How to extend / modify
 
@@ -2025,8 +2017,8 @@ but do not affect the wired `mumdia mbr` path.
   `binned_map`, so the RT map is computed once and shared; align already records the
   p95 residual that should set `rt_window_s`.
 - **Add an audit reason:** extend `RejectionReason` (`rejection.rs:22`) at its pipeline
-  position, with a `code()` arm and a branch in the ladder (`audit.rs:136`); prefer
-  emitting it from the in-extract sidecar so `load_extract_reasons` can pass it through.
+  position, with a `code()` arm and a branch in the ladder; an extraction reason needs
+  extract to record it per candidate first.
 - **New quant artifact column:** add the `Col` in the relevant `write_table`
   (`quant.rs:487`/`519`/`558`), bump the schema version in
   `mumdia-core/src/schema.rs`, and update the consumer (`report.rs`, `run_lfq_combine_grouped`).
