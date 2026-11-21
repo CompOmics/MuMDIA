@@ -216,6 +216,19 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **`run-experiment`: the second pass and quant no longer inherit a one-run-at-a-time plan.**
+  When the per-run chains run one at a time under `parallel_runs = auto` because each adapts
+  its own library in a DeepLC worker (`rt_library_scope = per_run`, or no run with seed
+  anchors), the second pass, which starts no such worker, now runs its first run alone and sizes
+  the rest from its measured peak, and quant takes that plan. Scheduling only; no table changes.
+- **`run-experiment` internals (no output change).** The multi-head head count is resolved once
+  and handed to every run's chain; the unreachable ungrouped tail of the per-run chain is gone
+  (`process_grouped_run`); the second-pass result selection is one function that returns the
+  scored table with the chromatograms its candidate ids index; the manifest records the first
+  pass's scored table with the hash its rescore already computed instead of reading it again;
+  the dead fallback after the transfer worker is removed (the worker writes its scored table on
+  every return); the module documentation describes the default second pass.
+
 - **The engine's shared crates lose code nothing used (docs/02, docs/03).** `mumdia-core`
   drops `ppm_match`, the `AMMONIA` constant and the five candidate-audit reason codes nothing
   produced (`PEPTIDE_NOT_GENERATED`, `MODIFICATION_NOT_ALLOWED`, `CHARGE_OUT_OF_RANGE`,
@@ -480,6 +493,22 @@ than a number. Both are recorded in every run's `manifest.json`.
   shared helper, a stale pooled `psms_extracted.parquet` included. Output is unchanged.
 
 ### Fixed
+
+- **`run-experiment`: a first run without seed anchors no longer makes every run adapt its own
+  retention-time library.** Under `rt_library_scope = first_run_only` the first run adapts the
+  library for the rest. When its seed was short of anchors (a blank, a failed or short
+  injection) the multi-head calibration was skipped, nothing was shared, and every other run ran
+  its own calibration, one at a time. The first run whose seed has the anchors now adapts for
+  every run, the first included, sequentially and overlapped; the experiment manifest reads that
+  run's anchor choice. Outputs change only in that case.
+- **`run-experiment` refuses `mbr.consensus_corr_min > 0` with a transfer strategy.** The
+  fragment-consensus guard reads each run's `fragment_quant.parquet`, which quant writes after
+  the transfer, so under `run-experiment` it never ran and nothing said so. `mumdia mbr --frag`
+  on a finished experiment is the path that applies it (docs/12).
+- **CI: the applied second pass is tested.** A smoke arm whose second pass applies (a noisier
+  second fixture and gate 0) asserts that every quantified candidate id is an empirical-library
+  row with a second-pass chromatogram; stub arms cover a near-blank first run, sequential and
+  overlapped.
 
 - **Desktop: a diaPASEF search is no longer split into bands (#351).** "Bands: Automatic" (the
   default) planned the search from the machine's memory alone, so a large search space on a timsTOF
