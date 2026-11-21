@@ -9,11 +9,10 @@
 //!
 //! This stage never re-runs compute and never changes any pipeline output, so it
 //! is safe to run after any search. It answers "where was each candidate first
-//! lost?" at the resolution the artifacts allow. The extraction stage collapses
-//! "no fragment traces" and "traces but no accepted peak" into a single observable
-//! event (a candidate is in `psms` or it is not); when a future in-extract audit
-//! sidecar `<psms>.audit.parquet` is present, its precise per-candidate reason
-//! refines the extract-stage bucket (see `load_extract_reasons`).
+//! lost?" at the resolution the artifacts allow. Extract writes no per-candidate
+//! table, so "no fragment traces", "traces but no accepted peak" and every gate
+//! rejection are one observable event (a candidate is in `psms` or it is not),
+//! labelled `DID_NOT_SURVIVE_EXTRACTION`.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -46,22 +45,6 @@ pub struct AuditParams<'a> {
     pub entrapment_substr: &'a str,
 }
 
-/// Optional per-candidate extract-stage reason refinement written by a future
-/// in-extract audit (`extract.emit_candidate_audit`). Returns a map
-/// candidate_id -> reason code string. Absent file -> empty map (no refinement).
-fn load_extract_reasons(psms_path: &str) -> HashMap<u32, String> {
-    let sidecar = format!("{psms_path}.audit.parquet");
-    let mut out = HashMap::new();
-    if let Ok(t) = TableFile::open(&sidecar) {
-        if let (Ok(cid), Ok(reason)) = (t.u32("candidate_id"), t.str("rejection_reason")) {
-            for (c, r) in cid.into_iter().zip(reason) {
-                out.insert(c, r);
-            }
-        }
-    }
-    out
-}
-
 pub fn run(p: AuditParams) -> Result<u64> {
     let t0 = Instant::now();
     // `--out` must not be one of this stage's own inputs: every input is read
@@ -84,7 +67,11 @@ pub fn run(p: AuditParams) -> Result<u64> {
     let pform = lib.str("peptidoform")?;
     let charge = lib.i32("charge")?;
     let label = lib.str("label")?;
-    let protein = lib.str("protein")?;
+    let protein = if p.entrapment_substr.is_empty() {
+        None
+    } else {
+        Some(lib.str("protein")?)
+    };
     let n = cid.len();
 
     // Survivor sets keyed by candidate_id from each downstream artifact. Projected: the
@@ -101,14 +88,19 @@ pub fn run(p: AuditParams) -> Result<u64> {
     let scored_t = TableFile::open(p.scored)?;
     // One run only. Every survivor set and q lookup here is keyed by candidate_id, so a
     // pooled table (several `source` values) would overwrite one run's q with another's
-    // and attribute the last run's fate to every run (docs/29 #16). `run-experiment`
-    // writes per-run split tables; audit those.
+    // and attribute the last run's fate to every run (docs/29 #16). The split tables of
+    // `run-experiment` are no way round it: they keep the experiment-wide grouped q, which
+    // sits on one winning row across all runs, so a precursor accepted in every run would
+    // fail the gates in every run but its winner's.
     if let Some(n_sources) = crate::stages::quant::pooled_source_count(&scored_t, p.scored)? {
         if n_sources > 1 {
             anyhow::bail!(
                 "audit: {} is a pooled scored table with {n_sources} sources; the audit is \
-                 per run and keys on candidate_id, so pass one run's split table \
-                 (<experiment>/<run>/scored.parquet)",
+                 per run and keys on candidate_id, so it needs the scored table of a \
+                 single-file `mumdia run`. A run-experiment split table \
+                 (<experiment>/<run>/scored.parquet) is no substitute: its precursor and \
+                 peptide q are experiment-wide, on one winning row across all runs (the \
+                 per-run unit there is run_psm_q)",
                 p.scored
             );
         }
@@ -134,29 +126,36 @@ pub fn run(p: AuditParams) -> Result<u64> {
         );
         (scored_t.f64("q_value")?, "q_value")
     };
-    // peptide-level q is optional (only present in some scored schemas).
-    let scored_pep_q = scored_t.f64("peptide_q_value").ok();
-    let mut q_by_cid: HashMap<u32, f64> = HashMap::with_capacity(scored_cid.len());
+    let q_by_cid: HashMap<u32, f64> = scored_cid.iter().copied().zip(scored_q).collect();
+    // The peptide gate, when the table has a peptide q (present means present, as for
+    // `precursor_q`). `rescore` writes `peptide_q_value` to each base peptide's winning row
+    // only and 1.0 to its other precursors, so a target reads its base peptide's winner q,
+    // as `precursors.tsv` does; a decoy keeps its own cell.
     let mut pepq_by_cid: HashMap<u32, f64> = HashMap::new();
-    for (i, c) in scored_cid.iter().enumerate() {
-        q_by_cid.insert(*c, scored_q[i]);
-        if let Some(pq) = &scored_pep_q {
-            pepq_by_cid.insert(*c, pq[i]);
+    if scored_t.has_column("peptide_q_value") {
+        let stored = scored_t
+            .f64("peptide_q_value")
+            .with_context(|| format!("audit: reading peptide_q_value from {}", p.scored))?;
+        let target = scored_t.str_eq("label", "target")?;
+        let base = scored_t.u32("base_peptide_id")?;
+        let winner = crate::stages::report::peptide_winner_q(&scored_t, &target)?;
+        for (i, c) in scored_cid.iter().enumerate() {
+            let q = if target[i] {
+                winner.get(&base[i]).copied().unwrap_or(1.0)
+            } else {
+                stored[i]
+            };
+            pepq_by_cid.insert(*c, q);
         }
     }
-    let extract_reasons = load_extract_reasons(p.psms);
 
     // Output columns.
+    // The library's own columns (candidate_id, peptidoform, charge, label) are written as
+    // read: the table has one row per library row, in library order.
     let mut run_c: Vec<String> = Vec::with_capacity(n);
-    let mut prec_c: Vec<u32> = Vec::with_capacity(n);
-    let mut seq_c: Vec<String> = Vec::with_capacity(n);
-    let mut chg_c: Vec<i32> = Vec::with_capacity(n);
-    let mut td_c: Vec<String> = Vec::with_capacity(n);
     let mut entrap_c: Vec<bool> = Vec::with_capacity(n);
     let mut f_generated: Vec<bool> = Vec::with_capacity(n);
     let mut f_traces: Vec<bool> = Vec::with_capacity(n);
-    let mut f_peak: Vec<bool> = Vec::with_capacity(n);
-    let mut f_peak_sel: Vec<bool> = Vec::with_capacity(n);
     let mut f_variant: Vec<bool> = Vec::with_capacity(n);
     let mut f_td_winner: Vec<bool> = Vec::with_capacity(n);
     let mut f_prec_fdr: Vec<bool> = Vec::with_capacity(n);
@@ -182,17 +181,8 @@ pub fn run(p: AuditParams) -> Result<u64> {
 
         // Earliest rejection reason along the ladder.
         let reason: RejectionReason = if !traces {
-            // Extraction produced no accepted row for this candidate. Refine with the
-            // in-extract audit sidecar if present; otherwise the generic bucket, which
-            // says only that the candidate did not survive extraction.
-            match extract_reasons.get(&c).map(String::as_str) {
-                Some("NO_FRAGMENT_TRACES") => RejectionReason::NoFragmentTraces,
-                Some("NO_VALID_FRAGMENTS") => RejectionReason::NoValidFragments,
-                Some("PEAK_NOT_SELECTED") => RejectionReason::PeakNotSelected,
-                Some("RT_PRUNED") => RejectionReason::RtPruned,
-                Some("WRONG_ISOLATION_WINDOW") => RejectionReason::WrongIsolationWindow,
-                _ => RejectionReason::DidNotSurviveExtraction,
-            }
+            // Extraction produced no accepted row for this candidate; it records no reason.
+            RejectionReason::DidNotSurviveExtraction
         } else if !variant {
             if is_decoy {
                 RejectionReason::OutcompetedByDecoy
@@ -212,15 +202,13 @@ pub fn run(p: AuditParams) -> Result<u64> {
         *waterfall.entry(reason.code()).or_insert(0) += 1;
 
         run_c.push(p.run_id.to_string());
-        prec_c.push(c);
-        seq_c.push(pform[i].clone());
-        chg_c.push(charge[i]);
-        td_c.push(label[i].clone());
-        entrap_c.push(!p.entrapment_substr.is_empty() && protein[i].contains(p.entrapment_substr));
+        entrap_c.push(
+            protein
+                .as_ref()
+                .is_some_and(|pr| pr[i].contains(p.entrapment_substr)),
+        );
         f_generated.push(true); // in the search space by construction
         f_traces.push(traces);
-        f_peak.push(traces); // artifact resolution: an accepted peak == present in psms
-        f_peak_sel.push(traces);
         f_variant.push(variant);
         f_td_winner.push(in_scored);
         f_prec_fdr.push(passed_prec);
@@ -237,15 +225,16 @@ pub fn run(p: AuditParams) -> Result<u64> {
         p.out,
         vec![
             Col::Str("run_id".into(), run_c),
-            Col::U32("precursor_id".into(), prec_c),
-            Col::Str("modified_sequence".into(), seq_c),
-            Col::I32("charge".into(), chg_c),
-            Col::Str("target_decoy_label".into(), td_c),
+            Col::U32("precursor_id".into(), cid),
+            Col::Str("modified_sequence".into(), pform),
+            Col::I32("charge".into(), charge),
+            Col::Str("target_decoy_label".into(), label),
             Col::Bool("entrapment_label".into(), entrap_c),
             Col::Bool("candidate_generated".into(), f_generated),
-            Col::Bool("traces_extracted".into(), f_traces),
-            Col::Bool("peak_generated".into(), f_peak),
-            Col::Bool("peak_selected".into(), f_peak_sel),
+            // artifact resolution: an accepted peak == present in psms
+            Col::Bool("traces_extracted".into(), f_traces.clone()),
+            Col::Bool("peak_generated".into(), f_traces.clone()),
+            Col::Bool("peak_selected".into(), f_traces),
             Col::Bool("variant_selected".into(), f_variant),
             Col::Bool("target_decoy_winner".into(), f_td_winner),
             Col::Bool("passed_precursor_fdr".into(), f_prec_fdr),
@@ -460,6 +449,11 @@ mod tests {
             &scored,
             vec![
                 Col::U32("candidate_id".into(), vec![1, 2, 3]),
+                Col::Str(
+                    "label".into(),
+                    vec!["target".into(), "target".into(), "decoy".into()],
+                ),
+                Col::U32("base_peptide_id".into(), vec![10, 20, 30]),
                 Col::F64("q_value".into(), vec![0.001, 0.001, 0.001]),
                 Col::F64("precursor_q".into(), vec![0.001, 0.001, 0.001]),
                 Col::F64("peptide_q_value".into(), vec![0.5, 0.001, 0.001]),
@@ -492,6 +486,100 @@ mod tests {
         let m: serde_json::Value =
             mumdia_io::json::read_json(&format!("{out}.metrics.json")).unwrap();
         assert_eq!(m["reported"], 1);
+    }
+
+    #[test]
+    fn a_target_reads_its_base_peptides_winner_q_and_a_decoy_its_own() {
+        // rescore writes peptide_q_value to each base peptide's winning row and 1.0 to the
+        // rest. 1 and 2 are two charges of one accepted peptide (base 7, winner 1), 3 is
+        // their decoy; 4 is a target whose base peptide (9) its decoy 5 won.
+        let lib = tmp("lib_sib.parquet");
+        let psms = tmp("psms_sib.parquet");
+        let comp = tmp("comp_sib.parquet");
+        let scored = tmp("scored_sib.parquet");
+        let out = tmp("audit_sib.parquet");
+        let cids = [1, 2, 3, 4, 5];
+        let labels = ["target", "target", "decoy", "target", "decoy"];
+        write_lib(&lib, &cids, &labels);
+        write_cid_only(&psms, &cids);
+        write_cid_only(&comp, &cids);
+        write_table(
+            &scored,
+            vec![
+                Col::U32("candidate_id".into(), cids.to_vec()),
+                Col::Str(
+                    "label".into(),
+                    labels.iter().map(|s| s.to_string()).collect(),
+                ),
+                Col::U32("base_peptide_id".into(), vec![7, 7, 7, 9, 9]),
+                Col::F64("q_value".into(), vec![0.001; 5]),
+                Col::F64(
+                    "precursor_q".into(),
+                    vec![0.001, 0.004, 0.001, 0.001, 0.001],
+                ),
+                Col::F64("peptide_q_value".into(), vec![0.001, 1.0, 1.0, 1.0, 0.001]),
+            ],
+        )
+        .unwrap();
+        run(AuditParams {
+            library_precursors: &lib,
+            psms: &psms,
+            competed: &comp,
+            scored: &scored,
+            out: &out,
+            q_threshold: 0.01,
+            run_id: "t",
+            entrapment_substr: "",
+        })
+        .unwrap();
+        let a = TableFile::open(&out).unwrap();
+        let reason = a.str("rejection_reason").unwrap();
+        let passed = a.bool("passed_peptide_fdr").unwrap();
+        assert_eq!(
+            reason,
+            [
+                "REPORTED",
+                "REPORTED",
+                "FAILED_PEPTIDE_FDR",
+                "FAILED_PEPTIDE_FDR",
+                "REMOVED_DURING_REPORTING"
+            ]
+        );
+        assert_eq!(passed, [true, true, false, false, true]);
+    }
+
+    #[test]
+    fn a_present_but_malformed_peptide_q_column_is_an_error() {
+        let lib = tmp("lib_badpep.parquet");
+        let psms = tmp("psms_badpep.parquet");
+        let comp = tmp("comp_badpep.parquet");
+        let scored = tmp("scored_badpep.parquet");
+        let out = tmp("audit_badpep.parquet");
+        write_lib(&lib, &[1], &["target"]);
+        write_cid_only(&psms, &[1]);
+        write_cid_only(&comp, &[1]);
+        write_table(
+            &scored,
+            vec![
+                Col::U32("candidate_id".into(), vec![1]),
+                Col::F64("precursor_q".into(), vec![0.001]),
+                Col::I32("peptide_q_value".into(), vec![0]),
+            ],
+        )
+        .unwrap();
+        let e = run(AuditParams {
+            library_precursors: &lib,
+            psms: &psms,
+            competed: &comp,
+            scored: &scored,
+            out: &out,
+            q_threshold: 0.01,
+            run_id: "t",
+            entrapment_substr: "",
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("peptide_q_value"), "{e}");
     }
 
     #[test]
@@ -531,7 +619,7 @@ mod tests {
     #[test]
     fn a_pooled_scored_table_is_refused() {
         // Keyed by candidate_id alone, a two-source table would let the second run's q
-        // overwrite the first's. The experiment writes split tables; audit those.
+        // overwrite the first's. The audit reads a single-file `run`'s table.
         let lib = tmp("lib_pool.parquet");
         let psms = tmp("psms_pool.parquet");
         let comp = tmp("comp_pool.parquet");
