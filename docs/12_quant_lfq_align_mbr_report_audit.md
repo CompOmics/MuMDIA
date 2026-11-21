@@ -369,8 +369,7 @@ table, so every extraction loss carries one reason (see the gotchas). Writes
    `charge`, `protein_group`, `base_peptide_id`) are read at the accepted rows only,
    once those rows are known, and the identification apex (the first finite
    `apex_rt` of a candidate in row order) is kept only for the candidates whose
-   chromatograms are loaded. The consensus mode's best target q per candidate is kept
-   for the same candidates. The values at every row that is used are the ones a whole
+   chromatograms are loaded. The values at every row that is used are the ones a whole
    read gives, and so is the null and type policy; the report's
    `candidates_with_scored_apex` still counts every candidate of the table with a
    finite apex. On a per-run split of a large experiment most scored rows are not
@@ -380,8 +379,7 @@ table, so every extraction loss carries one reason (see the gotchas). Writes
    whose `frag_name` starts with `ms1_` are MS1 isotope XIC pseudo-traces, not
    fragment ions; they are excluded from both peak detection and the top-N sum.
 
-   Only the accepted candidates' rows are kept (and, in consensus mode, the reliable
-   anchors'), except under `--out-peak-bounds`, which keeps every candidate and reads
+   Only the accepted candidates' rows are kept, except under `--out-peak-bounds`, which keeps every candidate and reads
    the table as it always has. The table is read row group by row group
    (`load_chromatograms`). A row group whose `candidate_id` statistics hold no
    accepted id is not opened: its `[min, max]` is tested against the sorted accepted
@@ -432,14 +430,10 @@ table, so every extraction loss carries one reason (see the gotchas). Writes
    `peak_fraction` and `peak_grace`. A collapsed `lo==hi` window is widened to the
    adjacent grid scans so `trapezoid_window` never returns a raw height (units bug,
    `quant.rs:164`).
-4. **Consensus mode** (`quant.rs:342`, `peak_window_mode == Consensus`): peak width is
-   treated as a near-constant instrument/gradient property. Over confident target
-   peptides (`pep_q <= reliable_q`) it takes the median left half-width `apex - lo` and
-   right half-width `hi - apex`, and applies `(apex - ml, apex + mr)` around each
-   candidate's apex. Requires `>= 20` anchors (`quant.rs:364`), else falls back to the
-   per-candidate windows. The consensus is local to one quant invocation; separate
-   runs estimate separate widths unless an external workflow supplies a shared
-   policy.
+4. **Consensus mode** (`peak_window_mode = consensus`) was removed in 0.15.0. It
+   replaced each walked window by the median half-widths of confident targets. Under
+   the default fixed window it changed no quantity, and the walked window it refined
+   measured worse than the fixed one (phase 2 below).
 5. **Phase 2:** integrate each fragment trace. Three integration modes, in the order
    the code decides between them:
 
@@ -488,7 +482,7 @@ table, so every extraction loss carries one reason (see the gotchas). Writes
      the per-run E. coli compression was 0.22-0.24 log2 both in runs clipped 2% and in runs
      clipped 94%.
    - **bounded**, when `bound_peak` is on and no fixed window is configured:
-     `trapezoid_window` restricts to the walked or consensus window.
+     `trapezoid_window` restricts to the walked window.
    - **whole trace**, otherwise: `trapezoid` over every sample.
 
    Two optional transforms apply inside the fixed window: `interference_envelope`
@@ -1822,8 +1816,9 @@ FDR/reporting); `audit.rs` tests the stages in that order and keeps the first lo
 - `bound_peak` (true): integrate over the detected window vs the whole trace.
 - `peak_fraction` (1/6): descent threshold, fraction of apex height.
 - `peak_grace` (1): consecutive sub-threshold scans bridged during the walk.
-- `peak_window_mode` (`PerCandidate`): `PerCandidate` or `Consensus` (`config.rs:717`).
-- `reliable_q` (0.001): confident-set cutoff calibrating the consensus half-widths.
+- `peak_window_mode` (`PerCandidate`) and `reliable_q` (0.001): parsed and part of the
+  configuration hash, but `per_candidate` is the only value since `consensus` was removed
+  in 0.15.0, and nothing reads `reliable_q`.
 - `q_filter` (`PeptideQ`): which q column to filter on:
   `PeptideQ`/`PrecursorQ`/`PsmQ`/`RunPsmQ`. Use `PeptideQ`/`PrecursorQ` only
   after a single-run rescore, because the grouped columns are populated on group

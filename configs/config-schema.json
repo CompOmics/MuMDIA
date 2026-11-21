@@ -3867,12 +3867,11 @@
       "optional": false,
       "default": "per_candidate",
       "default_text": "`per_candidate`",
-      "help": "Per-candidate window vs a consensus width derived from confident peptides.",
+      "help": "The walked window of each candidate (`per_candidate`, the only value since `consensus` was removed in 0.15.0). Kept so that the configuration hash does not move.",
       "gates": [],
       "source_struct": "QuantConfig",
       "choices": [
-        "per_candidate",
-        "consensus"
+        "per_candidate"
       ]
     },
     {
@@ -3884,7 +3883,7 @@
       "optional": false,
       "default": 0.001,
       "default_text": "0.001",
-      "help": "Peptide q-value cutoff defining the \"confident\" set that calibrates the consensus half-widths (Consensus mode only). Tighter than `q_threshold`.",
+      "help": "Read by nothing since `peak_window_mode = consensus` was removed in 0.15.0. Kept so that the configuration hash does not move.",
       "gates": [],
       "source_struct": "QuantConfig"
     },

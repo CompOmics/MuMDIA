@@ -3414,12 +3414,6 @@ pub enum PeakWindowMode {
     /// (collapsed).
     #[default]
     PerCandidate,
-    /// Consensus window: the median left and right half-widths of confident
-    /// peptides (a near-constant instrument/gradient property) applied around
-    /// each candidate's apex. Robust to a single window being distorted. The
-    /// widths are estimated per quant invocation, not shared automatically
-    /// across runs.
-    Consensus,
 }
 
 /// Cross-run normalization applied to the feature-by-run matrix in the LFQ combine
@@ -3502,10 +3496,11 @@ pub struct QuantConfig {
     /// the peak-window walk; the boundary triggers on `peak_grace + 1` consecutive
     /// sub-threshold scans (1 = stop on 2 consecutive misses).
     pub peak_grace: usize,
-    /// Per-candidate window vs a consensus width derived from confident peptides.
+    /// The walked window of each candidate (`per_candidate`, the only value since
+    /// `consensus` was removed in 0.15.0). Kept so that the configuration hash does not move.
     pub peak_window_mode: PeakWindowMode,
-    /// Peptide q-value cutoff defining the "confident" set that calibrates the
-    /// consensus half-widths (Consensus mode only). Tighter than `q_threshold`.
+    /// Read by nothing since `peak_window_mode = consensus` was removed in 0.15.0. Kept so
+    /// that the configuration hash does not move.
     pub reliable_q: f64,
     /// Which q-value column to filter candidates on (`peptide_q` default;
     /// `precursor_q` is single-run only; use `run_psm_q` for per-run slices of an
@@ -3996,14 +3991,6 @@ impl QuantConfig {
     /// ([`QuantConfig::normalisation_lfq`]), given that the normalisation ran.
     pub fn lfq_reads_normalised(&self) -> bool {
         !self.normalisation.is_off() && self.normalisation_lfq
-    }
-
-    /// Whether `peak_window_mode = consensus` is set where it changes no quantity: under a
-    /// fixed window every candidate with an apex integrates over that window, and the
-    /// consensus half-widths reach only the bounds reported for a candidate without one.
-    pub fn consensus_is_inert(&self) -> bool {
-        self.peak_window_mode == PeakWindowMode::Consensus
-            && (self.fixed_scan_halfwidth > 0 || self.fixed_window_s > 0.0)
     }
 }
 
@@ -6502,14 +6489,6 @@ impl Config {
                  every candidate takes equal weights"
             );
         }
-        if self.quant.consensus_is_inert() {
-            tracing::warn!(
-                "quant.peak_window_mode = consensus sets the half-widths of the walked window, \
-                 but a fixed window is set (fixed_scan_halfwidth or fixed_window_s) and every \
-                 candidate with an apex is integrated over it, so consensus changes no \
-                 quantity; set both to 0 to integrate over the consensus window"
-            );
-        }
         // ── numeric domains (docs/29 #18) ───────────────────────────────────────
         //
         // A value outside its domain used to be accepted and then either excluded every
@@ -7596,6 +7575,13 @@ const RETIRED: &[Retired] = &[
 
     // B: quantification options
     Retired {
+        path: "quant.peak_window_mode",
+        gone: Gone::Value("\"consensus\""),
+        why: "under the default fixed window it changed no quantity, and it refined only the \
+              walked window, which measured worse than the fixed window (docs/12, quantification \
+              phase 2)",
+    },
+    Retired {
         path: "quant.q1_step_weights",
         gone: Gone::Key("\"transmission\""),
         why: "uniform step weights measured the same replicate CV as the transmission, 0.120 \
@@ -8193,23 +8179,6 @@ mod tests {
         assert!(Config::from_json(r#"{"quant":{"baseline_quantile":-0.5}}"#).is_err());
         // Unknown enum variants must fail rather than fall back to the default ranking.
         assert!(Config::from_json(r#"{"quant":{"fragment_selection":"library"}}"#).is_err());
-    }
-
-    /// `peak_window_mode = consensus` sets the walked window's half-widths, so under a fixed
-    /// window (the default) it changes no quantity: accepted, with a warning. Under the
-    /// walked window it is read.
-    #[test]
-    fn consensus_under_a_fixed_window_is_accepted_and_flagged_as_inert() {
-        let c = Config::from_json(r#"{"quant":{"peak_window_mode":"consensus"}}"#).unwrap();
-        assert!(c.quant.consensus_is_inert());
-        let walked = Config::from_json(
-            r#"{"quant":{"peak_window_mode":"consensus","fixed_scan_halfwidth":0,
-                 "window_centre":"apex","fragment_selection":"observed_area",
-                 "baseline_subtract":false,"normalisation":"off"}}"#,
-        )
-        .unwrap();
-        assert!(!walked.quant.consensus_is_inert());
-        assert!(!QuantConfig::default().consensus_is_inert());
     }
 
     #[test]

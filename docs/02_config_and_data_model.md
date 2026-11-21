@@ -423,7 +423,7 @@ listed with its default and effect. Fields marked **default-off**, **inert**, or
 | `CompetitionMode` | config.rs:873-890 | **`winner_take_all`**, `none`, `unique_evidence`, `margin_gated` | within-group resolution |
 | `CompeteGroupBy` | config.rs:894-901 | `base_peptide`, `apex`, **`peptidoform_charge`** | competition grouping key; `peptidoform_charge` (precursor-level) is the default since 2026-09-06, `base_peptide` was renamed from `precursor`, which named stripped-peptide grouping inaccurately (see below) |
 | `RollupMethod` | config.rs:905-911 | **`top_n_sum`**, `sum` | protein rollup |
-| `PeakWindowMode` | config.rs:916-928 | **`per_candidate`**, `consensus` | quant integration window |
+| `PeakWindowMode` | config.rs:916-928 | **`per_candidate`** (`consensus` removed in 0.15.0) | quant integration window |
 | `NormalizeMethod` | config.rs:936-949 | `none`, **`median_ratio`**, `median` | cross-run LFQ normalization; `from_token` at 953-960 |
 | `QuantQColumn` | config.rs:971-988 | **`peptide_q`**, `precursor_q`, `psm_q`, `run_psm_q` | which q column quant filters on |
 | `MbrStrategy` | config.rs:1058-1068 | **`none`**, `empirical_library`, `rt_transfer`, `full` | only `none` vs not-`none` is distinguished in code; the three non-`none` variants behave identically and `validate()` warns |
@@ -824,8 +824,8 @@ requiring entrapment/target-decoy FDR validation before use.
 | `bound_peak` | `true` | integrate only over the detected peak window |
 | `peak_fraction` | 1/6 | descent threshold for the peak-window walk |
 | `peak_grace` | 1 | zig-zag grace (bridge N sub-threshold scans) |
-| `peak_window_mode` | `per_candidate` | per-candidate vs consensus window |
-| `reliable_q` | 0.001 | confident-set q for the consensus width |
+| `peak_window_mode` | `per_candidate` | the only value since `consensus` was removed in 0.15.0 |
+| `reliable_q` | 0.001 | read by nothing since `consensus` was removed in 0.15.0 |
 | `q_filter` | `peptide_q` | `peptide_q`, `precursor_q` (single-run only), `psm_q`, or `run_psm_q` |
 | `interference_envelope` | `false` | apex-outward interference envelope on fragment traces before integration (opt-in, benchmark-gated) |
 

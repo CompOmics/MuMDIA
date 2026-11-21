@@ -13,8 +13,7 @@ use anyhow::{anyhow, Context as _, Result};
 use arrow::array::{Array, Float32Array, StringArray, UInt32Array};
 use arrow::record_batch::RecordBatch;
 use mumdia_core::config::{
-    BaselineSource, FragmentSelection, PeakWindowMode, QuantConfig, QuantQColumn, RollupMethod,
-    WindowCentre,
+    BaselineSource, FragmentSelection, QuantConfig, QuantQColumn, RollupMethod, WindowCentre,
 };
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
@@ -2519,32 +2518,14 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     // Chromatograms, grouped by candidate, for the candidates quant actually uses.
     //
     // The chromatogram table is the largest artifact of a run (every extracted candidate,
-    // two traces per fragment), but the outputs below consult only (a) the rows that pass
-    // the quant filter and (b), in consensus mode, the reliable anchors whose windows set
-    // the median half-widths; every other candidate's window and areas were computed and
-    // discarded. So collect that candidate set first and keep only its rows while streaming
-    // the table batch by batch. Each candidate's window and areas depend only on its own
-    // rows (in stored order) and the consensus median only on the anchor set, so the outputs
-    // are identical to reading everything, while the resident set is proportional to the
-    // accepted rows (a few percent of the table). The peak-window diagnostic export is the
-    // one consumer that wants every candidate, so it keeps the full read.
-    let consensus_mode = p.cfg.bound_peak && p.cfg.peak_window_mode == PeakWindowMode::Consensus;
-    // `label == "target"` is read only under consensus mode (the anchor set here and the
-    // median half-widths below), so the second pass over the column is taken only there.
-    // Empty otherwise, and indexed only behind `consensus_mode`.
-    //
-    // It IS a second decode of the column, which a single `Vec<String>` would not have
-    // been. `label` holds two distinct values over the whole table, so it is dictionary
-    // encoded and this costs one more pass over the smallest column in the artifact, for
-    // `nrows` bools -- 879 KB on the six-run HYE table, against the ~21 MB of `String`
-    // spine plus payload that one `str` read would have held for the whole stage. Three
-    // spellings cannot be folded into one bit, and neither bit may be derived from the
-    // other: a label that is neither spelling is a target to the filter and not an anchor.
-    let is_target: Vec<bool> = if consensus_mode {
-        ps.str_eq("label", "target")?
-    } else {
-        Vec::new()
-    };
+    // two traces per fragment), but the outputs below consult only the rows that pass the
+    // quant filter; every other candidate's window and areas were computed and discarded.
+    // So collect that candidate set first and keep only its rows while streaming the table
+    // batch by batch. Each candidate's window and areas depend only on its own rows (in
+    // stored order), so the outputs are identical to reading everything, while the
+    // resident set is proportional to the accepted rows (a few percent of the table). The
+    // peak-window diagnostic export is the one consumer that wants every candidate, so it
+    // keeps the full read.
     let keep_all = p.out_peak_bounds.is_some() && p.cfg.bound_peak;
     let wanted: CidSet = if keep_all {
         CidSet::empty()
@@ -2555,31 +2536,11 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         // -- min, max, fill -- which is three passes over that, not over the table.
         let mut ids: Vec<u32> = Vec::new();
         for i in 0..ps.nrows {
-            if passes_quant_filter(is_decoy[i], pep_q[i], p.cfg.q_threshold, is_transferred[i])
-                || (consensus_mode && is_target[i] && pep_q[i] <= p.cfg.reliable_q)
-            {
+            if passes_quant_filter(is_decoy[i], pep_q[i], p.cfg.q_threshold, is_transferred[i]) {
                 ids.push(cid[i]);
             }
         }
         CidSet::from_ids(&ids)
-    };
-    // The best target q per candidate, for the consensus anchors. Only the candidates whose
-    // chromatograms are loaded are ever looked up (`index.cids` below), which outside
-    // `keep_all` is a subset of `wanted`, so the map holds those alone: the same values at
-    // every key that is read, without an entry per target row of the whole table.
-    let q_by_cid: HashMap<u32, f64> = if consensus_mode {
-        let mut m: HashMap<u32, f64> = HashMap::new();
-        for i in 0..ps.nrows {
-            if is_target[i] && (keep_all || wanted.contains(cid[i])) {
-                let e = m.entry(cid[i]).or_insert(f64::INFINITY);
-                if pep_q[i] < *e {
-                    *e = pep_q[i];
-                }
-            }
-        }
-        m
-    } else {
-        HashMap::new()
     };
     // `psms_scored` carries the exact identification apex (schema psms_scored v4;
     // the column has been present since v3). Older artifacts, or rows whose apex is
@@ -2595,8 +2556,8 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     // source a quantity actually used.
     //
     // The identification apex per candidate is the first finite `apex_rt` in row order.
-    // It is kept only for the candidates it can be looked up for (the loaded ones, as for
-    // `q_by_cid`; every candidate under `keep_all`). It used to be a map entry for every
+    // It is kept only for the candidates it can be looked up for (the loaded ones; every
+    // candidate under `keep_all`). It used to be a map entry for every
     // scored row, which on a large per-run table was the stage's largest structure. The
     // report's `candidates_with_scored_apex` still counts the WHOLE table's candidates with
     // a finite apex, as it always did, through one bit per candidate id.
@@ -2632,7 +2593,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     }
     // Nothing below reads a column of the scored table per row any more: the outputs walk
     // the accepted rows, whose values were gathered above.
-    drop((cid, is_decoy, pep_q, is_transferred, is_target));
+    drop((cid, is_decoy, pep_q, is_transferred));
     // `predicted_intensity` is OPTIONAL. Chromatogram artifacts written before that column
     // existed do not carry it, and the default `observed_area` ranking never reads it, so
     // probe the footer (which decodes no data) and project only what is present. Demanding
@@ -2786,9 +2747,9 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
 
     // Phase 1: per-candidate summed-XIC window (lo_rt, hi_rt, apex_rt), anchored at
     // the identification apex when available and otherwise using the legacy robust
-    // co-elution detector. Indexed by candidate position in `index` for the consensus
-    // estimate and for phase 2, which is the same ascending-candidate_id order the
-    // `BTreeMap<u32, _>` this replaces iterated in, without its node per candidate.
+    // co-elution detector. Indexed by candidate position in `index` for phase 2, which is
+    // the same ascending-candidate_id order the `BTreeMap<u32, _>` this replaces iterated
+    // in, without its node per candidate.
     //
     // Each candidate's window depends only on its own chromatogram rows, so this is
     // embarrassingly parallel; a range is an indexed parallel iterator, so the collected
@@ -2809,50 +2770,6 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             .collect()
     } else {
         Vec::new()
-    };
-
-    // Consensus mode: peak width is a near-constant instrument/gradient property, so
-    // take the median left/right half-width over CONFIDENT peptides (q <= reliable_q)
-    // and apply it around each candidate's apex. The median ignores the interference-
-    // stretched and collapsed per-candidate windows. It is estimated independently
-    // for each quant invocation/run; cross-run-identical widths require an external
-    // shared policy. Falls back to per-candidate if too few confident anchors.
-    // Spelled `consensus_mode` rather than repeating the two-term condition, because that
-    // is also the flag `is_target` was read under: they must not be able to drift apart.
-    let consensus: Option<(f64, f64)> = if consensus_mode {
-        // `q_by_cid` was taken with the scored columns, for the loaded candidates.
-        let (mut left, mut right) = (Vec::new(), Vec::new());
-        for (ci, &(lo, hi, apex)) in win.iter().enumerate() {
-            if lo.is_finite()
-                && hi.is_finite()
-                && apex.is_finite()
-                && q_by_cid
-                    .get(&index.cids[ci])
-                    .is_some_and(|&q| q <= p.cfg.reliable_q)
-            {
-                left.push(apex - lo);
-                right.push(hi - apex);
-            }
-        }
-        if left.len() >= 20 {
-            let ml = crate::stats::median_or(&mut left, 0.0);
-            let mr = crate::stats::median_or(&mut right, 0.0);
-            info!(
-                anchors = left.len(),
-                med_left_s = ml,
-                med_right_s = mr,
-                "quant: consensus peak window"
-            );
-            Some((ml, mr))
-        } else {
-            info!(
-                anchors = left.len(),
-                "quant: too few confident anchors, using per-candidate windows"
-            );
-            None
-        }
-    } else {
-        None
     };
 
     // Phase 2: integrate each fragment over the chosen window and retain the
@@ -2982,11 +2899,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                 };
                 (f64::NEG_INFINITY, f64::INFINITY, apex)
             } else {
-                let (lo, hi, apex) = win[ci];
-                match consensus {
-                    Some((ml, mr)) if apex.is_finite() => (apex - ml, apex + mr, apex),
-                    _ => (lo, hi, apex),
-                }
+                win[ci]
             };
             // A fixed window replaces the walked bounds entirely; it needs a finite apex
             // to centre on, so an unknown apex falls back to the configured window.
@@ -6812,8 +6725,7 @@ mod tests {
             assert_eq!(is_decoy[i], l == "decoy");
             assert_eq!(is_target[i], l == "target");
             // An unrecognised label is a target to the filter, as it was to `label ==
-            // "decoy"`, and is NOT a consensus anchor, as it was not to `label ==
-            // "target"`.
+            // "decoy"`.
             assert_eq!(
                 passes_quant_filter(is_decoy[i], 0.0, 0.01, false),
                 l != "decoy"
