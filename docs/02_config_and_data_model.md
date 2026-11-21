@@ -777,7 +777,7 @@ selection dominate.
 | `alt_peak_min_area_frac` | 0.10 | min integrated area of a promoted alternate as a fraction of the rank-0 peak; only used when `promote_top_peaks > 1` |
 | `alt_peak_min_separation_s` | 5.0 | min apex-RT separation of a promoted alternate from the rank-0 apex; only used when `promote_top_peaks > 1` |
 | `emit_candidate_audit` | `false` | **default-off**; in a single-file `run` gates the separate `audit` stage that writes `candidate_audit.parquet`; extract writes no per-candidate table; no-op for standalone `mumdia extract` and for `run-experiment`, which warns (P0.3) |
-| `apex_evidence_rank` | `true` | evidence-count apex. On by default: the legacy signature-intensity score is 0.0 at every qualifying scan when none of the top-K predicted fragments is observed, which silently selects the lowest-RT qualifying scan |
+| `apex_evidence_rank` | `true` | evidence-count apex; `false` was removed in 0.15.0 and is refused: the legacy signature-intensity score is 0.0 at every qualifying scan when none of the top-K predicted fragments is observed, which silently selects the lowest-RT qualifying scan |
 | `emit_gate_diagnostics` | `false` | **default-off** four gate-score columns |
 | `gate_mode` | `window_mean` | which spectral score `gate_min_score` thresholds |
 | `gate_coelution_min` | 0.5 | second threshold for `gate_mode = combined` |

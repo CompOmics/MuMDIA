@@ -1814,9 +1814,9 @@ fn coelution_gate_score(groups: &ScanGroups, distinct: &[u16], sig: &[u16], fint
 /// A group qualifies when it holds a matched fragment and its smoothed distinct-fragment
 /// count (`smoothed`, `apex_count_window`) is at least `thresh` (the maximum less
 /// `apex_count_tol`). The qualifying group with the highest score wins, the earliest on a
-/// tie: `(count + sig / (sig + 1)) * prior` under `apex_evidence_rank`, so the count
+/// tie: `(count + sig / (sig + 1)) * prior` (`apex_evidence_rank`), so the count
 /// dominates and the signature intensity (`sig_at`, the observed intensity of the top
-/// predicted fragments) breaks ties within a count, and the legacy `sig * prior` without it.
+/// predicted fragments) breaks ties within a count.
 /// `prior_at` is the RT prior (`apex_rt_prior_s`), 1 when off. The score is f32: once `sig`
 /// passes about 2e6 to 8e6 (by count), `count + sig / (sig + 1)` rounds to `count + 1`,
 /// equal-count groups tie, and without the prior the earliest of them wins.
@@ -1830,7 +1830,6 @@ fn pick_apex(
     thresh: f64,
     sig_at: impl Fn(usize) -> f32,
     prior_at: impl Fn(usize) -> f32,
-    evidence_rank: bool,
     refine_reach: Option<usize>,
 ) -> Option<usize> {
     let qualifies = |i: usize| counts[i] > 0 && smoothed[i] >= thresh;
@@ -1838,11 +1837,7 @@ fn pick_apex(
     let mut best = f32::NEG_INFINITY;
     for i in (0..counts.len()).filter(|&i| qualifies(i)) {
         let (sig, prior) = (sig_at(i), prior_at(i));
-        let score = if evidence_rank {
-            (counts[i] as f32 + sig / (sig + 1.0)) * prior
-        } else {
-            sig * prior
-        };
+        let score = (counts[i] as f32 + sig / (sig + 1.0)) * prior;
         if score > best {
             best = score;
             apex = Some(i);
@@ -5169,7 +5164,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             thresh,
             |i| sig.iter().map(|&o| groups.or_zero(i, o)).sum(),
             prior_at,
-            p.cfg.apex_evidence_rank,
             p.cfg.apex_refine_intensity.then_some(r),
         ) {
             // The apex reports the group's full intensity.
@@ -7257,48 +7251,30 @@ mod apex_gate_tests {
 
     /// [`pick_apex`] on unsmoothed counts (`apex_count_window` 1), within `tol` of the
     /// largest count, without an RT prior.
-    fn apex(
-        counts: &[usize],
-        tol: usize,
-        sig: &[f32],
-        evidence_rank: bool,
-        refine: Option<usize>,
-    ) -> Option<usize> {
+    fn apex(counts: &[usize], tol: usize, sig: &[f32], refine: Option<usize>) -> Option<usize> {
         let smoothed: Vec<f64> = counts.iter().map(|&c| c as f64).collect();
         let thresh = (smoothed.iter().copied().fold(0.0, f64::max) - tol as f64).max(0.0);
-        pick_apex(
-            counts,
-            &smoothed,
-            thresh,
-            |i| sig[i],
-            |_| 1.0,
-            evidence_rank,
-            refine,
-        )
+        pick_apex(counts, &smoothed, thresh, |i| sig[i], |_| 1.0, refine)
     }
 
     #[test]
     fn the_count_picks_the_apex_and_intensity_breaks_its_ties() {
         // Equal counts: the signature intensity.
-        assert_eq!(
-            apex(&[3, 3, 3], 0, &[10.0, 50.0, 20.0], true, None),
-            Some(1)
-        );
-        // One fragment more outweighs any intensity; the legacy rule reads intensity only.
-        assert_eq!(apex(&[3, 4], 1, &[1e3, 1.0], true, None), Some(1));
-        assert_eq!(apex(&[3, 4], 1, &[1e3, 1.0], false, None), Some(0));
+        assert_eq!(apex(&[3, 3, 3], 0, &[10.0, 50.0, 20.0], None), Some(1));
+        // One fragment more outweighs any intensity.
+        assert_eq!(apex(&[3, 4], 1, &[1e3, 1.0], None), Some(1));
         // Below the count tolerance a scan does not qualify, however bright.
-        assert_eq!(apex(&[2, 4, 4], 1, &[1e6, 5.0, 6.0], true, None), Some(2));
+        assert_eq!(apex(&[2, 4, 4], 1, &[1e6, 5.0, 6.0], None), Some(2));
         // Saturated f32: 6 + 5e6/(5e6 + 1) and 6 + 1e7/(1e7 + 1) both round to 7, so the
         // earlier scan wins at half the intensity. Pinned as it is: an f64 score would pick
         // the later one, and that change waits for its own measurement.
-        assert_eq!(apex(&[6, 6], 0, &[5e6, 1e7], true, None), Some(0));
+        assert_eq!(apex(&[6, 6], 0, &[5e6, 1e7], None), Some(0));
         // No qualifying scan.
-        assert_eq!(apex(&[0, 0], 0, &[0.0, 0.0], true, None), None);
+        assert_eq!(apex(&[0, 0], 0, &[0.0, 0.0], None), None);
         // The RT prior decides between equal counts and intensities.
         let prior = [0.2f32, 0.9, 0.5];
         assert_eq!(
-            pick_apex(&[3; 3], &[3.0; 3], 3.0, |_| 10.0, |i| prior[i], true, None),
+            pick_apex(&[3; 3], &[3.0; 3], 3.0, |_| 10.0, |i| prior[i], None),
             Some(1)
         );
     }
@@ -7309,16 +7285,16 @@ mod apex_gate_tests {
         // is 2; the region's most intense scan, 1, takes it.
         let counts = [0, 3, 4, 4, 3, 0];
         assert_eq!(
-            apex(&counts, 1, &[0.0, 9.0, 2.0, 1.0, 0.0, 0.0], true, None),
+            apex(&counts, 1, &[0.0, 9.0, 2.0, 1.0, 0.0, 0.0], None),
             Some(2)
         );
         assert_eq!(
-            apex(&counts, 1, &[0.0, 9.0, 2.0, 1.0, 0.0, 0.0], true, Some(0)),
+            apex(&counts, 1, &[0.0, 9.0, 2.0, 1.0, 0.0, 0.0], Some(0)),
             Some(1)
         );
         // No signature fragment seen in the region: the count's apex stands (the region's
         // first scan used to take it).
-        assert_eq!(apex(&counts, 1, &[0.0; 6], true, Some(0)), Some(2));
+        assert_eq!(apex(&counts, 1, &[0.0; 6], Some(0)), Some(2));
     }
 
     #[test]

@@ -2657,13 +2657,11 @@ pub struct ExtractConfig {
     /// signature-ion intensity only as a sub-integer tiebreak. In wide-window DIA a
     /// single fragment m/z channel is chimeric, so the tallest scan is often a
     /// co-isolated interferent; the scan where the most of the peptide's own
-    /// predicted transitions co-elute is a more reliable apex. Default `true`, on
-    /// correctness grounds rather than a count: `false` keeps the legacy
-    /// signature-intensity apex, whose score is 0.0 at every qualifying scan when none
-    /// of the top-K predicted fragments is observed, so the strict `>` never replaces
-    /// the first candidate and the apex silently becomes the LOWEST-RT qualifying scan.
-    /// The rolling distinct-fragment count (`apex_count_window`) still gates which scans
-    /// qualify in both modes.
+    /// predicted transitions co-elute is a more reliable apex. Must be `true`: `false`, the
+    /// legacy signature-intensity apex, was removed in 0.15.0 and is refused. Its score was
+    /// 0.0 at every qualifying scan when none of the top-K predicted fragments is observed,
+    /// so the apex silently became the LOWEST-RT qualifying scan. The rolling
+    /// distinct-fragment count (`apex_count_window`) gates which scans qualify.
     pub apex_evidence_rank: bool,
     /// Choose the apex by intensity INSIDE the region the fragment count selects. The
     /// qualifying scans (rolling distinct-fragment count within `apex_count_tol` of its
@@ -7660,6 +7658,11 @@ const RETIRED: &[Retired] = &[
         path: "search_seed.q1_deconvolved",
         gone: Gone::Key("false"),
         why: "counting only Q1-consistent peaks in the seed lost 2.5% of precursors (docs/37_ztscan.md section 10.3)",
+    },
+    Retired {
+        path: "extract.apex_evidence_rank",
+        gone: Gone::Value("false"),
+        why: "the legacy signature-intensity apex fell back to the lowest-RT scan and measured 1.0% fewer peptides on HYE for 27.6% more candidates (bench/README.md)",
     },
 
     // B: quantification options

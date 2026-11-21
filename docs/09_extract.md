@@ -688,9 +688,8 @@ qualifies, then by a per-scan score:
   is `n_frag + sig_sum/(sig_sum+1)` times the prior, so the number of distinct
   co-eluting predicted fragments dominates and observed signature intensity only
   breaks sub-integer ties. This is interference-resistant in wide-window DIA
-  because intensity is chimeric. It is the default; when false, the legacy
-  `sig_sum * prior` is used (`extract.rs:1902`), bit-identical to the pre-feature
-  behaviour. The score is f32 (`pick_apex`): once `sig_sum` passes about 2e6 to 8e6
+  because intensity is chimeric. The legacy `sig_sum * prior` score
+  (`apex_evidence_rank = false`) was removed in 0.15.0, and `false` is refused. The score is f32 (`pick_apex`): once `sig_sum` passes about 2e6 to 8e6
   (by count), `n_frag + sig_sum/(sig_sum+1)` rounds to `n_frag + 1`, scans of equal
   count tie, and the RT prior decides between them or, without one (the engine
   default; the shipped presets set 120 s), the earliest of them wins.
@@ -1502,7 +1501,7 @@ declutter" commit: `extract.scan_window_mode` (and the `ScanWindowMode` enum),
 | `apex_count_tol` | 1 | Count slack for qualifying apex scans |
 | `apex_count_window` | `"auto"` | Rolling-sum width for the count profile; 1 = no smoothing. `"auto"`: 1 on an Orbitrap Astral, 5 elsewhere. Window 5 cut AIF apex misassignment (median \|dRT\| 131s -> 9s) |
 | `apex_gaussian_sigma_scans` | 0.0 | Opt-in Gaussian apex smoother; 0 = off (`config.rs:572`) |
-| `apex_evidence_rank` | **true** | Breadth-of-evidence apex. The legacy signature-intensity apex silently falls back to the lowest-RT qualifying scan when none of the top-K predicted fragments is observed |
+| `apex_evidence_rank` | **true** | Breadth-of-evidence apex; `false` is refused since 0.15.0. The legacy signature-intensity apex silently fell back to the lowest-RT qualifying scan when none of the top-K predicted fragments is observed |
 | `emit_window_grid` | true | Zero-filled full-window-grid chromatograms |
 | `bucket_size` | 8192 | m/z bucket size (power of two) |
 | `peak_claim` | `None` | Shared-peak apportionment strategy (`PeakClaim`, `config.rs:132`) |
@@ -1548,7 +1547,7 @@ here for one index.
 | `extract.promote_top_peaks` (`config.rs:645`, default 1) | extra `psms_extracted` rows with `peak_rank >= 1` (`extract.rs:2297`); no new columns | **not schema-neutral in rows**: changes the scored population and therefore FDR; on diaPASEF (IM branch, seed 0) K = 2 lost 5.7% and K = 3 5.9%, and `retrace.repick` is the diaPASEF path (docs/35 section 12); gate pending |
 | `extract.emit_candidate_audit` (`config.rs:658`) | none in `extract.rs` (unused there); in `run` it gates the `audit` stage -> `candidate_audit.parquet` (`run.rs:428`) | diagnostic; no ID effect |
 | `extract.emit_gate_diagnostics` (`config.rs:673`) | 4 F32 cols `gate_apex`, `gate_peak_spectral`, `gate_coelution`, `gate_spectral_entropy` (`extract.rs:2511`) | diagnostic; no ID effect |
-| `extract.apex_evidence_rank` (`config.rs:667`) | none; changes the apex-selection score (`extract.rs:1890`) | **now the default**, promoted on correctness grounds rather than a count (docs/25 section 2): the legacy score cannot distinguish "no signature fragment observed anywhere" from "the earliest qualifying scan is the apex" |
+| `extract.apex_evidence_rank` (`config.rs:667`) | none; changes the apex-selection score (`extract.rs:1890`) | **the default**, promoted on correctness grounds rather than a count (docs/25 section 2); the legacy score (`false`) was removed in 0.15.0 (HYE: 27.6% more candidates, 1.0% fewer peptides, bench/README.md): it could not distinguish "no signature fragment observed anywhere" from "the earliest qualifying scan is the apex" |
 | `extract.apex_gaussian_sigma_scans` (`config.rs:572`) | none; smooths the apex count profile | not measured; gate pending |
 | `search_seed.two_pass_mass_cal` | none; refits the `<seed>.masscal.json` offset + tolerance | **default since 2026-10-11** (three NN seeds): Astral HYE +1.8%, ProteoBench Astral entrapment +1.1%, Astral HeLa entrapment +2.0% at a measured FDP of 1%, AIF HYE +0.5%; costs an Astral single cell 2.9% and raises the measured FDP at a reported 1% slightly (AIF entrapment 0.99% -> 1.02%, ProteoBench paired 0.86% -> 0.88%) |
 | `rt_im_train.adaptive_rt_window` (`config.rs:487`) | none; per-region RT half-window widths in `run_windows` | not measured; gate pending |
@@ -1586,7 +1585,7 @@ here for one index.
   HashMap f32 sum shifting the apex once broke reproducibility; keep ordered maps
   and sorted iteration wherever floats are summed.
 - **Default-off contract**: `retain_top_peaks=1`, `promote_top_peaks=1`,
-  `apex_evidence_rank=false`, `emit_contested_features=false`,
+  `emit_contested_features=false`,
   `emit_demix_features=false`, `emit_gate_diagnostics=false`, `peak_claim=None`
   make the schema and per-candidate compute byte-identical to the production chain.
   Every sensitivity knob added here must keep that property. Note that
