@@ -43,7 +43,7 @@ contracts); the citations below point there.
 | `rust/mumdia/crates/mumdia/src/main.rs` | CLI: one `clap` subcommand per stage (`Cmd` enum, `main.rs:20`); each arm loads config, hashes it, and calls the stage `run`. |
 | `rust/mumdia/crates/mumdia/src/stages/run.rs` | `run` orchestrator: preflight, library-source branch, per-run chain, manifest assembly (`run.rs:85`). |
 | `rust/mumdia/crates/mumdia/src/stages/mod.rs` | Re-exports every stage module. |
-| `rust/mumdia/crates/mumdia/src/stages/*.rs` | The stage implementations (`convert`, `digest`, `peptidoforms`, `predict_frag`, `prescan`, `search_seed`, `rt_im_train`, `extract`, `features`, `compete`, `rescore`, `quant`, `report`, `align`, `audit`). |
+| `rust/mumdia/crates/mumdia/src/stages/*.rs` | The stage implementations (`convert`, `digest`, `peptidoforms`, `predict_frag`, `prescan`, `search_seed`, `rt_im_train`, `extract`, `features`, `compete`, `rescore`, `quant`, `report`, `audit`). |
 | `rust/mumdia/crates/mumdia/src/stages/run_experiment.rs` | `run-experiment` orchestrator: N per-run chains, one combined rescore, optional MBR, per-run quant, cross-run LFQ, `experiment_manifest.json` (`run_experiment.rs:267`). |
 | `rust/mumdia/crates/mumdia/src/lib.rs` | Crate lib root (bin+lib split, `lib.rs:5-16`): re-exports the pipeline modules so integration tests can drive stages directly. Public modules: `stages`, `matchers` (fragment matchers, doc 06), `index` (`Library` + inverted index, doc 06), `predict` (predictor traits + native fallbacks, doc 06), `rescoring` (`percolator_lite` + native NN, doc 11), `calibrate` (LOESS/linear/percentile, doc 08), `peaks` (peak enumeration, doc 09), `spectra` (in-memory spectrum model + loaders), `sidecar` (Python worker dispatch, doc 13), `stats` (pearson/cosine/spectral_angle kernel), `fdr` (target-decoy + entrapment q, doc 11). |
 | `rust/mumdia/crates/mumdia-core/src/schema.rs` | Frozen `(logical name, schema version)` for every artifact (`artifact` module, `schema.rs:6`). |
@@ -314,7 +314,7 @@ Measured on the two experiments above (sizes count hard links once):
 `main.rs` is a thin `clap` layer: the `Cmd` enum (`main.rs:20`) defines one
 subcommand per stage plus the single-run `run` orchestrator, the experiment-wide
 `run-experiment` orchestrator (`main.rs:238`), the experiment-level
-`align`/`mbr`, and the utilities `inspect`/`report`/`doctor`. Each stage arm
+`mbr`, and the utilities `inspect`/`report`/`doctor`. Each stage arm
 loads the config, hashes its canonical JSON into a `config_hash`, and calls the
 stage `run`; every stage command is runnable standalone on prior outputs. Flags
 are `--kebab-case`; a `num_args = 1..` flag accepts several values.
@@ -323,7 +323,7 @@ Which subcommands read `--config` (verified against `main.rs`):
 
 | Takes `--config` | No `--config` |
 |---|---|
-| `digest`, `peptidoforms`, `predict-frag`, `search-seed`, `rt-im-train`, `extract`, `features`, `compete`, `rescore`, `quant`, `run`, `run-experiment`, `align`, `mbr`, `doctor` (optional) | `convert`, `quant-lfq`, `inspect`, `audit`, `report` |
+| `digest`, `peptidoforms`, `predict-frag`, `search-seed`, `rt-im-train`, `extract`, `features`, `compete`, `rescore`, `quant`, `run`, `run-experiment`, `mbr`, `doctor` (optional) | `convert`, `quant-lfq`, `inspect`, `audit`, `report` |
 
 The five with no `--config` are fixed-behavior: `convert` always runs on
 `Config::default()` (`main.rs:397`); `quant-lfq` takes typed string flags instead
@@ -348,7 +348,6 @@ order:
 | `quant-lfq` (`main.rs:184`) | `--inputs` (1+ per-run tables), `--method` (`maxlfq` default / `directlfq`), `--normalize` (`median_ratio` default / `median` / `none`) | `--out` = protein-by-run matrix; no `--config` |
 | `run` (`main.rs:199`) | `--mzml`, `--out-dir`; `--fasta` xor (`--lib-precursors` + `--lib-fragments`); `--config`, `--profile`, `--max-spectra`, `--top-peaks-ms2` | the full chain + `manifest.json` |
 | `run-experiment` (`main.rs:238`) | `--mzml` once per run (>=2), `--run-names` (opt, default the input file names, `experiment.run_naming`; docs/12 "Run names"), `--condition` once per run and `--sample-sheet` (opt; docs/12 "Normalisation scope"), `--out-dir`; `--fasta` xor (`--lib-precursors` + `--lib-fragments`); `--config`, `--profile`, `--max-spectra`, `--top-peaks-ms2` | per-run chains under `<out-dir>/<run>/`, one `scored_combined.parquet`, optional MBR tables, per-run `scored`/quant splits, `lfq_maxlfq.parquet`, `lfq_size_factors.tsv`, `experiment_manifest.json`, the experiment-wide `peptides.tsv`, `precursors.tsv` and `proteins.tsv` |
-| `align` (`main.rs:230`) | `--seed-psms` (1+ `seed_psms`, first = reference), `--config` | `--out` = `alignment.parquet` |
 | `mbr` (`main.rs:240`) | `--psms-scored` (experiment-wide `scored_combined`), `--psms-extracted` (1+ per-run in `source` order), `--frag` (0+ per-run `fragment_quant`), `--config` | `--out` = `transferred.parquet`, `--out-psms-scored` (opt augmented scored) |
 | `inspect` (`main.rs:261`) | positional `artifact` (any parquet) | schema + head + row count to stdout; no `--config` |
 | `audit` (`main.rs:265`) | `--lib-precursors`, `--psms-extracted`, `--competed`, `--psms-scored`, `--q` (0.01), `--run-id` (`run`), `--entrapment-substr` (`""`) | `--out` = `candidate_audit.parquet`; no `--config` |
@@ -400,8 +399,6 @@ Per-subcommand specifics that are easy to miss:
   per-run counts from the per-run split `scored.parquet` on `run_psm_q`.
   `mumdia report --experiment-dir` rewrites the three from the experiment
   manifest.
-- `align` uses `rt_im_train.q_train` for its training set and a hardcoded 100-knot
-  grid (`main.rs:666-667`); it needs >=2 seeds and is not part of the `run` chain.
 - `mbr` (`main.rs:671`) is a wired standalone command, not part of `run`. It
   hard-errors when `mbr.strategy = none` (`main.rs:680`), when fewer than two
   `--psms-extracted` are supplied (`main.rs:685`), or when `mbr.python` is unset
@@ -676,7 +673,7 @@ config (`main.rs:607`) before `run`. The fields this overview area touches:
 | `search_seed.top_n_peaks` | `300` | Seed-only, non-destructive peak cap; keep the default. Not the conversion cap `--top-peaks-ms2` (docs/04). |
 | `extract.bucket_size` | (see `ExtractConfig`) | Fragment-index bucket width; `search-seed` reads it too (`main.rs:473`). |
 | `rt_im_train.calibration_method` | `loess` | RT calibration; `none` is rejected by validation. |
-| `rt_im_train.q_train` | (see `RtImTrainConfig`) | Confident-seed q cutoff for the DeepLC fine-tune and the `align` reference set. |
+| `rt_im_train.q_train` | (see `RtImTrainConfig`) | Confident-seed q cutoff for the DeepLC fine-tune. |
 | `rt_im_train.finetune_deeplc` | `false` | Enables the per-run DeepLC fine-tune of iRT (best workflow). |
 | `rt_im_train.finetune_epochs` / `finetune_patience` | (see config) | DeepLC fine-tune schedule (`run.rs:259-260`). |
 | `rt_im_train.finetune_batch` | `0` | `0` auto-scales the fine-tune batch to seed size. |
@@ -760,7 +757,6 @@ not part of the `run` chain and needs >=2 runs.
   field, and check its prerequisites in `preflight` and `doctor`.
 - Stubs and unwired areas to be aware of: `mbr` has a wired standalone command
   (`mumdia mbr` -> `mbr_worker.py`) but is a partial sidecar (not the full
-  experiment-wide flow) and is not in the `run` chain (needs >=2 runs); `align` is
-  likewise standalone-only (needs >=2 runs); ion mobility / 4D (diaPASEF) is
+  experiment-wide flow) and is not in the `run` chain (needs >=2 runs); ion mobility / 4D (diaPASEF) is
   partial and lands in steps (docs/35_diapasef.md says which layers are in the
   tree; IM columns are null on 3D runs). Do not document these as complete.

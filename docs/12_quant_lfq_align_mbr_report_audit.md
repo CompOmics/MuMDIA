@@ -18,8 +18,8 @@ stages that operate across multiple runs.
   `quant.normalisation = "stable_set"`, the default since 2026-11-07): cross-run normalisation of the per-run
   precursor quantities by retention-time-binned medians of a stable set of ions, written
   to separate tables.
-- **align** (Stage D2, `mumdia align`): put >=2 runs on a common RT coordinate by
-  fitting a reference LOESS RT map per run and recording the residual spread.
+- **align** (Stage D2, `mumdia align`): removed in 0.15.0. It wrote a cross-run RT map
+  (`alignment.parquet`) that no stage read; the second pass builds its own map.
 - **mbr** (Stage D3, `mumdia mbr`): partially wired match-between-runs identification
   transfer. A Rust CLI + config gate that shells out to `scripts/mbr_worker.py`.
 - **report** (`mumdia report`): emit human-readable `peptides.tsv`, `precursors.tsv`
@@ -36,7 +36,6 @@ stages that operate across multiple runs.
 | `rust/mumdia/crates/mumdia/src/stages/quant.rs` | `quant` stage, its chromatogram reader and the cross-run fit (`fit_cross_run`) |
 | `rust/mumdia/crates/mumdia/src/stages/quant_norm.rs` | cross-run normalisation (`quant-normalise`, `quant.normalisation`, default `stable_set`) |
 | `rust/mumdia/crates/mumdia/src/quant_lfq.rs` | MaxLFQ/directLFQ ratio-alignment core (`lfq_profile`) and the `quant-lfq` combine with its size factors (`run_lfq_combine_grouped`) |
-| `rust/mumdia/crates/mumdia/src/stages/align.rs` | Stage D2 cross-run RT alignment |
 | `rust/mumdia/crates/mumdia/src/stages/report.rs` | `peptides.tsv` + `precursors.tsv` + `proteins.tsv` writer |
 | `rust/mumdia/crates/mumdia/src/stages/audit.rs` | candidate identification-loss ladder |
 | `rust/mumdia/crates/mumdia-core/src/rejection.rs` | `RejectionReason` enum + ladder ordering |
@@ -129,8 +128,8 @@ also written next to `<out>`: `<out>.peptide.parquet` (rolled up by stripped bas
 sequence) and `<out>.precursor.parquet` (by peptidoform + charge), each with columns
 `group` (str), `charge` (i32; -1 for peptide level), `run`, `quantity`, `n_features`,
 from the same normalized feature matrix and LFQ engine. The protein output is
-unchanged. Unlike `quant` and
-`align`, `run_lfq_combine_grouped` writes no `<out>.report.json`: it calls `write_table` and
+unchanged. Unlike `quant`,
+`run_lfq_combine_grouped` writes no `<out>.report.json`: it calls `write_table` and
 logs, with no `ArtifactReport` (`quant.rs:720`). `--quantity-column` names the input
 intensity column (`quantity` by default; `quantity_normalised` for the tables below).
 `--condition`, once per input in input order, estimates the size factors within each
@@ -151,12 +150,6 @@ smoothing; the global shift on the global row), `log2_shift`.
 Every table has a `<artifact>.report.json`. In `run-experiment` the tables are
 `<run>/peptide_quant_normalised.parquet` and `quant_normalisation.parquet` at the
 experiment root, and the manifest records both and a `cross_run_normalisation` block.
-
-### align
-Consumes one `seed_psms.parquet` per run (`--seed-psms`, first is the reference).
-Produces `alignment.parquet` (`align.rs:130`): `run_id` (u32), `source_rt` (f64),
-`reference_rt` (f64), `residual_spread` (f64). The mapping is emitted on a grid of
-`grid_n` points per run (`grid_n = 100`, hardcoded in `main.rs:667`).
 
 ### Run names (`run-experiment`)
 `<run>` in this document is the run's name: its subdirectory of the experiment, the label of
@@ -1404,27 +1397,6 @@ With it, MaxLFQ reads `quantity_normalised` with `NormalizeMethod::None` in plac
 `quantity` with `MedianRatio`. Status: benchmark-gated. It changes reported normalised
 quantities only, never an identification.
 
-### align (`align.rs:53`, `run`)
-
-`confident_rts` (`align.rs:32`) reads a seed table's `base_peptide_id`, `spectrum_q`,
-`observed_rt`, `score`, `label`, validates labels, and returns the best-scoring
-observed RT per base peptide among confident targets (`q <= q_train`, target only).
-The reference is `seeds[0]`. For each run, shared base peptides with the reference give
-paired `(this_rt, ref_rt)`. A LOESS map is fit only when there are `>= 4` shared
-peptides (`align.rs:93`, `Loess::fit(xs, ys, span=0.4, grid_n)`); the span is hardcoded
-at 0.4 and is independent of `rt_im_train.loess_span`. The residual spread is the p95 of
-`|ref - loess(this)|` on the shared set (`align.rs:105`); it is what sets how tight an
-MBR window can be. The mapping is emitted on `grid_n.max(2)` evenly-spaced grid points;
-the reference-run grid spans `[min(ref_rt, 0.0), max(ref_rt, 1.0)]` (`align.rs:58`) and
-each other run's grid extends that span to cover its own shared RTs (`align.rs:88`). The
-reference run and any run with too few shared peptides emit the identity map with
-residual 0 (the insufficient-anchor guard, `align.rs:93`/`align.rs:113`). `align::run`
-asserts at least one seed (`align.rs:55`) and writes an `alignment.report.json`
-(schema `alignment` v1, `align.rs:141`, the only literal-string schema here since there
-is no `schema.rs` constant for it). This is an experiment-level stage: with one run it
-degenerates to identity, and it is not part of the `run` chain. Real multi-run
-validation needs a multi-file experiment; only crafted two-run unit input exercises it.
-
 ### Second pass (`mbr.strategy = second_pass`, the default since 2026-10-13)
 
 `run-experiment` matches between runs by searching every run a second time on an
@@ -1791,9 +1763,6 @@ FDR/reporting); `audit.rs` tests the stages in that order and keeps the first lo
 | `lfq_profile` | quant_lfq.rs:84 | MaxLFQ least-squares per-sample profile |
 | `stats::median_or` | stats.rs | the shared in-place median (a given value for an empty slice) the profile and the size factors call |
 | `solve_fixed` | quant_lfq.rs:28 | dense Laplacian solve, first var fixed at 0 |
-| `AlignParams` | align.rs:22 | seeds + q_train + grid_n |
-| `confident_rts` | align.rs:32 | best observed RT per confident target base peptide |
-| `align::run` | align.rs:53 | reference LOESS RT map per run |
 | `run_mbr` | sidecar.rs:162 | build argv and spawn `mbr_worker.py` |
 | `binned_map` | mbr_worker.py:31 | monotone binned-median RT calibration |
 | `expected_rt` | mbr_worker.py:116 | cross-run predicted RT for a candidate in a run |
@@ -1859,9 +1828,6 @@ or `off`) and its settings `normalisation_rank` (unset, automatic) and `normalis
 (false) are read by `run-experiment` and `quant-normalise`; `normalisation` is omitted from
 the canonical configuration at `off`, the other two at their defaults. See
 [Cross-run normalisation](#cross-run-normalisation-quant_normrs-quantnormalisation).
-
-**align** reads `rt_im_train.q_train` (0.01, `config.rs:326`) as the anchor cutoff;
-`grid_n` is hardcoded to 100 in `main.rs:667` and the LOESS span to 0.4 in `align.rs:93`.
 
 **`MbrConfig`** (`config.rs:873`, defaults at `config.rs:898`): `strategy` (`None`;
 `MbrStrategy` at `config.rs:845`), `q_anchor` (0.01), `min_anchor_runs` (2),
@@ -1964,8 +1930,8 @@ but do not affect the wired `mumdia mbr` path.
   `RT_PRUNED`, `WRONG_ISOLATION_WINDOW`) have no producer.
 - **report.json coverage is partial.** `quant` writes reports for
   `peptide_quant`, `protein_quant`, and emitted `fragment_quant`; the peak-bounds
-  diagnostic gets none. `quant-lfq` and `mbr` write no `report.json`; `align` and `audit` do
-  (the latter as `<out>.metrics.json`). Do not assume every artifact here has a sidecar
+  diagnostic gets none. `quant-lfq` and `mbr` write no `report.json`; `audit` does
+  (as `<out>.metrics.json`). Do not assume every artifact here has a sidecar
   report.
 - **align / mbr need >=2 runs.** align degenerates to identity on one run; `mumdia mbr`
   hard-bails on `<2` psms paths (`main.rs:685`). Neither is in the single-run `run`
@@ -1990,9 +1956,6 @@ but do not affect the wired `mumdia mbr` path.
   (`--emit-transfer-targets`); it needs a Rust subcommand that then calls
   `extract --restrict-candidates --run-windows` and re-scores. Implement the
   `ReverseSequence`/`Both` nulls in the worker before honoring `decoy_transfer`.
-- **Consume `alignment.parquet` in MBR** instead of the worker's internal
-  `binned_map`, so the RT map is computed once and shared; align already records the
-  p95 residual that should set `rt_window_s`.
 - **Add an audit reason:** extend `RejectionReason` (`rejection.rs:22`) at its pipeline
   position, with a `code()` arm and a branch in the ladder; an extraction reason needs
   extract to record it per candidate first.

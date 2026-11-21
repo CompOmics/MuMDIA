@@ -15,7 +15,7 @@ rescores with a semi-supervised classifier. The pipeline is a DAG: mzML
 conversion and library creation/import are independent branches that converge at
 `search-seed`; optional DeepLC fine-tuning then sits between seed search and RT
 calibration. Extraction, features, competition, rescoring, quantification, and
-reporting follow. `align`, `mbr`, and `quant-lfq` are separate experiment-level
+reporting follow. `mbr` and `quant-lfq` are separate experiment-level
 commands.
 
 ---

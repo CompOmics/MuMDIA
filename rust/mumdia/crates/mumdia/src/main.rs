@@ -781,16 +781,6 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = OnOff::Off)]
         ion_mobility: OnOff,
     },
-    /// Cross-run RT alignment (experiment-level) -> alignment.parquet.
-    Align {
-        /// One seed_psms.parquet per run; the first is the reference.
-        #[arg(long, num_args = 1..)]
-        seed_psms: Vec<String>,
-        #[arg(long)]
-        out: String,
-        #[arg(long)]
-        config: Option<String>,
-    },
     /// Match-between-runs identification transfer (Stage D3) -> transferred.parquet.
     Mbr {
         /// Experiment-wide scored_combined.parquet (has the `source` column).
@@ -2905,21 +2895,6 @@ fn real_main() -> Result<()> {
                 outputs: &outputs,
                 shifts_out: &shifts_out,
                 cfg: &cfg.quant,
-                config_hash: &ch,
-            })?;
-        }
-        Cmd::Align {
-            seed_psms,
-            out,
-            config,
-        } => {
-            let cfg = load_config(&config)?;
-            let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
-            stages::align::run(stages::align::AlignParams {
-                seeds: &seed_psms,
-                out: &out,
-                q_train: cfg.rt_im_train.q_train,
-                grid_n: 100,
                 config_hash: &ch,
             })?;
         }

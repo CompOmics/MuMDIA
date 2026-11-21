@@ -667,7 +667,7 @@ stage-local helper `write_reports` (`stages/convert.rs:269-290`) that writes one
 report per artifact with a shared `params` and empty `stats`; note this
 `write_reports` lives in `convert.rs`, it is not part of the `mumdia-io` public
 API. Stages with report coverage build their `ArtifactReport` directly (see the
-`write_for` call sites in `align`, `compete`, `extract`, `search_seed`,
+`write_for` call sites in `compete`, `extract`, `search_seed`,
 `predict_frag`, `peptidoforms`, `rt_im_train`, `rescore`, `features`, `quant`).
 
 ### `record_artifact` and the manifest

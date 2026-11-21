@@ -1154,30 +1154,6 @@ in run-index order, with a header.
 
 ---
 
-## Stage D2: `align` (`stages/align.rs`)
-
-Experiment-level cross-run stage that prepares MBR. It puts every run on a common
-RT coordinate: the first input seed is the reference, and for each run it fits a
-monotone LOESS mapping from the run's observed RT to the reference RT over
-confidently shared peptides, then emits that mapping on a `grid_n`-point grid.
-The reference run (or a run with fewer than four shared peptides) uses the
-identity mapping. This artifact is written with an inline `alignment` (v1)
-`ArtifactReport` (`align.rs:141-153`); it is not registered in the frozen
-`schema.rs` artifact table.
-
-### alignment (`align.rs:130-138`)
-
-One row per (run, grid point).
-
-| column | Arrow type | nullable | units | meaning |
-|---|---|---|---|---|
-| `run_id` | UInt32 | no | - | 0-based input run index (position in the seed list); run 0 is the reference |
-| `source_rt` | Float64 | no | s | grid point in this run's own observed RT coordinate |
-| `reference_rt` | Float64 | no | s | RT mapped onto the reference coordinate; identity for the reference run or when fewer than four peptides are shared with the reference |
-| `residual_spread` | Float64 | no | s | 95th-percentile absolute LOESS residual on shared peptides for this run; 0.0 for the reference or an unfit run; bounds how tight an MBR window can be |
-
----
-
 ## Match-between-runs second pass (`stages/second_pass.rs`, `run-experiment`)
 
 The default `mbr.strategy = second_pass` adds these to an experiment directory
