@@ -3064,32 +3064,6 @@
       "source_struct": "FeaturesConfig"
     },
     {
-      "path": "features.bound_from_confident",
-      "name": "bound_from_confident",
-      "section": "features",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "Elution-peak boundary source. When false (default since 2026-10-04) each candidate detects its own peak boundary from its top-3-predicted-fragment profile. When true, a single set of left/right half-widths (seconds) is learned once from the confident seed PSMs (`spectrum_q <= 0.01`, target-only, the set that anchors RT calibration) and applied to EVERY candidate around its own apex, so a peptide whose peak is wider than the median is cut short. The shared width was introduced to stop a chimeric decoy from fitting its own boundaries; the entrapment measurement below shows no FDR cost from per-candidate bounds. Measured 2026-10-03 (doxy, 5 NN seeds per arm, benchmark config): per-candidate bounds gave Astral REP1 on the HYE library +2.20% peptides at 1% (Welch t +15.7) and the Orbitrap AIF entrapment run +0.17% (t +0.9) at an unchanged entrapment FDP (0.989% -> 1.000%, 2 SE 0.039); the share of IDs whose above-half-maximum peak extends past the bounds fell from 20% / 26% (left / right) to 2% / 6% on Astral. If the seed yields < 20 confident anchors when true, the stage logs a warning and falls back to per-candidate detection for that run.",
-      "gates": [],
-      "source_struct": "FeaturesConfig"
-    },
-    {
-      "path": "features.bound_confident_pct",
-      "name": "bound_confident_pct",
-      "section": "features",
-      "rust_type": "f64",
-      "kind": "float",
-      "optional": false,
-      "default": 50.0,
-      "default_text": "50.0",
-      "help": "Percentile (0-100) of the confident-set half-widths taken as the global left/ right elution half-width when `bound_from_confident` is true. 50 = median (typical real peak width); higher percentiles widen the shared window.",
-      "gates": [],
-      "source_struct": "FeaturesConfig"
-    },
-    {
       "path": "features.ms1_precursor_features",
       "name": "ms1_precursor_features",
       "section": "features",

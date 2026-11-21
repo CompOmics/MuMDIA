@@ -83,27 +83,20 @@ Either chromatogram layout is read (docs/15_data_dictionary.md, "Layout v2").
 `ChromStream` passes every v2 row through a `chromatograms::Decoder` before the row
 is stored, so a chunk holds exactly the v1 rows and every feature is the same. The
 main pass starts each chunk at a candidate's first row, where the decoder needs
-nothing earlier. The confident-bounds pass reads sub-chunks on the absolute
-`chunk_rows` grid, which can start inside a row group and inside a candidate. There
-`ChromStream::open_at` opens the table at that row group's first row and follows the
-rows before the sub-chunk through the decoder without keeping them, so the samples
-are v1's in order, bit for bit.
+nothing earlier.
 
 With the ion-mobility family on, the main pass also reads each row's per-point 1/K0
 list where the table has one (`im` in chromatograms v3, `im_trimmed` in v4):
 `ChromStream::open(ch, want_im)` projects it, the decoder rebuilds a v4 list with the
 trace's `+0.0` margins (`Decoder::row_im`), and the chunk stores it on the intensities'
-offsets (`RowSet::im_vals`, `ChromRow::im`). `want_im` is the resolved family switch;
-the confident-bounds pass (`open_at`) never reads it. On a 4D run the list roughly
+offsets (`RowSet::im_vals`, `ChromRow::im`). `want_im` is the resolved family switch. On a 4D run the list roughly
 doubles the resident trace memory of a chunk. With the family off, and on any table
 without the list, the projection and the stored chunk are what they were.
 
 ### Consumed: seed PSMs (optional, `features.rs:620`-`652`)
 
 `candidate_id` (u32), `score` (f64), `spectrum_q` (f64), `label` (str). Builds
-the `candidate_id -> seed score` and `-> identified flag` maps, and the
-confident-target set (`spectrum_q <= 0.01` and `label == "target"`) used for
-`bound_from_confident`.
+the `candidate_id -> seed score` and `-> identified flag` maps.
 
 ### Produced: features Parquet (`features.rs:912`-`931`)
 
@@ -145,12 +138,8 @@ Control flow of `run` (`features.rs:548`):
    splitting off `ms1_*` rows into `ms1x` (`features.rs:591`-`618`). A
    `ChromRow` (`features.rs:279`) holds `frag_name`, `frag_mz`, `frag_obs_mz`,
    `pred_int`, and the `rt`/`inten` vectors.
-3. Build the seed maps and confident-target set from the optional seed table
-   (`features.rs:620`-`652`).
-4. If `bound_from_confident` is set, learn a global elution half-width
-   (see "bound_from_confident" below), producing `Option<(L, R)>` in seconds
-   (`features.rs:658`-`702`).
-5. Compute the gradient as `max(apex_rt).max(1.0)` (`features.rs:704`); this is
+3. Build the seed maps from the optional seed table (`features.rs:620`-`652`).
+4. Compute the gradient as `max(apex_rt).max(1.0)` (`features.rs:704`); this is
    the run length used to normalize RT errors.
 6. Compute the three cross-charge corroboration columns by grouping rows by
    `peptidoform` (`features.rs:714`-`734`).
@@ -285,7 +274,7 @@ section). It mirrors the alignment and peak-bounding of
 
 In the chunked pass the parts are built once per PSM and shared with
 `fragment_features`: `apex_intensities` (the nearest-apex intensity per row),
-`peak_window` (the elution-peak window; global half-widths or the walk down the
+`peak_window` (the elution-peak window: the walk down the
 smoothed top-3 profile), and `PeakTraces` (the window, the sliced traces, both
 reference profiles and a `PairStats`). `evidence_from` then assembles the
 Evidence from them. `build_evidence` is a test-only (`#[cfg(test)]`) wrapper
@@ -913,33 +902,22 @@ another. Because the family registry order is frozen and append-only, appending
 a new family or feature at the end changes the id predictably while leaving all
 prior positions stable.
 
-## bound_from_confident (elution-boundary calibration, `features.rs:658`)
+## Elution-peak bounds
 
-`bound_from_confident` defaults to false since 2026-10-04: every candidate detects
-its own bounds with `elution_peak_rt_bounds`. Measured 2026-10-03 (doxy, 5 NN seeds per arm, benchmark config): per-candidate bounds gave Astral REP1 on the HYE library +2.20% peptides at 1% (Welch t +15.7) and the Orbitrap AIF entrapment run +0.17% (t +0.9) at an unchanged entrapment FDP (0.989% -> 1.000%, 2 SE 0.039); the share of IDs whose above-half-maximum peak extends past the bounds fell from 20% / 26% (left / right) to 2% / 6% on Astral.
-
-When `bound_from_confident` is true, the stage learns one pair of
-elution half-widths `(L, R)` in seconds from the confident-target seed set
-(`spectrum_q <= 0.01`, `label == "target"`; the same anchor set used for RT
-calibration and DeepLC fine-tune). For each confident candidate it detects the
-per-candidate peak with `elution_peak_rt_bounds` (`features.rs:1141`, which
-returns `None` for a candidate with fewer than 3 distinct scans, so it does not
-contribute an anchor) and records `apex - lo` and `hi - apex`. If at least 20
-anchors resolve, it takes the `bound_confident_pct` percentile of the left and
-right half-widths (median by default) and returns `Some((L, R))`; every
-candidate is then bounded on `[apex - L, apex + R]` via `global_bound_indices`
-(`features.rs:1114`), which falls back to the single apex-nearest scan
-`(ai, ai)` when the mapped window collapses between grid points (sparse grid or
-a half-width below one cycle). This
-removes per-candidate boundary manipulation, so a chimeric decoy is scored over
-a real-peptide-width window centred on its apex rather than one it can widen or
-narrow. With fewer than 20 anchors the stage logs a warning and falls back to
-per-candidate boundary detection for that run. When the flag is false, every
-candidate detects its own peak boundary from its top-3-predicted-fragment
-profile (the legacy path). The same `global_bounds` argument threads into
-`peak_window`, which sets the window of both `fragment_features` (under
+Every candidate detects its own elution-peak bounds from its top-3-predicted-fragment
+profile (`peak_window`), which sets the window of both `fragment_features` (under
 `bound_features`) and the Extended Evidence, so Minimal/Rich and Extended see the
 identical window.
+
+`features.bound_from_confident` and `features.bound_confident_pct` were removed in
+0.15.0. They learned one pair of left and right half-widths from the confident seed
+anchors and applied it to every candidate. It was off by default from 2026-10-04 after
+this measurement (2026-10-03, doxy, 5 NN seeds per arm, benchmark config): per-candidate
+bounds gave Astral REP1 on the HYE library +2.20% peptides at 1% (Welch t +15.7) and the
+Orbitrap AIF entrapment run +0.17% (t +0.9) at an unchanged entrapment FDP (0.989% ->
+1.000%, 2 SE 0.039); the share of IDs whose above-half-maximum peak extends past the
+bounds fell from 20% / 26% (left / right) to 2% / 6% on Astral. A configuration that
+sets either key at its old default still loads.
 
 ## The shared stats kernel (`stats.rs`)
 
@@ -1002,8 +980,6 @@ variant no longer exists).
 | `bound_features` | true | restrict trace-based features to the elution peak instead of the whole extracted window; **gates only the Minimal/Rich `fragment_features` path** (the Extended Evidence always peak-bounds, see gotchas) |
 | `bound_peak_fraction` | 1/3 | peak-boundary threshold as a fraction of apex height (DIA-NN-style; matched DIA-NN RT bounds best) |
 | `bound_peak_grace` | 0 | consecutive sub-threshold scans to bridge before stopping (0 = stop at first miss; 1 bridges a single-scan dip) |
-| `bound_from_confident` | false | true = learn one global left/right half-width from the confident seed set and apply it to every candidate; false (default since 2026-10-04) = per-candidate detection |
-| `bound_confident_pct` | 50.0 | percentile of the confident-set half-widths taken as the global half-width (50 = median) |
 | `chrom_loaders` | 3 | chromatogram decode threads in the main pass, an upper bound that `--threads` and the chunk count also cap (see "The chunked pass" below); changes time and memory only, never a value or a byte of the features table |
 | `q1_fragment_features` | `"auto"` | the `q1_fragments` family (eight `q1f_*` features of the per-fragment Q1 decision), which needs `extract.q1_fragments`; appended last under `extended`; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
 | `q1_precursor` | `"auto"` | the `q1_precursor` family (eight `q1p_*` features of the unfragmented precursor in the MS2 steps), whose evidence extract reads under the same key (psms_extracted v8); needs `extract.q1_fragments`; appended after `q1_fragment_features`; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
@@ -1117,8 +1093,7 @@ set `chrom_loaders: 1` there if that matters.
   `evidence_from`) takes no such flag
   and always peak-bounds `axis`/`traces` while still retaining
   `axis_full`/`traces_full`, so Extended families read whichever window they
-  name regardless of `bound_features`, and `global_bounds` from
-  `bound_from_confident` always applies to them.
+  name regardless of `bound_features`.
 - The peptidoform grouping for cross-charge features uses the ProForma string,
   which is charge-independent and keeps `DECOY_` peptidoforms grouped among
   themselves, so it is not a target/decoy label leak (`features.rs:714`).

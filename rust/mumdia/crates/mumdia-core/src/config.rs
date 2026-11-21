@@ -3143,22 +3143,6 @@ pub struct FeaturesConfig {
     /// scan below `bound_peak_fraction` (brittle on jagged/gappy profiles); 1 bridges
     /// a single-scan dip (DIA sampling gap / noise), giving steadier boundaries.
     pub bound_peak_grace: usize,
-    /// Elution-peak boundary source. When false (default since 2026-10-04) each
-    /// candidate detects its own peak boundary from its top-3-predicted-fragment
-    /// profile. When true, a single set of left/right half-widths (seconds) is learned
-    /// once from the confident seed PSMs (`spectrum_q <= 0.01`, target-only, the set
-    /// that anchors RT calibration) and applied to EVERY candidate around its own apex,
-    /// so a peptide whose peak is wider than the median is cut short. The shared width
-    /// was introduced to stop a chimeric decoy from fitting its own boundaries; the
-    /// entrapment measurement below shows no FDR cost from per-candidate bounds.
-    /// Measured 2026-10-03 (doxy, 5 NN seeds per arm, benchmark config): per-candidate bounds gave Astral REP1 on the HYE library +2.20% peptides at 1% (Welch t +15.7) and the Orbitrap AIF entrapment run +0.17% (t +0.9) at an unchanged entrapment FDP (0.989% -> 1.000%, 2 SE 0.039); the share of IDs whose above-half-maximum peak extends past the bounds fell from 20% / 26% (left / right) to 2% / 6% on Astral. If the seed yields < 20 confident
-    /// anchors when true, the stage logs a warning and falls back to per-candidate
-    /// detection for that run.
-    pub bound_from_confident: bool,
-    /// Percentile (0-100) of the confident-set half-widths taken as the global left/
-    /// right elution half-width when `bound_from_confident` is true. 50 = median
-    /// (typical real peak width); higher percentiles widen the shared window.
-    pub bound_confident_pct: f64,
     /// Emit the MS1 apex-isotope precursor feature `ms1_isotope_height_corr`
     /// (Pearson of the observed apex isotope heights `[i0,i1,i2]` against the
     /// Poisson-averagine model). Default false (the feature is present in the
@@ -3292,8 +3276,6 @@ impl Default for FeaturesConfig {
             bound_features: true,
             bound_peak_fraction: 1.0 / 3.0,
             bound_peak_grace: 0, // stop at first sub-threshold scan (legacy)
-            bound_from_confident: false, // per-candidate elution bounds (2026-10-04)
-            bound_confident_pct: 50.0, // median confident half-width
             ms1_precursor_features: false, // opt-in; overlaps ms1_isotope_cosine_apex
             chrom_loaders: 3,
             im_features: ImFeatures::Off,
@@ -6952,14 +6934,6 @@ impl Config {
                 self.features.coelution_corr_threshold
             )));
         }
-        if !self.features.bound_confident_pct.is_finite()
-            || !(0.0..=100.0).contains(&self.features.bound_confident_pct)
-        {
-            return Err(Invalid(format!(
-                "features.bound_confident_pct is a percentile and must be in [0, 100] (got {})",
-                self.features.bound_confident_pct
-            )));
-        }
         for (name, value) in [
             (
                 "extract.claim_cues.mz_close_sigma_ppm",
@@ -7595,6 +7569,16 @@ const RETIRED: &[Retired] = &[
     },
 
     // C: bound_from_confident, per-group calibration
+    Retired {
+        path: "features.bound_from_confident",
+        gone: Gone::Key("false"),
+        why: "one elution half-width learned from the confident anchors measured 2.20% fewer               peptides than per-candidate bounds and cut 20-26% of peaks short (docs/10,               elution-peak bounds)",
+    },
+    Retired {
+        path: "features.bound_confident_pct",
+        gone: Gone::Key("50.0"),
+        why: "it only set the percentile of features.bound_from_confident, which was removed",
+    },
 
     // D: MS1 surface, never-read keys and refused choices
 
@@ -8500,7 +8484,6 @@ mod tests {
             r#"{"features":{"bound_peak_fraction":-1.0}}"#,
             r#"{"quant":{"reliable_q":2.0}}"#,
             r#"{"features":{"coelution_corr_threshold":1.5}}"#,
-            r#"{"features":{"bound_confident_pct":101}}"#,
             r#"{"extract":{"frag_tol_ppm":0.0}}"#,
             r#"{"extract":{"bucket_size":1000}}"#,
             r#"{"extract":{"retain_top_peaks":1,"promote_top_peaks":3}}"#,
@@ -8528,7 +8511,6 @@ mod tests {
             r#"{"features":{"bound_peak_fraction":1.0}}"#,
             r#"{"quant":{"reliable_q":0.001}}"#,
             r#"{"features":{"coelution_corr_threshold":-1.0}}"#,
-            r#"{"features":{"bound_confident_pct":100}}"#,
             r#"{"mbr":{"consensus_corr_min":0.0}}"#,
             r#"{"compete":{"margin":0.0}}"#,
             r#"{"quant":{"fixed_window_s":0.0}}"#,

@@ -635,11 +635,6 @@ impl DecoderLease {
         }
     }
 
-    /// Threads to run on: the lease, or one when the budget was empty.
-    pub(crate) fn decoders(&self) -> usize {
-        self.n.max(1)
-    }
-
     /// What the budget actually granted, which may be zero.
     pub(crate) fn granted(&self) -> usize {
         self.n

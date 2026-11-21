@@ -697,7 +697,7 @@ The orchestrators therefore take the hash from the stage instead:
 
 - each stage an orchestrator calls has a `run_hashed` sibling of `run`
   (`digest`, `peptidoforms`, `predict_frag`, `search_seed`, `rt_im_train` (as
-  `run_in_memory`), `extract`, `features` and `features::run_with_bounds_hashed`,
+  `run_in_memory`), `extract`, `features`,
   `compete`, `rescore`, `quant`) that returns a `report::Written { rows, content_hash }`
   per output, taken from the report it just wrote. `convert::run` returns the
   four hashes in `ConvertOutputs::hashes`. `run` itself is unchanged and

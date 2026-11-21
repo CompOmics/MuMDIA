@@ -73,10 +73,6 @@ pub struct GroupRun<'a> {
 
 /// Paths the pooled stages continue with.
 /// What phase 1 of the band loop hands to phase 2.
-///
-/// The two phases exist because the confident elution half-widths are a property of the
-/// run, not of a band: every band has to have extracted before the first one can compute
-/// features on the pooled window.
 struct BandExtract {
     index: usize,
     /// Rows this band's extract accepted: the cost the features phase is dispatched on.
@@ -85,8 +81,6 @@ struct BandExtract {
     chrom: String,
     /// `(index, cal.json)`, as `summarise_cal` wants it.
     cal: (usize, String),
-    /// This band's confident anchors, moved out into the pool between the phases.
-    samples: features::BoundSamples,
     /// The extract-stage artifact records, recorded once phase 2 has run so the manifest
     /// keeps the order a single-phase loop wrote.
     recs: Vec<mumdia_core::manifest::ArtifactRecord>,
@@ -1172,9 +1166,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         // phase, most expensive first. Each band in flight holds its own extraction working
         // set, so that bound is what the stage's memory scales with; the artifacts are pooled
         // in band order regardless of which band finishes first.
-        // Phase 1 of two: retention-time windows and extraction for every band. The
-        // confident elution half-widths are a property of the RUN, so features cannot
-        // start until every band has contributed its anchors (see the pooling below).
+        // Phase 1 of two: retention-time windows and extraction for every band.
         let band_extract = |b: &Band| -> Result<BandExtract> {
             let mut recs: Vec<mumdia_core::manifest::ArtifactRecord> = Vec::new();
             let windows = gd(b.index, "run_windows.parquet");
@@ -1291,26 +1283,12 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                     ch,
                 ));
             }
-            // The band half of the pooled bounds: the same pass `features` would run
-            // internally, returning its anchors instead of a percentile of them.
-            let samples = features::confident_bound_samples(&features::FeaturesParams {
-                psms: &psms,
-                chromatograms: &chrom,
-                seed: Some(&pooled_seed),
-                out: "",
-                out_pin: "",
-                cfg: &cfg.features,
-                // A grouped run is never retraced (`Config::validate`).
-                imc_ref_w: false,
-                q1_tolerances: None,
-            })?;
             Ok(BandExtract {
                 index: b.index,
                 npsm: psms_written.rows,
                 psms,
                 chrom,
                 cal: (b.index, gd(b.index, "cal.json")),
-                samples,
                 recs,
             })
         };
@@ -1320,7 +1298,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 .map(|b| band_cost.get(&b.index).copied().unwrap_or(0.0))
                 .collect::<Vec<f64>>(),
         );
-        let mut extracted: Vec<BandExtract> =
+        let extracted: Vec<BandExtract> =
             groups::run_bounded(&bands, par, &extract_order, band_extract)?;
         debug_assert_eq!(
             extract_fingerprint,
@@ -1330,29 +1308,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         drop(ms2_scans);
         drop(ms1_scans);
 
-        // --- the run's confident elution half-widths, fitted once over every band
-        //
-        // An ungrouped run fits these from the whole run's confident anchors. A band holds
-        // a slice of the m/z range and therefore a slice of the anchors, so fitting per
-        // band puts most bands under the 20-anchor floor and they silently fall back to
-        // per-candidate boundary detection: measured on a seven-file immunopeptidomics
-        // search, 735 pooled anchors arrived as 0 or 1 per band and EVERY band fell back.
-        // Pooling the samples is the same move `seed-pool` already makes for the q scale
-        // and the mass calibration, and for the same reason.
-        let mut pooled_bounds = features::BoundSamples::default();
-        for e in &mut extracted {
-            pooled_bounds.absorb(std::mem::take(&mut e.samples));
-        }
-        let bounds = features::bounds_from_samples(&pooled_bounds, &cfg.features);
-        info!(
-            anchors = pooled_bounds.len(),
-            bands = extracted.len(),
-            left_hw_s = bounds.map(|b| b.0),
-            right_hw_s = bounds.map(|b| b.1),
-            "groups: confident elution half-widths pooled over the bands"
-        );
-
-        // Phase 2 of two: features and competition, every band on the pooled window.
+        // Phase 2 of two: features and competition.
         let band_features = |e: &BandExtract| -> Result<(
             pool::BandArtifacts,
             (usize, String),
@@ -1362,23 +1318,19 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             let feats = gd(e.index, "features.parquet");
             let pin = gd(e.index, "run.pin");
             info!(stage = %"features", group = e.index, "run: stage start");
-            let features_written = features::run_with_bounds_hashed(
-                features::FeaturesParams {
-                    psms: &e.psms,
-                    chromatograms: &e.chrom,
-                    // Corroboration keys on the seed by candidate id, and the band's tables
-                    // carry library-wide ids, so the pooled seed is the one that matches.
-                    // Its q is the pooled one either way, which is what "confident" has to
-                    // mean once the bands are scored together.
-                    seed: Some(&pooled_seed),
-                    out: &feats,
-                    out_pin: &pin,
-                    cfg: &cfg.features,
-                    imc_ref_w: false,
-                    q1_tolerances: None,
-                },
-                bounds,
-            )?;
+            let features_written = features::run_hashed(features::FeaturesParams {
+                psms: &e.psms,
+                chromatograms: &e.chrom,
+                // Corroboration keys on the seed by candidate id, and the band's tables
+                // carry library-wide ids, so the pooled seed is the one that matches.
+                // Its q is the pooled one either way.
+                seed: Some(&pooled_seed),
+                out: &feats,
+                out_pin: &pin,
+                cfg: &cfg.features,
+                imc_ref_w: false,
+                q1_tolerances: None,
+            })?;
             if keep_records {
                 recs.push(features_written.record(
                     &format!("{}[g{:02}]", artifact::FEATURES.0, e.index),

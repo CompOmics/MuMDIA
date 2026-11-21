@@ -346,7 +346,7 @@ handful of points, with a warning.
 | RT model (multi-head calibration) | the pooled seed, joined by peptidoform | the band's seed |
 | `rt-im-train` anchors | the pooled seed, iRT read from the seed row (`anchor_irt_from_seed`), one fit shared by every band | the band's seed, iRT joined from the band table |
 | `extract` mass calibration | the pooled `masscal.json` | the band's |
-| `features` seed corroboration and confident elution boundary | the pooled seed (library-wide ids) | the pooled seed (library-wide ids) |
+| `features` seed corroboration | the pooled seed (library-wide ids) | the pooled seed (library-wide ids) |
 
 Under `global`, after a per-band re-prediction of the library iRT, the pooled anchors carry
 the library's iRT as it was when seeded; `seed_pool::refresh_irt` then copies each anchor's
@@ -965,46 +965,27 @@ process sat at 0.1 s of CPU indefinitely, with no error and no output). The orch
 clamps the value to `threads - 1` and warns. The production runs are far from the bound (8
 bands on 128 threads), which is why this was not visible before.
 
-## 9. The confident elution bounds are pooled too
+## 9. The confident elution bounds (removed in 0.15.0)
 
-`features.bound_from_confident` (when on; off by default since 2026-10-04) fits one pair of elution half-widths from the
-run's confident seed anchors and gives every candidate the window `[apex - L, apex + R]`.
-It needs at least 20 anchors with a resolvable peak; below that it warns and falls back to
-per-candidate boundary detection.
-
-Twenty is a floor on the RUN's anchors, and a band holds a slice of the m/z range and
-therefore a slice of them. Measured on the seven-file immunopeptidomics search
+`features.bound_from_confident` fitted one pair of elution half-widths from the run's
+confident seed anchors and needed at least 20 of them. A band holds a slice of the m/z range
+and therefore a slice of the anchors. Measured on the seven-file immunopeptidomics search
 (`window_groups = 63`, 203M-precursor library), AT10273AUH had **735 confident anchors in
-the pooled seed and 0 or 1 in each band's chromatogram table**, so every band logged
+the pooled seed and 0 or 1 in each band's chromatogram table**, so every band fell back to
+per-candidate bounds while the unbanded run fitted a global window. Banded runs therefore
+pooled the samples of every band between two phases and fitted once.
 
-```text
-features: bound_from_confident set but < 20 confident anchors; falling back to
-per-candidate boundary
-```
-
-while the same run searched unbanded fitted a global window. That is a banded/unbanded
-divergence of the same kind as the per-band mass calibration of section 7, in the stage
-after it.
-
-The fix is the same move: the samples are pooled, not the fitted scalars. The band loop is
-now two phases. Phase 1 runs `rt-im-train` and `extract` for every band and calls
-`features::confident_bound_samples`, which is the pass `features` would have run
-internally -- same confident set, same row-group pruning, same detector -- returning the
-per-anchor half-widths instead of a percentile of them. The run absorbs every band's
-samples, fits `features::bounds_from_samples` once, and phase 2 runs `features` and
-`compete` for every band through `features::run_with_bounds_hashed` on that one pair. A run whose
-pooled set is genuinely under 20 anchors still falls back, now once rather than band by
-band.
-
-Two things come free with the split. The shared MS2 and MS1 buffers are dropped at the end
-of phase 1 rather than after competition, and phase 2 skips the extra streaming pass over
-the chromatogram table that each band used to make.
+The option was removed in 0.15.0, because per-candidate bounds measured better (docs/10,
+"Elution-peak bounds"), and the pooling went with it. The band loop keeps its two phases:
+phase 1 runs `rt-im-train` and `extract` for every band, and the shared MS2 and MS1
+buffers are dropped at its end rather than after competition; phase 2 runs `features` and
+`compete` for every band.
 
 Sizing the cost of the defect: rescoring one banded competed table (AT10273AUH,
 29,429,386 rows) under the first pass's own recipe gave 9,148 peptides against the
 unbanded first pass's 10,342, with the rescore recipe held fixed -- 11.5% of peptides,
 10.0% of precursors and 6.1% of protein groups, from a band search that pushed 88% MORE
-candidates into the scored table. How much of that this fix returns is not yet measured.
+candidates into the scored table.
 
 ## 10. What is not there yet
 
