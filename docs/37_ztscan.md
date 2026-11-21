@@ -52,7 +52,7 @@ column unless the configuration rules it out, and on every other search it is of
 | key | on a ZT Scan search | held off when |
 |---|---|---|
 | `convert.isolation_half_width` | the census's suggestion: 2.5 steps, rounded to 0.05 m/z (1.9 for the K562 method) | (a value set is kept) |
-| `rt_im_train.q1_calibrate` | on | `groups.window_groups > 1`; nothing reads it (`extract.q1_fragments = false` and `extract.q1_deconvolved` off) |
+| `rt_im_train.q1_calibrate` | on | `groups.window_groups > 1`; nothing reads it (`extract.q1_fragments = false`) |
 | `extract.q1_fragments` | on | the calibration is off |
 | `extract.q1_traces` (the cycle-trace table `chromatograms_q1.parquet`, section 15) | on | `extract.q1_fragments` is off |
 | `features.q1_fragment_features`, `q1_precursor`, `q1_multiscale`, `q1_deconvolved`, `q1_consistency` | on | `extract.q1_fragments` is off; `features.set` other than `extended` |
@@ -65,11 +65,10 @@ When a key is held off on ZT Scan input the log says which and why. These are th
 recipe (`configs/examples/diann-library.json`) resolved on a ZT Scan run has exactly the
 canonical configuration of `ztscan.json`, and so the same configuration hash and the same
 tables (section 12). What stays opt-in, as before: the classifier's sensitivity settings
-(section 4), the counts of Q1-consistent peaks (`extract.q1_deconvolved`,
-`search_seed.q1_deconvolved`, section 10.3), `quant.q1_fragments`,
-and the MS1 calibration keys of docs/09 section 11. The Q1 sweep keys (`extract.q1_cycles`, `extract.q1_profile`,
+(section 4), `quant.q1_fragments` and the MS1 calibration keys of docs/09 section 11. The Q1 sweep keys (`extract.q1_cycles`, `extract.q1_profile`,
 `extract.q1_gate_max_offset`, `features.q1_features`), `features.ms1_envelope` and the separable model of section 15
-(`features.q1_separable`) were removed in 0.15.0.
+(`features.q1_separable`) were removed in 0.15.0, as were the counts of Q1-consistent peaks
+(`extract.q1_deconvolved`, `search_seed.q1_deconvolved`, section 10.3).
 
 **Spelling, and the configuration hash.** Each switch takes `"auto"`, `true` or `false`;
 `quant.q1_cycle_halfwidth` a number of cycles (0 is off), `"auto"` or `null`;
@@ -236,7 +235,7 @@ files"). The others stay opt-in.
 | multi-scale Q1 scores (3, 7, 11 steps) | `features.q1_multiscale` | docs/09, section 14 | +0.32% / +0.09%, inside the seed spread; nothing on top of the other two | yes |
 | Q1-deconvolved evidence as features | `features.q1_deconvolved` | docs/09, section 14 | +0.51% precursors, +0.64% at matched FDP, just beyond the seed spread | yes |
 | the three together | (the three keys) | section 10 below | +0.76% precursors, +1.38% human precursors at matched FDP, beyond the seed spread on both libraries | |
-| count only Q1-consistent peaks in the seed, in extract | `search_seed.q1_deconvolved`, `extract.q1_deconvolved` | docs/07, docs/09 section 14 | -2.5% (seed), -25.6% (extract), -38% (both) | no |
+| count only Q1-consistent peaks in the seed, in extract | `search_seed.q1_deconvolved`, `extract.q1_deconvolved` | docs/07, docs/09 section 14 | -2.5% (seed), -25.6% (extract), -38% (both) | removed in 0.15.0 |
 | score each fragment's Q1 centre against its expected one | `features.q1_consistency` | docs/10, "q1_consistency" | on top of the four: +2.97% human precursors at the measured FDP and +2.48% precursors on the human library (the family alone, its columns kept out of the rescore prefilter: +2.28% and +1.85%) | yes |
 | the library's search space: charges 1-4, lengths 6-40, protein N-terminal acetylation, two variable modifications | the library build (`digest.*`, `peptidoforms.*`, or the predictor of an imported library) | section 11 below | +3.47% precursors, +4.09% human precursors at matched FDP, the measured FDP 1.18% against 1.22%; two missed cleavages -1.0% | the desktop sets it with the analysis; `run` names what differs for a FASTA library |
 | the sensitivity rescore | `rescore.folds` 5, `rescore.train_margin_frac` 0.75, `rescore.seeds` 3 | docs/28, section 21; section 11 below | on the section 11 library +1.24% / +0.57% at matched FDP; on top of the released recipe +0.82% / +0.78% (section 12), for 2-6x the rescore time | no (an option for a final pass, section 4) |
@@ -683,9 +682,7 @@ byte; 2 is the setting to take when extract's time matters more than half a perc
 - `extract.q1_traces` set to `true` on any input that is not a ZT Scan run, and without
   `extract.q1_fragments`.
 - `features.q1_precursor`, `features.q1_multiscale` and `features.q1_deconvolved` without
-  `extract.q1_fragments`; `extract.q1_deconvolved` without `rt_im_train.q1_calibrate`;
-  `search_seed.q1_deconvolved` with `count_fragments_once`; both
-  `q1_deconvolved` keys with `groups.window_groups > 1`, on spectra with 1/K0 and on
+  `extract.q1_fragments`; `features.q1_deconvolved` on spectra with 1/K0 and on
   spectra_ms2 without the recorded sweep.
 
 ## 10. The unfragmented precursor, multi-scale Q1 scores and Q1-deconvolved evidence
@@ -781,8 +778,8 @@ is cleaner, but a quarter of the real precursors no longer meet the presence rul
 entrapment library the extract form keeps 73,653 human precursors at the matched FDP
 (73,476-73,868, -24.5%) and both forms 61,671 (-36.7%), at a lower measured FDP at a reported
 1% (1.09-1.19% and 1.05-1.13% against 1.25-1.31%): a smaller pool, not a better ranking. The
-hard forms stay off: they are a speed lever (extract 209 s against 559 s) with an
-identification loss no tolerance removed. The 2-step arm was run with a development build that
+hard forms were a speed lever (extract 209 s against 559 s) with an identification loss no
+tolerance removed, and 0.15.0 removed them. The 2-step arm was run with a development build that
 overrode the learned tolerance; the shipped keys have no such override.
 
 The same evidence as features (`features.q1_deconvolved`, the extraction unchanged) separates
@@ -889,8 +886,8 @@ their features are label-blind. So `configs/examples/ztscan.json` sets `features
 `features.q1_multiscale` and `features.q1_deconvolved`. All three, rather than the two that
 carry most of it: leaving the multi-scale family out costs 0.34% on the entrapment library, and
 the set was measured as a whole. The keys that count only Q1-consistent peaks
-(`search_seed.q1_deconvolved`, `extract.q1_deconvolved`) lose identifications at every
-tolerance and stay off and out of the recipe. The three families are automatic for ZT Scan
+(`search_seed.q1_deconvolved`, `extract.q1_deconvolved`) lost identifications at every
+tolerance and were removed in 0.15.0. The three families are automatic for ZT Scan
 files since 0.12.0, as the rest of the recipe is ("Automatic for ZT Scan files").
 
 ## 11. The library for a ZT Scan search

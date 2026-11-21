@@ -300,10 +300,10 @@ pub fn configure_extract(
     ext: &mut mumdia_core::config::ExtractConfig,
 ) -> Result<()> {
     let decision = cfg.extract.q1_fragments.on();
-    let q1_dec = cfg.extract.q1_deconvolved || cfg.features.q1_deconvolved.on();
+    let q1_dec = cfg.features.q1_deconvolved.on();
     if decision || q1_dec {
         let cal = cal_json.context(
-            "extract.q1_fragments and extract.q1_deconvolved need the run's cal.json with its \
+            "extract.q1_fragments and features.q1_deconvolved need the run's cal.json with its \
              Q1 calibration: pass --q1-cal",
         )?;
         ext.q1_model = Some(read_model_opts(cal, decision)?);
@@ -316,14 +316,14 @@ pub fn configure_extract(
 }
 
 /// [`read_model`], with the decision tolerances only when `decision` (`extract.q1_fragments`;
-/// `extract.q1_deconvolved` alone needs the window and its offsets, not them).
+/// `features.q1_deconvolved` alone needs the window and its offsets, not them).
 pub fn read_model_opts(cal_json: &str, decision: bool) -> Result<Q1FragModel> {
     let cal: serde_json::Value = mumdia_io::json::read_json(cal_json)
         .with_context(|| format!("extract.q1_fragments: reading {cal_json}"))?;
     let block = &cal["q1_calibration"];
     if block.is_null() {
         bail!(
-            "extract.q1_fragments / extract.q1_deconvolved: {cal_json} has no q1_calibration; \
+            "extract.q1_fragments / features.q1_deconvolved: {cal_json} has no q1_calibration; \
              it is written by rt_im_train.q1_calibrate"
         );
     }
@@ -332,15 +332,15 @@ pub fn read_model_opts(cal_json: &str, decision: bool) -> Result<Q1FragModel> {
 }
 
 /// The tolerance (steps) of the Q1-deconvolved evidence the Q1 calibration learned
-/// (`q1_calibration.deconvolution.tol_steps` of `cal.json`, `extract.q1_deconvolved`).
+/// (`q1_calibration.deconvolution.tol_steps` of `cal.json`, `features.q1_deconvolved`).
 pub fn read_deconvolution_tol(cal_json: &str) -> Result<f64> {
     let cal: serde_json::Value = mumdia_io::json::read_json(cal_json)
-        .with_context(|| format!("extract.q1_deconvolved: reading {cal_json}"))?;
+        .with_context(|| format!("features.q1_deconvolved: reading {cal_json}"))?;
     let block = &cal["q1_calibration"];
     if !matches!(block["status"].as_str(), Some("fitted" | "nominal")) {
         bail!(
-            "extract.q1_deconvolved: the Q1 calibration of {cal_json} has status {}, so there \
-             is no calibrated window to place the peaks with; unset extract.q1_deconvolved for \
+            "features.q1_deconvolved: the Q1 calibration of {cal_json} has status {}, so there \
+             is no calibrated window to place the peaks with; unset features.q1_deconvolved for \
              this run",
             block["status"]
         );
@@ -350,9 +350,9 @@ pub fn read_deconvolution_tol(cal_json: &str) -> Result<f64> {
         .filter(|t| t.is_finite() && *t > 0.0)
         .with_context(|| {
             format!(
-                "extract.q1_deconvolved: {cal_json} has no q1_calibration.deconvolution \
+                "features.q1_deconvolved: {cal_json} has no q1_calibration.deconvolution \
                  tolerance: rt_im_train.q1_calibrate learns it only when \
-                 extract.q1_deconvolved is on"
+                 features.q1_deconvolved is on"
             )
         })
 }

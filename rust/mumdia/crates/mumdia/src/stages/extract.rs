@@ -339,9 +339,6 @@ struct Guard<'a> {
     im_gate: bool,
     /// The trace pad in seconds (`ExtractParams::trace_pad`), 0 without one.
     pad: f64,
-    /// `extract.q1_deconvolved`: the per-peak Q1 centroids and each candidate's expected
-    /// centre (`stages::q1dec`); `None` with the key off, when every peak passes.
-    q1: Option<&'a crate::stages::q1dec::Q1Gate>,
 }
 
 impl<'a> Guard<'a> {
@@ -362,14 +359,6 @@ impl<'a> Guard<'a> {
         self.win.admits(c, rt, pim)
     }
 
-    /// `extract.q1_deconvolved`: whether peak `j` of `scan` sits on the Q1 sweep where
-    /// fragment `frag` of candidate `c` is expected (its trace's centroid within the learned
-    /// tolerance of the fragment's calibrated centre). Always true with the key off.
-    #[inline]
-    fn q1_admits(&self, c: usize, frag: u16, scan: &Ms2Scan, j: usize) -> bool {
-        self.q1.is_none_or(|g| g.admits_frag(c, frag, scan, j))
-    }
-
     /// A peak the window does not admit but the trace pad does: it goes into the candidate's
     /// traces with its full intensity and takes no part in a peak claim, so the in-window
     /// hits of every candidate are what they are without the pad. Always false without one.
@@ -378,21 +367,12 @@ impl<'a> Guard<'a> {
         self.pad > 0.0 && self.win.admits_padded(c, rt, pim, self.pad)
     }
 
-    /// Whether candidate `c` claims peak `j` of `scan` (its fragment `frag`) on the two-pass
-    /// paths: the window admits the peak, the Q1 decision admits it, and the allowlist holds
-    /// the candidate.
+    /// Whether candidate `c` claims peak `j` of `scan` on the two-pass paths: the window
+    /// admits the peak and the allowlist holds the candidate.
     #[inline]
-    fn claims(
-        &self,
-        restrict: Option<&CandMask>,
-        c: u32,
-        frag: u16,
-        scan: &Ms2Scan,
-        j: usize,
-    ) -> bool {
+    fn claims(&self, restrict: Option<&CandMask>, c: u32, scan: &Ms2Scan, j: usize) -> bool {
         let cu = c as usize;
         self.admits(cu, scan.rt_seconds, self.scan_im(scan).map(|v| v[j]))
-            && self.q1_admits(cu, frag, scan, j)
             && restrict.is_none_or(|s| s.contains(c))
     }
 }
@@ -1489,9 +1469,6 @@ fn demix_solve_scan(
                 if !guard.admits(cc, apex_rt, pim) {
                     return;
                 }
-                if !guard.q1_admits(cc, frag, scan, j) {
-                    return;
-                }
                 claimants.push((c, frag, pi));
             };
             pr.probe(None, q_mz, lo, hi, &mut push);
@@ -2487,9 +2464,6 @@ impl ProbeTask<'_> {
                 trace_only.clear();
                 ix.probe_binned(q_mz, bin, |cid, _pmz, pint, frag| {
                     let c = cid as usize;
-                    if !guard.q1_admits(c, frag, scan, j) {
-                        return;
-                    }
                     let inside = guard.admits(c, rt, pim);
                     if !inside && !guard.pads(c, rt, pim) {
                         return;
@@ -2934,7 +2908,7 @@ fn extract_twopass_windows(
                     claimants.clear();
                     {
                         let mut push = |cid: u32, frag: u16, pi: f32| {
-                            if guard.claims(restrict, cid, frag, scan, j) {
+                            if guard.claims(restrict, cid, scan, j) {
                                 claimants.push((cid, frag, pi));
                             }
                         };
@@ -2982,7 +2956,7 @@ fn extract_twopass_windows(
                         claimants.clear();
                         {
                             let mut push = |cid: u32, frag: u16, pi: f32| {
-                                if guard.claims(restrict, cid, frag, scan, j) {
+                                if guard.claims(restrict, cid, scan, j) {
                                     claimants.push((cid, frag, pi));
                                 }
                             };
@@ -3050,7 +3024,7 @@ fn extract_twopass_windows(
                         claimants.clear();
                         {
                             let mut push = |cid: u32, frag: u16, pi: f32| {
-                                if guard.claims(restrict, cid, frag, scan, j) {
+                                if guard.claims(restrict, cid, scan, j) {
                                     claimants.push((cid, frag, pi));
                                 }
                             };
@@ -3164,7 +3138,7 @@ fn extract_twopass_windows(
                         claimants.clear();
                         {
                             let mut push = |cid: u32, frag: u16, pi: f32| {
-                                if guard.claims(restrict, cid, frag, scan, j) {
+                                if guard.claims(restrict, cid, scan, j) {
                                     claimants.push((cid, frag, pi));
                                 }
                             };
@@ -3232,7 +3206,7 @@ fn extract_twopass_windows(
                     claimants.clear();
                     {
                         let mut push = |cid: u32, frag: u16, pi: f32| {
-                            if guard.claims(restrict, cid, frag, scan, j) {
+                            if guard.claims(restrict, cid, scan, j) {
                                 claimants.push((cid, frag, pi));
                             }
                         };
@@ -4412,20 +4386,20 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     }
     // The sweep's Q1 grid, built once for the gate below and the per-fragment decision.
     let mut q1_grid: Option<q1frag::Q1Grid> = None;
-    // `extract.q1_deconvolved`: every MS2 peak's Q1 centroid (`stages::q1dec`) and each
-    // candidate's calibrated expected centre; a hit counts only within the learned tolerance.
-    let q1_gate: Option<crate::stages::q1dec::Q1Gate> = if p.cfg.q1_deconvolved
-        || (p.cfg.q1_dec_features && p.cfg.q1_fragments.on())
+    // `features.q1_deconvolved`: every MS2 peak's Q1 centroid (`stages::q1dec`) and each
+    // candidate's calibrated expected centre, which the evidence at each row's apex reads.
+    let q1_gate: Option<crate::stages::q1dec::Q1Gate> = if p.cfg.q1_dec_features
+        && p.cfg.q1_fragments.on()
     {
         if has_im {
             anyhow::bail!(
-                "extract: extract.q1_deconvolved and features.q1_deconvolved read a scanning \
-                 quadrupole's Q1 steps, and these spectra carry 1/K0 (diaPASEF); unset them"
+                "extract: features.q1_deconvolved reads a scanning \
+                 quadrupole's Q1 steps, and these spectra carry 1/K0 (diaPASEF); unset it"
             );
         }
         let (Some(m), Some(tol_steps)) = (p.cfg.q1_model.as_ref(), p.cfg.q1_dec_tol_steps) else {
             anyhow::bail!(
-                "extract: extract.q1_deconvolved needs the run's Q1 calibration with its \
+                "extract: features.q1_deconvolved needs the run's Q1 calibration with its \
                  deconvolution tolerance (cal.json q1_calibration.deconvolution, from \
                  rt_im_train.q1_calibrate); `mumdia run` reads it, `mumdia extract` takes it \
                  as --q1-cal"
@@ -4433,7 +4407,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         };
         let sweep = crate::spectra::load_q1_sweep(p.ms2)?.ok_or_else(|| {
             anyhow::anyhow!(
-                "extract: extract.q1_deconvolved needs the Q1 sweep spectra_ms2 v3 records \
+                "extract: features.q1_deconvolved needs the Q1 sweep spectra_ms2 v3 records \
                  (q1_cycle, q1_step), and {} has none: convert it again with \
                  convert.isolation_half_width",
                 p.ms2
@@ -4507,9 +4481,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         win: &win,
         im_gate,
         pad: trace_pad_s,
-        // Only `extract.q1_deconvolved` gates the hits; `features.q1_deconvolved` reads the
-        // centroids at each row's apex instead.
-        q1: q1_gate.as_ref().filter(|_| p.cfg.q1_deconvolved),
     };
     // The per-point 1/K0 of the traces is written only on 4D data with a consumer on.
     let chrom_im = has_im && p.chrom_im;
@@ -4749,9 +4720,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                     {
                         let mut push = |cid: u32, frag: u16, pi: f32| {
                             let c = cid as usize;
-                            if !guard.q1_admits(c, frag, scan, j) {
-                                return;
-                            }
                             let inside = guard.admits(c, rt, pim);
                             if !inside && !guard.pads(c, rt, pim) {
                                 return;
@@ -6714,14 +6682,15 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 }
             }
         }
-        // The Q1-deconvolved evidence (`extract.q1_deconvolved`, `features.q1_deconvolved`),
+        // The Q1-deconvolved evidence (`features.q1_deconvolved`),
         // only then.
         if let Some(g) = &q1_gate {
             if let Some(obj) = params.as_object_mut() {
                 obj.insert(
                     "q1_deconvolved".into(),
                     json!({
-                        "gate": p.cfg.q1_deconvolved,
+                        // The hard count went in 0.15.0; the key stays so reports keep their bytes.
+                        "gate": false,
                         "features": p.cfg.q1_dec_features,
                         "tol_mz": g.tol_mz,
                         "step_mz": g.dec.step_mz,
@@ -7533,7 +7502,6 @@ mod accumulate_tests {
                 win: &win,
                 im_gate,
                 pad: 0.0,
-                q1: None,
             };
             pool.install(|| {
                 // `bound = 0` flushes nothing, so the comparison is over the accumulator.
@@ -7657,7 +7625,6 @@ mod accumulate_tests {
             win: &win,
             im_gate: false,
             pad: 0.0,
-            q1: None,
         };
         let mass_off = MassOffset {
             scalar_ppm: 0.0,
@@ -7781,7 +7748,6 @@ mod accumulate_tests {
             win: &win,
             im_gate: false,
             pad: 0.0,
-            q1: None,
         };
         let mass_off = MassOffset {
             scalar_ppm: 0.0,
@@ -7866,7 +7832,6 @@ mod accumulate_tests {
             win: &win,
             im_gate: false,
             pad: 0.0,
-            q1: None,
         };
         let mass_off = MassOffset {
             scalar_ppm: 0.0,

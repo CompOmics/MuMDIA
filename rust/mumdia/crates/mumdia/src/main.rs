@@ -328,8 +328,8 @@ enum Cmd {
         #[arg(long)]
         fragment_offset: Option<u32>,
         /// The run's `cal.json` with its Q1 calibration (`rt_im_train.q1_calibrate`), which
-        /// `extract.q1_fragments` decides with and `extract.q1_deconvolved` /
-        /// `features.q1_deconvolved` read their tolerance from.
+        /// `extract.q1_fragments` decides with and `features.q1_deconvolved`
+        /// reads its tolerance from.
         #[arg(long)]
         q1_cal: Option<String>,
         #[arg(long)]

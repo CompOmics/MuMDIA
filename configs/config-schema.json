@@ -1678,21 +1678,6 @@
       "source_struct": "SearchSeedConfig"
     },
     {
-      "path": "search_seed.q1_deconvolved",
-      "name": "q1_deconvolved",
-      "section": "search_seed",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "Scanning-quadrupole spectra (SCIEX ZT Scan DIA read with `convert.isolation_half_width`, spectra_ms2 v3): count a peak for a candidate only when its Q1 centroid lies within 2 steps of the candidate's nominal expected Q1 centre (`stages::q1dec`). Every MS2 peak is given the centroid of its trace along the Q1 axis (mutual-nearest peaks of adjacent steps of one cycle, split at valleys), so a fragment m/z another precursor shares, transmitted around that precursor's position, no longer counts for this one. The seed runs before the Q1 calibration, so the centre is the precursor's isotope envelope with no window offset. Refused on spectra that carry 1/K0 and with window groups. Default false. Benchmark-gated (docs/37_ztscan.md). Omitted from the canonical configuration at its default.",
-      "gates": [
-        "benchmark-gated"
-      ],
-      "source_struct": "SearchSeedConfig"
-    },
-    {
       "path": "search_seed.frag_tol_mad_k",
       "name": "frag_tol_mad_k",
       "section": "search_seed",
@@ -2206,7 +2191,7 @@
       "optional": false,
       "default": "auto",
       "default_text": "`auto`",
-      "help": "Scanning-quadrupole spectra (SCIEX ZT Scan DIA read with `convert.isolation_half_width`): calibrate the Q1 dimension on the confident seed PSMs (`stages::q1cal`). For each anchor's strongest library fragments, the matched intensity in every Q1 step near its precursor over the cycles around its seed scan gives the fragment's observed Q1 centre; the expected centre is that of the transmission, summed over the precursor's isotopes weighted by their abundance. The window-centre offset is fitted as a smooth function of precursor m/z (and of fragment m/z and retention time when they reduce the residuals), with the effective half-width and edge width, and written to `cal.json` (`q1_calibration`), with the residual distribution in steps before and after and which reading of the target (centre or edge) fits; `extract.q1_fragments` and the Q1-deconvolved keys decide with it. Refused on any other layout, on spectra with 1/K0 and with `groups.window_groups > 1`. `\"auto\"` (the default since 0.12.0): on for a ZT Scan search unless `groups.window_groups > 1` or `extract.q1_fragments = false` (and `extract.q1_deconvolved` off) leave nothing to read it, off for every other search (`ZtSwitch`, docs/37_ztscan.md, \"Automatic for ZT Scan files\"; docs/08_rt_im_train.md, section 4h). Omitted from the canonical configuration unless on.",
+      "help": "Scanning-quadrupole spectra (SCIEX ZT Scan DIA read with `convert.isolation_half_width`): calibrate the Q1 dimension on the confident seed PSMs (`stages::q1cal`). For each anchor's strongest library fragments, the matched intensity in every Q1 step near its precursor over the cycles around its seed scan gives the fragment's observed Q1 centre; the expected centre is that of the transmission, summed over the precursor's isotopes weighted by their abundance. The window-centre offset is fitted as a smooth function of precursor m/z (and of fragment m/z and retention time when they reduce the residuals), with the effective half-width and edge width, and written to `cal.json` (`q1_calibration`), with the residual distribution in steps before and after and which reading of the target (centre or edge) fits; `extract.q1_fragments` and `features.q1_deconvolved` decide with it. Refused on any other layout, on spectra with 1/K0 and with `groups.window_groups > 1`. `\"auto\"` (the default since 0.12.0): on for a ZT Scan search unless `groups.window_groups > 1` or `extract.q1_fragments = false` leave nothing to read it, off for every other search (`ZtSwitch`, docs/37_ztscan.md, \"Automatic for ZT Scan files\"; docs/08_rt_im_train.md, section 4h). Omitted from the canonical configuration unless on.",
       "gates": [],
       "source_struct": "RtImTrainConfig",
       "choices": [
@@ -2276,21 +2261,6 @@
         "true",
         "false"
       ]
-    },
-    {
-      "path": "extract.q1_deconvolved",
-      "name": "q1_deconvolved",
-      "section": "extract",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "Scanning-quadrupole spectra: count a peak for a candidate only when its Q1 centroid (the intensity-weighted mean step target of its trace along the Q1 axis within one cycle, `stages::q1dec`) lies within the tolerance the Q1 calibration learns from the confident seed PSMs (`q1_calibration.deconvolution`) of the candidate's calibrated expected Q1 centre. Applies to every hit extract collects (the traces, the apex, the presence rules, the gate and the features read them), not to the per-fragment decision's patches, which read the spectra directly. Needs `rt_im_train.q1_calibrate` (which then learns the tolerance) and spectra_ms2 v3; refused on spectra that carry 1/K0 and with window groups. Default false. Benchmark-gated (docs/37_ztscan.md). Omitted from the canonical configuration at its default.",
-      "gates": [
-        "benchmark-gated"
-      ],
-      "source_struct": "ExtractConfig"
     },
     {
       "path": "extract.fixed_scan_window",
@@ -3230,7 +3200,7 @@
       "optional": false,
       "default": "auto",
       "default_text": "`auto`",
-      "help": "The Q1-deconvolved evidence family of scanning-quadrupole spectra (`q1d_*`): every MS2 peak is given the Q1 centroid of its trace along the sweep (`stages::q1dec`, the evidence of `extract.q1_deconvolved`), and at each row's apex, over the scans of the apex cycle and the two either side whose window covers the precursor, extract reads for every library fragment the nearest peak and whether its centroid lies within the tolerance the Q1 calibration learns of the fragment's expected Q1 centre: the fragments with such a consistent match (`q1d_n_frag`), those matched only inconsistently (`q1d_n_incons`), the consistent share of the matched intensity (`q1d_share`, and in the apex cycle alone `q1d_apex_share`) and the predicted-intensity share of the fragments with a consistent match (`q1d_pred_share`), written to psms_extracted v8 and appended after every other column of the `extended` set. The extraction itself is unchanged (unlike `extract.q1_deconvolved`, which counts only the consistent peaks). Needs `extract.q1_fragments`. `\"auto\"` (the default since 0.12.0): on for a ZT Scan search under the `extended` set with `extract.q1_fragments` on, off for every other search (`ZtSwitch`, docs/37_ztscan.md, \"Automatic for ZT Scan files\"). Omitted from the canonical configuration unless on.",
+      "help": "The Q1-deconvolved evidence family of scanning-quadrupole spectra (`q1d_*`): every MS2 peak is given the Q1 centroid of its trace along the sweep (`stages::q1dec`), and at each row's apex, over the scans of the apex cycle and the two either side whose window covers the precursor, extract reads for every library fragment the nearest peak and whether its centroid lies within the tolerance the Q1 calibration learns of the fragment's expected Q1 centre: the fragments with such a consistent match (`q1d_n_frag`), those matched only inconsistently (`q1d_n_incons`), the consistent share of the matched intensity (`q1d_share`, and in the apex cycle alone `q1d_apex_share`) and the predicted-intensity share of the fragments with a consistent match (`q1d_pred_share`), written to psms_extracted v8 and appended after every other column of the `extended` set. The extraction itself is unchanged. Needs `extract.q1_fragments`. `\"auto\"` (the default since 0.12.0): on for a ZT Scan search under the `extended` set with `extract.q1_fragments` on, off for every other search (`ZtSwitch`, docs/37_ztscan.md, \"Automatic for ZT Scan files\"). Omitted from the canonical configuration unless on.",
       "gates": [],
       "source_struct": "FeaturesConfig",
       "choices": [

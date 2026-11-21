@@ -1338,7 +1338,7 @@ Three additions read the sweep further. Each has its own key, omitted from the c
 configuration unless it is on; with all of them off nothing below is computed and every
 artifact keeps its bytes. The three feature families are automatic for ZT Scan files (docs/37_ztscan.md,
 "Automatic for ZT Scan files"); the hard counts (`extract.q1_deconvolved`,
-`search_seed.q1_deconvolved`) stay opt-in. What they measured is in docs/37_ztscan.md, section
+`search_seed.q1_deconvolved`) were removed in 0.15.0. What they measured is in docs/37_ztscan.md, section
 10.
 
 **The unfragmented precursor** (`features.q1_precursor`, `stages/q1score.rs`). Part of a
@@ -1390,13 +1390,10 @@ the fragment monoisotopic weigh more, so a large fragment's centre lies up to ab
 the envelope's), stored per library fragment as its shift from the candidate's centre in
 1/16 step. The tolerance is learned by the Q1 calibration (docs/08_rt_im_train.md, section 4h,
 `deconvolution`) and handed to extract with the model (`ExtractConfig::q1_dec_tol_steps`;
-`mumdia extract --q1-cal`). Two consumers:
+`mumdia extract --q1-cal`). The hard counts that kept only the consistent peaks
+(`extract.q1_deconvolved`, `search_seed.q1_deconvolved`) lost 25.6% and 2.5% of the precursors
+and were removed in 0.15.0 (docs/37_ztscan.md, section 10.3). One consumer remains:
 
-- `extract.q1_deconvolved` counts only the consistent peaks: every probe site asks
-  `Guard::q1_admits` beside the RT window, so the hits, the presence rules, the apex, the gate
-  and the traces see only them (`search_seed.q1_deconvolved` does the same in the seed against
-  the precursor's nominal envelope centre within `q1dec::SEED_TOL_STEPS`, docs/07). Needs
-  `rt_im_train.q1_calibrate`; refused with window groups and on spectra with 1/K0.
 - `features.q1_deconvolved` leaves the extraction as it is and reads, at each row's apex scan,
   for every library fragment the nearest peak in every scan of the apex cycle and the two either
   side whose window covers the precursor (`q1dec::row_evidence`): `q1d_n_frag` (fragments with
@@ -1572,7 +1569,7 @@ here for one index.
 | `features.q1_precursor`, `features.q1_multiscale`, `features.q1_deconvolved` (automatic for ZT Scan files, need `extract.q1_fragments`) | psms_extracted v8: 8 `q1p_*`, 9 or 12 `q1m*`, 5 `q1d_*` F64 cols; as many features (section 14) | ZT Scan REP01, four NN seeds, the three on top of the recipe: +0.76% precursors, +1.38% human precursors at a matched entrapment FDP, beyond the seed spread on both libraries; each alone inside it except `q1_deconvolved`; in `configs/examples/ztscan.json`; one acquisition |
 | `extract.q1_traces` (automatic for ZT Scan files, off otherwise) | `chromatograms_q1.parquet`: the traces on Q1 cycles with `q1_class` (chromatograms v5/v6, section 15) | no table read by a later stage changes; reading elution on cycles instead of the steps measured -1.2% to -4.7%, so it is a separate table |
 | `features.q1_separable` (removed in 0.15.0) | psms_extracted v9: 10 `q1s_*` F64 and 5 list columns (section 15) | ZT Scan REP01, four NN seeds: +0.34% / -0.17% (entrapment at matched FDP / human library), inside the seed spread |
-| `extract.q1_deconvolved`, `search_seed.q1_deconvolved` (default false) | none; only Q1-consistent peaks are counted (section 14) | ZT Scan REP01: -25.6% precursors (extract, learned 1.0-step tolerance), -8.4% at 2 steps, -2.5% (seed), -38% (both); keep off |
+| `extract.q1_deconvolved`, `search_seed.q1_deconvolved` (removed in 0.15.0) | none; only Q1-consistent peaks are counted (section 14) | ZT Scan REP01: -25.6% precursors (extract, learned 1.0-step tolerance), -8.4% at 2 steps, -2.5% (seed), -38% (both); keep off |
 | `rescore.shadow_q1` (automatic for ZT Scan files, needs `extract.q1_fragments`) | none; the shadow test co-isolates by m/z and counts shared fragments by their Q1 centre (docs/11) | ZT Scan REP01: no count change (inside the seed range), fewer entrapment precursors at 1%; with the other three keys +3.02% precursors, +3.17% at a matched FDP, measured FDP at 1% 1.22% against 1.39%, +2.3% in a three-run experiment |
 | `extract.ms1_calibrate = "surface"` (default `true`) | none; MS1 reads at a per-m/z, per-retention-time offset (section 11) | ZT Scan REP01: +0.2% precursors, +0.2% human precursors on an entrapment library at a combined FDP of 1.39% (one seed); with `prec_tol_auto` and `q1_calibrate` +0.46% (four NN seeds), +0.19% at 1.40% against 1.39%; one acquisition |
 | `extract.prec_tol_auto` (default false) | none; sets `prec_tol_ppm` from the calibrated MS1 residuals (section 11) | ZT Scan REP01: 7.1-7.4 ppm, +0.45% precursors, -0.1% human precursors on the entrapment library at 1.37% (one seed); one acquisition |

@@ -1569,18 +1569,6 @@ pub struct SearchSeedConfig {
     /// configuration at its default.
     #[serde(skip_serializing_if = "is_false")]
     pub count_fragments_once: bool,
-    /// Scanning-quadrupole spectra (SCIEX ZT Scan DIA read with
-    /// `convert.isolation_half_width`, spectra_ms2 v3): count a peak for a candidate only
-    /// when its Q1 centroid lies within 2 steps of the candidate's nominal expected Q1 centre
-    /// (`stages::q1dec`). Every MS2 peak is given the centroid of its trace along the Q1 axis
-    /// (mutual-nearest peaks of adjacent steps of one cycle, split at valleys), so a fragment
-    /// m/z another precursor shares, transmitted around that precursor's position, no longer
-    /// counts for this one. The seed runs before the Q1 calibration, so the centre is the
-    /// precursor's isotope envelope with no window offset. Refused on spectra that carry 1/K0
-    /// and with window groups. Default false. Benchmark-gated (docs/37_ztscan.md). Omitted
-    /// from the canonical configuration at its default.
-    #[serde(skip_serializing_if = "is_false")]
-    pub q1_deconvolved: bool,
     /// Size the learned fragment tolerance from the robust spread of the calibrant
     /// deviations, `frag_tol_mad_k x 1.4826 x MAD`, instead of `1.5 x p95`, where MAD is
     /// the median of `|deviation - median|`. Still floored at `frag_tol_floor_ppm`. Under
@@ -1624,7 +1612,6 @@ impl Default for SearchSeedConfig {
             mass_cal_loess: false,
             frag_tol_floor_ppm: 5.0,
             count_fragments_once: false,
-            q1_deconvolved: false,
             frag_tol_mad_k: 0.0,
             widen_tol_below: DEFAULT_WIDEN_TOL_BELOW,
             widen_tol_factor: DEFAULT_WIDEN_TOL_FACTOR,
@@ -2165,11 +2152,11 @@ pub struct RtImTrainConfig {
     /// fragment m/z and retention time when they reduce the residuals), with the effective
     /// half-width and edge width, and written to `cal.json` (`q1_calibration`), with the
     /// residual distribution in steps before and after and which reading of the target
-    /// (centre or edge) fits; `extract.q1_fragments` and the Q1-deconvolved keys decide with
-    /// it. Refused on any other layout, on spectra with 1/K0 and with
+    /// (centre or edge) fits; `extract.q1_fragments` and `features.q1_deconvolved` decide
+    /// with it. Refused on any other layout, on spectra with 1/K0 and with
     /// `groups.window_groups > 1`. `"auto"` (the default since 0.12.0): on for a ZT Scan
-    /// search unless `groups.window_groups > 1` or `extract.q1_fragments = false` (and
-    /// `extract.q1_deconvolved` off) leave nothing to read it, off for every other search
+    /// search unless `groups.window_groups > 1` or `extract.q1_fragments = false` leave
+    /// nothing to read it, off for every other search
     /// ([`ZtSwitch`], docs/37_ztscan.md, "Automatic for ZT Scan files"; docs/08_rt_im_train.md,
     /// section 4h). Omitted from the canonical configuration unless on.
     #[serde(skip_serializing_if = "ZtSwitch::omitted")]
@@ -2413,20 +2400,7 @@ pub struct ExtractConfig {
     /// configuration file.
     #[serde(skip)]
     pub q1_repick_peaks: usize,
-    /// Scanning-quadrupole spectra: count a peak for a candidate only when its Q1 centroid
-    /// (the intensity-weighted mean step target of its trace along the Q1 axis within one
-    /// cycle, `stages::q1dec`) lies within the tolerance the Q1 calibration learns from the
-    /// confident seed PSMs (`q1_calibration.deconvolution`) of the candidate's calibrated
-    /// expected Q1 centre. Applies to every hit extract collects (the traces, the apex, the
-    /// presence rules, the gate and the features read them), not to the per-fragment
-    /// decision's patches, which read the spectra directly. Needs
-    /// `rt_im_train.q1_calibrate` (which then learns the tolerance) and spectra_ms2 v3;
-    /// refused on spectra that carry 1/K0 and with window groups. Default
-    /// false. Benchmark-gated (docs/37_ztscan.md). Omitted from the canonical configuration
-    /// at its default.
-    #[serde(skip_serializing_if = "is_false")]
-    pub q1_deconvolved: bool,
-    /// What extract read from the run's `cal.json` under `q1_deconvolved`: the tolerance
+    /// What extract read from the run's `cal.json` under `features.q1_deconvolved`: the tolerance
     /// (steps) the Q1 calibration learned. Set by `run` / `run-experiment` (and `mumdia
     /// extract --q1-cal`). Never read from a configuration file.
     #[serde(skip)]
@@ -3035,7 +3009,6 @@ impl Default for ExtractConfig {
             q1_model: None,
             q1_repick: false,
             q1_repick_peaks: Q1_REPICK_PEAKS,
-            q1_deconvolved: false,
             q1_dec_tol_steps: None,
             q1_precursor: false,
             q1_multiscale: false,
@@ -3276,8 +3249,7 @@ pub struct FeaturesConfig {
     #[serde(skip_serializing_if = "ZtSwitch::omitted")]
     pub q1_multiscale: ZtSwitch,
     /// The Q1-deconvolved evidence family of scanning-quadrupole spectra (`q1d_*`): every MS2 peak
-    /// is given the Q1 centroid of its trace along the sweep (`stages::q1dec`, the evidence of
-    /// `extract.q1_deconvolved`), and at each row's apex, over the scans of the apex cycle and the
+    /// is given the Q1 centroid of its trace along the sweep (`stages::q1dec`), and at each row's apex, over the scans of the apex cycle and the
     /// two either side whose window covers the precursor, extract reads for every library fragment
     /// the nearest peak and whether its centroid lies within the tolerance the Q1 calibration
     /// learns of the fragment's expected Q1 centre: the fragments with such a consistent match
@@ -3285,8 +3257,7 @@ pub struct FeaturesConfig {
     /// the matched intensity (`q1d_share`, and in the apex cycle alone `q1d_apex_share`) and the
     /// predicted-intensity share of the fragments with a consistent match (`q1d_pred_share`),
     /// written to psms_extracted v8 and appended after every other column of the `extended` set.
-    /// The extraction itself is unchanged (unlike `extract.q1_deconvolved`, which counts only the
-    /// consistent peaks). Needs `extract.q1_fragments`. `"auto"` (the default since 0.12.0): on for
+    /// The extraction itself is unchanged. Needs `extract.q1_fragments`. `"auto"` (the default since 0.12.0): on for
     /// a ZT Scan search under the `extended` set with `extract.q1_fragments` on, off for every
     /// other search ([`ZtSwitch`], docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from
     /// the canonical configuration unless on.
@@ -5705,8 +5676,8 @@ impl Config {
 
     /// The keys that ask for the ZT Scan analysis explicitly: an automatic key set to `true`
     /// (a number above 0 for `quant.q1_cycle_halfwidth`, a count other than the default for
-    /// `retrace.q1_repick_peaks`), and the opt-in keys that read the Q1 sweep as well
-    /// (`extract.q1_deconvolved`, `search_seed.q1_deconvolved`, `quant.q1_fragments`). Called
+    /// `retrace.q1_repick_peaks`), and the opt-in key that reads the Q1 sweep as well
+    /// (`quant.q1_fragments`). Called
     /// before [`Config::resolve_ztscan`], so on means asked for.
     pub fn ztscan_keys_on(&self) -> Vec<&'static str> {
         let (ex, f) = (&self.extract, &self.features);
@@ -5729,11 +5700,6 @@ impl Config {
             ),
             (self.rescore.shadow_q1.on(), "rescore.shadow_q1"),
             (self.quant.q1_cycles() > 0, "quant.q1_cycle_halfwidth"),
-            (ex.q1_deconvolved, "extract.q1_deconvolved"),
-            (
-                self.search_seed.q1_deconvolved,
-                "search_seed.q1_deconvolved",
-            ),
             (self.quant.q1_fragments, "quant.q1_fragments"),
         ]
         .into_iter()
@@ -5873,12 +5839,11 @@ impl Config {
             }
         };
         let grouped = self.groups.window_groups > 1;
-        // The Q1 calibration runs when something reads it: the per-fragment decisions, or
-        // the Q1-deconvolved count of `extract.q1_deconvolved`.
+        // The Q1 calibration runs when something reads it: the per-fragment decisions.
         let decisions = !self.extract.q1_fragments.is_off();
         let cal_why = if grouped {
             Some("groups.window_groups > 1: it calibrates the Q1 sweep of an ungrouped run")
-        } else if !decisions && !self.extract.q1_deconvolved {
+        } else if !decisions {
             Some("nothing reads it: extract.q1_fragments is off")
         } else {
             None
@@ -6897,25 +6862,9 @@ impl Config {
                 "convert.tdf_mz_ppm must be finite and > 0, and convert.tdf_min_points >= 1".into(),
             ));
         }
-        let ex = &self.extract;
         // What each key of the ZT Scan analysis reads (`validate_ztscan`), checked again
         // once `"auto"` is resolved.
         self.validate_ztscan()?;
-        if self.search_seed.q1_deconvolved && self.search_seed.count_fragments_once {
-            return Err(Invalid(
-                "search_seed.q1_deconvolved counts every matching peak near the candidate's Q1 \
-                 centre; it does not combine with search_seed.count_fragments_once (a diaPASEF \
-                 setting)"
-                    .into(),
-            ));
-        }
-        if (ex.q1_deconvolved || self.search_seed.q1_deconvolved) && self.groups.window_groups > 1 {
-            return Err(Invalid(
-                "search_seed.q1_deconvolved and extract.q1_deconvolved read the whole Q1 sweep \
-                 of an ungrouped run; they are not supported with groups.window_groups > 1"
-                    .into(),
-            ));
-        }
         if self.rescore.shadow_q1.on() && self.rescore.shadow_min_shared == 0 {
             return Err(Invalid(
                 "rescore.shadow_q1 is a term of the shadow test, which \
@@ -7436,14 +7385,6 @@ impl Config {
                     .into(),
             ));
         }
-        if ex.q1_deconvolved && !calibrated {
-            return Err(Invalid(
-                "extract.q1_deconvolved compares each peak's Q1 centroid with the \
-                 calibrated expected centre, within the tolerance rt_im_train.q1_calibrate \
-                 learns from the seed; set it as well"
-                    .into(),
-            ));
-        }
         let decided = !ex.q1_fragments.is_off();
         if f.q1_fragment_features.on() && !decided {
             return Err(Invalid(
@@ -7709,6 +7650,16 @@ const RETIRED: &[Retired] = &[
         path: "features.q1_separable",
         gone: Gone::Key("false"),
         why: "the separable Q1 model measured inside the seed spread (docs/37_ztscan.md section 15)",
+    },
+    Retired {
+        path: "extract.q1_deconvolved",
+        gone: Gone::Key("false"),
+        why: "counting only Q1-consistent peaks lost 25.6% of precursors (docs/37_ztscan.md section 10.3)",
+    },
+    Retired {
+        path: "search_seed.q1_deconvolved",
+        gone: Gone::Key("false"),
+        why: "counting only Q1-consistent peaks in the seed lost 2.5% of precursors (docs/37_ztscan.md section 10.3)",
     },
 
     // B: quantification options
@@ -8935,8 +8886,8 @@ mod tests {
         }
     }
 
-    /// The phase-5 keys of the ZT Scan plan (`features.q1_precursor`, `features.q1_multiscale`,
-    /// `search_seed.q1_deconvolved`, `extract.q1_deconvolved`) are omitted at their defaults,
+    /// The phase-5 keys of the ZT Scan plan (`features.q1_precursor`, `features.q1_multiscale`)
+    /// are omitted at their defaults,
     /// part of the identity when set, and refused without what they read or with what they
     /// cannot combine with; extract's hidden switches and the learned tolerance never reach
     /// the configuration.
@@ -8953,27 +8904,19 @@ mod tests {
         }
         let on = Config::from_json(
             r#"{"rt_im_train":{"q1_calibrate":true},
-                "extract":{"q1_fragments":true,"q1_deconvolved":true},
-                "search_seed":{"q1_deconvolved":true},
+                "extract":{"q1_fragments":true},
                 "features":{"q1_precursor":true,"q1_multiscale":true}}"#,
         )
         .unwrap();
         let c = on.canonical_json();
-        for key in [
-            r#""q1_precursor":true"#,
-            r#""q1_multiscale":true"#,
-            r#""q1_deconvolved":true"#,
-        ] {
+        for key in [r#""q1_precursor":true"#, r#""q1_multiscale":true"#] {
             assert!(c.contains(key), "{key}: {c}");
         }
-        assert_eq!(c.matches(r#""q1_deconvolved":true"#).count(), 2);
         let mut hidden = on.clone();
         hidden.extract.q1_precursor = true;
         hidden.extract.q1_multiscale = true;
         hidden.extract.q1_dec_tol_steps = Some(1.25);
         assert_eq!(hidden.canonical_json(), c);
-        // The seed key alone needs nothing else.
-        assert!(Config::from_json(r#"{"search_seed":{"q1_deconvolved":true}}"#).is_ok());
         let fd = Config::from_json(
             r#"{"rt_im_train":{"q1_calibrate":true},"extract":{"q1_fragments":true},
                 "features":{"q1_deconvolved":true}}"#,
@@ -8985,9 +8928,6 @@ mod tests {
             r#"{"features":{"q1_multiscale":true}}"#,
             r#"{"rt_im_train":{"q1_calibrate":true},"features":{"q1_deconvolved":true}}"#,
             r#"{"rt_im_train":{"q1_calibrate":true},"features":{"q1_precursor":true}}"#,
-            r#"{"extract":{"q1_deconvolved":true}}"#,
-            r#"{"search_seed":{"q1_deconvolved":true,"count_fragments_once":true}}"#,
-            r#"{"search_seed":{"q1_deconvolved":true},"groups":{"window_groups":4}}"#,
         ] {
             assert!(refused_standalone(bad), "{bad} must be refused");
         }
@@ -9277,10 +9217,6 @@ mod tests {
             (
                 r#"{"retrace":{"q1_repick_peaks":2}}"#,
                 "retrace.q1_repick_peaks",
-            ),
-            (
-                r#"{"search_seed":{"q1_deconvolved":true}}"#,
-                "search_seed.q1_deconvolved",
             ),
             (r#"{"extract":{"q1_traces":true}}"#, "extract.q1_traces"),
         ] {

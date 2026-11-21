@@ -984,8 +984,8 @@ a 2D-correlation floor of 0.556 (first pass 1.31, 0.82 and 0.519), under which 7
 anchors' fragments belong, 20.8% are interfered and 0.1% are absent. The entrapment-library
 run learns 1.10, 0.68 and 0.578.
 
-**The deconvolution tolerance** (`deconvolution`, only under `extract.q1_deconvolved` or
-`features.q1_deconvolved`, which read it; docs/09_extract.md, section 14). For at most 3,000
+**The deconvolution tolerance** (`deconvolution`, only under `features.q1_deconvolved`, which
+reads it; docs/09_extract.md, section 14). For at most 3,000
 anchors and 3,000 decoy seed PSMs (each one per candidate at its best scan, every k-th), the
 full peak lists of the seed scan's cycle in the steps within the window's reach plus six
 either side of the expected centre are read, every peak is given its trace's Q1 centroid

@@ -403,7 +403,7 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
     // the `cal.json` just written. Like retrace, the RT bootstrap pass, which only collects
     // anchors, skips it, unless that pass's extract decides per fragment
     // (`extract.q1_fragments`), which reads the calibration and the tolerances it learns.
-    let q1_dec = cfg.extract.q1_deconvolved || cfg.features.q1_deconvolved.on();
+    let q1_dec = cfg.features.q1_deconvolved.on();
     if cfg.rt_im_train.q1_calibrate.on()
         && (retrace_allowed || cfg.extract.q1_fragments.on() || q1_dec)
     {

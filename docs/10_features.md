@@ -803,8 +803,8 @@ calibration, which learns the tolerance); appended after `q1_multiscale`, before
 centroid along the sweep against the expected Q1 centre of the library fragment it matches, in
 the apex cycle and the two either side: `q1d_n_frag`, `q1d_n_incons`, `q1d_share`,
 `q1d_pred_share`, `q1d_apex_share` (docs/09_extract.md, section 14). The extraction is not
-changed; `extract.q1_deconvolved`, which counts only the consistent peaks, is the hard form of
-the same evidence.
+changed; `extract.q1_deconvolved`, which counted only the consistent peaks, was the hard form of
+the same evidence and was removed in 0.15.0.
 
 For all three the switch comes from the configuration, so a psms_extracted table without the
 columns is an error rather than zeros, and the schema id changes only with a family on. Every
