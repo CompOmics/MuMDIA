@@ -2446,11 +2446,6 @@ pub struct ExtractConfig {
     /// psms_extracted v8). Never read from a configuration file.
     #[serde(skip)]
     pub q1_dec_features: bool,
-    /// `features.q1_separable`, handed to extract by the same callers: extract fits the
-    /// separable model of each row's Q1 patch (`stages::q1trace::fit`, psms_extracted v9).
-    /// Never read from a configuration file.
-    #[serde(skip)]
-    pub q1_separable: bool,
     /// Fewest consecutive scan groups over which `presence_min_coelution` fragments must be
     /// present (the co-elution run) for a candidate to be accepted; values below 1 read as 1.
     /// `min_coelution_run` floors the same run, so the larger of the two applies.
@@ -2976,7 +2971,7 @@ impl ExtractConfig {
     }
 
     /// Copy the `features` and `retrace` keys extract reads into their mirror fields
-    /// (`q1_precursor`, `q1_multiscale`, `q1_dec_features`, `q1_separable`,
+    /// (`q1_precursor`, `q1_multiscale`, `q1_dec_features`,
     /// and `q1_repick` / `q1_repick_peaks` under `q1_fragments`). The orchestrated chain and
     /// the standalone `mumdia extract` both reach it through `q1frag::configure_extract`, so
     /// the two write the same evidence.
@@ -2986,7 +2981,6 @@ impl ExtractConfig {
         self.q1_precursor = cfg.features.q1_precursor.on();
         self.q1_multiscale = cfg.features.q1_multiscale.on();
         self.q1_dec_features = cfg.features.q1_deconvolved.on();
-        self.q1_separable = cfg.features.q1_separable;
         if self.q1_fragments.on() {
             self.q1_repick = cfg.retrace.q1_repick.on();
             self.q1_repick_peaks = cfg.retrace.q1_repick_peaks;
@@ -3046,7 +3040,6 @@ impl Default for ExtractConfig {
             q1_precursor: false,
             q1_multiscale: false,
             q1_dec_features: false,
-            q1_separable: false,
             fixed_scan_window: 2,
             frag_tol_ppm: 20.0,
             prec_tol_ppm: 3.0,
@@ -3315,20 +3308,6 @@ pub struct FeaturesConfig {
     /// unless on.
     #[serde(skip_serializing_if = "ZtSwitch::omitted")]
     pub q1_consistency: ZtSwitch,
-    /// The separable model of scanning-quadrupole spectra (`q1s_*`, `stages::q1trace`): each
-    /// row's Q1 patch (the per-fragment decision's RT x step patch, which it needs) fitted as one
-    /// elution profile shared by the decision's fragments times each fragment's calibrated Q1
-    /// transmission, with an amplitude and a floor per fragment. Ten `q1s_*` columns (the set's
-    /// R^2, the predicted-intensity-weighted R^2 and interference share of the present fragments,
-    /// the explained and floor shares, the amplitudes' agreement with the prediction, the
-    /// fragments fitted, the profile's width and its apex against the row's) appended to the
-    /// `extended` set after the `q1d_*` columns (before `q1_consistency`'s), and per row the profile, its cycles' retention times
-    /// and each fragment's amplitude, R^2 and interference share as lists (psms_extracted v9).
-    /// Needs `extract.q1_fragments`; refused on any input that is not a ZT Scan run. Default
-    /// false: measured within the seed spread (docs/37_ztscan.md, section 15). Omitted from the
-    /// canonical configuration at its default.
-    #[serde(skip_serializing_if = "is_false")]
-    pub q1_separable: bool,
 }
 impl Default for FeaturesConfig {
     fn default() -> Self {
@@ -3354,7 +3333,6 @@ impl Default for FeaturesConfig {
             q1_multiscale: ZtSwitch::Auto,
             q1_deconvolved: ZtSwitch::Auto,
             q1_consistency: ZtSwitch::Auto,
-            q1_separable: false,
         }
     }
 }
@@ -5752,7 +5730,6 @@ impl Config {
             (self.rescore.shadow_q1.on(), "rescore.shadow_q1"),
             (self.quant.q1_cycles() > 0, "quant.q1_cycle_halfwidth"),
             (ex.q1_deconvolved, "extract.q1_deconvolved"),
-            (f.q1_separable, "features.q1_separable"),
             (
                 self.search_seed.q1_deconvolved,
                 "search_seed.q1_deconvolved",
@@ -7494,13 +7471,6 @@ impl Config {
                     .into(),
             ));
         }
-        if f.q1_separable && !decided {
-            return Err(Invalid(
-                "features.q1_separable fits the RT x step patch of extract.q1_fragments; set it \
-                 as well"
-                    .into(),
-            ));
-        }
         if f.q1_consistency.on() && !decided {
             return Err(Invalid(
                 "features.q1_consistency reads the per-fragment Q1 decision columns that \
@@ -7734,6 +7704,11 @@ const RETIRED: &[Retired] = &[
         path: "features.ms1_envelope",
         gone: Gone::Key("false"),
         why: "the MS1 isotope-envelope family measured inside seed noise (docs/10_features.md, ms1_envelope)",
+    },
+    Retired {
+        path: "features.q1_separable",
+        gone: Gone::Key("false"),
+        why: "the separable Q1 model measured inside the seed spread (docs/37_ztscan.md section 15)",
     },
 
     // B: quantification options
@@ -9237,24 +9212,22 @@ mod tests {
         );
     }
 
-    /// `extract.q1_traces` is automatic (on for ZT Scan input, off otherwise, `false` kept) and
-    /// `features.q1_separable` opt-in: both omitted from the canonical configuration unless on,
-    /// and refused without the per-fragment decision they read.
+    /// `extract.q1_traces` is automatic (on for ZT Scan input, off otherwise, `false` kept):
+    /// omitted from the canonical configuration unless on, and refused without the
+    /// per-fragment decision it reads.
     #[test]
-    fn the_cycle_trace_key_is_automatic_and_the_separable_one_opt_in() {
+    fn the_cycle_trace_key_is_automatic() {
         let d = Config::default();
-        assert!(d.extract.q1_traces.is_auto() && !d.features.q1_separable);
+        assert!(d.extract.q1_traces.is_auto());
         let canon = d.canonical_json();
-        assert!(!canon.contains("q1_traces") && !canon.contains("q1_separable"));
-        let on =
-            Config::from_json(r#"{"extract":{"q1_traces":true},"features":{"q1_separable":true}}"#)
-                .unwrap();
+        assert!(!canon.contains("q1_traces"));
+        let on = Config::from_json(r#"{"extract":{"q1_traces":true}}"#).unwrap();
         let oc = on.canonical_json();
-        assert!(oc.contains(r#""q1_traces":true"#) && oc.contains(r#""q1_separable":true"#));
+        assert!(oc.contains(r#""q1_traces":true"#));
         let mut auto = Config::default();
         auto.resolve_ztscan(ZtScanInputs::All { half_width: 1.9 })
             .unwrap();
-        assert!(auto.extract.q1_traces.on() && !auto.features.q1_separable);
+        assert!(auto.extract.q1_traces.on());
         let mut none = Config::default();
         none.resolve_ztscan(ZtScanInputs::None).unwrap();
         assert!(none.extract.q1_traces.is_off());
@@ -9263,15 +9236,10 @@ mod tests {
         off.resolve_ztscan(ZtScanInputs::All { half_width: 1.9 })
             .unwrap();
         assert!(off.extract.q1_traces.is_off() && off.extract.q1_fragments.on());
-        for json in [
-            r#"{"extract":{"q1_fragments":false,"q1_traces":true}}"#,
-            r#"{"extract":{"q1_fragments":false},"features":{"q1_separable":true}}"#,
-        ] {
-            assert!(Config::from_json(json).is_err(), "{json}");
-        }
-        let mut zt =
-            Config::from_json(r#"{"extract":{"q1_traces":true},"features":{"q1_separable":true}}"#)
-                .unwrap();
+        assert!(
+            Config::from_json(r#"{"extract":{"q1_fragments":false,"q1_traces":true}}"#).is_err()
+        );
+        let mut zt = Config::from_json(r#"{"extract":{"q1_traces":true}}"#).unwrap();
         zt.resolve_ztscan(ZtScanInputs::All { half_width: 1.9 })
             .unwrap();
         assert!(zt.extract.q1_traces.on() && zt.extract.q1_fragments.on());
@@ -9315,10 +9283,6 @@ mod tests {
                 "search_seed.q1_deconvolved",
             ),
             (r#"{"extract":{"q1_traces":true}}"#, "extract.q1_traces"),
-            (
-                r#"{"features":{"q1_separable":true}}"#,
-                "features.q1_separable",
-            ),
         ] {
             let mut c = Config::from_json(json).unwrap();
             let e = c

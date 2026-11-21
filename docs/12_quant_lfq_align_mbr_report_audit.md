@@ -1049,7 +1049,7 @@ which `run-experiment` does once.
 Two further readings of a ZT Scan run were measured for quantification on the K562 three-run
 experiment (docs/37_ztscan.md, section 15): the traces collapsed to one value a cycle measure the
 replicate CV of the 4-cycle window on the interleaved traces (0.104 both), and quantities from the
-amplitudes of the separable RT x step model (`features.q1_separable`) times its elution profile
+amplitudes of the separable RT x step model (`features.q1_separable`, removed in 0.15.0) times its elution profile
 measured 0.165, so that option was not kept. The cycle traces of `extract.q1_traces` are written
 for drawing; quant does not read them.
 

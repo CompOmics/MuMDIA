@@ -335,11 +335,6 @@ pub fn q1m_features(q1p: bool) -> Vec<&'static str> {
     super::q1score::q1m_columns(q1p)
 }
 
-/// The separable-model family (`features.q1_separable`, [`super::q1trace`]): the
-/// psms_extracted v9 columns of the same names, appended after [`Q1D_FEATURES`] (before
-/// [`Q1C_FEATURES`] when that is on).
-pub const Q1SEP_FEATURES: &[&str] = super::q1trace::Q1S_COLUMNS;
-
 /// The Q1-consistency family (`features.q1_consistency`, [`super::q1consist`]): the
 /// per-fragment Q1 decisions of psms_extracted v6 read against each fragment's expected Q1
 /// centre, appended last, after every other column of the `extended` set and every other
@@ -367,8 +362,6 @@ pub struct Q1Families {
     pub q1d: bool,
     /// `features.q1_consistency` ([`Q1C_FEATURES`]).
     pub q1c: bool,
-    /// `features.q1_separable` ([`Q1SEP_FEATURES`]).
-    pub q1sep: bool,
 }
 
 impl Q1Families {
@@ -380,7 +373,6 @@ impl Q1Families {
             q1m: cfg.q1_multiscale.on(),
             q1d: cfg.q1_deconvolved.on(),
             q1c: cfg.q1_consistency.on(),
-            q1sep: cfg.q1_separable,
         }
     }
 }
@@ -398,7 +390,6 @@ pub fn active_features_fam(
         q1m,
         q1d,
         q1c,
-        q1sep,
     } = fam;
     let mut v: Vec<String> = MINIMAL_FEATURES.iter().map(|s| s.to_string()).collect();
     if matches!(set, FeatureSet::Rich | FeatureSet::Extended) {
@@ -430,9 +421,6 @@ pub fn active_features_fam(
         if q1d {
             v.extend(Q1D_FEATURES.iter().map(|s| s.to_string()));
         }
-        if q1sep {
-            v.extend(Q1SEP_FEATURES.iter().map(|s| s.to_string()));
-        }
         if q1c {
             v.extend(Q1C_FEATURES.iter().map(|s| s.to_string()));
         }
@@ -452,9 +440,6 @@ fn q1s_feature_names(cfg: &FeaturesConfig) -> Vec<&'static str> {
     }
     if cfg.q1_deconvolved.on() {
         v.extend_from_slice(Q1D_FEATURES);
-    }
-    if cfg.q1_separable {
-        v.extend_from_slice(Q1SEP_FEATURES);
     }
     v
 }
@@ -3549,7 +3534,7 @@ fn run_chunked(
     let q1s_cols = read_on(
         true,
         &q1s_names[..],
-        "features.q1_precursor / q1_multiscale / q1_deconvolved / q1_separable",
+        "features.q1_precursor / q1_multiscale / q1_deconvolved",
         "extract writes it under the same key with extract.q1_fragments",
     )?;
     // The Q1-consistency family (`features.q1_consistency`): the per-fragment Q1 decision
@@ -6117,7 +6102,8 @@ mod tests {
                 active_features(set, false)
             );
         }
-        for cols in [&on] {
+        {
+            let cols = &on;
             let ix = ColIx::new(cols, &extended_name_refs(false));
             let mut seen: Vec<usize> = ix
                 .named()
@@ -6165,7 +6151,6 @@ mod tests {
                 q1m: false,
                 q1d: false,
                 q1c: false,
-                q1sep: false,
             },
         );
         let m = active_features_fam(
@@ -6177,7 +6162,6 @@ mod tests {
                 q1m: true,
                 q1d: false,
                 q1c: false,
-                q1sep: false,
             },
         );
         let pm = active_features_fam(
@@ -6189,7 +6173,6 @@ mod tests {
                 q1m: true,
                 q1d: false,
                 q1c: false,
-                q1sep: false,
             },
         );
         assert_eq!(&p[..q1f.len()], &q1f[..]);
@@ -6210,7 +6193,6 @@ mod tests {
                     q1m: false,
                     q1d: false,
                     q1c: false,
-                    q1sep: false
                 }
             ),
             q1f
@@ -6226,7 +6208,6 @@ mod tests {
                         q1m: true,
                         q1d: false,
                         q1c: false,
-                        q1sep: false
                     }
                 ),
                 active_features(set, false)

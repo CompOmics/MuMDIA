@@ -1220,16 +1220,6 @@ pub struct Q1fRow {
     /// `features.q1_deconvolved`: the row's `q1d_*` values ([`super::q1dec::Q1D_COLUMNS`]);
     /// empty with the key off.
     pub q1d: Vec<f64>,
-    /// `features.q1_separable`: the row's `q1s_*` values ([`super::q1trace::Q1S_COLUMNS`]), its
-    /// elution profile and its patch cycles' retention times, and per library fragment its
-    /// amplitude, R^2 and interference share ([`super::q1trace::SepFit`]); empty with the key
-    /// off.
-    pub q1s: Vec<f64>,
-    pub q1s_elution: Vec<f32>,
-    pub q1s_cycle_rt: Vec<f32>,
-    pub q1s_amp: Vec<f32>,
-    pub q1s_r2: Vec<f32>,
-    pub q1s_interf: Vec<f32>,
 }
 
 impl Q1fRow {

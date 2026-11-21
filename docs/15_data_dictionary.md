@@ -496,8 +496,9 @@ whose apex is not in the sweep carries the "no evidence" values given.
 | `q1d_apex_share` | Float64 | no | fraction | the consistent share in the apex cycle alone |
 
 Conditional columns of v9, appended last under `features.q1_separable` (scanning-quadrupole
-spectra under `extract.q1_fragments`; docs/09_extract.md, section 15): the separable model of each
-row's Q1 patch (`stages::q1trace::fit`). A row whose apex is not in the sweep carries the values of no
+spectra under `extract.q1_fragments`; docs/09_extract.md, section 15), which 0.15.0 removed; tables
+written before it still read. The separable model of each
+row's Q1 patch. A row whose apex is not in the sweep carries the values of no
 fit (0, a prediction-weighted interference share of 1) and NaN lists.
 
 | column | Arrow type | nullable | units | meaning |

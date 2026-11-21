@@ -3975,11 +3975,6 @@ impl PsmRows {
         let mut q1p_rows: Vec<Vec<f64>> = Vec::new();
         let mut q1m_rows: Vec<Vec<f64>> = Vec::new();
         let mut q1d_rows: Vec<Vec<f64>> = Vec::new();
-        // The separable model's values and lists (v9), taken out the same way.
-        let sep = cfg.q1_separable && cfg.q1_fragments.on();
-        let mut sep_rows: Vec<Vec<f64>> = Vec::new();
-        let (mut sep_el, mut sep_rt, mut sep_amp, mut sep_r2, mut sep_if) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         // psms_extracted v6: the per-fragment Q1 decision, appended last, only under
         // `extract.q1_fragments`: the row's summary, then one list per decision with an entry
         // per library fragment.
@@ -4045,14 +4040,6 @@ impl PsmRows {
                 if cfg.q1_dec_features {
                     q1d_rows.push(r.q1d);
                 }
-                if sep {
-                    sep_rows.push(r.q1s);
-                    sep_el.push(r.q1s_elution);
-                    sep_rt.push(r.q1s_cycle_rt);
-                    sep_amp.push(r.q1s_amp);
-                    sep_r2.push(r.q1s_r2);
-                    sep_if.push(r.q1s_interf);
-                }
             }
             cols.push(Col::ListF32("q1f_frag_class".into(), cl));
             cols.push(Col::ListF32("q1f_frag_offset".into(), of));
@@ -4085,21 +4072,6 @@ impl PsmRows {
                     q1d_rows.iter().map(|v| v[k]).collect(),
                 ));
             }
-        }
-        // psms_extracted v9: the separable model of each row's Q1 patch, appended last, only
-        // under `features.q1_separable` (`stages::q1trace`).
-        if sep {
-            for (k, name) in q1trace::Q1S_COLUMNS.iter().enumerate() {
-                cols.push(Col::F64(
-                    (*name).into(),
-                    sep_rows.iter().map(|v| v[k]).collect(),
-                ));
-            }
-            cols.push(Col::ListF32("q1s_elution".into(), sep_el));
-            cols.push(Col::ListF32("q1s_cycle_rt".into(), sep_rt));
-            cols.push(Col::ListF32("q1s_frag_amp".into(), sep_amp));
-            cols.push(Col::ListF32("q1s_frag_r2".into(), sep_r2));
-            cols.push(Col::ListF32("q1s_frag_interf".into(), sep_if));
         }
         cols
     }
@@ -4668,10 +4640,10 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     });
     // `extract.q1_traces` (`stages::q1trace`): every accepted candidate's traces once more on Q1
     // cycles, into `chromatograms_q1.parquet`, collapsed with the decision's calibrated model
-    // and grid; `features.q1_separable` fits the decision's patches.
-    if (p.cfg.q1_traces.on() || p.cfg.q1_separable) && q1f_ctx.is_none() {
+    // and grid.
+    if p.cfg.q1_traces.on() && q1f_ctx.is_none() {
         anyhow::bail!(
-            "extract: extract.q1_traces and features.q1_separable read the Q1 sweep through the \
+            "extract: extract.q1_traces reads the Q1 sweep through the \
              per-fragment decision's grid and calibrated model; set extract.q1_fragments as well"
         );
     }
@@ -5519,31 +5491,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                     if p.cfg.q1_multiscale {
                         row.q1m = q1score::multiscale(pt, cand, d, x.model, env.as_deref());
                     }
-                    // `features.q1_separable`: the separable model of the patch
-                    // (`stages::q1trace`), with the retention time of each patch cycle (its
-                    // step nearest the expected centre).
-                    if p.cfg.q1_separable {
-                        let s = q1trace::fit(pt, d, cand, x.model);
-                        let c0 = x.grid.scan_cycle[*si];
-                        let aci = pt.cycles.iter().position(|&c| c == c0).unwrap_or(d.apex_ci);
-                        row.q1s = q1trace::values(&s, d, cand, aci);
-                        let mid = x.grid.nearest_step(cand.centre);
-                        row.q1s_cycle_rt = pt
-                            .cycles
-                            .iter()
-                            .map(|&c| {
-                                x.grid
-                                    .scan(c, mid)
-                                    .map_or(f32::NAN, |k| x.scans[k].rt_seconds as f32)
-                            })
-                            .collect();
-                        let f32s =
-                            |v: &[f64]| -> Vec<f32> { v.iter().map(|&y| y as f32).collect() };
-                        row.q1s_elution = f32s(&s.elution);
-                        row.q1s_amp = f32s(&s.amp);
-                        row.q1s_r2 = f32s(&s.r2);
-                        row.q1s_interf = f32s(&s.interf);
-                    }
                     // `features.q1_deconvolved`: the deconvolved evidence at the apex scan.
                     if let (true, Some(g)) = (p.cfg.q1_dec_features, q1_gate.as_ref()) {
                         let targets: Vec<f64> = cand.frags.iter().map(|f| f.target_mz).collect();
@@ -5572,13 +5519,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                     }
                     if p.cfg.q1_dec_features {
                         row.q1d = crate::stages::q1dec::empty_evidence();
-                    }
-                    if p.cfg.q1_separable {
-                        let n = cand.frags.len();
-                        row.q1s = q1trace::empty_values();
-                        row.q1s_amp = vec![f32::NAN; n];
-                        row.q1s_r2 = vec![f32::NAN; n];
-                        row.q1s_interf = vec![f32::NAN; n];
                     }
                     row
                 }
@@ -6694,7 +6634,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 false,
                 p.cfg.q1_fragments.on()
                     && (p.cfg.q1_precursor || p.cfg.q1_multiscale || p.cfg.q1_dec_features),
-                p.cfg.q1_fragments.on() && p.cfg.q1_separable,
+                false,
             ),
             psms_written,
         ),
@@ -6758,16 +6698,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                             "multiscale": p.cfg.q1_multiscale,
                             "scales_steps": crate::stages::q1score::SCALES,
                             "deconvolved_evidence": p.cfg.q1_dec_features,
-                        }),
-                    );
-                }
-                // The separable model (`features.q1_separable`), only when on.
-                if p.cfg.q1_separable {
-                    obj.insert(
-                        "q1_separable".into(),
-                        json!({
-                            "iterations": q1trace::SEP_ITERS,
-                            "bound_frac": q1trace::SEP_BOUND_FRAC,
                         }),
                     );
                 }

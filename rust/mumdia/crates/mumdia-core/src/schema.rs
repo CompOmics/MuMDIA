@@ -102,9 +102,10 @@ pub mod artifact {
     /// and the multi-scale Q1 scores `q1m3_*`, `q1m7_*` and `q1m11_*` (Float64), each
     /// family only under its key. Readers select columns by name.
     pub const PSMS_EXTRACTED_V8: (&str, u32) = ("psms_extracted", 8);
-    /// v9, written only under `features.q1_separable` (scanning-quadrupole spectra under
-    /// `extract.q1_fragments`, which carry no 1/K0): the table of v6, v7 or v8 plus, appended
-    /// last, the separable model of each row's Q1 patch (`stages::q1trace`): the `q1s_*` feature
+    /// v9, written only under `features.q1_separable` until 0.15.0 removed it
+    /// (scanning-quadrupole spectra under `extract.q1_fragments`, which carry no 1/K0): the
+    /// table of v6, v7 or v8 plus, appended last, the separable model of each row's Q1 patch
+    /// (`stages::q1trace` before 0.15.0): the `q1s_*` feature
     /// values (Float64) and five Float32 lists, `q1s_elution` and `q1s_cycle_rt` (the elution
     /// profile, maximum 1, and the retention time of each patch cycle), and `q1s_frag_amp`,
     /// `q1s_frag_r2` and `q1s_frag_interf` with one entry per library fragment in the library's
