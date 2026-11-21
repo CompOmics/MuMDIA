@@ -248,9 +248,6 @@ pub struct PatternInput<'a> {
     /// to the precursor here). They stay in the set `S` and in the scale, which are the
     /// experiment's, and take no part in either level. Empty: none.
     pub masked: &'a [bool],
-    /// `quant.q1_integration = elution_fit`: the integration weights of the window samples
-    /// (`q1quant::elution_weights`), in place of the trapezoid weights. `None`: the trapezoid.
-    pub weights: Option<&'a [f64]>,
 }
 
 /// A pattern rule's quantity, the fragments of `S`, and the status.
@@ -285,10 +282,7 @@ pub fn pattern_quantity(
     }
     let pp: Vec<f64> = (0..nf).map(|f| if sel[f] { p[f] } else { 0.0 }).collect();
     let tm: Vec<bool> = inp.rt.iter().map(|r| r.is_finite()).collect();
-    let tw = match inp.weights {
-        Some(k) => k.to_vec(),
-        None => trapezoid_weights(inp.rt),
-    };
+    let tw = trapezoid_weights(inp.rt);
     // The slots this run fits: `S` less the masked ones (all of `S` without a mask).
     let fit: Vec<bool> = (0..nf)
         .map(|f| sel[f] && !inp.masked.get(f).copied().unwrap_or(false))
@@ -671,7 +665,7 @@ mod tests {
         );
     }
 
-    fn pattern_case(masked: &[bool], weights: Option<&[f64]>) -> PatternQuantity {
+    fn pattern_case(masked: &[bool]) -> PatternQuantity {
         // Four fragments, a Gaussian elution over five samples, fragment 3 interfered.
         let rt = [10.0, 11.0, 12.0, 13.0, 14.0];
         let pred = [1.0f32, 0.8, 0.6, 0.5];
@@ -694,7 +688,6 @@ mod tests {
                 pred: &pred,
                 eligible: &eligible,
                 masked,
-                weights,
             },
             5.0,
             5.0,
@@ -706,9 +699,9 @@ mod tests {
     /// set and the scale; every slot masked gives no quantity.
     #[test]
     fn a_masked_slot_leaves_the_fit_and_keeps_the_set() {
-        let none = pattern_case(&[], None);
-        assert_eq!(pattern_case(&[false; 4], None), none);
-        let m = pattern_case(&[false, false, false, true], None);
+        let none = pattern_case(&[]);
+        assert_eq!(pattern_case(&[false; 4]), none);
+        let m = pattern_case(&[false, false, false, true]);
         assert_eq!(m.1, none.1);
         assert_eq!(m.2, "quantified");
         // The masked fit sees only the clean fragments: their quantity is the clean one,
@@ -727,16 +720,8 @@ mod tests {
             m.0
         );
         assert_eq!(
-            pattern_case(&[true; 4], None),
+            pattern_case(&[true; 4]),
             (None, 4, "no_belonging_pattern_fragments")
-        );
-        // Weights replace the trapezoid: unit weights sum the samples.
-        let w = pattern_case(&[false, false, false, true], Some(&[1.0; 5]));
-        let want_sum = 100.0 * scale * 2.8;
-        assert!(
-            (w.0.unwrap() - want_sum).abs() < 1e-9 * want_sum,
-            "{:?}",
-            w.0
         );
     }
 

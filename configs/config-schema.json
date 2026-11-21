@@ -4159,7 +4159,7 @@
       "optional": false,
       "default": false,
       "default_text": "false",
-      "help": "Scanning-quadrupole spectra (SCIEX ZT Scan DIA): quantify from the per-fragment Q1 decisions of `extract.q1_fragments` (which it needs; psms_extracted v6). Every fragment trace of an accepted candidate is first collapsed to one value per cycle: the steps of a cycle (the interleaved samples of the windows that cover the precursor) are combined as the least-squares amplitude `sum(w x) / sum(w^2)` under the weights `w` of `q1_step_weights` (the calibrated isotope-envelope transmission at the precursor's calibrated expected Q1 centre, by default), at the mean retention time of the cycle. On those cycle traces the fragments that do not belong (interfered or absent) are left out of the quantity when at least `q1_min_belonging` fragments belong: out of the profile that centres the window, out of the top-N ranking and out of the pattern fit in that run (the pattern set and its scale stay those of the experiment). With fewer, the candidate keeps every fragment (`q1_quant = fallback` in peptide_quant v4). The fixed window then counts cycles, not steps. Reads the run's `psms_extracted` (its report records the Q1 model) and its spectra_ms2 v3 (step and cycle of each sample): `run` and `run-experiment` pass them, `mumdia quant` takes `--psms-extracted` and `--spectra-ms2`. Refused with `fragment_selection = cross_run` (its weights would read a left-out fragment as zero). Default false. Benchmark-gated: no known-ratio ZT Scan data has been measured (docs/12, \"Quantification from the fragments that belong\"). Omitted from the canonical configuration at its default.",
+      "help": "Scanning-quadrupole spectra (SCIEX ZT Scan DIA): quantify from the per-fragment Q1 decisions of `extract.q1_fragments` (which it needs; psms_extracted v6). Every fragment trace of an accepted candidate is first collapsed to one value per cycle: the steps of a cycle (the interleaved samples of the windows that cover the precursor) are combined as the least-squares amplitude `sum(w x) / sum(w^2)` under the weights `w` (the calibrated isotope-envelope transmission at the precursor's calibrated expected Q1 centre), at the mean retention time of the cycle. On those cycle traces the fragments that do not belong (interfered or absent) are left out of the quantity when at least `q1_min_belonging` fragments belong: out of the profile that centres the window, out of the top-N ranking and out of the pattern fit in that run (the pattern set and its scale stay those of the experiment). With fewer, the candidate keeps every fragment (`q1_quant = fallback` in peptide_quant v4). The fixed window then counts cycles, not steps. Reads the run's `psms_extracted` (its report records the Q1 model) and its spectra_ms2 v3 (step and cycle of each sample): `run` and `run-experiment` pass them, `mumdia quant` takes `--psms-extracted` and `--spectra-ms2`. Refused with `fragment_selection = cross_run` (its weights would read a left-out fragment as zero). Default false. Benchmark-gated: no known-ratio ZT Scan data has been measured (docs/12, \"Quantification from the fragments that belong\"). Omitted from the canonical configuration at its default.",
       "gates": [
         "benchmark-gated"
       ],
@@ -4177,40 +4177,6 @@
       "help": "`q1_fragments`: the fewest fragments that belong for the quantity to be restricted to them; a candidate with fewer keeps every fragment, on the same cycle traces. At least 1. Default 3 (75.6% of the accepted targets on the ZT Scan K562 run, 0.8% of the decoys). Omitted from the canonical configuration at its default.",
       "gates": [],
       "source_struct": "QuantConfig"
-    },
-    {
-      "path": "quant.q1_step_weights",
-      "name": "q1_step_weights",
-      "section": "quant",
-      "rust_type": "Q1StepWeights",
-      "kind": "enum",
-      "optional": false,
-      "default": "transmission",
-      "default_text": "`transmission`",
-      "help": "`q1_fragments`: how the steps of a cycle are weighted when they are collapsed. `transmission` (default): the expected Q1 profile of the fragment (the calibrated trapezoid transmission summed over the precursor's isotopes) at its calibrated expected centre and width (the row's own fitted centre carries its fit noise into each run's value); `uniform`: every step alike (the mean of the cycle's steps). The two measured the same replicate precision on the ZT Scan K562 runs. Omitted from the canonical configuration at its default.",
-      "gates": [],
-      "source_struct": "QuantConfig",
-      "choices": [
-        "transmission",
-        "uniform"
-      ]
-    },
-    {
-      "path": "quant.q1_integration",
-      "name": "q1_integration",
-      "section": "quant",
-      "rust_type": "Q1Integration",
-      "kind": "enum",
-      "optional": false,
-      "default": "trapezoid",
-      "default_text": "`trapezoid`",
-      "help": "`q1_fragments`: how a cycle trace is integrated over the fixed window. `trapezoid` (default): the trapezoid rule over the window's cycles, as every other trace. `elution_fit`: one Gaussian elution profile per candidate and run, fitted (a weighted parabola of the log intensity) to the summed window samples of the fragments it quantifies, and each fragment's area its least-squares amplitude under that profile times the profile's area; the trapezoid where the fit fails. Needs the scan form of the fixed window. Omitted from the canonical configuration at its default.",
-      "gates": [],
-      "source_struct": "QuantConfig",
-      "choices": [
-        "trapezoid",
-        "elution_fit"
-      ]
     },
     {
       "path": "quant.q1_cycle_halfwidth",

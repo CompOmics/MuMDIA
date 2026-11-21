@@ -675,8 +675,7 @@ byte; 2 is the setting to take when extract's time matters more than half a perc
   `retrace.repick` or `extract.apex_refine_intensity`; `rescore.shadow_q1` with
   `shadow_min_shared = 0`; `retrace.q1_repick_peaks` without `retrace.q1_repick`.
 - `quant.q1_fragments` without `extract.q1_fragments` or with `fragment_selection =
-  cross_run`; `q1_min_belonging = 0`; `q1_integration = elution_fit` without the scan form of
-  the fixed window; its three companions without it.
+  cross_run`; `q1_min_belonging = 0`; `q1_min_belonging` without it.
 - `quant.q1_cycle_halfwidth` without the scan form of the fixed window or with
   `fixed_scan_halfwidth_scale`; `mumdia quant` with it and no `--spectra-ms2`.
 - `extract.q1_traces` set to `true` on any input that is not a ZT Scan run, and without

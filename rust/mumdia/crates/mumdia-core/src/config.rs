@@ -3705,9 +3705,8 @@ pub struct QuantConfig {
     /// fragment trace of an accepted candidate is first collapsed to one value per cycle:
     /// the steps of a cycle (the interleaved samples of the windows that cover the
     /// precursor) are combined as the least-squares amplitude `sum(w x) / sum(w^2)` under
-    /// the weights `w` of `q1_step_weights` (the calibrated isotope-envelope transmission at
-    /// the precursor's calibrated expected Q1 centre, by default), at the mean retention time of
-    /// the cycle. On those cycle traces the fragments that do not belong (interfered or absent)
+    /// the weights `w` (the calibrated isotope-envelope transmission at the precursor's
+    /// calibrated expected Q1 centre), at the mean retention time of the cycle. On those cycle traces the fragments that do not belong (interfered or absent)
     /// are left out of the quantity when at least `q1_min_belonging` fragments belong: out of
     /// the profile that centres the window, out of the top-N ranking and out of the pattern
     /// fit in that run (the pattern set and its scale stay those of the experiment). With
@@ -3727,24 +3726,6 @@ pub struct QuantConfig {
     /// Omitted from the canonical configuration at its default.
     #[serde(skip_serializing_if = "is_default_q1_min_belonging")]
     pub q1_min_belonging: usize,
-    /// `q1_fragments`: how the steps of a cycle are weighted when they are collapsed.
-    /// `transmission` (default): the expected Q1 profile of the fragment (the calibrated
-    /// trapezoid transmission summed over the precursor's isotopes) at its calibrated expected
-    /// centre and width (the row's own fitted centre carries its fit noise into each run's
-    /// value); `uniform`: every step alike (the mean of the cycle's steps). The two measured
-    /// the same replicate precision on the ZT Scan K562 runs. Omitted from the canonical
-    /// configuration at its default.
-    #[serde(skip_serializing_if = "Q1StepWeights::is_transmission")]
-    pub q1_step_weights: Q1StepWeights,
-    /// `q1_fragments`: how a cycle trace is integrated over the fixed window. `trapezoid`
-    /// (default): the trapezoid rule over the window's cycles, as every other trace.
-    /// `elution_fit`: one Gaussian elution profile per candidate and run, fitted (a weighted
-    /// parabola of the log intensity) to the summed window samples of the fragments it
-    /// quantifies, and each fragment's area its least-squares amplitude under that profile
-    /// times the profile's area; the trapezoid where the fit fails. Needs the scan form of the
-    /// fixed window. Omitted from the canonical configuration at its default.
-    #[serde(skip_serializing_if = "Q1Integration::is_trapezoid")]
-    pub q1_integration: Q1Integration,
     /// Scanning-quadrupole spectra (SCIEX ZT Scan DIA, spectra_ms2 v3 written under
     /// `convert.isolation_half_width`): the fixed scan window's half-width in Q1 cycles rather
     /// than in samples. A ZT Scan trace interleaves the steps of every window that covers the
@@ -4107,43 +4088,6 @@ fn is_default_q1_min_belonging(v: &usize) -> bool {
     *v == Q1_MIN_BELONGING
 }
 
-/// How the steps of a cycle are weighted when `quant.q1_fragments` collapses them. See
-/// [`QuantConfig::q1_step_weights`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum Q1StepWeights {
-    /// The fragment's expected Q1 profile at the calibrated expected centre (default).
-    #[default]
-    Transmission,
-    /// Every step alike.
-    Uniform,
-}
-
-impl Q1StepWeights {
-    /// The default, which the canonical configuration omits.
-    pub fn is_transmission(&self) -> bool {
-        *self == Q1StepWeights::Transmission
-    }
-}
-
-/// How a cycle trace of `quant.q1_fragments` is integrated. See
-/// [`QuantConfig::q1_integration`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum Q1Integration {
-    /// The trapezoid rule over the window's cycles (default).
-    #[default]
-    Trapezoid,
-    /// A Gaussian elution profile fitted per candidate and run.
-    ElutionFit,
-}
-
-impl Q1Integration {
-    /// The default, which the canonical configuration omits.
-    pub fn is_trapezoid(&self) -> bool {
-        *self == Q1Integration::Trapezoid
-    }
-}
 impl Default for QuantConfig {
     fn default() -> Self {
         Self {
@@ -4177,8 +4121,6 @@ impl Default for QuantConfig {
             fragment_detail: false,
             q1_fragments: false,
             q1_min_belonging: 3, // Q1_MIN_BELONGING
-            q1_step_weights: Q1StepWeights::Transmission,
-            q1_integration: Q1Integration::Trapezoid,
             q1_cycle_halfwidth: None,
             explicit: QuantExplicit::default(),
             resolved: Vec::new(),
@@ -6301,22 +6243,9 @@ impl Config {
                         .into(),
                 ));
             }
-            if q.q1_integration == Q1Integration::ElutionFit && !scan_window {
-                return Err(Invalid(
-                    "quant.q1_integration = elution_fit fits the cycles of the fixed scan \
-                     window, so it needs quant.fixed_scan_halfwidth > 0, \
-                     quant.fixed_window_s = 0 and quant.fixed_scan_halfwidth_scale = 0."
-                        .into(),
-                ));
-            }
-        } else if q.q1_min_belonging != Q1_MIN_BELONGING
-            || !q.q1_step_weights.is_transmission()
-            || !q.q1_integration.is_trapezoid()
-        {
+        } else if q.q1_min_belonging != Q1_MIN_BELONGING {
             return Err(Invalid(
-                "quant.q1_min_belonging, quant.q1_step_weights and quant.q1_integration act \
-                 only under quant.q1_fragments; set it as well"
-                    .into(),
+                "quant.q1_min_belonging acts only under quant.q1_fragments; set it as well".into(),
             ));
         }
         if q.q1_cycles() > 0 {
@@ -7666,6 +7595,18 @@ const RETIRED: &[Retired] = &[
     },
 
     // B: quantification options
+    Retired {
+        path: "quant.q1_step_weights",
+        gone: Gone::Key("\"transmission\""),
+        why: "uniform step weights measured the same replicate CV as the transmission, 0.120 \
+              (docs/12, \"Quantification from the fragments that belong\")",
+    },
+    Retired {
+        path: "quant.q1_integration",
+        gone: Gone::Key("\"trapezoid\""),
+        why: "the elution fit measured a worse replicate CV than the trapezoid, 0.133 against \
+              0.120 (docs/12, \"Quantification from the fragments that belong\")",
+    },
 
     // C: bound_from_confident, per-group calibration
 
@@ -8968,45 +8909,29 @@ mod tests {
     fn the_q1_quant_keys_leave_the_default_config_hash_alone() {
         assert_eq!(QuantConfig::default().q1_min_belonging, Q1_MIN_BELONGING);
         let canon = Config::default().canonical_json();
-        for key in ["q1_min_belonging", "q1_step_weights", "q1_integration"] {
-            assert!(!canon.contains(key), "{key}: {canon}");
-        }
+        assert!(!canon.contains("q1_min_belonging"), "{canon}");
         let base = r#""rt_im_train":{"q1_calibrate":true},"extract":{"q1_fragments":true}"#;
         let on = Config::from_json(&format!(
-            r#"{{{base},"quant":{{"q1_fragments":true,"q1_min_belonging":4,
-                "q1_step_weights":"uniform","q1_integration":"elution_fit"}}}}"#
+            r#"{{{base},"quant":{{"q1_fragments":true,"q1_min_belonging":4}}}}"#
         ))
         .unwrap();
         assert_eq!(on.quant.q1_min_belonging, 4);
-        assert_eq!(on.quant.q1_step_weights, Q1StepWeights::Uniform);
-        assert_eq!(on.quant.q1_integration, Q1Integration::ElutionFit);
         let c = on.canonical_json();
-        for key in [
-            r#""q1_min_belonging":4"#,
-            r#""q1_step_weights":"uniform""#,
-            r#""q1_integration":"elution_fit""#,
-        ] {
-            assert!(c.contains(key), "{key}: {c}");
-        }
-        // The quant key alone keeps the defaults of its three companions out.
+        assert!(c.contains(r#""q1_min_belonging":4"#), "{c}");
+        // The quant key alone keeps the default of its companion out.
         let q =
             Config::from_json(&format!(r#"{{{base},"quant":{{"q1_fragments":true}}}}"#)).unwrap();
         let qc = q.canonical_json();
-        assert!(!qc.contains("q1_min_belonging") && !qc.contains("q1_integration"));
+        assert!(!qc.contains("q1_min_belonging"));
         for bad in [
             r#"{"quant":{"q1_fragments":true}}"#.to_string(),
             format!(
                 r#"{{{base},"quant":{{"q1_fragments":true,"fragment_selection":"cross_run"}}}}"#
             ),
             format!(r#"{{{base},"quant":{{"q1_fragments":true,"q1_min_belonging":0}}}}"#),
-            format!(
-                r#"{{{base},"quant":{{"q1_fragments":true,"q1_integration":"elution_fit",
-                    "fragment_selection":"predicted","window_centre":"apex",
-                    "fixed_scan_halfwidth":0,"fixed_window_s":5.0}}}}"#
-            ),
             r#"{"quant":{"q1_min_belonging":4}}"#.to_string(),
-            r#"{"quant":{"q1_step_weights":"uniform"}}"#.to_string(),
-            r#"{"quant":{"q1_integration":"elution_fit"}}"#.to_string(),
+            format!(r#"{{{base},"quant":{{"q1_fragments":true,"q1_step_weights":"uniform"}}}}"#),
+            format!(r#"{{{base},"quant":{{"q1_fragments":true,"q1_integration":"elution_fit"}}}}"#),
         ] {
             assert!(refused_standalone(&bad), "{bad} must be refused");
         }

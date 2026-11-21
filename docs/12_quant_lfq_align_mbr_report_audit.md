@@ -1077,7 +1077,8 @@ which it needs:
   at the step's target: the calibrated trapezoid transmission summed over the precursor's
   isotopes with the fragment-conditional weights (`q1frag::CandQ1`), at the precursor's
   calibrated expected centre (the run's Q1 offset at its m/z and its isotope envelope).
-  `quant.q1_step_weights = uniform` uses `w = 1` (the mean of the steps). The weights do not
+  Uniform weights (`w = 1`, the mean of the steps) measured the same and were removed in
+  0.15.0 with `quant.q1_step_weights`. The weights do not
   use the row's own fitted centre (`q1f_centre`): that carries its fit noise into each run's
   value (measured below). The value is the fragment's intensity at full transmission,
   the same quantity in every run whatever the precursor's position against the steps, and the
@@ -1092,26 +1093,20 @@ which it needs:
   `pattern_area`, and the dispersion leaves such a cell out of its candidate in every run. A
   candidate with fewer fragments that belong keeps every one of them, on the same cycle
   traces, so one precursor is in the same units in every run.
-- **Integration** (`quant.q1_integration`). `trapezoid` (default): the trapezoid rule over the
-  window's cycles. `elution_fit`: one Gaussian elution profile per candidate and run, the
-  weighted (`y^2`) parabola of `ln y` fitted to the summed window samples of the fragments it
-  quantifies, and each fragment's area its least-squares amplitude under the profile times the
-  profile's area (`sum(k x)`, `k = G sigma sqrt(2 pi) / sum(G^2)`); the trapezoid where the fit
-  fails (fewer than three positive cycles, a parabola that does not open downward, a width
-  outside a fifth of the spacing to three window spans, a centre beyond the window). Under the
-  pattern rules the same weights replace the trapezoid weights of both levels and of the
-  export's `pattern_area`. It needs the scan form of the fixed window.
+- **Integration.** The trapezoid rule over the window's cycles. A Gaussian elution fit per
+  candidate and run (`quant.q1_integration = elution_fit`) measured a worse CV (below) and was
+  removed in 0.15.0.
 
 `peptide_quant` is then v4, with `q1_quant` per row: `belonging`, `fallback` (fewer than
 `q1_min_belonging` belong), `uncollapsed` (the candidate has no decision, its decision does not
 list its chromatogram rows, or a point is not a scan of the sweep; the traces are read as
 extracted) or `no_traces`. The quant reports record `params.q1_fragments` (the inputs, the
-settings, the model, the candidates by outcome, the masked fragments, the elution fits). `run`
+settings, the model, the candidates by outcome, the masked fragments). `run`
 and `run-experiment` pass the run's `psms_extracted` (the second pass's when it ran, whose
 chromatograms are the ones quantified) and its spectra to every quant pass; `mumdia quant`
 takes `--psms-extracted` and `--spectra-ms2`. Refused without `extract.q1_fragments`, with
-`fragment_selection = cross_run` (its weights would read a masked fragment as an area of 0),
-and, for `elution_fit`, without the scan form of the fixed window. Off, quant reads nothing
+`fragment_selection = cross_run` (its weights would read a masked fragment as an area of 0).
+Off, quant reads nothing
 more and every artifact keeps its bytes.
 
 **Measured (2026-11-11), replicate precision only.** No ZT Scan data with known ratios could be
@@ -1133,9 +1128,9 @@ without the phase-2 keys (its own identifications).
 | base, default recipe | 0.319 | 25.3% | 0.133 |
 | phase-2 keys, default recipe | 0.273 | 34.6% | 0.111 |
 | + `quant.q1_fragments` | **0.120** | 73.4% | **0.054** |
-| + `q1_fragments`, `q1_step_weights = uniform` | 0.120 | 73.3% | 0.054 |
+| + `q1_fragments`, `q1_step_weights = uniform` (removed in 0.15.0) | 0.120 | 73.3% | 0.054 |
 | + `q1_fragments`, weights at the row's fitted centre (first implementation) | 0.125 | 71.3% | 0.057 |
-| + `q1_fragments`, `q1_integration = elution_fit` | 0.133 | 68.5% | 0.061 |
+| + `q1_fragments`, `q1_integration = elution_fit` (removed in 0.15.0) | 0.133 | 68.5% | 0.061 |
 | + `q1_fragments`, `q1_min_belonging` 5 | 0.115 | 77.0% | 0.051 |
 | + `q1_fragments`, no restriction (`q1_min_belonging` 1000: collapse only) | 0.106 | 82.4% | 0.047 |
 | + `q1_fragments`, `fixed_scan_halfwidth` 2 / 4 (cycles) | 0.125 / 0.117 | | 0.056 / 0.053 |
@@ -1862,11 +1857,10 @@ FDR/reporting); `audit.rs` tests the stages in that order and keeps the first lo
   The last two are omitted from the canonical configuration at their defaults, and all
   three cross-run values are described in
   [Cross-run fragment selection and background](#cross-run-fragment-selection-and-background).
-- `q1_fragments` (false), `q1_min_belonging` (3), `q1_step_weights` (`transmission` or
-  `uniform`) and `q1_integration` (`trapezoid` or `elution_fit`): quantification of ZT Scan
+- `q1_fragments` (false) and `q1_min_belonging` (3): quantification of ZT Scan
   DIA traces collapsed to Q1 cycles from the fragments that belong
   ([Quantification from the fragments that belong](#quantification-from-the-fragments-that-belong-quantq1_fragments-zt-scan-dia));
-  each omitted from the canonical configuration at its default, and the last three refused
+  each omitted from the canonical configuration at its default, and the second refused
   without the first.
 - `q1_cycle_halfwidth` (`"auto"`: 4 for a ZT Scan search, 0 otherwise): the fixed window's
   half-width in Q1 cycles on spectra that record the sweep (docs/37_ztscan.md, section 6);

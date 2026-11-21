@@ -13,8 +13,8 @@ use anyhow::{anyhow, Context as _, Result};
 use arrow::array::{Array, Float32Array, StringArray, UInt32Array};
 use arrow::record_batch::RecordBatch;
 use mumdia_core::config::{
-    BaselineSource, FragmentSelection, PeakWindowMode, Q1Integration, QuantConfig, QuantQColumn,
-    RollupMethod, WindowCentre,
+    BaselineSource, FragmentSelection, PeakWindowMode, QuantConfig, QuantQColumn, RollupMethod,
+    WindowCentre,
 };
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
@@ -1101,9 +1101,6 @@ fn scan_window_at(len: usize, centre: usize, half: usize) -> Option<(usize, usiz
 /// under the pattern export the window's retention times for the spacing fit, and the
 /// counts behind the share of exactly-zero flank samples where that share is recorded.
 struct Applied {
-    /// `quant.q1_integration = elution_fit` under a fixed window: whether the candidate's
-    /// elution profile was fitted (`false`: the trapezoid applied). `None` otherwise.
-    elution_fitted: Option<bool>,
     lo_rt: f64,
     hi_rt: f64,
     apex: f64,
@@ -1194,20 +1191,6 @@ fn integrate_window(rt: &[f32], mut w: Vec<f32>, envelope: bool) -> f64 {
         w = center_envelope_1d(&w);
     }
     trapezoid(rt, &w)
-}
-
-/// `quant.q1_integration = elution_fit`: the area of window samples `w` under the
-/// candidate's fitted elution profile (`q1quant::elution_weights`), after the optional
-/// apex-outward envelope.
-fn elution_area(mut w: Vec<f32>, k: &[f64], envelope: bool) -> f64 {
-    if envelope {
-        w = center_envelope_1d(&w);
-    }
-    let mut a = 0.0f64;
-    for (x, kk) in w.iter().zip(k) {
-        a += *x as f64 * kk;
-    }
-    a
 }
 
 /// Mean of the raw samples in the `flank` samples either side of `[lo, hi)`; NaN without
@@ -2458,7 +2441,7 @@ enum Q1Kept {
 }
 
 /// `quant.q1_fragments`: the store with every trace collapsed to one value per Q1 cycle
-/// ([`q1quant::collapse_trace`], weighted by `quant.q1_step_weights`), the candidates in the
+/// ([`q1quant::collapse_trace`], weighted by the transmission), the candidates in the
 /// same order and their rows in the same order, so the index of the new store lists them as
 /// `index` did; and per row whether it is left out of the quantity. A candidate keeps its
 /// traces as extracted when it has no psms_extracted row, when its decision does not list
@@ -2515,7 +2498,6 @@ fn q1_apply(
     }
     let fmz = q1quant::load_fragment_mz(&p.chromatograms[0].path, &wanted)?;
     let sweep = q1quant::SweepScans::load(inp.spectra_ms2)?;
-    let rule = p.cfg.q1_step_weights;
     let min_belong = p.cfg.q1_min_belonging;
     type Traces = Vec<(Vec<f32>, Vec<f32>)>;
     type Collapsed = Result<(Traces, Vec<bool>, Q1Status), Q1Kept>;
@@ -2555,7 +2537,7 @@ fn q1_apply(
                     if a == NO_AXIS {
                         return (Vec::new(), Vec::new());
                     }
-                    let w = |t: f64| q1quant::step_weight(rule, &model, &cand, k, t);
+                    let w = |t: f64| q1quant::step_weight(&model, &cand, k, t);
                     q1quant::collapse_trace(&located[&a], store.rt(i), store.inten(i), &w)
                 })
                 .collect();
@@ -3134,7 +3116,6 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     } else {
         (store, index, None)
     };
-    let q1_elution = q1a.is_some() && p.cfg.q1_integration == Q1Integration::ElutionFit;
     // `quant.q1_cycle_halfwidth`: each candidate's fixed-window half-width in samples, from its
     // samples per Q1 cycle. `None` with the key off.
     let cycle_win: Option<CycleWindow> = if p.cfg.q1_cycles() > 0 {
@@ -3459,55 +3440,6 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             let centre_on = |k: usize, len: usize| -> usize {
                 (k as isize + shift).clamp(0, len.saturating_sub(1) as isize) as usize
             };
-            // `quant.q1_integration = elution_fit`: the integration weights of the window on
-            // the candidate's axis, from the summed samples of the fragments it quantifies (less
-            // the experiment background where one applies). `None` where the fit gives way, and
-            // the trapezoid applies.
-            let elution: Option<(u32, usize, usize, Vec<f64>)> = if q1_elution && fixed {
-                rows.iter()
-                    .map(|&i| store.axis_id[i])
-                    .find(|&a| a != NO_AXIS)
-                    .and_then(|a| {
-                        let ax = store.axis(a);
-                        let k = match (cand_axis, cand_k) {
-                            (Some(ca), Some(k)) if ca == a => k,
-                            _ => nearest_index(ax, integration_apex, store.rt_sorted),
-                        };
-                        let (lo, hi) = if profile_centre {
-                            scan_window_at(ax.len(), centre_on(k, ax.len()), half)?
-                        } else {
-                            fixed_window_indices(
-                                ax,
-                                integration_apex,
-                                half,
-                                p.cfg.fixed_window_s,
-                                store.rt_sorted,
-                            )?
-                        };
-                        let mut y = vec![0.0f64; hi - lo];
-                        for (slot, &i) in rows.iter().enumerate() {
-                            if store.axis_id[i] != a || cmask.as_ref().is_some_and(|m| m[slot]) {
-                                continue;
-                            }
-                            let it = store.inten(i);
-                            let b = pooled_bg
-                                .and_then(|m| m.get(&c))
-                                .and_then(|f| f.get(store.name(i)))
-                                .map_or(0.0, |&b| b as f32);
-                            for (j, yj) in y.iter_mut().enumerate() {
-                                let v = it[lo + j];
-                                if v.is_finite() {
-                                    *yj += (v - b).max(0.0) as f64;
-                                }
-                            }
-                        }
-                        let rtw: Vec<f64> = ax[lo..hi].iter().map(|&r| r as f64).collect();
-                        q1quant::elution_weights(&rtw, &y).map(|k| (a, lo, hi, k))
-                    })
-            } else {
-                None
-            };
-            let elution_tried = q1_elution && fixed;
             for (slot, &i) in rows.iter().enumerate() {
                 let rt = store.rt(i);
                 let it = store.inten(i);
@@ -3594,14 +3526,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                                     }),
                                 };
                             }
-                            match &elution {
-                                Some((a, elo, ehi, k))
-                                    if store.axis_id[i] == *a && lo == *elo && hi == *ehi =>
-                                {
-                                    elution_area(w, k, p.cfg.interference_envelope)
-                                }
-                                _ => integrate_window(&rt[lo..hi], w, p.cfg.interference_envelope),
-                            }
+                            integrate_window(&rt[lo..hi], w, p.cfg.interference_envelope)
                         }
                         None => {
                             if export {
@@ -3665,27 +3590,8 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                         window_rt = ax[lo..hi].to_vec();
                     }
                 }
-                // `quant.q1_integration = elution_fit`: the pattern window's integration
-                // weights, from the summed samples of the slots this run fits.
-                let pattern_k: Option<Vec<f64>> = if q1_elution {
-                    let mut y = vec![0.0f64; nt];
-                    for slot in 0..n {
-                        if cmask.as_ref().is_some_and(|m| m[slot]) {
-                            continue;
-                        }
-                        for (t, yt) in y.iter_mut().enumerate() {
-                            *yt += x[slot * nt + t];
-                        }
-                    }
-                    q1quant::elution_weights(&rtw, &y)
-                } else {
-                    None
-                };
                 if pattern_export {
-                    let tw = match &pattern_k {
-                        Some(k) => k.clone(),
-                        None => quant_pattern::trapezoid_weights(&rtw),
-                    };
+                    let tw = quant_pattern::trapezoid_weights(&rtw);
                     for (slot, &i) in rows.iter().enumerate() {
                         // A masked slot is exported as unobserved and without an area here,
                         // so it neither makes the fragment eligible nor enters the dispersion.
@@ -3711,7 +3617,6 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                             pred: &index.slot_pred[index.slots(ci)],
                             eligible: &eligible,
                             masked: cmask.as_deref().unwrap_or(&[]),
-                            weights: pattern_k.as_deref(),
                         },
                         fit.phi,
                         fit.phi_cell(),
@@ -3719,7 +3624,6 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                     ));
                 }
             }
-            let elution_fitted = elution_tried.then_some(elution.is_some());
             Applied {
                 lo_rt,
                 hi_rt,
@@ -3729,7 +3633,6 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                 pattern,
                 window_rt,
                 zero_counts,
-                elution_fitted,
             }
         })
         .collect();
@@ -4285,7 +4188,6 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         }
         // `quant.q1_fragments`, only then, so every other report keeps its bytes.
         if let (Some(a), Some(inp)) = (&q1a, p.q1) {
-            let elution: Vec<Option<bool>> = applied.iter().map(|x| x.elution_fitted).collect();
             let pattern_fallbacks = applied
                 .iter()
                 .filter(|x| {
@@ -4299,8 +4201,6 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                     "psms_extracted": inp.psms_extracted,
                     "spectra_ms2": inp.spectra_ms2,
                     "min_belonging": p.cfg.q1_min_belonging,
-                    "step_weights": format!("{:?}", p.cfg.q1_step_weights),
-                    "integration": format!("{:?}", p.cfg.q1_integration),
                     "step_mz": a.model.step_mz,
                     "half_width_mz": a.model.half_width_mz,
                     "edge_width_mz": a.model.edge_width_mz,
@@ -4314,8 +4214,6 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                     },
                     "masked_fragments": a.masked_rows,
                     "rows": n_q1_rows,
-                    "elution_fitted": elution.iter().filter(|&&e| e == Some(true)).count(),
-                    "elution_trapezoid": elution.iter().filter(|&&e| e == Some(false)).count(),
                     "pattern_no_belonging": pattern_fallbacks,
                 }),
             );

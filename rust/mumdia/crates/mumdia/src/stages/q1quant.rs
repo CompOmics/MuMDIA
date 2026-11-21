@@ -14,8 +14,8 @@
 //! gets the weight `w_s`, the fragment's expected Q1 profile (the trapezoid transmission
 //! summed over the precursor's isotopes, `q1frag::CandQ1`) at the step's target and the
 //! precursor's calibrated expected centre, and the cycle's value is the least-squares
-//! amplitude `sum(w x) / sum(w^2)` at the mean retention time of the cycle's samples
-//! (`quant.q1_step_weights = uniform`: `w = 1`, the mean). The expected centre is the run's
+//! amplitude `sum(w x) / sum(w^2)` at the mean retention time of the cycle's samples.
+//! The expected centre is the run's
 //! calibration (its offset at the precursor m/z and the isotope envelope), not the row's own
 //! fitted centre (`q1f_centre`): weights at the fitted centre carry its fit noise into each
 //! run's value, and on the K562 runs raised the median replicate CV from 0.120 to 0.125.
@@ -28,10 +28,6 @@
 //! candidate keeps every fragment, on the same cycle traces, so one precursor is in the same
 //! units in every run whichever way each run went.
 //!
-//! [`elution_weights`] is `quant.q1_integration = elution_fit`: one Gaussian elution profile
-//! fitted to the window samples, and the integration weights that give each fragment its
-//! least-squares amplitude under it times the profile's area.
-//!
 //! Deterministic: every sum runs in sample order, the scans are ordered by retention time and
 //! then by scan index, and every lookup takes the nearest scan with ties to the earlier.
 
@@ -39,7 +35,7 @@ use std::collections::HashMap;
 
 use anyhow::{bail, Context, Result};
 use arrow::array::{Array, Int32Array, UInt32Array};
-use mumdia_core::config::{Q1FragModel, Q1StepWeights};
+use mumdia_core::config::Q1FragModel;
 use mumdia_io::table::{ListF32, TableFile};
 
 use super::q1frag;
@@ -491,114 +487,10 @@ pub fn collapse_trace(
     (out_rt, out_it)
 }
 
-/// The weight of a step of target `t` for fragment `f` of `cand` under `rule`: its expected
-/// Q1 profile at the calibrated centre and width (`transmission`), or 1 (`uniform`).
-pub fn step_weight(
-    rule: Q1StepWeights,
-    m: &Q1FragModel,
-    cand: &q1frag::CandQ1,
-    f: usize,
-    t: f64,
-) -> f64 {
-    match rule {
-        Q1StepWeights::Transmission => cand.expected(m, f, t, 0.0, 1.0),
-        Q1StepWeights::Uniform => 1.0,
-    }
-}
-
-/// `quant.q1_integration = elution_fit`: the integration weights of window samples at
-/// retention times `rt` (NaN outside the trace) under one Gaussian elution profile fitted to
-/// their summed intensities `y`. The profile is the weighted least-squares parabola of
-/// `ln y` (weights `y^2`) over the samples with `y > 0`; each fragment's area is then
-/// `sum(k x)` with `k = G sigma sqrt(2 pi) / sum(G^2)`, its least-squares amplitude under
-/// the profile `G` times the profile's area. `None` (the trapezoid applies) with fewer than
-/// three positive samples, a parabola that does not open downward, a width outside a fifth
-/// of the median spacing to three window spans, or a centre more than one spacing outside
-/// the window.
-pub fn elution_weights(rt: &[f64], y: &[f64]) -> Option<Vec<f64>> {
-    debug_assert_eq!(rt.len(), y.len());
-    let fin: Vec<usize> = (0..rt.len()).filter(|&i| rt[i].is_finite()).collect();
-    if fin.len() < 3 {
-        return None;
-    }
-    let (t_first, t_last) = (rt[fin[0]], rt[fin[fin.len() - 1]]);
-    let span = t_last - t_first;
-    if span.is_nan() || span <= 0.0 {
-        return None;
-    }
-    let mut gaps: Vec<f64> = fin.windows(2).map(|w| rt[w[1]] - rt[w[0]]).collect();
-    let dt = super::quant_pattern::median(&mut gaps);
-    let mid = 0.5 * (t_first + t_last);
-    // Normal equations of ln y = a + b u + c u^2, u = t - mid, weights y^2.
-    let mut s = [0.0f64; 5];
-    let mut r = [0.0f64; 3];
-    let mut npos = 0usize;
-    for &i in &fin {
-        if !(y[i] > 0.0 && y[i].is_finite()) {
-            continue;
-        }
-        npos += 1;
-        let u = rt[i] - mid;
-        let w = y[i] * y[i];
-        let l = y[i].ln();
-        let mut up = 1.0;
-        for sk in s.iter_mut() {
-            *sk += w * up;
-            up *= u;
-        }
-        r[0] += w * l;
-        r[1] += w * l * u;
-        r[2] += w * l * u * u;
-    }
-    if npos < 3 {
-        return None;
-    }
-    // [s0 s1 s2; s1 s2 s3; s2 s3 s4] [a b c]' = r, by Cramer's rule.
-    let det3 = |m: [[f64; 3]; 3]| -> f64 {
-        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
-    };
-    let a = [[s[0], s[1], s[2]], [s[1], s[2], s[3]], [s[2], s[3], s[4]]];
-    let d = det3(a);
-    if d == 0.0 || !d.is_finite() {
-        return None;
-    }
-    let mut ab = a;
-    let mut ac = a;
-    for ((rb, rc), &rk) in ab.iter_mut().zip(ac.iter_mut()).zip(&r) {
-        rb[1] = rk;
-        rc[2] = rk;
-    }
-    let (b, c) = (det3(ab) / d, det3(ac) / d);
-    if c.is_nan() || c >= 0.0 || !b.is_finite() {
-        return None;
-    }
-    let sigma = (-0.5 / c).sqrt();
-    let u0 = -b / (2.0 * c);
-    let t0 = mid + u0;
-    let sigma_ok = sigma.is_finite() && sigma >= 0.2 * dt && sigma <= 3.0 * span;
-    let centre_ok = t0 >= t_first - dt && t0 <= t_last + dt;
-    if !sigma_ok || !centre_ok {
-        return None;
-    }
-    let g: Vec<f64> = rt
-        .iter()
-        .map(|&t| {
-            if t.is_finite() {
-                let z = (t - t0) / sigma;
-                (-0.5 * z * z).exp()
-            } else {
-                0.0
-            }
-        })
-        .collect();
-    let sgg: f64 = g.iter().map(|x| x * x).sum();
-    if sgg.is_nan() || sgg <= 0.0 {
-        return None;
-    }
-    let area = sigma * (2.0 * std::f64::consts::PI).sqrt();
-    Some(g.iter().map(|x| x * area / sgg).collect())
+/// The weight of a step of target `t` for fragment `f` of `cand`: its expected Q1 profile at
+/// the calibrated centre and width.
+pub fn step_weight(m: &Q1FragModel, cand: &q1frag::CandQ1, f: usize, t: f64) -> f64 {
+    cand.expected(m, f, t, 0.0, 1.0)
 }
 
 #[cfg(test)]
@@ -672,14 +564,11 @@ mod tests {
         for &(r, c, t) in &meta {
             if (t - pm).abs() <= 1.9 {
                 rt.push(r as f32);
-                it.push(
-                    (amp[c as usize] * step_weight(Q1StepWeights::Transmission, &m, &cand, 0, t))
-                        as f32,
-                );
+                it.push((amp[c as usize] * step_weight(&m, &cand, 0, t)) as f32);
             }
         }
         let located = sw.locate_axis(&rt, pm).unwrap();
-        let w = |t: f64| step_weight(Q1StepWeights::Transmission, &m, &cand, 0, t);
+        let w = |t: f64| step_weight(&m, &cand, 0, t);
         let (crt, cit) = collapse_trace(&located, &rt, &it, &w);
         assert_eq!(crt.len(), 5);
         for (c, (&a, &x)) in amp.iter().zip(&cit).enumerate() {
@@ -724,40 +613,6 @@ mod tests {
         let pm = 505.0;
         assert!(sw.locate_axis(&[100.0, 100.5], pm).is_none());
         assert_eq!(sw.locate_axis(&[], pm), Some(Vec::new()));
-    }
-
-    #[test]
-    fn the_elution_weights_integrate_a_gaussian_exactly() {
-        let rt: Vec<f64> = (0..7).map(|i| 10.0 + i as f64).collect();
-        let (t0, sigma, amp) = (13.3, 1.2, 50.0);
-        let g = |t: f64| amp * (-0.5 * ((t - t0) / sigma).powi(2)).exp();
-        let y: Vec<f64> = rt.iter().map(|&t| g(t)).collect();
-        let k = elution_weights(&rt, &y).unwrap();
-        let area: f64 = k.iter().zip(&y).map(|(a, b)| a * b).sum();
-        let want = amp * sigma * (2.0 * std::f64::consts::PI).sqrt();
-        assert!((area - want).abs() < 1e-6 * want, "{area} vs {want}");
-        // A second fragment of the same shape and a third of its height gets a third.
-        let y3: Vec<f64> = y.iter().map(|v| v / 3.0).collect();
-        let a3: f64 = k.iter().zip(&y3).map(|(a, b)| a * b).sum();
-        assert!((a3 - want / 3.0).abs() < 1e-6 * want);
-        // Samples outside the trace weigh 0.
-        let mut rt_n = rt.clone();
-        rt_n[0] = f64::NAN;
-        let kn = elution_weights(&rt_n, &y).unwrap();
-        assert_eq!(kn[0], 0.0);
-    }
-
-    #[test]
-    fn the_elution_fit_gives_way_where_there_is_no_peak() {
-        let rt: Vec<f64> = (0..7).map(|i| i as f64).collect();
-        // Rising: the parabola of ln y opens upward or the centre is outside the window.
-        assert!(elution_weights(&rt, &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]).is_none());
-        // Too few positive samples.
-        assert!(elution_weights(&rt, &[0.0, 0.0, 5.0, 3.0, 0.0, 0.0, 0.0]).is_none());
-        // Flat.
-        assert!(elution_weights(&rt, &[5.0; 7]).is_none());
-        // Too few samples.
-        assert!(elution_weights(&rt[..2], &[1.0, 2.0]).is_none());
     }
 
     #[test]
@@ -862,8 +717,7 @@ mod run_tests {
                 c_int.push(
                     grid.iter()
                         .map(|&(c, s)| {
-                            let w =
-                                step_weight(Q1StepWeights::Transmission, &m, &cand, f, target(s));
+                            let w = step_weight(&m, &cand, f, target(s));
                             let own = 100.0 * pred[f] as f64 * G[c as usize] * w;
                             let interfered = if cls[f] == 2.0 { 5000.0 } else { 0.0 };
                             (own + interfered) as f32
@@ -1008,27 +862,6 @@ mod run_tests {
         assert_eq!(block["candidates"]["belonging"], 1);
         assert_eq!(block["candidates"]["fallback"], 1);
         assert_eq!(block["masked_fragments"], 1);
-        // Uniform step weights: the mean of the steps, smaller than the amplitude.
-        let uni = QuantConfig {
-            q1_step_weights: Q1StepWeights::Uniform,
-            ..cfg.clone()
-        };
-        let (tu, _) = quant(&fx, &uni, "uni");
-        assert!(tu.opt_f64("quantity").unwrap()[0].unwrap() < got);
-        // The elution fit integrates the same cycles under a fitted Gaussian.
-        let ef = QuantConfig {
-            q1_integration: mumdia_core::config::Q1Integration::ElutionFit,
-            ..cfg.clone()
-        };
-        let (te, repe) = quant(&fx, &ef, "ef");
-        let ge = te.opt_f64("quantity").unwrap()[0].unwrap();
-        assert!(ge > 0.5 * want && ge < 2.0 * want, "{ge} vs {want}");
-        assert!(
-            repe["params"]["q1_fragments"]["elution_fitted"]
-                .as_u64()
-                .unwrap()
-                >= 1
-        );
         // Deterministic.
         let (t2, _) = quant(&fx, &cfg, "on2");
         assert_eq!(t2.opt_f64("quantity").unwrap(), q);
