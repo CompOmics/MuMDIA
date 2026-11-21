@@ -582,7 +582,7 @@ to 21:04 with the peptides inside the seed spread, which is why `K = 0` is the d
 since 2026-09-27 (`docs/08_rt_im_train.md`, "Sharded whole-library prediction").
 
 **Band lists** (`groups.rt_adaptation = once_per_run`, `--bands <tsv>`). A grouped run
-under global calibration can adapt all its bands in one call:
+adapts all its bands in one call:
 `deeplc_finetune.py - <seed|-> - --bands <tsv> (--multihead N | --no-finetune)`, where
 each TSV line is `lib_in<TAB>lib_out` and the positional `lib_in` and `lib_out` are `-`.
 The worker reads each band's `peptidoform` column, fits the calibration once, predicts the

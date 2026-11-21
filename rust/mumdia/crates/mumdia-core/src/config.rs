@@ -4866,11 +4866,9 @@ pub enum GroupCalibration {
     /// each group's LOESS and multi-head fit see the whole run's anchors. The default: a
     /// group holds a fraction of the anchors, and the fit quality is what sets the RT
     /// window that the extract of every group then pays for.
+    /// The only value since 0.15.0, which removed `per_group` (each group on its own seeds).
     #[default]
     Global,
-    /// Each group calibrates on its own seeds only. Cheaper by one pooling pass and fully
-    /// independent per group; kept for the comparison, not as a recommendation.
-    PerGroup,
 }
 
 /// What a grouped run's band plan balances.
@@ -4887,18 +4885,16 @@ pub enum GroupBalance {
 }
 
 /// How often a grouped run adapts the library's retention times (the multi-head calibration
-/// or the base-model re-prediction) under `groups.calibration = global`.
+/// or the base-model re-prediction).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum GroupRtAdaptation {
-    /// One DeepLC sidecar per band, each fitting the pooled anchors and predicting its own
-    /// band. The behaviour before this setting existed, and the default until 2026-09-27.
-    PerBand,
     /// One sidecar per run over the union of the bands: the calibration is fitted once, each
     /// unique sequence is predicted once, and every band's table is written under the name
     /// a per-band run gives it. A library the caller already re-predicted with the base
     /// model (`run-experiment` with the multi-head calibration off) is not re-predicted per
-    /// band again. The default since 2026-09-27.
+    /// band again. The default since 2026-09-27, and the only value since 0.15.0, which
+    /// removed `per_band` (one sidecar per band).
     #[default]
     OncePerRun,
 }
@@ -4939,15 +4935,14 @@ pub struct GroupsConfig {
     /// probing and the run deadlocks. A larger value is clamped to `threads - 1` with a
     /// warning rather than hanging.
     pub parallel: usize,
-    /// How often the library's retention times are adapted under `calibration = global`:
-    /// `once_per_run` (the default since 2026-09-27) runs one DeepLC sidecar per run over the
-    /// union of the bands, `per_band` (the previous default) one per band. `per_group`
-    /// calibration always adapts per band.
+    /// How often the library's retention times are adapted: `once_per_run` (the default
+    /// since 2026-09-27, and since 0.15.0 the only value) runs one DeepLC sidecar per run
+    /// over the union of the bands. `per_band`, one sidecar per band, was removed in 0.15.0.
     ///
-    /// Each per-band sidecar starts an interpreter, imports torch and DeepLC, reads the
-    /// pooled seed, refits the same heads on the same anchors (head 2503 in every band of
-    /// the HYE sweep) and predicts every sequence of its band, so a sequence whose charge
-    /// states fall in two bands is predicted twice (10.9M HYE rows are 4.91M unique
+    /// Each per-band sidecar started an interpreter, imported torch and DeepLC, read the
+    /// pooled seed, refitted the same heads on the same anchors (head 2503 in every band of
+    /// the HYE sweep) and predicted every sequence of its band, so a sequence whose charge
+    /// states fell in two bands was predicted twice (10.9M HYE rows are 4.91M unique
     /// sequences). On HYE Astral the multi-head step took about 13 min unbanded and 19-24
     /// min at 2-16 bands. `once_per_run` fits once, predicts the union once and writes each
     /// band's table under the name a per-band run gives it
@@ -5047,8 +5042,8 @@ pub struct GroupsConfig {
     /// before.
     pub pool_chromatograms: bool,
     /// Let the bands extract with unbounded retention-time windows. Default `false`: when the
-    /// fit a band extracts with has fewer than two target anchors (the pooled seed under
-    /// `calibration = global`, the band's own seed under `per_group`), the run stops with an
+    /// fit the bands extract with has fewer than two target anchors (on the pooled seed),
+    /// the run stops with an
     /// error before a band extracts with it. The seeds are counted right after `seed-pool`,
     /// before any DeepLC sidecar or extraction, and the fit itself is checked again before
     /// its windows are written. `true` keeps the previous behaviour and logs a warning that
@@ -5070,8 +5065,7 @@ pub struct GroupsConfig {
     /// Check the seed first: the library and its decoys, the seed's fragment tolerance and
     /// the input file. A run without a confident seed can be searched ungrouped
     /// (`window_groups = 1`), which keeps the unbounded fallback: on an ordinary library it
-    /// fits in memory, and single-cell blank wells are searched that way. Under `per_group`,
-    /// `calibration = global` fits one calibration on the anchors of every band. Omitted
+    /// fits in memory, and single-cell blank wells are searched that way. Omitted
     /// from the canonical configuration at its default, so the config hash of every
     /// configuration that does not set it is unchanged (`docs/33_window_groups.md` section
     /// 4c).
@@ -7578,6 +7572,16 @@ const RETIRED: &[Retired] = &[
         path: "features.bound_confident_pct",
         gone: Gone::Key("50.0"),
         why: "it only set the percentile of features.bound_from_confident, which was removed",
+    },
+    Retired {
+        path: "groups.calibration",
+        gone: Gone::Value("\"per_group\""),
+        why: "calibrating each band on its own seed was kept only for comparison, and bands               without anchors stopped the run (docs/33_window_groups.md section 4)",
+    },
+    Retired {
+        path: "groups.rt_adaptation",
+        gone: Gone::Value("\"per_band\""),
+        why: "one sidecar per band measured slower than once_per_run with the same peptides               (docs/33_window_groups.md section 4b)",
     },
 
     // D: MS1 surface, never-read keys and refused choices
@@ -10338,8 +10342,6 @@ mod tests {
             Config::default().groups.rt_adaptation,
             GroupRtAdaptation::OncePerRun
         );
-        let c = Config::from_json(r#"{"groups":{"rt_adaptation":"per_band"}}"#).unwrap();
-        assert_eq!(c.groups.rt_adaptation, GroupRtAdaptation::PerBand);
         assert!(Config::from_json(r#"{"groups":{"rt_adaptation":"sometimes"}}"#).is_err());
         assert_eq!(Config::default().groups.balance, GroupBalance::Precursors);
         let c = Config::from_json(r#"{"groups":{"balance":"cost"}}"#).unwrap();

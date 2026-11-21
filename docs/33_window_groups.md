@@ -30,9 +30,9 @@ on.
 | Field | Default | Meaning |
 |---|---|---|
 | `window_groups` | `1` | Number of groups. `1` is the ordinary single-library search. Clamped to the number of distinct isolation windows; groups whose band selects no precursor are merged into a neighbour, so the number actually searched can be smaller (the log and `groups/plan.json` say how many). |
-| `calibration` | `global` | Whose seed anchors calibrate each group's retention time and mass: `global` pools every group's seeds first (section 4); `per_group` uses the group's own. |
+| `calibration` | `global` | Whose seed anchors calibrate each group's retention time and mass: `global` pools every group's seeds first (section 4). The only value since 0.15.0, which removed `per_group`. |
 | `parallel` | `1` | Bands in flight at a time, through a bounded queue that starts the most expensive band first (section 8, "Scheduling the bands"). Clamped below the thread count. |
-| `rt_adaptation` | `once_per_run` | Adapts the library's retention times in one DeepLC worker per run over the union of the bands, under `global` calibration (section 4b); `per_band` runs one per band. Float-equivalent; default since 2026-09-27. |
+| `rt_adaptation` | `once_per_run` | Adapts the library's retention times in one DeepLC worker per run over the union of the bands (section 4b). Default since 2026-09-27 and the only value since 0.15.0, which removed `per_band`. |
 | `balance` | `precursors` | `cost` balances the cuts on precursors times MS2 peaks per window instead (section 2). Output-changing, opt-in. |
 | `delete_band_intermediates` | `true` | Delete each band's `psms_extracted` and `features` tables once the pool is written (section 6). Disk only; default since 2026-09-27. |
 | `pool_competed` | `false` | `false` leaves the competed rows per band and has rescore read the band tables with a table-to-source map, where that cannot change a result (section 5). `psms_scored.parquet` is byte-identical; the pooled competed table is not written. `true` writes it. Default since 2026-09-26. |
@@ -154,9 +154,9 @@ in the ungrouped single-run case. Both buffers are dropped at the end of the ext
 phase, before `pool::run` reads and rewrites the run's largest artifacts.
 
 What makes the sharing safe is NOT that nothing corrects the observed m/z. The per-run mass
-recalibration corrects exactly that -- `peak.mz / mass_off.factor_at(peak.mz)` -- and under
-`groups.calibration = per_group` each band applies its own factor to the same buffer. It is
-safe because that corrected value is computed into a local (`q_mz`) at every call site and
+recalibration corrects exactly that -- `peak.mz / mass_off.factor_at(peak.mz)` -- and the
+bands need not share one factor (the removed `groups.calibration = per_group` gave each band
+its own). It is safe because that corrected value is computed into a local (`q_mz`) at every call site and
 never written back; because the stages take a shared slice they cannot write through;
 because `load_ms2` and `load_ms1` sort by retention time before returning, so no stage
 re-sorts; because `select_peaks` returns peak indices instead of truncating `scan.peaks`;
@@ -191,8 +191,8 @@ column. The saving scales with `groups.parallel` and nothing is traded for it: a
 Measured on the fixture at `window_groups: 3, parallel: 2`, the load-ms2 and load-ms1 stage
 lines go from 6 MS2 decodes and 3 MS1 decodes to 2 and 1, and the run's artifacts are
 byte-identical to the pre-change binary's under both `calibration: global` and
-`calibration: per_group`, which is the mode in which the bands apply different mass offsets
-to the one shared buffer.
+`calibration: per_group` (removed in 0.15.0), which was the mode in which the bands applied
+different mass offsets to the one shared buffer.
 
 At production scale one run's MS2 was about 1 GB decoded (301,127 scans on the immuno data,
 293,271 on the Astral data), and 63 bands were 126 decodes of it. Since `Peak` was narrowed
@@ -208,16 +208,14 @@ and eight concurrent copies about 4.8 million. Deleting the id halves that to on
 scan. How many of those become distinct mappings depends on the allocator's size classes
 and is not measured here; the block count is exact.
 
-`ci/smoke.sh` runs a grouped arm (`window_groups: 3, parallel: 2, calibration: per_group`)
+`ci/smoke.sh` runs a grouped arm (`window_groups: 3, parallel: 2, calibration: global`)
 so that this path, and `run_groups` generally, has regression cover: without it every
-assertion in the suite is about the ungrouped `scans: None` arm, which is a no-op. The arm
-sets `allow_unbounded_rt: true`, because no band of the fixture reaches a confident anchor
-on its own q scale (section 4c). Three more runs check the refusal: the same search without
-the key and a global search without anchors both stop right after the seed, with no band
-windows, no extracted table and one MS2 decode, and the global search with the key extracts
-and logs the warning.
+assertion in the suite is about the ungrouped `scans: None` arm, which is a no-op. Two more
+runs check the refusal (section 4c): a search whose pooled seed has no anchors stops right
+after the seed, with no band windows, no extracted table and one MS2 decode, and the same
+search with `allow_unbounded_rt: true` extracts and logs the warning.
 
-## 4. The seed pool and the two calibration modes
+## 4. The seed pool and the calibration
 
 Each band's seed has two problems as a calibration anchor set. Its `spectrum_q` was
 estimated on the band's PSMs alone, and the q floor is `1/T` (`docs/11_compete_rescore_fdr.md`), so a
@@ -280,7 +278,8 @@ calibration already uses the pooled anchors under `groups.calibration = global`:
   `two_pass_mass_cal` and the `mass_cal_loess` grid work on this path, because both read the
   deviations rather than a scalar.
 - The band's own `<seed>.masscal.json` is unchanged: still fitted on that band's confident
-  targets alone, and still what `groups.calibration = per_group` extracts with.
+  targets alone. No band extracts with it since 0.15.0 removed `groups.calibration =
+  per_group`.
 
 The band's q is not the pooled q in either direction, so the sidecar carries more than the
 band's own selection: EVERY target PSM of the band is offered whatever its own q says, and
@@ -339,16 +338,16 @@ is an error naming it. When the pooled fit has fewer than `masscal::MIN_CALIBRAN
 deviations the pool keeps the configured tolerance rather than fitting a percentile of a
 handful of points, with a warning.
 
-`groups.calibration` decides which anchors each band's calibration sees:
+Each band's calibration sees the pooled anchors:
 
-| | `global` (default) | `per_group` |
-|---|---|---|
-| RT model (multi-head calibration) | the pooled seed, joined by peptidoform | the band's seed |
-| `rt-im-train` anchors | the pooled seed, iRT read from the seed row (`anchor_irt_from_seed`), one fit shared by every band | the band's seed, iRT joined from the band table |
-| `extract` mass calibration | the pooled `masscal.json` | the band's |
-| `features` seed corroboration | the pooled seed (library-wide ids) | the pooled seed (library-wide ids) |
+| | anchors |
+|---|---|
+| RT model (multi-head calibration) | the pooled seed, joined by peptidoform |
+| `rt-im-train` anchors | the pooled seed, iRT read from the seed row (`anchor_irt_from_seed`), one fit shared by every band |
+| `extract` mass calibration | the pooled `masscal.json` |
+| `features` seed corroboration | the pooled seed (library-wide ids) |
 
-Under `global`, after a per-band re-prediction of the library iRT, the pooled anchors carry
+After a per-band re-prediction of the library iRT, the pooled anchors carry
 the library's iRT as it was when seeded; `seed_pool::refresh_irt` then copies each anchor's
 new value from its band's table into `seed_psms_calibrated.parquet`, which is what
 `rt-im-train` reads. The RT fit is then identical across bands (same anchors, same model),
@@ -359,8 +358,7 @@ fit to its own table (`rt_im_train::apply_in_memory`), writing its `run_windows.
 `cal.json` identical to the one it wrote when it fitted for itself
 (`one_fit_applied_writes_what_the_whole_stage_writes`). Before, each band decoded the pooled
 seed and refitted the same curve, one seed decode and one fit per band on the band loop's
-critical path; the log now shows one `stage=rt-fit` line per run. `per_group` fits per band,
-as before.
+critical path; the log now shows one `stage=rt-fit` line per run.
 
 Refitting per band is sound because the multi-head ridge and the base-model re-prediction
 are deterministic in their anchors: the same pooled anchors give the same head selection,
@@ -370,42 +368,43 @@ would be trained once per band, so `rt_im_train.finetune_deeplc` with `window_gr
 refused when the configuration loads; fine-tune the library once beforehand (`docs/08_rt_im_train.md`, once per library) and
 search that table.
 
-`per_group` is kept for the comparison the design asked for, not as a recommendation: it is
-one pooling pass cheaper and every group is independent, but each group fits on a fraction
-of the anchors, and the fit quality sets the RT window that the extract of every group then
-pays for. On the CI fixture it cannot fit at all (no band has a confident anchor, for the
-`1/T` reason above), and at real scale it fails in the same way: on AT10234AUH three of
-seven bands had no confident seed on their own q scale (section 8).
+`groups.calibration = per_group`, which calibrated each group on its own seed, was removed
+in 0.15.0. It was kept for the comparison the design asked for, not as a recommendation: it
+was one pooling pass cheaper and every group was independent, but each group fitted on a
+fraction of the anchors, and the fit quality sets the RT window that the extract of every
+group then pays for. On the CI fixture it could not fit at all (no band had a confident
+anchor, for the `1/T` reason above), and at real scale it failed in the same way: on
+AT10234AUH three of seven bands had no confident seed on their own q scale (section 8), so
+with the refusal of section 4c such a run stopped.
 
 ### 4b. One retention-time adaptation per run (`groups.rt_adaptation`)
 
-The per-band refit above is sound but not cheap. Each band's DeepLC sidecar starts an
-interpreter, imports torch and DeepLC, reads the pooled seed, refits the same heads on the
-same anchors (head 2503 in every band of the HYE sweep), and predicts every sequence of its
+The per-band refit above is sound but not cheap. Each band's DeepLC sidecar started an
+interpreter, imported torch and DeepLC, read the pooled seed, refitted the same heads on the
+same anchors (head 2503 in every band of the HYE sweep), and predicted every sequence of its
 own band. The charge states of one peptidoform sit at `(M + z * 1.007) / z`, which differ by
 a factor of at least 1.33, so they usually fall in different bands and each of those bands
 predicts the sequence again: the 10.9M HYE precursor rows are 4.91M unique sequences
 unbanded. Measured on HYE Astral (2026-09-24), the multi-head step took about 13 min
 unbanded and 19-24 min at 2-16 bands.
 
-`groups.rt_adaptation = once_per_run` (the default since 2026-09-27; `per_band` is the
-behaviour before the setting existed) runs one worker per run under `calibration = global`:
+`groups.rt_adaptation = once_per_run` (the default since 2026-09-27, and the only value
+since 0.15.0, which removed `per_band`, the behaviour before the setting existed) runs one
+worker per run:
 `deeplc_finetune.py - <seed> - --bands <tsv>`, where `groups/rt_bands.tsv` lists every
 band's table and output. The worker fits the multi-head calibration once, predicts the union
 of the bands' unique sequences once, in the order the bands list them, and rewrites each band
 with the rule a single table gets, writing `groups/gNN/lib_precursors_multihead.parquet` (or
 `_deeplc` for the base-model re-prediction) and its `.summary.json` under the names a
 per-band run uses. The shared-band reuse of later runs, `seed_pool::refresh_irt` and the
-manifest records are therefore unchanged. `per_group` keeps one sidecar per band, fitted on
-the band's own anchors.
+manifest records are therefore unchanged.
 
 The setting also covers a re-prediction the caller has already made. With the multi-head
 calibration off and `library_irt` resolving to DeepLC, `run-experiment` re-predicts the
 imported library once for the whole experiment, and each band of each run then re-predicted
 its slice of that table again, because `experiment.rt_library_scope` shares only an
 adaptation (a fine-tune or the multi-head calibration). Under `once_per_run` the bands keep
-the experiment-level values (`GroupRun::library_irt_repredicted`); under `per_band` they
-re-predict as before.
+the experiment-level values (`GroupRun::library_irt_repredicted`).
 
 Output effect: float-equivalent to `per_band`, not bit-identical. A sequence is predicted
 once, in different company from its per-band prediction, and torch's CPU kernels round by
@@ -427,15 +426,13 @@ at 16 bands went from 36:06 to 25:39 and an eight-band entrapment run from 5:44 
 of the band rows moved, by at most 0.07 s (0.6%, at most 2.9 s, on the entrapment library),
 with the same heads; and the peptides at 1% moved +0.35% (3 seeds) and +0.24% (10 seeds, the
 entrapment FDP +0.022 pp against two standard errors of 0.027). That is why it is the
-default.
+default, and why `per_band` was removed in 0.15.0.
 
 On a synthetic library one `--bands` call over contiguous bands writes exactly the
 whole-library column band by band, under both the multi-head calibration and the base model
 (`tests/python/test_deeplc_predict.py`,
 `test_bands_write_the_whole_library_column_band_by_band`), so the union call reproduces what
-an unbanded run predicts. Before defaulting it on: the per-band max |delta `predicted_irt`|
-and the selected heads against `per_band`, and peptides at 1% on a banded HYE arm inside the
-seed spread, on two acquisitions.
+an unbanded run predicts.
 
 ### 4c. Too few anchors: the run stops before it extracts (`groups.allow_unbounded_rt`)
 
@@ -460,25 +457,19 @@ reached 560 GB, and one aborted at 664 GB at the host's commit limit.
 A grouped run therefore stops with an error instead of extracting without windows. It checks
 twice:
 
-- **On the seeds, right after `seed-pool`.** Under `calibration = global` the pooled seed is
-  counted, under `per_group` each band's own seed, as the confident target peptides at
+- **On the seeds, right after `seed-pool`.** The pooled seed is counted as the confident
+  target peptides at
   `spectrum_q < rt_im_train.q_train` (`rt_im_train::seed_anchor_bound`, the rows the fit
   takes before it joins their iRT). A seed with fewer than two cannot give a fit with two, so
   the run stops here, before the band slices, the DeepLC sidecars, the extraction decode and
-  the MS1 offset learned on it. Under `per_group` one error names every band whose seed has fewer than
-  two. A run without anchors therefore stops right after its seed, not after a DeepLC pass
+  the MS1 offset learned on it. A run without anchors therefore stops right after its seed, not after a DeepLC pass
   over the whole library or after most bands have extracted.
 - **On the fit itself.** A seed with anchors can still give a fit on fewer than two, when the
-  re-predicted iRT is not finite or `rt_im_train.anchor_x_filter` removes them. Under
-  `global` the shared fit is checked before the spectra are decoded for extraction; under
-  `per_group` each band's fit is checked before the band's `run_windows.parquet`, `cal.json`
-  or any extraction output is written. Bands already in flight then finish, and no further
-  band starts (`groups::run_bounded`). This message says how many of the seed's anchors the
-  fit kept and points at the iRT rather than at the seed.
+  re-predicted iRT is not finite or `rt_im_train.anchor_x_filter` removes them. The shared
+  fit is checked before the spectra are decoded for extraction. This message says how many
+  of the seed's anchors the fit kept and points at the iRT rather than at the seed.
 
-The errors begin `groups: the retention-time windows would be unbounded` (`global`),
-`groups: the retention-time windows of band gNN would be unbounded` or `groups: the
-retention-time windows of N of the M bands would be unbounded` (`per_group`). Each names the
+The error begins `groups: the retention-time windows would be unbounded`. It names the
 run's output directory, so a multi-run experiment says which run stopped, and gives the
 number of anchors, the number of bands and the fragment tolerance extract would use. A
 grouped run takes its anchors at `rt_im_train.q_train` and, unlike an ungrouped one, does
@@ -489,9 +480,7 @@ The decision is `rt_im_train::windows_unbounded` (`n_train < 2`), the same funct
 chooses the unbounded windows, and the seed count bounds `n_train` from above, so a run is
 refused exactly when it would have extracted without windows. A fit on two or more anchors is
 not affected, including one below `min_seed_for_calibration` that gets the fixed fallback
-window. On real data `per_group` bands often have no confident anchor on their own q scale
-(on AT10234AUH three of seven, section 8), so that mode now stops where it used to extract
-without windows. The ungrouped path is unchanged.
+window. The ungrouped path is unchanged.
 
 What to do:
 
@@ -502,9 +491,7 @@ What to do:
    DeepLC step that rewrote it instead.
 2. Search the run ungrouped (`groups.window_groups = 1`) if the library fits in memory
    without bands. The ungrouped path keeps the unbounded fallback.
-3. Under `per_group`, use `calibration = global` (the default), which fits one calibration on
-   the anchors of every band.
-4. To extract with unbounded windows deliberately, set `groups.allow_unbounded_rt = true`.
+3. To extract with unbounded windows deliberately, set `groups.allow_unbounded_rt = true`.
    The run then behaves exactly as before, with a warning that names the key. The key is
    omitted from the canonical configuration at `false`, so no existing config hash changes.
 
@@ -720,10 +707,8 @@ band, and nothing after compete reads them.
 ## 7. The run-level `cal.json`
 
 `groups::summarise_cal` writes it from the bands' own so that tooling written for an
-ungrouped run (the CI smoke checker, notebooks) reads it unchanged. Under `global` the
-first band's record is the run's, because the fit is one; under `per_group` the record sums
-`n_train`, takes the median `w_rt`, weights the residual summaries by anchors and reports
-`calibration_status = mixed` when the bands disagree. Either way it adds `window_groups`,
+ungrouped run (the CI smoke checker, notebooks) reads it unchanged. The first band's
+record is the run's, because the fit is one. It adds `window_groups`,
 `groups_calibration` and a `groups` list with each band's `n_train`, `w_rt`, status and
 median absolute residual. As everywhere, the in-sample residuals are fit diagnostics, not
 error estimates (`docs/08_rt_im_train.md` section 4).
@@ -738,7 +723,7 @@ configuration, `native_tda`), 2026-09-20, same binary:
 | ungrouped | 1 | 150 | 168 of 168 |
 | `window_groups: 3`, global | 3 | 151 | 168 of 168 |
 | `window_groups: 8`, global | 5 (three merged: empty bands) | 151 | 168 of 168 |
-| `window_groups: 3`, per_group | 3 | 147 | RT checks fail: no band has a confident anchor (`1/T`) |
+| `window_groups: 3`, per_group (removed in 0.15.0) | 3 | 147 | RT checks fail: no band has a confident anchor (`1/T`) |
 
 The fixture cannot measure memory or time; the real-scale measurement below does.
 

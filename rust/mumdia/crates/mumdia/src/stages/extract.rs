@@ -139,8 +139,9 @@ pub struct ExtractParams<'a> {
     ///
     /// Borrowed, never owned, and the stage only reads them. What makes that safe is not
     /// that nothing here corrects the observed m/z -- the per-peak mass recalibration
-    /// corrects exactly that, `peak.mz / mass_off.factor_at(peak.mz)`, and each band
-    /// applies its own factor under `groups.calibration = per_group`. It is safe because
+    /// corrects exactly that, `peak.mz / mass_off.factor_at(peak.mz)`, and the bands need
+    /// not share one factor (the removed `groups.calibration = per_group` gave each band its
+    /// own). It is safe because
     /// the corrected value is computed into a LOCAL (`q_mz`) at every one of those call
     /// sites and never written back, the scans arrive as a shared slice that no stage can
     /// write through, and the loaders have already sorted by retention time so no stage
@@ -2702,9 +2703,9 @@ fn accumulate_groups(
     // The memory-cheap version of that hoist -- writing the corrected value back into
     // `scan.peaks` instead of into a side buffer -- is now FORBIDDEN, not merely
     // unmeasured. Under `groups.window_groups > 1` the scans are one buffer lent to every
-    // band (`ExtractParams::scans`), and under `groups.calibration = per_group` each band
-    // applies its own `MassOffset` to it, so band g00's factor would be baked into the
-    // peaks band g01 reads. The borrow checker stops it today, because `scans` arrives as
+    // band (`ExtractParams::scans`), and a band that applied its own `MassOffset` to it
+    // (as the removed `groups.calibration = per_group` did) would bake band g00's factor
+    // into the peaks band g01 reads. The borrow checker stops it today, because `scans` arrives as
     // a shared slice; do not reach for `&mut` to get around that.
     let (tx, rx) = std::sync::mpsc::channel::<(usize, usize, HitStore)>();
     {

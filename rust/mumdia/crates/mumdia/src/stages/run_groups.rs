@@ -6,8 +6,8 @@
 //! run produces. Per group: the band of the library is written as a precursor table of its
 //! own (local ids), seeded, given a retention-time model and windows, extracted, featured
 //! and competed, in a directory `groups/gNN/` under the run. Between the seeds and the RT
-//! model the seeds are pooled (`groups.calibration = global`), so every group's calibration
-//! is fitted on the whole run's anchors; `per_group` calibrates each group on its own.
+//! model the seeds are pooled, so every group's calibration is fitted on the whole run's
+//! anchors.
 //! `groups.parallel` bands run at a time in this process, so the resident set is that many
 //! bands' libraries, hits and accepted rows -- plus ONE copy of the run's spectra, which
 //! this module decodes once per PHASE and lends to every band's seed and extract. Before
@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use mumdia_core::config::{Config, GroupBalance, GroupCalibration, GroupRtAdaptation};
+use mumdia_core::config::{Config, GroupBalance};
 use mumdia_core::manifest::Manifest;
 use mumdia_core::schema::artifact;
 use mumdia_io::record_artifact;
@@ -56,9 +56,8 @@ pub struct GroupRun<'a> {
     pub library_input: bool,
     /// The caller has already re-predicted `lib_precursors` with the DeepLC base model
     /// (`run-experiment` does so once per experiment when the multi-head calibration is
-    /// off). Under `groups.rt_adaptation = once_per_run` the bands then keep those values
-    /// rather than re-predicting their slices of the same table; under `per_band` they
-    /// re-predict as before. Only a caller that did the re-prediction may set it.
+    /// off). The bands then keep those values rather than re-predicting their slices of the
+    /// same table. Only a caller that did the re-prediction may set it.
     pub library_irt_repredicted: bool,
     /// A previous run's `groups/` directory whose band slices (`gNN/lib_precursors.parquet`)
     /// this run may take instead of writing its own, when its plan is this run's plan: the
@@ -163,24 +162,6 @@ fn record_hashing(
     Ok(())
 }
 
-/// Whose anchors a grouped run's retention-time fit is made on, for [`refuse_unbounded_rt`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RtFitScope {
-    /// The pooled seed of every band (`groups.calibration = global`): one fit for every band.
-    Pooled,
-    /// The band of this index, fitted on its own seed (`groups.calibration = per_group`).
-    Band(usize),
-}
-
-impl RtFitScope {
-    fn band(self) -> Option<usize> {
-        match self {
-            RtFitScope::Pooled => None,
-            RtFitScope::Band(index) => Some(index),
-        }
-    }
-}
-
 /// A count of retention-time anchors, and where it was taken.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Anchors {
@@ -270,31 +251,21 @@ fn target_anchors(n: usize) -> String {
     }
 }
 
-/// The fragment-tolerance clause of the message, from the tolerance of every refused fit
-/// whose masscal could be read: one tolerance is stated with its origin, several as their
-/// range.
-fn tolerance_clause(tols: &[PlannedFragTol]) -> String {
-    let Some(first) = tols.first() else {
+/// The fragment-tolerance clause of the message, when the fit's masscal could be read.
+fn tolerance_clause(tol: Option<PlannedFragTol>) -> String {
+    let Some(t) = tol else {
         return String::new();
     };
-    if tols.iter().all(|t| t == first) {
-        let ppm = first.ppm;
-        return match first.learned {
-            Some(true) => {
-                format!(
-                    ", and extract would search at the learned fragment tolerance of {ppm:.1} ppm"
-                )
-            }
-            Some(false) => format!(
-                ", and with too few fragment calibrants to learn a tolerance extract would \
-                 search at the configured {ppm:.1} ppm"
-            ),
-            None => format!(", and extract would search at a fragment tolerance of {ppm:.1} ppm"),
-        };
+    let ppm = t.ppm;
+    match t.learned {
+        Some(true) => {
+            format!(", and extract would search at the learned fragment tolerance of {ppm:.1} ppm")
+        }
+        Some(false) => format!(
+            ", and with too few fragment calibrants to learn a tolerance extract would search              at the configured {ppm:.1} ppm"
+        ),
+        None => format!(", and extract would search at a fragment tolerance of {ppm:.1} ppm"),
     }
-    let lo = tols.iter().map(|t| t.ppm).fold(f64::INFINITY, f64::min);
-    let hi = tols.iter().map(|t| t.ppm).fold(f64::NEG_INFINITY, f64::max);
-    format!(", and extract would search at fragment tolerances from {lo:.1} to {hi:.1} ppm")
 }
 
 /// What a fit did with its seed's anchors, for an [`Anchors::Fit`] refusal.
@@ -312,94 +283,28 @@ fn fit_clause(n_train: usize, seed: Option<usize>) -> String {
     }
 }
 
-/// The refusal of the unbounded fits `refused` (the pooled one, or one or more bands): what
-/// happened, what it would cost and what to try. `tols` are their fragment tolerances.
-fn unbounded_rt_message(
-    run: RtRun,
-    refused: &[(RtFitScope, Anchors)],
-    tols: &[PlannedFragTol],
-) -> String {
-    let tol = tolerance_clause(tols);
-    let cut = format!(
-        "target peptides at spectrum_q below rt_im_train.q_train = {}",
-        run.q_train
+/// The refusal of the unbounded pooled fit `a`: what happened, what it would cost and what
+/// to try. `tol` is its fragment tolerance.
+fn unbounded_rt_message(run: RtRun, a: Anchors, tol: Option<PlannedFragTol>) -> String {
+    let tol = tolerance_clause(tol);
+    let what = match a {
+        Anchors::Seed(n) => format!(
+            "The pooled seed of the {} bands has {} (target peptides at spectrum_q below              rt_im_train.q_train = {}), fewer than the two a retention-time calibration              needs{tol}.",
+            run.bands,
+            target_anchors(n),
+            run.q_train
+        ),
+        Anchors::Fit { n_train, seed } => format!(
+            "The retention-time fit on the pooled seed of the {} bands {}{tol}.",
+            run.bands,
+            fit_clause(n_train, seed)
+        ),
+    };
+    let mut m = format!(
+        "groups: the retention-time windows would be unbounded in {}. {what} Every band would          then extract every candidate over the whole gradient, and the memory of the run has          no bound (docs/33_window_groups.md section 4c).",
+        run.out_dir
     );
-    let name = |s: RtFitScope| match s.band() {
-        Some(i) => format!("g{i:02}"),
-        None => "pooled".to_string(),
-    };
-    let mut m = match refused {
-        [(RtFitScope::Pooled, a)] => {
-            let what = match *a {
-                Anchors::Seed(n) => format!(
-                    "The pooled seed of the {} bands has {} ({cut}), fewer than the two a \
-                     retention-time calibration needs{tol}.",
-                    run.bands,
-                    target_anchors(n)
-                ),
-                Anchors::Fit { n_train, seed } => format!(
-                    "The retention-time fit on the pooled seed of the {} bands {}{tol}.",
-                    run.bands,
-                    fit_clause(n_train, seed)
-                ),
-            };
-            format!(
-                "groups: the retention-time windows would be unbounded in {}. {what} Every band \
-                 would then extract every candidate over the whole gradient, and the memory of \
-                 the run has no bound (docs/33_window_groups.md section 4c).",
-                run.out_dir
-            )
-        }
-        _ => {
-            let head = match refused {
-                [(s, _)] => format!(
-                    "groups: the retention-time windows of band {} would be unbounded in {}.",
-                    name(*s),
-                    run.out_dir
-                ),
-                _ => format!(
-                    "groups: the retention-time windows of {} of the {} bands would be \
-                     unbounded in {}.",
-                    refused.len(),
-                    run.bands,
-                    run.out_dir
-                ),
-            };
-            let what = match refused {
-                [(s, Anchors::Fit { n_train, seed })] => format!(
-                    "The retention-time fit of band {} {}{tol}.",
-                    name(*s),
-                    fit_clause(*n_train, *seed)
-                ),
-                [(s, a)] => format!(
-                    "The seed of band {} has {} ({cut}), fewer than the two a retention-time \
-                     calibration needs{tol}.",
-                    name(*s),
-                    target_anchors(a.n())
-                ),
-                _ => {
-                    let list: Vec<String> = refused
-                        .iter()
-                        .map(|(s, a)| format!("{} {}", name(*s), a.n()))
-                        .collect();
-                    format!(
-                        "Their seeds have fewer than the two target anchors a retention-time \
-                         calibration needs ({cut}): {}{tol}.",
-                        list.join(", ")
-                    )
-                }
-            };
-            format!(
-                "{head} Under groups.calibration = per_group each band is calibrated on its own \
-                 seed. {what} Such a band would extract every one of its candidates over the \
-                 whole gradient, and its memory has no bound (docs/33_window_groups.md section \
-                 4c). groups.calibration = global fits one calibration on the anchors of all {} \
-                 bands.",
-                run.bands
-            )
-        }
-    };
-    if refused.iter().all(|(_, a)| matches!(a, Anchors::Seed(_))) {
+    if matches!(a, Anchors::Seed(_)) {
         m.push_str(
             " Check the seed: the library and its decoys, search_seed.fragment_tol_ppm and the \
              input file. A grouped run takes its anchors at rt_im_train.q_train and does not \
@@ -417,46 +322,33 @@ fn unbounded_rt_message(
     m
 }
 
-/// Stop a grouped run when a retention-time fit it would extract with leaves the windows
-/// unbounded. `fits` are the fits checked at once: the pooled one (`calibration = global`),
-/// or one per band (`per_group`), and the error names every unbounded one. A grouped run
-/// checks twice: on the seeds' anchor counts right after `seed-pool` ([`Anchors::Seed`],
-/// before any DeepLC sidecar, band slice or extraction), and on the fit itself
-/// ([`Anchors::Fit`], before its windows are written). With `allow`
-/// (`groups.allow_unbounded_rt`) the run goes on exactly as before, with a warning per
-/// unbounded fit. An ungrouped run is not checked: it keeps the unbounded fallback of
-/// `rt-im-train`. `frag_tol` is read only for unbounded fits.
+/// Stop a grouped run when the pooled retention-time fit it would extract with leaves the
+/// windows unbounded. A grouped run checks twice: on the pooled seed's anchor count right
+/// after `seed-pool` ([`Anchors::Seed`], before any DeepLC sidecar, band slice or
+/// extraction), and on the fit itself ([`Anchors::Fit`], before its windows are written).
+/// With `allow` (`groups.allow_unbounded_rt`) the run goes on exactly as before, with a
+/// warning. An ungrouped run is not checked: it keeps the unbounded fallback of
+/// `rt-im-train`. `frag_tol` is read only for an unbounded fit.
 fn refuse_unbounded_rt(
     run: RtRun,
-    fits: &[(RtFitScope, Anchors)],
+    a: Anchors,
     allow: bool,
-    frag_tol: impl Fn(RtFitScope) -> Option<PlannedFragTol>,
+    frag_tol: impl Fn() -> Option<PlannedFragTol>,
 ) -> Result<()> {
-    let unbounded: Vec<(RtFitScope, Anchors)> = fits
-        .iter()
-        .copied()
-        .filter(|(_, a)| unbounded_rt(a.n(), allow) != UnboundedRt::Bounded)
-        .collect();
-    if unbounded.is_empty() {
-        return Ok(());
-    }
-    if allow {
-        for (scope, a) in &unbounded {
+    match unbounded_rt(a.n(), allow) {
+        UnboundedRt::Bounded => Ok(()),
+        UnboundedRt::Allowed => {
             warn!(
                 n_train = a.n(),
                 bands = run.bands,
-                group = scope.band(),
                 out_dir = %run.out_dir,
-                frag_tol_ppm = frag_tol(*scope).map(|t| t.ppm),
-                "groups: fewer than two retention-time anchors; extracting with unbounded RT \
-                 windows because groups.allow_unbounded_rt = true. Every candidate is \
-                 extracted over the whole gradient, and the memory is not bounded"
+                frag_tol_ppm = frag_tol().map(|t| t.ppm),
+                "groups: fewer than two retention-time anchors; extracting with unbounded RT                  windows because groups.allow_unbounded_rt = true. Every candidate is                  extracted over the whole gradient, and the memory is not bounded"
             );
+            Ok(())
         }
-        return Ok(());
+        UnboundedRt::Refused => bail!("{}", unbounded_rt_message(run, a, frag_tol())),
     }
-    let tols: Vec<PlannedFragTol> = unbounded.iter().filter_map(|(s, _)| frag_tol(*s)).collect();
-    bail!("{}", unbounded_rt_message(run, &unbounded, &tols))
 }
 
 /// Content fingerprint of the scans lent to the bands. FNV-1a over every field the
@@ -523,8 +415,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     // the scans are the same bytes for all of them, and one decode serves the lot. The
     // buffer is dropped at the end of the seeding phase rather than held to the end of the
     // run. Nothing between here and extract reads the spectra, and what sits in between is
-    // the retention-time phase, where DeepLC sidecar processes run -- one per band under
-    // `groups.rt_adaptation = per_band`, 63 of them on the 63-band run. Holding ~1 GB of
+    // the retention-time phase, where the DeepLC sidecar runs. Holding ~1 GB of
     // decoded MS2 across that is exactly the resident set the banding exists to bound, so
     // the extraction phase below decodes it a second time instead. Two decodes per run
     // against the 2m this replaces (m = bands), and `run.rs` refuses to share for the same
@@ -799,61 +690,36 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         "seed-pool",
         ch,
     )?;
-    let global = cfg.groups.calibration == GroupCalibration::Global;
     // A seed with fewer than two confident target anchors cannot give a fit with bounded
     // windows (`rt_im_train::seed_anchor_bound` bounds the fit's `n_train` from above), and
     // unbounded windows make every band extract every candidate over the whole gradient.
-    // Refused here, before the MS1 offset, the band slices, the DeepLC sidecars and the
+    // Refused here, before the MS1 offset, the band slices, the DeepLC sidecar and the
     // extraction decode, so a run without anchors stops right after its seed rather than
-    // after a DeepLC pass over the whole library or after most bands have extracted. Every
-    // seed whose fit a band would apply is counted: the pooled one under `global`, each
-    // band's own under `per_group`, all named in one error. The exact check on the fit
-    // itself follows below, for the anchors a non-finite iRT or `anchor_x_filter` removes.
-    // Nothing is counted when `groups.allow_unbounded_rt` lets the run go on anyway.
+    // after a DeepLC pass over the whole library or after most bands have extracted. The
+    // exact check on the fit itself follows below, for the anchors a non-finite iRT or
+    // `anchor_x_filter` removes. Nothing is counted when `groups.allow_unbounded_rt` lets the
+    // run go on anyway.
     let rt_run = RtRun {
         out_dir: g.out_dir,
         bands: bands.len(),
         q_train: cfg.rt_im_train.q_train,
     };
-    let (pooled_seed_anchors, band_seed_anchors): (Option<usize>, BTreeMap<usize, usize>) =
-        if cfg.groups.allow_unbounded_rt {
-            (None, BTreeMap::new())
-        } else {
-            // `extract_cfg` below changes only the MS1 offset, so the configured fragment
-            // tolerance is extract's fallback here as well.
-            let frag_tol = |s: RtFitScope| {
-                let seed = match s.band() {
-                    None => pooled_seed.as_str(),
-                    Some(i) => bands.iter().find(|b| b.index == i)?.seed.as_str(),
-                };
-                planned_frag_tol(&crate::masscal::json_path(seed), cfg.extract.frag_tol_ppm)
-            };
-            if global {
-                let n = rt_im_train::seed_anchor_bound(&pooled_seed, rt_run.q_train)?;
-                refuse_unbounded_rt(
-                    rt_run,
-                    &[(RtFitScope::Pooled, Anchors::Seed(n))],
-                    false,
-                    frag_tol,
-                )?;
-                (Some(n), BTreeMap::new())
-            } else {
-                let counts = bands
-                    .iter()
-                    .map(|b| {
-                        let n = rt_im_train::seed_anchor_bound(&b.seed, rt_run.q_train)?;
-                        Ok((b.index, n))
-                    })
-                    .collect::<Result<BTreeMap<usize, usize>>>()?;
-                let fits: Vec<(RtFitScope, Anchors)> = counts
-                    .iter()
-                    .map(|(&i, &n)| (RtFitScope::Band(i), Anchors::Seed(n)))
-                    .collect();
-                refuse_unbounded_rt(rt_run, &fits, false, frag_tol)?;
-                (None, counts)
-            }
-        };
-    // --- RT model per band, against the pooled or the band's own anchors
+    // `extract_cfg` below changes only the MS1 offset, so the configured fragment tolerance
+    // is extract's fallback here as well.
+    let frag_tol = || {
+        planned_frag_tol(
+            &crate::masscal::json_path(&pooled_seed),
+            cfg.extract.frag_tol_ppm,
+        )
+    };
+    let pooled_seed_anchors: Option<usize> = if cfg.groups.allow_unbounded_rt {
+        None
+    } else {
+        let n = rt_im_train::seed_anchor_bound(&pooled_seed, rt_run.q_train)?;
+        refuse_unbounded_rt(rt_run, Anchors::Seed(n), false, frag_tol)?;
+        Some(n)
+    };
+    // --- RT model for every band, against the pooled anchors
     let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
     let python = cfg.predict_frag.deeplc_python.as_deref();
     let script =
@@ -869,15 +735,11 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         "library".to_string()
     };
     let mut repredicted: Vec<(String, u32)> = Vec::new();
-    // `groups.rt_adaptation = once_per_run`: one DeepLC worker for all the bands under
-    // global calibration, rather than one per band (see `GroupRtAdaptation`). `per_group`
-    // fits each band on its own anchors, so it keeps the per-band loop.
-    let once_per_run = cfg.groups.rt_adaptation == GroupRtAdaptation::OncePerRun && global;
+    // One DeepLC worker for all the bands (`groups.rt_adaptation = once_per_run`).
     // The caller re-predicted the library with the base model already, and the bands are
     // slices of that table: re-predicting them again only recomputes the same model's
-    // values in different company. Kept per band under `per_band`, which is today's
-    // behaviour.
-    let keep_caller_irt = once_per_run && repredict && g.library_irt_repredicted;
+    // values in different company.
+    let keep_caller_irt = repredict && g.library_irt_repredicted;
     if let Some(shared) = g.shared_bands {
         // Take a previous run's adapted bands wholesale: same ids, same row order, which is
         // what `fragment_offset` and the per-band seed views key on. Only the retention
@@ -902,10 +764,6 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             "groups: reusing a previous run's adapted bands"
         );
     }
-    let union_mode = g.shared_bands.is_none()
-        && once_per_run
-        && !keep_caller_irt
-        && (g.mh_heads > 0 || repredict);
     if g.shared_bands.is_none() && keep_caller_irt {
         info!(
             groups = bands.len(),
@@ -919,9 +777,8 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     // A previous run of the same experiment that planned the same bands under the same
     // library wrote the same bytes (a slice is a deterministic function of the library and
     // the row span), so its slices are taken instead where `slices_from` offers them.
-    let per_band_sidecar =
-        g.shared_bands.is_none() && !keep_caller_irt && (g.mh_heads > 0 || repredict);
-    if per_band_sidecar {
+    let adapt_bands = g.shared_bands.is_none() && !keep_caller_irt && (g.mh_heads > 0 || repredict);
+    if adapt_bands {
         let reuse_dir = g
             .slices_from
             .filter(|dir| same_plan(&format!("{dir}/plan.json"), &d("groups/plan.json")));
@@ -954,7 +811,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             b.span = None;
         }
     }
-    if union_mode {
+    if adapt_bands {
         let name = band_lib_name(&rt_model);
         let pairs: Vec<(String, String)> = bands
             .iter()
@@ -1008,72 +865,10 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             b.span = None;
         }
     }
-    for b in bands
-        .iter_mut()
-        .filter(|_| g.shared_bands.is_none() && !union_mode && !keep_caller_irt)
-    {
-        let anchors = if global { &pooled_seed } else { &b.seed };
-        let out = if g.mh_heads > 0 {
-            let out = gd(b.index, "lib_precursors_multihead.parquet");
-            info!(stage = %"deeplc-multihead", group = b.index, "run: stage start");
-            crate::sidecar::run_deeplc_multihead(
-                python.expect("mh_heads is 0 unless an interpreter resolved"),
-                &script,
-                &b.prec,
-                anchors,
-                &out,
-                g.mh_heads,
-                cfg.rt_im_train.q_train,
-                cfg.rt_im_train.window_holdout_frac,
-                rayon::current_num_threads(),
-                cfg.rt_im_train.deeplc_predict_shards,
-                crate::cache::projection_dir(cfg).as_ref(),
-            )?;
-            if g.irt_placeholder {
-                crate::sidecar::require_every_row_repredicted(&out)?;
-            }
-            Some(out)
-        } else if repredict {
-            let out = gd(b.index, "lib_precursors_deeplc.parquet");
-            info!(stage = %"deeplc-repredict", group = b.index, "run: stage start");
-            crate::sidecar::run_deeplc_repredict(
-                python.expect("repredicts_library_irt implies deeplc_python"),
-                &script,
-                &b.prec,
-                &out,
-                rayon::current_num_threads(),
-                cfg.rt_im_train.deeplc_predict_shards,
-                crate::cache::projection_dir(cfg).as_ref(),
-            )?;
-            Some(out)
-        } else {
-            None
-        };
-        if let Some(out) = out {
-            if keep_records {
-                let rows = mumdia_io::table::nrows(&out)?;
-                record_hashing(
-                    g.man.as_deref_mut(),
-                    &format!(
-                        "{}[g{:02}]",
-                        artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
-                        b.index
-                    ),
-                    crate::stages::predict_frag::precursors_schema(&out)?,
-                    &out,
-                    rows,
-                    &rt_model,
-                    ch,
-                )?;
-            }
-            repredicted.push((out.clone(), b.offset));
-            b.prec = out;
-        }
-    }
     // The pooled anchors carry the library's iRT as it was when seeded; after a
     // re-prediction each anchor takes its band's new value, so rt-im-train can read the
     // anchors' iRT from the seed while holding one band's table.
-    let anchors_for_windows = if global && !repredicted.is_empty() {
+    let anchors_for_windows = if !repredicted.is_empty() {
         let refreshed = d("seed_psms_calibrated.parquet");
         info!(stage = %"seed-refresh", "run: stage start");
         seed_pool::refresh_irt(&pooled_seed, &refreshed, &repredicted)?;
@@ -1081,11 +876,11 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     } else {
         None
     };
-    // Under global calibration every band fits the same pooled anchors with their iRT read
-    // from the seed, so the retention-time fit is a property of the run: fitted here once,
-    // and each band only applies it to its own table (docs/33 section 4). Before, each band
-    // decoded the pooled seed and refitted the same curve. `per_group` fits per band.
-    let shared_rt_fit = if global {
+    // Every band fits the same pooled anchors with their iRT read from the seed, so the
+    // retention-time fit is a property of the run: fitted here once, and each band only
+    // applies it to its own table (docs/33 section 4). Before, each band decoded the pooled
+    // seed and refitted the same curve.
+    let shared_rt_fit = {
         let anchors = anchors_for_windows.as_deref().unwrap_or(&pooled_seed);
         info!(stage = %"rt-fit", anchors = %anchors, "run: stage start");
         let fit = rt_im_train::fit_from_seed(anchors, &cfg.rt_im_train)?;
@@ -1101,24 +896,14 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         // (`groups.allow_unbounded_rt`).
         refuse_unbounded_rt(
             rt_run,
-            &[(
-                RtFitScope::Pooled,
-                Anchors::Fit {
-                    n_train: fit.n_train(),
-                    seed: pooled_seed_anchors,
-                },
-            )],
-            cfg.groups.allow_unbounded_rt,
-            |_| {
-                planned_frag_tol(
-                    &crate::masscal::json_path(&pooled_seed),
-                    cfg.extract.frag_tol_ppm,
-                )
+            Anchors::Fit {
+                n_train: fit.n_train(),
+                seed: pooled_seed_anchors,
             },
+            cfg.groups.allow_unbounded_rt,
+            frag_tol,
         )?;
-        Some(fit)
-    } else {
-        None
+        fit
     };
 
     // --- windows, extract, features, compete per band
@@ -1171,61 +956,22 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             let mut recs: Vec<mumdia_core::manifest::ArtifactRecord> = Vec::new();
             let windows = gd(b.index, "run_windows.parquet");
             let cal = gd(b.index, "cal.json");
-            let mass_cal = if global {
-                format!("{pooled_seed}.masscal.json")
-            } else {
-                format!("{}.masscal.json", b.seed)
-            };
+            let mass_cal = format!("{pooled_seed}.masscal.json");
             info!(stage = %"rt-im-train", group = b.index, "run: stage start");
             // Handed to this band's extract in memory; see `rt_im_train::RtWindows`.
-            let (windows_written, fitted_windows) = match &shared_rt_fit {
-                // Global: the run's one fit, applied to this band's table.
-                Some(fit) => rt_im_train::apply_in_memory(
-                    fit,
-                    &rt_im_train::ApplyParams {
-                        precursor_span: b.span,
-                        library_precursors: &b.prec,
-                        out_windows: &windows,
-                        out_cal: &cal,
-                        cfg: &cfg.rt_im_train,
-                        config_hash: ch,
-                        im_window_floor: None,
-                    },
-                )?,
-                // Per group: this band's own anchors, iRT joined from its own table. The
-                // seeds were counted after `seed-pool`; this is the exact check on the band's
-                // fit, for anchors lost to a non-finite iRT or `anchor_x_filter`. A refused
-                // band writes no `run_windows.parquet` or `cal.json` and does not extract;
-                // allowed, this is where its warning is logged (`groups.allow_unbounded_rt`).
-                None => rt_im_train::run_in_memory_checked(
-                    rt_im_train::RtImTrainParams {
-                        precursor_span: b.span,
-                        seed_psms: &b.seed,
-                        library_precursors: &b.prec,
-                        out_windows: &windows,
-                        out_cal: &cal,
-                        cfg: &cfg.rt_im_train,
-                        config_hash: ch,
-                        im_window_floor: None,
-                        im_anchor_q: Some(cfg.search_seed.fdr_seed),
-                        anchor_irt_from_seed: false,
-                    },
-                    |fit| {
-                        refuse_unbounded_rt(
-                            rt_run,
-                            &[(
-                                RtFitScope::Band(b.index),
-                                Anchors::Fit {
-                                    n_train: fit.n_train(),
-                                    seed: band_seed_anchors.get(&b.index).copied(),
-                                },
-                            )],
-                            cfg.groups.allow_unbounded_rt,
-                            |_| planned_frag_tol(&mass_cal, ext_cfg.frag_tol_ppm),
-                        )
-                    },
-                )?,
-            };
+            // The run's one fit, applied to this band's table.
+            let (windows_written, fitted_windows) = rt_im_train::apply_in_memory(
+                &shared_rt_fit,
+                &rt_im_train::ApplyParams {
+                    precursor_span: b.span,
+                    library_precursors: &b.prec,
+                    out_windows: &windows,
+                    out_cal: &cal,
+                    cfg: &cfg.rt_im_train,
+                    config_hash: ch,
+                    im_window_floor: None,
+                },
+            )?;
             if keep_records {
                 recs.push(windows_written.record(
                     &format!("{}[g{:02}]", artifact::RUN_WINDOWS.0, b.index),
@@ -1393,7 +1139,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     // resident across `pool::run` below.
 
     // The run-level cal.json, as an ungrouped run writes it.
-    groups::summarise_cal(&cals, global, &d("cal.json"))?;
+    groups::summarise_cal(&cals, &d("cal.json"))?;
 
     // --- pool into the single-run artifacts
     //
@@ -1574,7 +1320,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             content_hash,
             params: json!({
                 "window_groups": arts.len(),
-                "calibration": if global { "global" } else { "per_group" },
+                "calibration": "global",
             }),
             stats: BTreeMap::from([
                 ("groups".to_string(), json!(arts.len())),
@@ -1640,8 +1386,8 @@ mod tests {
         q_train: 0.01,
     };
 
-    fn configured(ppm: f64) -> impl Fn(RtFitScope) -> Option<PlannedFragTol> {
-        move |_| {
+    fn configured(ppm: f64) -> impl Fn() -> Option<PlannedFragTol> {
+        move || {
             Some(PlannedFragTol {
                 ppm,
                 learned: Some(false),
@@ -1649,11 +1395,8 @@ mod tests {
         }
     }
 
-    fn refusal(
-        fits: &[(RtFitScope, Anchors)],
-        frag_tol: impl Fn(RtFitScope) -> Option<PlannedFragTol>,
-    ) -> String {
-        refuse_unbounded_rt(RUN, fits, false, frag_tol)
+    fn refusal(a: Anchors, frag_tol: impl Fn() -> Option<PlannedFragTol>) -> String {
+        refuse_unbounded_rt(RUN, a, false, frag_tol)
             .unwrap_err()
             .to_string()
     }
@@ -1687,31 +1430,27 @@ mod tests {
 
     /// A bounded fit passes without reading the masscal, an allowed unbounded one passes, and
     /// a refused one stops with a message that names the run and says what happened, what it
-    /// costs and what to try: for the pooled seed, and for a band's own fit that lost the
+    /// costs and what to try: for the pooled seed, and for the pooled fit that lost the
     /// seed's anchors to the iRT.
     #[test]
     fn the_guard_stops_an_unbounded_fit_with_a_message_naming_the_key() {
-        let pooled = RtFitScope::Pooled;
-        let band = RtFitScope::Band(5);
-        let unread = |_| -> Option<PlannedFragTol> { panic!("a bounded fit reads no masscal") };
-        let ok = |fits: &[(RtFitScope, Anchors)], allow| {
-            refuse_unbounded_rt(RUN, fits, allow, configured(20.0)).is_ok()
-        };
-        assert!(refuse_unbounded_rt(RUN, &[(pooled, Anchors::Seed(2))], false, unread).is_ok());
+        let unread = || -> Option<PlannedFragTol> { panic!("a bounded fit reads no masscal") };
+        let ok = |a: Anchors, allow| refuse_unbounded_rt(RUN, a, allow, configured(20.0)).is_ok();
+        assert!(refuse_unbounded_rt(RUN, Anchors::Seed(2), false, unread).is_ok());
         let bounded_fit = Anchors::Fit {
             n_train: 400,
             seed: Some(410),
         };
-        assert!(refuse_unbounded_rt(RUN, &[(band, bounded_fit)], false, unread).is_ok());
-        assert!(ok(&[(pooled, Anchors::Seed(0))], true));
+        assert!(refuse_unbounded_rt(RUN, bounded_fit, false, unread).is_ok());
+        assert!(ok(Anchors::Seed(0), true));
         let lost = Anchors::Fit {
             n_train: 1,
             seed: Some(3),
         };
-        assert!(ok(&[(band, lost)], true));
+        assert!(ok(lost, true));
 
         // The pooled seed: the early check, before any retention-time step.
-        let e = refusal(&[(pooled, Anchors::Seed(0))], configured(20.0));
+        let e = refusal(Anchors::Seed(0), configured(20.0));
         assert!(
             e.starts_with("groups: the retention-time windows would be unbounded in out/run_b.")
         );
@@ -1731,29 +1470,26 @@ mod tests {
                 "groups.allow_unbounded_rt = true",
             ],
         );
-        assert!(!e.contains("per_group"), "{e}");
 
-        // A band's fit that kept fewer anchors than its seed had: the exact check names the
-        // iRT, not the seed.
-        let e = refusal(&[(band, lost)], |_| {
+        // A fit that kept fewer anchors than its seed had: the exact check names the iRT, not
+        // the seed.
+        let e = refusal(lost, || {
             Some(PlannedFragTol {
                 ppm: 9.5,
                 learned: Some(true),
             })
         });
-        assert!(e.starts_with(
-            "groups: the retention-time windows of band g05 would be unbounded in out/run_b."
-        ));
+        assert!(
+            e.starts_with("groups: the retention-time windows would be unbounded in out/run_b.")
+        );
         assert_contains(
             &e,
             &[
-                "groups.calibration = per_group",
+                "The retention-time fit on the pooled seed of the 63 bands",
                 "kept 1 of the seed's 3 confident target peptides",
                 "no finite predicted iRT",
                 "rt_im_train.anchor_x_filter",
                 "the learned fragment tolerance of 9.5 ppm",
-                "groups.calibration = global",
-                "all 63 bands",
                 "The rt-im-train warning above",
                 "predicted_irt",
                 "groups.allow_unbounded_rt = true",
@@ -1762,13 +1498,10 @@ mod tests {
         assert!(!e.contains("library and its decoys"), "{e}");
         // A fit without the seed's count says how many anchors it had.
         let e = refusal(
-            &[(
-                pooled,
-                Anchors::Fit {
-                    n_train: 1,
-                    seed: None,
-                },
-            )],
+            Anchors::Fit {
+                n_train: 1,
+                seed: None,
+            },
             configured(20.0),
         );
         assert_contains(
@@ -1776,73 +1509,10 @@ mod tests {
             &["The retention-time fit on the pooled seed of the 63 bands had 1 target anchor,"],
         );
         // Without a readable masscal the message leaves the tolerance out.
-        let e = refusal(&[(pooled, Anchors::Seed(1))], |_| None);
+        let e = refusal(Anchors::Seed(1), || None);
         assert!(!e.contains("fragment tolerance of"), "{e}");
         assert!(!e.contains(" ppm"), "{e}");
         assert_contains(&e, &["has 1 target anchor (", "needs. Every band"]);
-    }
-
-    /// Under `per_group` the seeds of every band are checked at once: the error names each
-    /// band whose seed cannot bound its windows, and only those, and reads only their
-    /// masscals. A run where every band has anchors goes on.
-    #[test]
-    fn a_per_group_refusal_names_every_unbounded_band_and_only_those() {
-        let fits = [
-            (RtFitScope::Band(0), Anchors::Seed(0)),
-            (RtFitScope::Band(1), Anchors::Seed(250)),
-            (RtFitScope::Band(2), Anchors::Seed(1)),
-            (RtFitScope::Band(3), Anchors::Seed(2)),
-        ];
-        let tol = |s: RtFitScope| match s {
-            RtFitScope::Band(0) => Some(PlannedFragTol {
-                ppm: 20.0,
-                learned: Some(false),
-            }),
-            RtFitScope::Band(2) => Some(PlannedFragTol {
-                ppm: 9.5,
-                learned: Some(true),
-            }),
-            other => panic!("the masscal of a bounded fit was read: {other:?}"),
-        };
-        let e = refusal(&fits, tol);
-        assert!(
-            e.starts_with(
-                "groups: the retention-time windows of 2 of the 63 bands would be unbounded in \
-                 out/run_b."
-            ),
-            "{e}"
-        );
-        assert_contains(
-            &e,
-            &[
-                "Their seeds have fewer than the two target anchors",
-                "rt_im_train.q_train = 0.01): g00 0, g02 1,",
-                "fragment tolerances from 9.5 to 20.0 ppm",
-                "groups.calibration = global",
-                "groups.allow_unbounded_rt = true",
-            ],
-        );
-        assert!(!e.contains("g01") && !e.contains("g03"), "{e}");
-        // Allowed, the same bands go on; with anchors in every band nothing is refused.
-        assert!(refuse_unbounded_rt(RUN, &fits, true, tol).is_ok());
-        let anchored = [
-            (RtFitScope::Band(1), Anchors::Seed(250)),
-            (RtFitScope::Band(3), Anchors::Seed(2)),
-        ];
-        assert!(refuse_unbounded_rt(RUN, &anchored, false, tol).is_ok());
-        // One band is named on its own.
-        let e = refusal(&fits[..1], tol);
-        assert!(
-            e.starts_with("groups: the retention-time windows of band g00 would be unbounded"),
-            "{e}"
-        );
-        assert_contains(
-            &e,
-            &[
-                "The seed of band g00 has 0 target anchors (",
-                "the configured 20.0 ppm",
-            ],
-        );
     }
 
     /// The tolerance in the message is the one extract would read from the masscal that
