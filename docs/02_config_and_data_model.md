@@ -794,7 +794,6 @@ requiring entrapment/target-decoy FDR validation before use.
 | `set` | `minimal` | feature set (minimal / rich / extended) |
 | `emit_pin` | `false` | write the Percolator-style `.pin` text file requested by `--out-pin`. Off by default: no MuMDIA stage consumes it (`rescore` builds its own PIN) and at 1.5M rows by 387 features it is a ~5.4 GB text write, so set it true only when an external tool needs the file |
 | `coelution_corr_threshold` | 0.9 | co-elution correlation cutoff |
-| `prec_tol_ppm` | 20.0 | precursor tolerance for MS1 features |
 | `bound_features` | `true` | restrict trace features to the elution peak |
 | `bound_peak_fraction` | 1/3 | peak-boundary descent fraction of apex height |
 | `bound_peak_grace` | 0 | consecutive sub-threshold scans to bridge |

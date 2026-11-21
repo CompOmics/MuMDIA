@@ -3203,7 +3203,6 @@ pub struct FeaturesConfig {
     /// an external tool wants the file. Set true to get the artifact back.
     pub emit_pin: bool,
     pub coelution_corr_threshold: f64,
-    pub prec_tol_ppm: f64,
     /// Restrict trace-based features (co-elution, profile, xcorr, interference,
     /// base width) to the elution peak around the apex rather than the whole
     /// extracted RT window, so they are not diluted over large RT stretches.
@@ -3404,7 +3403,6 @@ impl Default for FeaturesConfig {
             // external tool.
             emit_pin: false,
             coelution_corr_threshold: 0.9,
-            prec_tol_ppm: 20.0,
             bound_features: true,
             bound_peak_fraction: 1.0 / 3.0,
             bound_peak_grace: 0, // stop at first sub-threshold scan (legacy)
@@ -6117,8 +6115,11 @@ impl Config {
     /// quantification recipe it sets ([`QuantConfig::explicit`]), resolve the recipe's
     /// defaults against the rest of it ([`Config::resolve_quant_recipe`]), then validate.
     pub fn from_json(s: &str) -> Result<Self, crate::error::ConfigError> {
-        let mut c: Config =
+        let mut v: serde_json::Value =
             serde_json::from_str(s).map_err(|e| crate::error::ConfigError::Parse(e.to_string()))?;
+        strip_retired(&mut v, RETIRED)?;
+        let mut c: Config = serde_json::from_value(v)
+            .map_err(|e| crate::error::ConfigError::Parse(e.to_string()))?;
         c.quant.explicit = quant_explicit_keys(s);
         c.resolve_quant_recipe();
         c.validate()?;
@@ -7240,7 +7241,6 @@ impl Config {
             )));
         }
         for (name, value) in [
-            ("features.prec_tol_ppm", self.features.prec_tol_ppm),
             (
                 "extract.claim_cues.mz_close_sigma_ppm",
                 self.extract.claim_cues.mz_close_sigma_ppm,
@@ -7796,6 +7796,109 @@ impl Config {
 
 /// Which keys of the quantification recipe the JSON configuration `s` sets
 /// ([`QuantConfig::explicit`]). Called on text that already parsed as a [`Config`].
+/// The release that removed the entries of [`RETIRED`].
+const RETIRED_IN: &str = "0.15.0";
+
+/// What [`RETIRED`] removed at a path.
+enum Gone {
+    /// The key, whose default was this JSON. That value is dropped; any other is refused.
+    Key(&'static str),
+    /// This JSON value of a key that stays: refused.
+    Value(&'static str),
+    /// A section whose every key is a `Key` entry listed before it: dropped once empty.
+    Section,
+}
+
+/// A removed configuration key, value or section, and why it went.
+struct Retired {
+    /// Dotted path of the key.
+    path: &'static str,
+    gone: Gone,
+    /// Why it went, for the refusal.
+    why: &'static str,
+}
+
+/// Keys and values removed because they measured neutral or worse, or did nothing. An old
+/// configuration, saved desktop setup or manifest (every manifest records every key) that sets
+/// a removed key at its old default still loads: [`strip_retired`] drops the key, which then
+/// changes nothing. Any other value, and every removed value of a kept key, is refused with
+/// the release and the reason.
+const RETIRED: &[Retired] = &[
+    // Entries are grouped by the change that removed them, one blank line between groups.
+    Retired {
+        path: "features.prec_tol_ppm",
+        gone: Gone::Key("20.0"),
+        why: "it was never read; extract.prec_tol_ppm sets the precursor tolerance",
+    },
+    // A: Q1 and MS1 families, hard Q1 counts, Q1 sweep, extract arms
+
+    // B: quantification options
+
+    // C: bound_from_confident, per-group calibration
+
+    // D: MS1 surface, never-read keys and refused choices
+
+    // E: rt_transfer MBR tier
+
+    // F: prescreen components
+];
+
+fn json_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    use serde_json::Value as V;
+    match (a, b) {
+        (V::Number(x), V::Number(y)) => x.as_f64() == y.as_f64(),
+        (V::Array(x), V::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| json_equal(p, q))
+        }
+        (V::Object(x), V::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, p)| y.get(k).is_some_and(|q| json_equal(p, q)))
+        }
+        _ => a == b,
+    }
+}
+
+/// Apply [`RETIRED`] (`table`) to a parsed configuration before it is deserialised.
+fn strip_retired(
+    v: &mut serde_json::Value,
+    table: &[Retired],
+) -> Result<(), crate::error::ConfigError> {
+    for r in table {
+        let (parent, key) = r.path.rsplit_once('.').unwrap_or(("", r.path));
+        let mut obj = Some(&mut *v);
+        for part in parent.split('.').filter(|p| !p.is_empty()) {
+            obj = obj.and_then(|o| o.get_mut(part));
+        }
+        let Some(serde_json::Value::Object(map)) = obj else {
+            continue;
+        };
+        let Some(got) = map.get(key) else { continue };
+        let refused = || {
+            crate::error::ConfigError::Invalid(format!(
+                "{} = {got} was removed in {RETIRED_IN}: {}; delete it from the configuration",
+                r.path, r.why
+            ))
+        };
+        let parse =
+            |j: &str| serde_json::from_str::<serde_json::Value>(j).expect("RETIRED holds JSON");
+        match r.gone {
+            Gone::Key(d) if json_equal(got, &parse(d)) => {
+                map.remove(key);
+            }
+            Gone::Key(_) => return Err(refused()),
+            Gone::Value(bad) if json_equal(got, &parse(bad)) => return Err(refused()),
+            Gone::Value(_) => {}
+            Gone::Section => {
+                if got.as_object().is_some_and(|m| m.is_empty()) {
+                    map.remove(key);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn quant_explicit_keys(s: &str) -> QuantExplicit {
     let v: serde_json::Value = serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
     let q = v.get("quant");
@@ -7810,6 +7913,64 @@ fn quant_explicit_keys(s: &str) -> QuantExplicit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A retired key loads at its old default and is refused at any other value; a retired
+    /// value is refused; an emptied section is dropped.
+    #[test]
+    fn retired_keys_load_at_their_old_default_and_are_refused_otherwise() {
+        let table = [
+            Retired {
+                path: "a.x",
+                gone: Gone::Key("1.0"),
+                why: "w",
+            },
+            Retired {
+                path: "a",
+                gone: Gone::Section,
+                why: "w",
+            },
+            Retired {
+                path: "b.m",
+                gone: Gone::Value("\"old\""),
+                why: "w",
+            },
+        ];
+        let run = |j: &str| {
+            let mut v: serde_json::Value = serde_json::from_str(j).unwrap();
+            strip_retired(&mut v, &table).map(|()| v.to_string())
+        };
+        assert_eq!(
+            run(r#"{"a":{"x":1},"b":{"m":"new"}}"#).unwrap(),
+            r#"{"b":{"m":"new"}}"#
+        );
+        assert_eq!(run(r#"{"a":{"x":1.0,"y":2}}"#).unwrap(), r#"{"a":{"y":2}}"#);
+        let e = run(r#"{"a":{"x":2}}"#).unwrap_err().to_string();
+        assert!(e.contains("a.x = 2 was removed in 0.15.0: w"), "{e}");
+        assert!(run(r#"{"b":{"m":"old"}}"#).is_err());
+        // The shipped table: every old default loads, every other value is refused.
+        for r in RETIRED {
+            let nest = |leaf: &str| {
+                r.path
+                    .rsplit('.')
+                    .fold(leaf.to_string(), |acc, k| format!("{{\"{k}\":{acc}}}"))
+            };
+            match r.gone {
+                Gone::Key(d) => {
+                    Config::from_json(&nest(d)).unwrap_or_else(|e| panic!("{}: {e}", r.path));
+                    assert!(
+                        Config::from_json(&nest("\"__other__\"")).is_err(),
+                        "{}",
+                        r.path
+                    );
+                }
+                Gone::Value(bad) => {
+                    let e = Config::from_json(&nest(bad)).unwrap_err().to_string();
+                    assert!(e.contains(RETIRED_IN), "{}: {e}", r.path);
+                }
+                Gone::Section => {}
+            }
+        }
+    }
 
     /// `output.retain` parses, defaults to `all`, and is never part of the canonical
     /// configuration, so a pruned run keeps the configuration hash of an unpruned one.

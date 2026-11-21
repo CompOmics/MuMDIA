@@ -3098,19 +3098,6 @@
       "source_struct": "FeaturesConfig"
     },
     {
-      "path": "features.prec_tol_ppm",
-      "name": "prec_tol_ppm",
-      "section": "features",
-      "rust_type": "f64",
-      "kind": "float",
-      "optional": false,
-      "default": 20.0,
-      "default_text": "20.0",
-      "help": "",
-      "gates": [],
-      "source_struct": "FeaturesConfig"
-    },
-    {
       "path": "features.bound_features",
       "name": "bound_features",
       "section": "features",

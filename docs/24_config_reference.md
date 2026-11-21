@@ -66,7 +66,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`rt_im_train`](#rt_im_train) | `RtImTrainConfig` | 35 | [docs/08_rt_im_train.md](08_rt_im_train.md) |
 | [`extract`](#extract) | `ExtractConfig` | 53 | [docs/09_extract.md](09_extract.md) |
 | [`extract.claim_cues`](#extractclaim_cues) | `ClaimCues` | 7 | [docs/09_extract.md](09_extract.md) |
-| [`features`](#features) | `FeaturesConfig` | 20 | [docs/10_features.md](10_features.md) |
+| [`features`](#features) | `FeaturesConfig` | 19 | [docs/10_features.md](10_features.md) |
 | [`compete`](#compete) | `CompeteConfig` | 6 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
 | [`rescore`](#rescore) | `RescoreConfig` | 32 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
 | [`quant`](#quant) | `QuantConfig` | 31 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
@@ -448,7 +448,6 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 | `set` | `FeatureSet` | `minimal` |  |  |
 | `emit_pin` | `bool` | `false` |  | Write the Percolator-style `.pin` text file requested by `--out-pin`. No MuMDIA stage consumes it (`rescore` builds its own PIN for the sidecars); it exists for external tooling. At 1.5M rows x 387 features it is a ~5.4 GB text write. Default false: nothing in MuMDIA reads it, which makes the write pure cost unless an external tool wants the file. Set true to get the artifact back. |
 | `coelution_corr_threshold` | `f64` | `0.9` |  |  |
-| `prec_tol_ppm` | `f64` | `20.0` |  |  |
 | `bound_features` | `bool` | `true` |  | Restrict trace-based features (co-elution, profile, xcorr, interference, base width) to the elution peak around the apex rather than the whole extracted RT window, so they are not diluted over large RT stretches. |
 | `bound_peak_fraction` | `f64` | `1.0 / 3.0 (0.333333)` | diagnostic | Peak-boundary threshold as a fraction of apex height (DIA-NN-style: descend to peak*fraction, or stop earlier at a valley below it). 1/3 matched DIA-NN's RT bounds best in the diagnostic-plot benchmark. |
 | `bound_peak_grace` | `usize` | `0` |  | Grace when walking the elution-peak boundary: number of consecutive sub-threshold scans to BRIDGE before stopping. 0 (default) stops at the first scan below `bound_peak_fraction` (brittle on jagged/gappy profiles); 1 bridges a single-scan dip (DIA sampling gap / noise), giving steadier boundaries. |
@@ -1298,7 +1297,7 @@ A switch of the ZT Scan analysis (docs/37_ztscan.md, "Automatic for ZT Scan file
 | `true` |  | On (`true`). |
 | `false` |  | Off (`false`). |
 
-2 enum(s) are declared in `rust/mumdia/crates/mumdia-core/src/config.rs` but are not reachable from `Config`, so they are not config values: `NormalizeMethod`, `ZtScanInputs`. They are CLI-only or helper types.
+3 enum(s) are declared in `rust/mumdia/crates/mumdia-core/src/config.rs` but are not reachable from `Config`, so they are not config values: `Gone`, `NormalizeMethod`, `ZtScanInputs`. They are CLI-only or helper types.
 
 ## Environment variables
 
@@ -1515,6 +1514,6 @@ instead of looking like an absent field.
 
 ## Coverage
 
-26 structs and 383 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 52 enumerations, 1 named profile(s), 107 environment variables read and 27 set.
+26 structs and 382 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 52 enumerations, 1 named profile(s), 107 environment variables read and 27 set.
 
-42 field(s) carry a gating marker in their doc comment. 60 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.
+42 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.

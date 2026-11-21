@@ -1039,7 +1039,6 @@ variant no longer exists).
 |---|---|---|
 | `set` | `Minimal` | which set `active_features` returns (Minimal 14 / Rich 44 / Extended 381) |
 | `coelution_corr_threshold` | 0.9 | threshold for `n_coelution_above` (count of pairwise fragment correlations at or above it) |
-| `prec_tol_ppm` | 20.0 | precursor tolerance carried for feature bookkeeping |
 | `bound_features` | true | restrict trace-based features to the elution peak instead of the whole extracted window; **gates only the Minimal/Rich `fragment_features` path** (the Extended Evidence always peak-bounds, see gotchas) |
 | `bound_peak_fraction` | 1/3 | peak-boundary threshold as a fraction of apex height (DIA-NN-style; matched DIA-NN RT bounds best) |
 | `bound_peak_grace` | 0 | consecutive sub-threshold scans to bridge before stopping (0 = stop at first miss; 1 bridges a single-scan dip) |
