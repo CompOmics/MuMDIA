@@ -7,7 +7,7 @@
 set -u
 ROOT=$1; BIN=$2; MZ=$3; LIBP=$4; LIBF=$5; CFG=$6; THREADS=$7
 SEEDS=${SEEDS:-"0 1 2"}
-ARMS=${ARMS:-"OFF PRESCAN CAP300 SEN BAL STR AGG"}
+ARMS=${ARMS:-"OFF PRESCAN SEN BAL STR AGG"}
 export MUMDIA_CACHE_DIR=off
 mkdir -p "$ROOT"
 log() { echo "$(date +%T) $*" >> "$ROOT/progress.log"; }
@@ -41,7 +41,7 @@ for arm in $ARMS; do
         --isolation-windows "$B/spectra/isolation_windows.parquet" --lib-precursors "$LIB" \
         --run-windows "$B/run_windows.parquet" --out "$A/survivors.parquet" \
         --config "$ROOT/cfg_prescan.json" && R="--restrict-candidates $A/survivors.parquet" || continue ;;
-    *) case $arm in CAP300) P="--preset balanced --top-peaks 300";; SEN) P="--preset sensitive";;
+    *) case $arm in SEN) P="--preset sensitive";;
          BAL) P="--preset balanced";; STR) P="--preset stringent";; AGG) P="--preset aggressive";; esac
        T "${arm}_screen" "$BIN" --threads "$THREADS" prescreen --ms2 "$B/spectra/spectra_ms2.parquet" \
          --lib-precursors "$LIB" --run-windows "$B/run_windows.parquet" --out "$A/survivors.parquet" \

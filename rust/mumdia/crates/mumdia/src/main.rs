@@ -214,9 +214,6 @@ enum Cmd {
         /// Per-candidate RT bounds (candidate_id, rt_lo, rt_hi). Omitted: whole gradient.
         #[arg(long)]
         run_windows: Option<String>,
-        /// MS1 spectra, for `prescreen.mass_hypotheses.ms1` only.
-        #[arg(long)]
-        ms1: Option<String>,
         #[arg(long)]
         out: String,
         #[arg(long)]
@@ -227,16 +224,9 @@ enum Cmd {
         /// Override `prescreen.target` (implies preset custom).
         #[arg(long)]
         target: Option<f64>,
-        /// Override `prescreen.top_peaks` (0 = uncapped).
-        #[arg(long)]
-        top_peaks: Option<usize>,
         /// Also write `<out>.scores.parquet`.
         #[arg(long)]
         write_scores: bool,
-        /// Evaluation only: score a seeded sample of about N candidates (survivors then cover
-        /// the sample only and are not an extract allowlist).
-        #[arg(long, default_value_t = 0)]
-        sample_candidates: usize,
         /// The database-free tag prefilter only: keep the candidates with an observed trimer
         /// in their isolation window (no fragment score; pass no --run-windows for the
         /// retention-time-free prefilter).
@@ -2351,14 +2341,11 @@ fn real_main() -> Result<()> {
             ms2,
             lib_precursors,
             run_windows,
-            ms1,
             out,
             config,
             preset,
             target,
-            top_peaks,
             write_scores,
-            sample_candidates,
             tags_only,
         } => {
             let mut cfg = load_config(&config)?;
@@ -2369,9 +2356,6 @@ fn real_main() -> Result<()> {
             if let Some(t) = target {
                 cfg.prescreen.preset = mumdia_core::config::PrescreenPreset::Custom;
                 cfg.prescreen.target = t;
-            }
-            if let Some(n) = top_peaks {
-                cfg.prescreen.top_peaks = n;
             }
             cfg.prescreen.write_scores |= write_scores;
             cfg.validate()?;
@@ -2386,11 +2370,9 @@ fn real_main() -> Result<()> {
                 ms2: &ms2,
                 library_precursors: &lib_precursors,
                 run_windows: run_windows.as_deref(),
-                ms1: ms1.as_deref(),
                 out: &out,
                 config: &cfg,
                 config_hash: &ch,
-                sample_candidates,
                 tags_only,
             })?;
         }

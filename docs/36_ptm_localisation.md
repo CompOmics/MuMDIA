@@ -32,8 +32,7 @@ consulted.
 1. **Isomer groups.** The scored rows that carry a localised modification (`localise.mods`,
    default `["Phospho"]`) are grouped by (source, base peptide, modification composition,
    label). The composition key is the sorted list of mass deltas, terminal ones included
-   (`hypotheses::composition_key`); the prescreen's sibling key, which adds charge and label,
-   lives in the same module (`hypotheses::sibling_key`). A modification written as a mass
+   (`hypotheses::composition_key`). A modification written as a mass
    within 1e-3 Da of its catalogue mass counts as the modification.
 2. **Peaks.** Within a group and charge, the accepted rows (`run_psm_q <= localise.q_max`,
    default 0.01) are sorted by apex retention time and cut into chromatographic peaks

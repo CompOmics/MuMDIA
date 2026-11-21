@@ -422,8 +422,7 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
         })?;
     }
 
-    let survivors =
-        prescreen::run_if_enabled(cfg, ch, &co.ms2, Some(&co.ms1), lib_p, &windows, out_dir)?;
+    let survivors = prescreen::run_if_enabled(cfg, ch, &co.ms2, lib_p, &windows, out_dir)?;
     // Counted and hashed only when there is a manifest to record them in.
     if let (Some(s), Some(m)) = (&survivors, manifest.as_deref_mut()) {
         m.record(record_artifact(
