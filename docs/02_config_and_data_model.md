@@ -776,7 +776,7 @@ selection dominate.
 | `promote_top_peaks` | 1 | K peak groups PROMOTED to real feature/rescore rows, each carrying `peak_rank` (selected apex stays rank 0). Must be `<= retain_top_peaks`. **Behaviour-changing and entrapment-gated**: it changes the extracted row population, so compete/rescore must collapse per candidate or the decoy null is K-inflated |
 | `alt_peak_min_area_frac` | 0.10 | min integrated area of a promoted alternate as a fraction of the rank-0 peak; only used when `promote_top_peaks > 1` |
 | `alt_peak_min_separation_s` | 5.0 | min apex-RT separation of a promoted alternate from the rank-0 apex; only used when `promote_top_peaks > 1` |
-| `emit_candidate_audit` | `false` | **default-off**; in `run` gates the separate `audit` stage that writes `candidate_audit.parquet`; no stage writes `<psms>.audit.parquet`, although `audit` will read it if present (`load_extract_reasons`); no-op for standalone `mumdia extract` (P0.3) |
+| `emit_candidate_audit` | `false` | **default-off**; in a single-file `run` gates the separate `audit` stage that writes `candidate_audit.parquet`; extract writes no per-candidate table; no-op for standalone `mumdia extract` and for `run-experiment`, which warns (P0.3) |
 | `apex_evidence_rank` | `true` | evidence-count apex. On by default: the legacy signature-intensity score is 0.0 at every qualifying scan when none of the top-K predicted fragments is observed, which silently selects the lowest-RT qualifying scan |
 | `emit_gate_diagnostics` | `false` | **default-off** four gate-score columns |
 | `gate_mode` | `window_mean` | which spectral score `gate_min_score` thresholds |

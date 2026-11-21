@@ -476,6 +476,12 @@ fn fit_run(pts: &[(f64, f64, f64)]) -> Curve {
     c
 }
 
+/// The number of runs an ion must be quantified in to enter the estimate, its own run
+/// included.
+pub fn min_runs(n_runs: usize) -> usize {
+    n_runs.div_ceil(2).max(2)
+}
+
 /// Fit every run's curve. Fewer than two runs give zero shifts. `rank` fixes the subspace
 /// dimension (`quant.normalisation_rank`); it must leave a residual dimension
 /// (`rank <= runs - 2`), which the caller checks.
@@ -486,7 +492,7 @@ pub fn fit(m: &Matrix, rank: Option<usize>) -> StableFit {
     if r < 2 {
         return StableFit { curves, passes };
     }
-    let need = r.div_ceil(2).max(2);
+    let need = min_runs(r);
     for pass in 0..=ITERATIONS {
         let s = shift_matrix(m, &curves);
         let (dev, ab) = deviations(m, &s, need);

@@ -3100,7 +3100,7 @@ fn real_main() -> Result<()> {
                 let prec_lfq = lfq
                     .as_deref()
                     .and_then(mumdia::quant_lfq::precursor_lfq_sibling);
-                let counts = stages::report::run_experiment_localised(
+                let counts = stages::report::run_experiment(
                     stages::report::ExperimentReportParams {
                         scored: &scored,
                         run_names: &runs,
@@ -3155,7 +3155,7 @@ fn real_main() -> Result<()> {
                     fasta: fasta.as_deref(),
                     out_sites: &sites,
                 });
-                let counts = stages::report::run_localised(
+                let counts = stages::report::run(
                     stages::report::ReportParams {
                         scored: &psms_scored,
                         peptide_quant: peptide_quant.as_deref(),

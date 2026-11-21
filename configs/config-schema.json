@@ -4234,7 +4234,7 @@
       "optional": true,
       "default": "null",
       "default_text": "null",
-      "help": "`stable_set` only: the dimension of the subspace of the run space that holds the composition effects, fixed. Unset (the default), each iteration counts the eigenvalues of the most abundant complete ions' deviations above 3 times their median (at least 1, at most `n_runs - 2`), the rule the method was confirmed with. That count is fragile: on Q Exactive AIF it chose 2 where the design has two conditions (docs/12, \"Cross-run normalisation\"), so a design with `G` sample groups can fix it at `G - 1`. Must be >= 1. Omitted from the canonical configuration when unset.",
+      "help": "`stable_set` only: the dimension of the subspace of the run space that holds the composition effects, fixed. Unset (the default), each iteration counts the eigenvalues of the most abundant complete ions' deviations above 3 times their median (at least 1, at most `n_runs - 2`), the rule the method was confirmed with. That count is fragile: on Q Exactive AIF it chose 2 where the design has two conditions (docs/12, \"Cross-run normalisation\"), so a design with `G` sample groups can fix it at `G - 1`. Must be >= 1 and at most `n_runs - 2`; `run-experiment` refuses a larger value before it searches. Omitted from the canonical configuration when unset.",
       "gates": [],
       "source_struct": "QuantConfig"
     },

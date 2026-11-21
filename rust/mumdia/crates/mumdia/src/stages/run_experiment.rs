@@ -132,6 +132,11 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
         }
     }
     refuse_unchecked_cross_run_step(cfg)?;
+    // The cross-run normalisation runs after every run's search, rescore and quant; a rank
+    // the run count cannot carry used to fail there and leave no report.
+    if !cfg.quant.normalisation.is_off() {
+        crate::stages::quant_norm::check_rank(cfg.quant.normalisation_rank, p.mzmls.len())?;
+    }
     Ok(())
 }
 
@@ -2810,7 +2815,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         }
     };
     let annotations = published.as_ref().map(|(path, _)| path.clone());
-    let rep_counts = report::run_experiment_localised(
+    let rep_counts = report::run_experiment(
         report::ExperimentReportParams {
             scored: &scored_for_quant,
             run_names: &names,
