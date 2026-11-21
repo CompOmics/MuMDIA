@@ -23,12 +23,22 @@ use mumdia_io::table::{write_table_hashed, Col, TableFile};
 use serde_json::json;
 use tracing::{info, warn};
 
-use super::quant_stable::{self, StableFit};
+use super::quant_stable::{self, min_runs, StableFit};
 
-/// The number of runs an ion must be quantified in to enter the estimate, its own run
-/// included.
-pub fn min_runs(n_runs: usize) -> usize {
-    n_runs.div_ceil(2).max(2)
+/// Refuse a `quant.normalisation_rank` that leaves no residual dimension with `n_runs` runs.
+/// `run-experiment` checks it before any search, because [`run`] comes after every run's
+/// search, rescore and quant.
+pub fn check_rank(rank: Option<usize>, n_runs: usize) -> Result<()> {
+    if let Some(k) = rank {
+        if n_runs >= 2 && k + 2 > n_runs {
+            bail!(
+                "quant.normalisation_rank = {k} leaves no residual dimension with {n_runs} \
+                 runs; it must be at most {} (the number of sample groups less one)",
+                n_runs.saturating_sub(2)
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Inputs and outputs of [`run`].
@@ -113,15 +123,7 @@ pub fn run(p: NormaliseParams) -> Result<NormaliseWritten> {
     if n < 2 {
         warn!("quant-normalise: one run has no cross-run reference; its shift is 0");
     }
-    if let Some(k) = p.cfg.normalisation_rank {
-        if n >= 2 && k + 2 > n {
-            bail!(
-                "quant.normalisation_rank = {k} leaves no residual dimension with {n} runs; it \
-                 must be at most {} (the number of sample groups less one)",
-                n.saturating_sub(2)
-            );
-        }
-    }
+    check_rank(p.cfg.normalisation_rank, n)?;
     let tables: Vec<QuantTable> = p
         .inputs
         .iter()
@@ -389,6 +391,17 @@ mod tests {
         assert_eq!(min_runs(3), 2);
         assert_eq!(min_runs(6), 3);
         assert_eq!(min_runs(18), 9);
+    }
+
+    #[test]
+    fn a_rank_without_a_residual_dimension_is_refused() {
+        // Two runs leave no rank: 1 is refused. Three runs take 1, not 2. No rank (`auto`)
+        // and one run (no cross-run reference) always pass.
+        assert!(check_rank(Some(1), 2).is_err());
+        assert!(check_rank(Some(1), 3).is_ok());
+        assert!(check_rank(Some(2), 3).is_err());
+        assert!(check_rank(None, 2).is_ok());
+        assert!(check_rank(Some(5), 1).is_ok());
     }
 
     fn write_quant(path: &str, rows: &[(&str, i32, Option<f64>, Option<f64>)]) {

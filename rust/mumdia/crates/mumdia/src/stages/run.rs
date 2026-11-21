@@ -701,7 +701,8 @@ pub fn run(p: RunParams) -> Result<()> {
             competed: &competed[0],
             scored: &scored,
             out: &audit_out,
-            q_threshold: 0.01,
+            // The report's threshold, so `reported` agrees with the TSVs of the same run.
+            q_threshold: cfg.quant.q_threshold,
             run_id: p.out_dir,
             entrapment_substr: "",
         })?;
@@ -861,7 +862,7 @@ pub fn run(p: RunParams) -> Result<()> {
         fasta: p.fasta,
         out_sites: &sites_tsv,
     });
-    let counts = report::run_localised(
+    let counts = report::run(
         report::ReportParams {
             scored: &scored,
             peptide_quant: Some(&pep_q),

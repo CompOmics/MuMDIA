@@ -3783,7 +3783,8 @@ pub struct QuantConfig {
     /// median (at least 1, at most `n_runs - 2`), the rule the method was confirmed with.
     /// That count is fragile: on Q Exactive AIF it chose 2 where the design has two
     /// conditions (docs/12, "Cross-run normalisation"), so a design with `G` sample groups
-    /// can fix it at `G - 1`. Must be >= 1. Omitted from the canonical configuration when
+    /// can fix it at `G - 1`. Must be >= 1 and at most `n_runs - 2`; `run-experiment` refuses
+    /// a larger value before it searches. Omitted from the canonical configuration when
     /// unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub normalisation_rank: Option<usize>,

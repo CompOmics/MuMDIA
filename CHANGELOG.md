@@ -216,6 +216,16 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **Quant and report code keep one copy of each helper (#358, docs/12).** The candidate audit no
+  longer looks for `<psms>.audit.parquet`, which nothing writes, so every extraction loss is
+  `DID_NOT_SURVIVE_EXTRACTION` as before, and it writes the library's columns as read instead
+  of copying them (the `protein` column is read only for an entrapment substring).
+  `report::run` and `report::run_experiment` take the localisation argument in place of
+  `run_localised` and `run_experiment_localised`; `quant_lfq::maxlfq`, `quant_lfq::directlfq`
+  and `protein_annotations::publish`, which only tests called, are gone. The seven TSV
+  writers share one atomic writer and one transfer-cell formatter, the report's stripped
+  sequence is `quant_lfq::base_sequence`, and the stable-set fit and the shifts report
+  share one minimum-runs rule. Every output is byte-identical.
 - **`run-experiment`: the second pass and quant no longer inherit a one-run-at-a-time plan.**
   When the per-run chains run one at a time under `parallel_runs = auto` because each adapts
   its own library in a DeepLC worker (`rt_library_scope = per_run`, or no run with seed
@@ -228,7 +238,6 @@ than a number. Both are recorded in every run's `manifest.json`.
   pass's scored table with the hash its rescore already computed instead of reading it again;
   the dead fallback after the transfer worker is removed (the worker writes its scored table on
   every return); the module documentation describes the default second pass.
-
 - **The engine's shared crates lose code nothing used (docs/02, docs/03).** `mumdia-core`
   drops `ppm_match`, the `AMMONIA` constant and the five candidate-audit reason codes nothing
   produced (`PEPTIDE_NOT_GENERATED`, `MODIFICATION_NOT_ALLOWED`, `CHARGE_OUT_OF_RANGE`,
@@ -494,6 +503,24 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **`run-experiment` refuses a `quant.normalisation_rank` the run count cannot carry before
+  it searches (#358).** The cross-run normalisation needs a rank of at most the number of runs less
+  two and checked it only when it ran, after every run's search, rescore and quant, so two
+  runs with `normalisation_rank: 1` lost the cross-run LFQ, the TSVs and the experiment
+  manifest that `mumdia report --experiment-dir` rebuilds from. The preflight now applies the
+  same rule when `quant.normalisation` is on (docs/12, "Cross-run normalisation").
+- **The candidate audit gates a sibling precursor on its peptide's q (#358, docs/12, "audit").**
+  `rescore` writes `peptide_q_value` to each base peptide's winning row only and 1.0 to its
+  other charge states and modforms, and the audit read each row's own cell, so every accepted
+  sibling of an accepted peptide read `FAILED_PEPTIDE_FDR` with `reported = false` while
+  `precursors.tsv` listed it. A target now reads its base peptide's winner q, as the report
+  does; a decoy keeps its own cell, and a present `peptide_q_value` of the wrong type is an
+  error. In `run`, the audit also gates on `quant.q_threshold`, the report's threshold, where
+  it used a fixed 0.01. Only `candidate_audit.parquet` and its metrics change.
+- **The audit's refusal of a pooled scored table no longer sends the user to the
+  `run-experiment` split tables (#358).** Their precursor and peptide q are experiment-wide, on one
+  winning row across all runs, so an audit of one of them failed most accepted precursors of
+  the run; the message names a single-file `run` output.
 - **`run-experiment`: a first run without seed anchors no longer makes every run adapt its own
   retention-time library.** Under `rt_library_scope = first_run_only` the first run adapts the
   library for the rest. When its seed was short of anchors (a blank, a failed or short
@@ -509,7 +536,6 @@ than a number. Both are recorded in every run's `manifest.json`.
   second fixture and gate 0) asserts that every quantified candidate id is an empirical-library
   row with a second-pass chromatogram; stub arms cover a near-blank first run, sequential and
   overlapped.
-
 - **Desktop: a diaPASEF search is no longer split into bands (#351).** "Bands: Automatic" (the
   default) planned the search from the machine's memory alone, so a large search space on a timsTOF
   diaPASEF `.d` was given several bands, and the engine stopped it after Start: bands are refused on
