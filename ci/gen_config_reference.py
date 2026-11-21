@@ -1238,8 +1238,8 @@ COMPUTED_ENV_DEFAULTS: dict[str, str] = {
         "snappy. `zstd`, or `uncompressed` / `none`, changes the codec (`table.rs` `codec`)"
     ),
     "MUMDIA_PARQUET_DECODE_THREADS": (
-        "automatic column groups, up to the codec pool's threads; one reader for a "
-        "coalesced scan or inside a rayon pool. `k` asks for k groups, `1` is one reader "
+        "automatic column groups, up to the codec pool's threads; one reader inside a "
+        "rayon pool. `k` asks for k groups, `1` is one reader "
         "(`table.rs` `automatic_decode_groups`)"
     ),
     "MUMDIA_PARQUET_THREADS": (
@@ -1266,12 +1266,6 @@ COMPUTED_ENV_DEFAULTS: dict[str, str] = {
         "set by the desktop environment, often unset; an absolute value puts the engine's "
         "caches in `$XDG_CACHE_HOME/mumdia` on Linux when MUMDIA_CACHE_DIR is unset "
         "(`cache.rs` `root`)"
-    ),
-    "MUMDIA_WIDE_SCAN": (
-        "`plain`: the plain reader with its parallel decode for rescore's feature "
-        "stream and compete's pass-through copy. `rowgroup` decodes the feature stream "
-        "one row group a batch; `coalesced` reads each row group's projected column "
-        "chunks in one sequential read (`stages/mod.rs` `WideScan`)"
     ),
 }
 

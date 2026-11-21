@@ -33,7 +33,6 @@ use parquet::schema::types::{ColumnPath, SchemaDescriptor};
 use crate::codec::{codec_pool, ColumnEncoder};
 pub use crate::publish::{publish_byte_copy, publish_copy_of, AtomicPath, FileCopy};
 pub use crate::report::Written;
-pub use crate::span_cache::SpanReadOptions;
 
 /// The codec every artifact is written with. Snappy by default, which is what released
 /// artifacts use and what the sidecars' pyarrow reads without configuration;
@@ -2452,16 +2451,10 @@ impl Iterator for BatchReader {
 pub const MIN_DECODE_GROUP_BYTES: u64 = 4 << 20;
 
 /// Column groups of an automatic scan ([`ScanOptions::decode_threads`] `None`) over
-/// `bytes()` of compressed data: one reader from inside a rayon pool (see `crate::codec`)
-/// and for a coalesced scan, else [`crate::codec::codec_threads`] groups of at least
-/// [`MIN_DECODE_GROUP_BYTES`] each.
-///
-/// A coalesced scan exists to give seek-bound storage one forward read per row group.
-/// Column groups would each hold their own spans, read their own slices of every row group
-/// and run their own prefetcher, so the disk would see up to eight interleaved streams
-/// again; an explicit `decode_threads` still splits.
-fn automatic_decode_groups(coalesced: bool, bytes: impl FnOnce() -> u64) -> usize {
-    if coalesced || rayon::current_thread_index().is_some() {
+/// `bytes()` of compressed data: one reader from inside a rayon pool (see `crate::codec`),
+/// else [`crate::codec::codec_threads`] groups of at least [`MIN_DECODE_GROUP_BYTES`] each.
+fn automatic_decode_groups(bytes: impl FnOnce() -> u64) -> usize {
+    if rayon::current_thread_index().is_some() {
         return 1;
     }
     crate::codec::codec_threads().min((bytes() / MIN_DECODE_GROUP_BYTES).max(1) as usize)
@@ -2471,35 +2464,18 @@ fn automatic_decode_groups(coalesced: bool, bytes: impl FnOnce() -> u64) -> usiz
 /// every getter uses: one `File`, pages fetched one at a time.
 #[derive(Clone, Debug, Default)]
 pub struct ScanOptions {
-    /// Read each selected row group's projected column chunks as one byte span, with one
-    /// sequential read, and decode from memory ([`crate::span_cache::SpanCache`]). For a
-    /// wide projection on a spinning disk this turns a row group's several hundred strided
-    /// page reads into one forward read; on an SSD or from the page cache it changes
-    /// nothing measurable. Costs up to the options' resident budget in memory.
-    pub coalesce: Option<SpanReadOptions>,
     /// Decode the projected columns with up to this many readers, one per contiguous
     /// group of root columns, on the codec pool ([`crate::codec`]), and join each batch
     /// column-wise. The batches are the single reader's batches exactly, so this is on by
     /// default: `None` picks [`crate::codec::codec_threads`] groups, fewer when the
     /// projection has fewer root columns or less than [`MIN_DECODE_GROUP_BYTES`] of data
-    /// per group, and the single reader from inside a rayon pool or under
-    /// [`ScanOptions::coalesce`] (whose point is one forward read per row group, which
-    /// column groups with their own span caches would break up). `Some(1)` is the single
-    /// reader always; `Some(k)` asks for k groups whatever the size, coalesced or not.
+    /// per group, and the single reader from inside a rayon pool. `Some(1)` is the single
+    /// reader always; `Some(k)` asks for k groups whatever the size.
     /// `MUMDIA_PARQUET_DECODE_THREADS=k` replaces `None` with `Some(k)` process-wide.
     pub decode_threads: Option<usize>,
 }
 
 impl ScanOptions {
-    /// Coalesced reads ([`ScanOptions::coalesce`]) with the default span budget, decoded
-    /// by one reader unless [`ScanOptions::with_decode_threads`] asks for groups.
-    pub fn coalesced() -> ScanOptions {
-        ScanOptions {
-            coalesce: Some(SpanReadOptions::default()),
-            decode_threads: None,
-        }
-    }
-
     /// These options with [`ScanOptions::decode_threads`] set to `threads`.
     pub fn with_decode_threads(mut self, threads: usize) -> ScanOptions {
         self.decode_threads = Some(threads.max(1));
@@ -2517,7 +2493,6 @@ struct ReadSpec {
     /// Sorted, unique root columns; `None` reads every column.
     roots: Option<Vec<usize>>,
     batch_size: usize,
-    coalesce: Option<SpanReadOptions>,
     /// `(rows, keep)` runs over the handle's rows ([`TableFile::batches_selected`] on a
     /// whole file).
     runs: Option<Vec<(usize, bool)>>,
@@ -2582,35 +2557,10 @@ impl ReadSpec {
         groups
     }
 
-    /// The parquet leaf columns under the projected roots.
-    fn leaves(&self) -> Vec<usize> {
-        let descr = self.meta.metadata().file_metadata().schema_descr();
-        (0..descr.num_columns())
-            .filter(|&c| match &self.roots {
-                None => true,
-                Some(r) => r.binary_search(&descr.get_column_root_idx(c)).is_ok(),
-            })
-            .collect()
-    }
-
     fn build(&self) -> Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader> {
-        match &self.coalesce {
-            None => {
-                let file = std::fs::File::open(&self.path)
-                    .with_context(|| format!("opening {}", self.path))?;
-                self.build_with(file)
-            }
-            Some(o) => {
-                let cache = crate::span_cache::SpanCache::plan(
-                    &self.path,
-                    self.meta.metadata(),
-                    &self.row_groups(),
-                    &self.leaves(),
-                    o.clone(),
-                )?;
-                self.build_with(cache)
-            }
-        }
+        let file =
+            std::fs::File::open(&self.path).with_context(|| format!("opening {}", self.path))?;
+        self.build_with(file)
     }
 
     fn build_with<T: parquet::file::reader::ChunkReader + 'static>(
@@ -3143,7 +3093,7 @@ impl TableFile {
         batch_size: usize,
         dict: &[&str],
     ) -> Result<BatchReader> {
-        let mut spec = self.read_spec(columns, batch_size, None)?;
+        let mut spec = self.read_spec(columns, batch_size)?;
         if let Some(meta) = self.dict_meta(dict)? {
             spec.meta = meta;
         }
@@ -3216,7 +3166,7 @@ impl TableFile {
             ArrowReaderOptions::new().with_offset_index_policy(PageIndexPolicy::Optional),
         )
         .with_context(|| format!("reading parquet offset index {}", self.path))?;
-        let mut spec = self.read_spec(columns, batch_size, None)?;
+        let mut spec = self.read_spec(columns, batch_size)?;
         spec.meta = meta;
         spec.runs = Some(runs.to_vec());
         self.scan_spec(spec, &ScanOptions::default())
@@ -3232,7 +3182,7 @@ impl TableFile {
         batch_size: usize,
         opts: &ScanOptions,
     ) -> Result<BatchReader> {
-        let spec = self.read_spec(columns, batch_size, opts.coalesce.clone())?;
+        let spec = self.read_spec(columns, batch_size)?;
         self.scan_spec(spec, opts)
     }
 
@@ -3251,9 +3201,7 @@ impl TableFile {
         });
         let k = match requested {
             Some(k) => k.max(1),
-            None => automatic_decode_groups(spec.coalesce.is_some(), || {
-                spec.root_bytes().iter().map(|&(_, b)| b).sum()
-            }),
+            None => automatic_decode_groups(|| spec.root_bytes().iter().map(|&(_, b)| b).sum()),
         };
         let groups = if k > 1 {
             spec.column_groups(k)
@@ -3270,17 +3218,11 @@ impl TableFile {
                 schema,
             });
         }
-        let n = groups.len();
         let readers = groups
             .into_iter()
             .map(|roots| {
                 ReadSpec {
                     roots: Some(roots),
-                    // Each group holds its own spans, so the groups share the budget.
-                    coalesce: spec.coalesce.clone().map(|mut o| {
-                        o.max_resident_bytes /= n as u64;
-                        o
-                    }),
                     ..spec.clone()
                 }
                 .build()
@@ -3324,19 +3266,13 @@ impl TableFile {
         Ok(Some(roots))
     }
 
-    fn read_spec(
-        &self,
-        columns: Option<&[&str]>,
-        batch_size: usize,
-        coalesce: Option<SpanReadOptions>,
-    ) -> Result<ReadSpec> {
+    fn read_spec(&self, columns: Option<&[&str]>, batch_size: usize) -> Result<ReadSpec> {
         Ok(ReadSpec {
             path: self.path.clone(),
             meta: self.meta.clone(),
             selection: self.selection.clone(),
             roots: self.projection_roots(columns)?,
             batch_size: batch_size.max(1),
-            coalesce,
             runs: None,
         })
     }
@@ -4916,7 +4852,7 @@ mod streaming_tests {
     /// Parallel decode (R2): the column groups' batches joined column-wise are the single
     /// reader's batches exactly, schema included, over several row groups, list and
     /// nullable columns, projections, row spans that trim both ends, batch sizes that
-    /// straddle row groups, more groups than columns, and coalesced reads.
+    /// straddle row groups and more groups than columns.
     #[test]
     fn parallel_decode_yields_the_single_readers_batches() {
         let p = tmp("decode.parquet");
@@ -4942,17 +4878,13 @@ mod streaming_tests {
                     let one = ScanOptions::default().with_decode_threads(1);
                     let want = collect(t, cols, bs, &one);
                     for k in [2usize, 3, 64] {
-                        for o in [
-                            ScanOptions::default().with_decode_threads(k),
-                            ScanOptions::coalesced().with_decode_threads(k),
-                        ] {
-                            let got = collect(t, cols, bs, &o);
-                            assert!(
-                                got == want,
-                                "{cols:?} batch {bs} with {k} groups on {} rows",
-                                t.nrows
-                            );
-                        }
+                        let o = ScanOptions::default().with_decode_threads(k);
+                        let got = collect(t, cols, bs, &o);
+                        assert!(
+                            got == want,
+                            "{cols:?} batch {bs} with {k} groups on {} rows",
+                            t.nrows
+                        );
                     }
                 }
             }
@@ -4978,25 +4910,11 @@ mod streaming_tests {
                 .decode_groups(),
             1
         );
-        // A coalesced scan splits only when asked to: automatically it keeps one reader
-        // over any amount of data, and so one forward read per row group.
-        assert_eq!(automatic_decode_groups(true, || 1 << 40), 1);
         assert_eq!(
-            automatic_decode_groups(false, || 1 << 40),
+            automatic_decode_groups(|| 1 << 40),
             crate::codec::codec_threads()
         );
-        assert_eq!(automatic_decode_groups(false, || 1), 1);
-        assert_eq!(
-            whole
-                .scan(
-                    None,
-                    1_000,
-                    &ScanOptions::coalesced().with_decode_threads(3)
-                )
-                .unwrap()
-                .decode_groups(),
-            3
-        );
+        assert_eq!(automatic_decode_groups(|| 1), 1);
         // From inside a rayon pool the groups are decoded in turn, with the same batches,
         // and automatic mode stays on the single reader.
         let pool = rayon::ThreadPoolBuilder::new()
@@ -5024,7 +4942,7 @@ mod streaming_tests {
                     .decode_groups(),
                 1
             );
-            assert_eq!(automatic_decode_groups(false, || 1 << 40), 1);
+            assert_eq!(automatic_decode_groups(|| 1 << 40), 1);
         });
         std::fs::remove_file(&p).ok();
     }
@@ -5037,7 +4955,7 @@ mod streaming_tests {
         let p = tmp("groups.parquet");
         write_table(&p, mixed_cols(20_000)).unwrap();
         let t = TableFile::open(&p).unwrap();
-        let spec = t.read_spec(None, 1_000, None).unwrap();
+        let spec = t.read_spec(None, 1_000).unwrap();
         for k in 1..=12 {
             let groups = spec.column_groups(k);
             assert!(groups.len() <= k && !groups.is_empty());
@@ -5050,7 +4968,7 @@ mod streaming_tests {
             assert!(groups.iter().all(|g| !g.is_empty()));
         }
         assert_eq!(spec.column_groups(64).len(), t.schema.fields().len());
-        let spec = t.read_spec(Some(&["rt", "id"]), 1_000, None).unwrap();
+        let spec = t.read_spec(Some(&["rt", "id"]), 1_000).unwrap();
         assert_eq!(spec.column_groups(8), vec![vec![0], vec![10]]);
         std::fs::remove_file(&p).ok();
     }

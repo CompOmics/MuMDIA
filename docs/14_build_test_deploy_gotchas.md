@@ -28,7 +28,7 @@ configurations in `configs/`, the container definition in `Dockerfile` +
 | `rust/mumdia/.cargo/config.toml.example` | Committed template of the above; a fresh clone with no local copy builds into `./target` |
 | `rust/mumdia/crates/mumdia/Cargo.toml` | The bin+lib crate `mumdia`; `[[bin]]` name `mumdia` -> `src/main.rs`; all deps come from `workspace.dependencies` |
 | `rust/mumdia/crates/mumdia-core/Cargo.toml` | Core crate; depends only on `serde`/`serde_json`/`thiserror` (no arrow/parquet, so no I/O layer) |
-| `rust/mumdia/crates/mumdia-io/Cargo.toml` | I/O crate; adds `arrow`/`parquet`/`blake3` over `mumdia-core`, plus `rayon` for the dedicated parquet codec pool (`codec.rs`) and `bytes` for the `SpanCache` `ChunkReader` (`span_cache.rs`) |
+| `rust/mumdia/crates/mumdia-io/Cargo.toml` | I/O crate; adds `arrow`/`parquet`/`blake3` over `mumdia-core`, plus `rayon` for the dedicated parquet codec pool (`codec.rs`) |
 | `rust/mumdia/crates/mumdia/tests/pipeline.rs` | The only integration test file: extract -> features -> compete -> rescore on crafted Parquet |
 | `rust/mumdia/crates/mumdia-core/build.rs` | Stamps the git commit and build date into the crate so `manifest.json` can record them |
 | `.github/workflows/ci.yml` | Nine jobs: `lint` (fmt + clippy `-D warnings` + rustdoc), `audit` (`cargo audit` on both lockfiles, engine and desktop), `build-test` (`cargo test --workspace`) matrix on ubuntu/macos/windows, `smoke` (release build of the binary, then end-to-end `run` and `run-experiment` on a generated fixture, ubuntu + windows), `sidecar-imports` (a real conda env per sidecar, matrixed, plus `pip-audit`), `smoke-cross-platform` (asserts the two platforms produced byte-identical `peptides.tsv` and `proteins.tsv`), `desktop` (the console's own workspace: fmt, clippy, unit tests, and a frontend/backend consistency check), `desktop-windows` (the console on Windows and its MSI, installed and uninstalled), `sidecars` (compileall + JSON/YAML parse + doc-reference check + generated-document freshness); on push-to-`main`, every PR, weekly, and on demand. The Rust jobs skip their steps when `ci/ci_scope.sh` finds nothing they check in the change |
@@ -125,8 +125,7 @@ resolver (`resolver = "2"`, `Cargo.toml:2`) and lists three members
 depends on `serde`/`serde_json`/`thiserror` only (no arrow/parquet, so the core
 types stay I/O-free); `mumdia-io` adds `arrow`/`parquet`/`blake3` over
 `mumdia-core`, plus `rayon` for its own parquet codec pool (parallel column
-encode and decode, `codec.rs`) and `bytes` for the coalescing `ChunkReader`
-(`span_cache.rs`); the `mumdia` bin+lib crate pulls the full set including
+encode and decode, `codec.rs`); the `mumdia` bin+lib crate pulls the full set including
 `clap`, `rayon`, `mzdata`, and `tracing`. The engine needs **no cmake and no system C libraries**, which is what the feature
 selection buys: `parquet` uses `default-features = false, features =
 ["arrow","snap","zstd"]` to drop the C zlib-ng backend that needs cmake, keeping the

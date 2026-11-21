@@ -1343,7 +1343,7 @@ moves to another function.
 | `MUMDIA_NN_WARM_START` | sidecar | `0` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_WD` | sidecar | `1e-4` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_PARQUET_COMPRESSION` | engine | computed: snappy. `zstd`, or `uncompressed` / `none`, changes the codec (`table.rs` `codec`) | `rust/mumdia/crates/mumdia-io/src/table.rs::codec` |
-| `MUMDIA_PARQUET_DECODE_THREADS` | engine | computed: automatic column groups, up to the codec pool's threads; one reader for a coalesced scan or inside a rayon pool. `k` asks for k groups, `1` is one reader (`table.rs` `automatic_decode_groups`) | `rust/mumdia/crates/mumdia-io/src/table.rs::TableFile::scan_spec` |
+| `MUMDIA_PARQUET_DECODE_THREADS` | engine | computed: automatic column groups, up to the codec pool's threads; one reader inside a rayon pool. `k` asks for k groups, `1` is one reader (`table.rs` `automatic_decode_groups`) | `rust/mumdia/crates/mumdia-io/src/table.rs::TableFile::scan_spec` |
 | `MUMDIA_PARQUET_THREADS` | engine | computed: min(`--threads`, 8), or min(cores, 8) without `--threads`. `0` or `1` is serial (`codec.rs` `codec_threads`) | `rust/mumdia/crates/mumdia-io/src/codec.rs::codec_threads` |
 | `MUMDIA_PEPTDEEP_DEVICE` | sidecar | `"auto"` | `scripts/peptdeep_worker.py::main` |
 | `MUMDIA_PREDICT_FRAG_CONCURRENT` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/stages/predict_frag.rs::assign_predictions` |
@@ -1362,7 +1362,6 @@ moves to another function.
 | `MUMDIA_SIDECAR_SPACE_CHECK` | engine | computed: on (before the handoff is written, a rescore sidecar run is refused when its work directory has less room than a PIN or raw handoff cannot be smaller than, and warned about below the files' usual size). `0` / `off` / `false` / `no` skips the check (`stages/rescore.rs` `check_sidecar_space`) | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::check_sidecar_space` |
 | `MUMDIA_TEMP_DIR` | engine | computed: the system's temporary directory. A path (or `--temp-dir`, which wins) is created, must take a write and a rename, and becomes `TMP`, `TEMP` and `TMPDIR` of the engine and every worker it starts, with `MPLCONFIGDIR` under it unless set (`storage.rs` `apply`) | `rust/mumdia/crates/mumdia/src/storage.rs::apply`, `rust/mumdia/crates/mumdia/src/storage.rs::report` |
 | `MUMDIA_THERMO_PARSER` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs::locate_parser` |
-| `MUMDIA_WIDE_SCAN` | engine | computed: `plain`: the plain reader with its parallel decode for rescore's feature stream and compete's pass-through copy. `rowgroup` decodes the feature stream one row group a batch; `coalesced` reads each row group's projected column chunks in one sequential read (`stages/mod.rs` `WideScan`) | `rust/mumdia/crates/mumdia/src/stages/mod.rs::WideScan::from_env` |
 | `MUMDIA_WINDOW_FEATURES` | engine | computed: on when unset; `0` leaves the fixed-window feature family out (`features.rs` `env_families`) | `rust/mumdia/crates/mumdia/src/stages/features.rs::env_families` |
 | `MUMDIA_XGB_DEPTH` | sidecar | `"6"` | `scripts/mokapot_worker.py::make_model` |
 | `MUMDIA_XGB_JOBS` | sidecar | `"0"` | `scripts/mokapot_worker.py::make_model` |
@@ -1378,7 +1377,7 @@ moves to another function.
 | `VIRTUAL_ENV` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
 | `XDG_CACHE_HOME` | engine | computed: set by the desktop environment, often unset; an absolute value puts the engine's caches in `$XDG_CACHE_HOME/mumdia` on Linux when MUMDIA_CACHE_DIR is unset (`cache.rs` `root`) | `rust/mumdia/crates/mumdia/src/cache.rs::root` |
 
-106 variables are read: 44 engine-side, 67 sidecar-side, 5 on both sides.
+105 variables are read: 43 engine-side, 67 sidecar-side, 5 on both sides.
 
 ### Variables the code sets
 
@@ -1453,6 +1452,6 @@ instead of looking like an absent field.
 
 ## Coverage
 
-26 structs and 363 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 49 enumerations, 1 named profile(s), 106 environment variables read and 27 set.
+26 structs and 363 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 49 enumerations, 1 named profile(s), 105 environment variables read and 27 set.
 
 30 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.

@@ -427,19 +427,12 @@ however many folds are configured. The stage logs the figure before allocating, 
 
 **Reading the feature columns.** The feature pass (`for_each_feature_batch`) is the
 widest read of the stage: every selected feature column of every row of every
-input, once. It reads through `stages::wide_scan_options`, which is the plain
-reader with its parallel decode and 16,384-row batches unless `MUMDIA_WIDE_SCAN`
-asks otherwise (docs/03 "Sequential row-group reads"). The plain reader seeks once
-per page, which is what limits it on a spinning array (44 MB/s measured on the
-immunopeptidomics competed tables against a 133 MB/s ceiling). Two opt-ins address
-that: `MUMDIA_WIDE_SCAN=rowgroup` decodes one row group a batch
-(`feature_batch_rows`, at most 131,072 rows), so the reader sweeps each column chunk
-before the next one, and `MUMDIA_WIDE_SCAN=coalesced` reads each row group's
-projected column chunks in one sequential read at 16,384-row batches. Neither is
-the default: from the page cache the stream over the 879,018-row HYE competed table
-took 1.54 s plain, 1.58 s `rowgroup` and 2.50 s `coalesced`, and neither has been
-measured on the spinning array yet. The rows reach the handoff and the matrix in
-file order whatever the reader and batch size
+input, once. It reads with the plain reader, its parallel decode and 16,384-row
+batches. `MUMDIA_WIDE_SCAN`, which chose a row-group or a coalesced reader instead, was
+removed in 0.15.0: from the page cache the stream over the 879,018-row HYE competed
+table took 1.54 s plain, 1.58 s `rowgroup` and 2.50 s `coalesced` (docs/03
+"Sequential row-group reads"). The rows reach the handoff and the matrix in
+file order whatever the batch size
 (`every_read_mode_streams_the_same_feature_rows`).
 
 The stream hands out whole decoded batches (`FeatureBatch`), and each consumer

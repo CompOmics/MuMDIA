@@ -1651,7 +1651,6 @@ dependencies = [
  "anyhow",
  "arrow",
  "blake3",
- "bytes",
  "mumdia-core",
  "parquet",
  "rayon",
