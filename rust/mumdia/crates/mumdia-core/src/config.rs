@@ -3861,7 +3861,7 @@ impl Default for QuantConfig {
 /// already extracted, sub-threshold candidate on retention-time agreement alone. On the same
 /// pools its transfers measured 2.3-2.7% entrapment FDP (ProteoBench) and about 4x the
 /// false-ID rate of the direct identifications (single cells). The variant still parses and
-/// serialises, so the canonical configuration does not move, but [`RETIRED`] and
+/// serialises, so the canonical configuration does not move, but `RETIRED` and
 /// `validate()` refuse it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]

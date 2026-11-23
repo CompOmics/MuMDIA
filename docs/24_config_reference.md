@@ -1335,14 +1335,14 @@ instead of looking like an absent field.
 - `peptidoforms.fixed_mods[].name` (`String`)
 - `peptidoforms.fixed_mods[].residue` (`char`)
 
-25 environment read(s) whose name is not a literal. Reads with the same function, access and argument share one entry, which gives their number when there is more than one:
+13 environment read(s) whose name is not a literal. Reads with the same function, access and argument share one entry, which gives their number when there is more than one:
 
-- `rust/mumdia/crates/mumdia-core/src/config.rs::Config::resolve_ztscan_on: env read via closure of `*k`` (3 reads)
-- `rust/mumdia/crates/mumdia-core/src/config.rs::Config::resolve_ztscan_on: env read via closure of `self.extract.q1_fragments`` (3 reads)
-- `rust/mumdia/crates/mumdia-core/src/config.rs::Config::resolve_ztscan_on: env read via closure of `self.extract.q1_traces`` (3 reads)
-- `rust/mumdia/crates/mumdia-core/src/config.rs::Config::resolve_ztscan_on: env read via closure of `self.rescore.shadow_q1`` (3 reads)
-- `rust/mumdia/crates/mumdia-core/src/config.rs::Config::resolve_ztscan_on: env read via closure of `self.retrace.q1_repick`` (3 reads)
-- `rust/mumdia/crates/mumdia-core/src/config.rs::Config::resolve_ztscan_on: env read via closure of `self.rt_im_train.q1_calibrate`` (3 reads)
+- `rust/mumdia/crates/mumdia-core/src/config.rs::Config::resolve_ztscan_on: env read via closure of `*k``
+- `rust/mumdia/crates/mumdia-core/src/config.rs::Config::resolve_ztscan_on: env read via closure of `self.extract.q1_fragments``
+- `rust/mumdia/crates/mumdia-core/src/config.rs::Config::resolve_ztscan_on: env read via closure of `self.extract.q1_traces``
+- `rust/mumdia/crates/mumdia-core/src/config.rs::Config::resolve_ztscan_on: env read via closure of `self.rescore.shadow_q1``
+- `rust/mumdia/crates/mumdia-core/src/config.rs::Config::resolve_ztscan_on: env read via closure of `self.retrace.q1_repick``
+- `rust/mumdia/crates/mumdia-core/src/config.rs::Config::resolve_ztscan_on: env read via closure of `self.rt_im_train.q1_calibrate``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::PsmRows::push: env read via closure of `&mut self``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::PsmStream::push: env read via closure of `&mut self``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::flush_below: env read via closure of `chunk.slices_mut()``
