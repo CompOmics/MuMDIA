@@ -81,9 +81,9 @@ Licence identifiers by crate count:
 | `cc` | 1.2.65 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/cc-rs](https://github.com/rust-lang/cc-rs) |
 | `cfg-if` | 1.0.4 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/cfg-if](https://github.com/rust-lang/cfg-if) |
 | `chrono` | 0.4.45 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/chronotope/chrono](https://github.com/chronotope/chrono) |
-| `clap` | 4.6.7 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
+| `clap` | 4.6.9 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
 | `clap_builder` | 4.6.7 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
-| `clap_derive` | 4.6.7 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
+| `clap_derive` | 4.6.9 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
 | `clap_lex` | 1.1.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
 | `colorchoice` | 1.0.5 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-cli/anstyle.git](https://github.com/rust-cli/anstyle.git) |
 | `comfy-table` | 8.0.1 | MIT | - | [https://github.com/nukesor/comfy-table](https://github.com/nukesor/comfy-table) |
@@ -172,9 +172,9 @@ Licence identifiers by crate count:
 | `phf_shared` | 0.14.0 | MIT | - | [https://github.com/rust-phf/rust-phf](https://github.com/rust-phf/rust-phf) |
 | `pin-project-lite` | 0.2.17 | Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/taiki-e/pin-project-lite](https://github.com/taiki-e/pin-project-lite) |
 | `pkg-config` | 0.3.34 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/pkg-config-rs](https://github.com/rust-lang/pkg-config-rs) |
-| `proc-macro2` | 1.0.106 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/proc-macro2](https://github.com/dtolnay/proc-macro2) |
+| `proc-macro2` | 1.0.107 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/proc-macro2](https://github.com/dtolnay/proc-macro2) |
 | `quick-xml` | 0.41.0 | MIT | - | [https://github.com/tafia/quick-xml](https://github.com/tafia/quick-xml) |
-| `quote` | 1.0.46 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/quote](https://github.com/dtolnay/quote) |
+| `quote` | 1.0.47 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/quote](https://github.com/dtolnay/quote) |
 | `r-efi` | 5.3.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later | `Apache-2.0` | [https://github.com/r-efi/r-efi](https://github.com/r-efi/r-efi) |
 | `r-efi` | 6.0.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later | `Apache-2.0` | [https://github.com/r-efi/r-efi](https://github.com/r-efi/r-efi) |
 | `rayon` | 1.12.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rayon-rs/rayon](https://github.com/rayon-rs/rayon) |
@@ -204,7 +204,7 @@ Licence identifiers by crate count:
 | `strsim` | 0.11.1 | MIT | - | [https://github.com/rapidfuzz/strsim-rs](https://github.com/rapidfuzz/strsim-rs) |
 | `syn` | 1.0.109 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/syn](https://github.com/dtolnay/syn) |
 | `syn` | 2.0.118 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/syn](https://github.com/dtolnay/syn) |
-| `syn` | 3.0.5 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/syn](https://github.com/dtolnay/syn) |
+| `syn` | 3.0.10 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/syn](https://github.com/dtolnay/syn) |
 | `thiserror` | 1.0.69 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/thiserror](https://github.com/dtolnay/thiserror) |
 | `thiserror` | 2.0.21 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/thiserror](https://github.com/dtolnay/thiserror) |
 | `thiserror-impl` | 1.0.69 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/thiserror](https://github.com/dtolnay/thiserror) |
@@ -465,7 +465,7 @@ Notices recovered for 149 of 208 crates (the remainder ship no copyright line in
 
 - Copyright (c) 2014, Kang Seonghoon.
 
-**clap 4.6.7**
+**clap 4.6.9**
 
 - Copyright (c) Individual contributors
 
@@ -473,7 +473,7 @@ Notices recovered for 149 of 208 crates (the remainder ship no copyright line in
 
 - Copyright (c) Individual contributors
 
-**clap_derive 4.6.7**
+**clap_derive 4.6.9**
 
 - Copyright (c) Individual contributors
 

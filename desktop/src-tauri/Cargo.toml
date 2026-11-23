@@ -44,7 +44,7 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 # the two need not match. The probe asks only for `query_row`, `optional` and the
 # read-only open flags.
 # `bundled` builds SQLite from source, so no system library is needed.
-rusqlite = { version = "0.41", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 
 # The elevated launch of Microsoft's Visual C++ runtime installer (`vcruntime::win`):
 # `ShellExecuteExW` with the `runas` verb, then a wait for its exit code (its
