@@ -258,7 +258,7 @@ built this library (144,821 candidate PSMs: `peptidoform, charge, label, score,
 spectrum_q, observed_rt, predicted_irt, matched_peaks, scan_index`, ...). The
 `run` orchestrator recomputes its own seed each time and does not read this file
 (`run.rs` computes search-seed internally), so it is provided for standalone
-stages (`rt-im-train`, `align`, `mbr`, `audit`) and for inspection.
+stages (`rt-im-train`, `mbr`, `audit`) and for inspection.
 `lib/seed_psms.parquet.masscal.json` is the per-run fragment mass recalibration
 written by `search-seed` (`{"frag_ppm_offset": 0.79, "frag_tol_ppm": 19.2,
 "n_dev": 65678}`); it likewise belongs to that prior run.

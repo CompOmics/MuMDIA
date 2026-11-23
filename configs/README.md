@@ -33,7 +33,7 @@ find one that can import what that worker imports. The search order is
 
 1. the role's own environment variable: `MUMDIA_PYTHON_RESCORE`,
    `MUMDIA_PYTHON_DEEPLC`, `MUMDIA_PYTHON_MS2PIP`, `MUMDIA_PYTHON_PEPTDEEP`,
-   `MUMDIA_PYTHON_IM2DEEP`, `MUMDIA_PYTHON_MBR`;
+   `MUMDIA_PYTHON_IM2DEEP`;
 2. `MUMDIA_PYTHON`, for all roles at once;
 3. an activated environment, via `CONDA_PREFIX` or `VIRTUAL_ENV`;
 4. `python3`, then `python`, on `PATH`.

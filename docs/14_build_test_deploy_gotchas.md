@@ -28,7 +28,7 @@ configurations in `configs/`, the container definition in `Dockerfile` +
 | `rust/mumdia/.cargo/config.toml.example` | Committed template of the above; a fresh clone with no local copy builds into `./target` |
 | `rust/mumdia/crates/mumdia/Cargo.toml` | The bin+lib crate `mumdia`; `[[bin]]` name `mumdia` -> `src/main.rs`; all deps come from `workspace.dependencies` |
 | `rust/mumdia/crates/mumdia-core/Cargo.toml` | Core crate; depends only on `serde`/`serde_json`/`thiserror` (no arrow/parquet, so no I/O layer) |
-| `rust/mumdia/crates/mumdia-io/Cargo.toml` | I/O crate; adds `arrow`/`parquet`/`blake3` over `mumdia-core`, plus `rayon` for the dedicated parquet codec pool (`codec.rs`) and `bytes` for the `SpanCache` `ChunkReader` (`span_cache.rs`) |
+| `rust/mumdia/crates/mumdia-io/Cargo.toml` | I/O crate; adds `arrow`/`parquet`/`blake3` over `mumdia-core`, plus `rayon` for the dedicated parquet codec pool (`codec.rs`) |
 | `rust/mumdia/crates/mumdia/tests/pipeline.rs` | The only integration test file: extract -> features -> compete -> rescore on crafted Parquet |
 | `rust/mumdia/crates/mumdia-core/build.rs` | Stamps the git commit and build date into the crate so `manifest.json` can record them |
 | `.github/workflows/ci.yml` | Nine jobs: `lint` (fmt + clippy `-D warnings` + rustdoc), `audit` (`cargo audit` on both lockfiles, engine and desktop), `build-test` (`cargo test --workspace`) matrix on ubuntu/macos/windows, `smoke` (release build of the binary, then end-to-end `run` and `run-experiment` on a generated fixture, ubuntu + windows), `sidecar-imports` (a real conda env per sidecar, matrixed, plus `pip-audit`), `smoke-cross-platform` (asserts the two platforms produced byte-identical `peptides.tsv` and `proteins.tsv`), `desktop` (the console's own workspace: fmt, clippy, unit tests, and a frontend/backend consistency check), `desktop-windows` (the console on Windows and its MSI, installed and uninstalled), `sidecars` (compileall + JSON/YAML parse + doc-reference check + generated-document freshness); on push-to-`main`, every PR, weekly, and on demand. The Rust jobs skip their steps when `ci/ci_scope.sh` finds nothing they check in the change |
@@ -125,8 +125,7 @@ resolver (`resolver = "2"`, `Cargo.toml:2`) and lists three members
 depends on `serde`/`serde_json`/`thiserror` only (no arrow/parquet, so the core
 types stay I/O-free); `mumdia-io` adds `arrow`/`parquet`/`blake3` over
 `mumdia-core`, plus `rayon` for its own parquet codec pool (parallel column
-encode and decode, `codec.rs`) and `bytes` for the coalescing `ChunkReader`
-(`span_cache.rs`); the `mumdia` bin+lib crate pulls the full set including
+encode and decode, `codec.rs`); the `mumdia` bin+lib crate pulls the full set including
 `clap`, `rayon`, `mzdata`, and `tracing`. The engine needs **no cmake and no system C libraries**, which is what the feature
 selection buys: `parquet` uses `default-features = false, features =
 ["arrow","snap","zstd"]` to drop the C zlib-ng backend that needs cmake, keeping the
@@ -407,9 +406,8 @@ things in order.
    skipped entirely when no role is in use, so a native configuration is not failed
    over a directory it never opens. The previous version failed exactly that case,
    and a missing script directory was the most common misconfiguration.
-2. One line per interpreter role, for all four roles (`Role::Rescore`,
-   `DeepLc`, `Ms2pip`, `Mbr`; `python.rs:35`). `mbr.python` was previously never
-   probed. A role that is neither required by the config nor explicitly named
+2. One line per interpreter role (`Role::Rescore`, `DeepLc`, `Ms2pip`, `Peptdeep`,
+   `Im2deep`; `python.rs:35`). A role that is neither required by the config nor explicitly named
    prints `[skip]` and is not probed at all. An `"auto"` field is resolved by
    `python::discover` (`python.rs:245`) exactly as a run would resolve it, and the
    line states the provenance (configured, which environment variable, the
@@ -673,7 +671,7 @@ A pull request is diffed as its merge commit against the first parent (hence
 `fetch-depth: 2` on those checkouts), a push against `github.event.before`; a
 scheduled or dispatched run, or any run whose base cannot be established, does
 everything.
-`CI_SCOPE_FILES=$'docs/04_convert.md\nscripts/mbr_worker.py' bash ci/ci_scope.sh smoke`
+`CI_SCOPE_FILES=$'docs/04_convert.md\nscripts/nn_rescore_worker.py' bash ci/ci_scope.sh smoke`
 prints the decision for a list of paths. A path that belongs to no class is treated as
 the engine, so a new directory costs a full run until it is classified, never a skipped
 check.

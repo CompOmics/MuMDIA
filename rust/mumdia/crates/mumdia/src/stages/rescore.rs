@@ -23,41 +23,9 @@ use crate::rescoring::{
 };
 use crate::stages::features::FeatureSchema;
 
-/// Fewest rows per decoded batch while streaming the ~390 feature columns of a competed
+/// Rows per decoded batch while streaming the ~390 feature columns of a competed
 /// table (~16k rows x 387 f64 is about 50 MB per batch).
 const FEATURE_BATCH_ROWS: usize = 1 << 14;
-
-/// Most rows per decoded batch of that stream: the competed row-group cap
-/// (`compete::COMPETED_ROW_GROUP_ROWS`), ~400 MB of decoded f64 at 387 features.
-const FEATURE_BATCH_ROWS_MAX: usize = 1 << 17;
-
-/// Rows per decoded batch of the feature stream over `t` under the wide-scan mode `mode`.
-///
-/// 16,384 rows (~50 MB of decoded f64) under the plain reader (the default) and the
-/// coalesced one. Under `MUMDIA_WIDE_SCAN=rowgroup` a batch is one row group: the largest
-/// row group of `t`, clamped to `[FEATURE_BATCH_ROWS, FEATURE_BATCH_ROWS_MAX]`. The arrow
-/// reader fills a batch column by column, so a batch that covers a whole row group reads
-/// every page of one column chunk before it moves to the next, which is a near-forward
-/// sweep through the row group; a 16,384-row batch visits every column chunk of the group
-/// once per batch instead (step 1 of R1 in the 2026-09-25 survey). The competed table
-/// carries the features file's 65,536-row groups or compete's own 131,072. The coalesced
-/// reader reads a row group with one sequential read whatever the batch size, so it keeps
-/// the floor. Measured from the page cache on the HYE competed table (879,018 rows,
-/// 131,072-row groups): 1.54 s plain at 16,384 rows, 1.58 s plain at a row group, 2.50 s
-/// coalesced at 16,384 rows and 2.76 s coalesced at a row group, so the larger batch buys
-/// no time where the read is not the limit and costs ~350 MB of decoded f64; whether it
-/// buys time on a seek-bound disk is not measured.
-///
-/// The rows reach the closure one at a time in file order whatever the batch size, so the
-/// handoff and the matrix are unchanged
-/// (`every_read_mode_streams_the_same_feature_rows` covers both readers and several sizes).
-fn feature_batch_rows(t: &TableFile, mode: super::WideScan) -> usize {
-    if mode != super::WideScan::RowGroup {
-        return FEATURE_BATCH_ROWS;
-    }
-    let largest = t.row_group_rows().into_iter().max().unwrap_or(0);
-    largest.clamp(FEATURE_BATCH_ROWS, FEATURE_BATCH_ROWS_MAX)
-}
 
 /// Payload bytes of the per-PSM metadata columns that stay resident beside the feature
 /// matrix for the whole stage.
@@ -2877,14 +2845,12 @@ fn for_each_feature_row(
     feat_names: &[String],
     f: impl FnMut(usize, &[f32]) -> Result<()>,
 ) -> Result<()> {
-    // Every feature column of every row: the widest read of the stage, read as
-    // `MUMDIA_WIDE_SCAN` says (`WideScan`); the batches are the plain reader's either way.
-    let mode = super::WideScan::from_env();
+    // Every feature column of every row: the widest read of the stage.
     for_each_feature_row_with(
         competed,
         feat_names,
-        &mode.options(),
-        |t| feature_batch_rows(t, mode),
+        &mumdia_io::table::ScanOptions::default(),
+        |_| FEATURE_BATCH_ROWS,
         f,
     )
 }
@@ -3040,12 +3006,11 @@ fn for_each_feature_batch(
     keep: Option<&[bool]>,
     f: impl FnMut(&FeatureBatch<'_>) -> Result<()>,
 ) -> Result<()> {
-    let mode = super::WideScan::from_env();
     for_each_feature_batch_with(
         competed,
         feat_names,
-        &mode.options(),
-        |t| feature_batch_rows(t, mode),
+        &mumdia_io::table::ScanOptions::default(),
+        |_| FEATURE_BATCH_ROWS,
         keep,
         f,
     )
@@ -4811,43 +4776,9 @@ b
     }
 
     #[test]
-    fn the_feature_batch_follows_the_row_groups_within_its_bounds() {
-        let names: Vec<String> = ["f0", "f1", "f2"].iter().map(|s| s.to_string()).collect();
-        use super::super::WideScan;
-        let (rowgroup, plain, coalesced) =
-            (WideScan::RowGroup, WideScan::Plain, WideScan::Coalesced);
-        let small = scratch("fbr_small.parquet");
-        crafted_competed(&small, 7, 100.0, &names, false);
-        // A tiny table still reads in batches of the floor.
-        assert_eq!(
-            feature_batch_rows(&TableFile::open(&small).unwrap(), rowgroup),
-            FEATURE_BATCH_ROWS
-        );
-        // One batch per row group between the floor and the cap.
-        let mid = scratch("fbr_mid.parquet");
-        let mut w = mumdia_io::table::TableWriter::new(&mid).with_row_group_rows(40_000);
-        w.write_cols(vec![Col::F64("f0".into(), vec![1.0; 100_000])])
-            .unwrap();
-        w.close().unwrap();
-        let mid = TableFile::open(&mid).unwrap();
-        assert_eq!(feature_batch_rows(&mid, rowgroup), 40_000);
-        // The default plain reader keeps the floor, and so does the coalesced reader,
-        // which reads the group whole whatever the batch.
-        assert_eq!(feature_batch_rows(&mid, plain), FEATURE_BATCH_ROWS);
-        assert_eq!(feature_batch_rows(&mid, coalesced), FEATURE_BATCH_ROWS);
-        // A table written as one huge group is read in batches of the cap.
-        let big = scratch("fbr_big.parquet");
-        write_table(&big, vec![Col::F64("f0".into(), vec![1.0; 200_000])]).unwrap();
-        assert_eq!(
-            feature_batch_rows(&TableFile::open(&big).unwrap(), rowgroup),
-            FEATURE_BATCH_ROWS_MAX
-        );
-    }
-
-    #[test]
     fn every_read_mode_streams_the_same_feature_rows() {
-        // The coalesced reader, the plain reader with its parallel column groups, and any
-        // batch size have to hand the closure the same rows: the handoff and the matrix are
+        // The plain reader, with or without its parallel column groups, and any batch size
+        // have to hand the closure the same rows: the handoff and the matrix are
         // built from them one at a time.
         let names: Vec<String> = ["f0", "f1", "f2"].iter().map(|s| s.to_string()).collect();
         let a = scratch("modes_a.parquet");
@@ -4874,95 +4805,12 @@ b
         assert_eq!(reference.len(), 12);
         for scan in [
             mumdia_io::table::ScanOptions::default().with_decode_threads(2),
-            mumdia_io::table::ScanOptions::coalesced(),
-            mumdia_io::table::ScanOptions::coalesced().with_decode_threads(3),
+            mumdia_io::table::ScanOptions::default().with_decode_threads(3),
         ] {
             for rows in [1, 3, 16_384] {
                 assert_eq!(collect(&scan, rows), reference, "{scan:?}, {rows} rows");
             }
         }
-    }
-
-    /// The feature stream over a real competed table, by read mode and batch size.
-    ///
-    /// `MUMDIA_BENCH_PARQUET=<psms_competed.parquet> cargo test -p mumdia --release
-    /// bench_feature_stream -- --ignored --nocapture`. Every arm narrows every value and
-    /// folds its bits into a checksum, which the arms must agree on; the minimum of
-    /// `MUMDIA_BENCH_REPS` (3) interleaved rounds is printed.
-    #[test]
-    #[ignore = "benchmark; needs MUMDIA_BENCH_PARQUET"]
-    fn bench_feature_stream_a_real_artifact() {
-        let Ok(src) = std::env::var("MUMDIA_BENCH_PARQUET") else {
-            println!("set MUMDIA_BENCH_PARQUET to a real competed table to run this");
-            return;
-        };
-        let reps: usize = std::env::var("MUMDIA_BENCH_REPS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(3);
-        let names = FeatureSchema::read(&src).unwrap().feature_columns;
-        let competed = vec![src.clone()];
-        let t = TableFile::open(&src).unwrap();
-        println!(
-            "{src}: {} rows, {} features, row groups {:?}",
-            t.nrows,
-            names.len(),
-            t.row_group_rows().iter().take(4).collect::<Vec<_>>()
-        );
-        type Arm = (&'static str, mumdia_io::table::ScanOptions, bool);
-        let arms: Vec<Arm> = vec![
-            (
-                "plain, 16,384 rows",
-                mumdia_io::table::ScanOptions::default(),
-                false,
-            ),
-            (
-                "plain, row group",
-                mumdia_io::table::ScanOptions::default(),
-                true,
-            ),
-            (
-                "coalesced, 16,384 rows",
-                mumdia_io::table::ScanOptions::coalesced(),
-                false,
-            ),
-            (
-                "coalesced, row group",
-                mumdia_io::table::ScanOptions::coalesced(),
-                true,
-            ),
-        ];
-        let mut best = vec![f64::INFINITY; arms.len()];
-        let mut sums: Vec<u64> = vec![0; arms.len()];
-        for _ in 0..reps {
-            for (k, (_, scan, aligned)) in arms.iter().enumerate() {
-                let t0 = std::time::Instant::now();
-                let mut sum = 0u64;
-                let sizing = |t: &TableFile| {
-                    if *aligned {
-                        feature_batch_rows(t, super::super::WideScan::RowGroup)
-                    } else {
-                        FEATURE_BATCH_ROWS
-                    }
-                };
-                for_each_feature_row_with(&competed, &names, scan, sizing, |_, v| {
-                    for x in v {
-                        sum = sum.wrapping_add(u64::from(x.to_bits()));
-                    }
-                    Ok(())
-                })
-                .unwrap();
-                best[k] = best[k].min(t0.elapsed().as_secs_f64());
-                sums[k] = sum;
-            }
-        }
-        for (k, (name, _, _)) in arms.iter().enumerate() {
-            println!("{name:>24}: {:7.2} s", best[k]);
-        }
-        assert!(
-            sums.windows(2).all(|w| w[0] == w[1]),
-            "arms disagree: {sums:?}"
-        );
     }
 
     #[test]
@@ -5019,12 +4867,8 @@ b
             );
 
             // The batch form the stage uses: whole decoded batches staged column by column,
-            // with batches smaller than, straddling and larger than the 5-row blocks, under
-            // both readers.
-            for scan in [
-                mumdia_io::table::ScanOptions::default(),
-                mumdia_io::table::ScanOptions::coalesced(),
-            ] {
+            // with batches smaller than, straddling and larger than the 5-row blocks.
+            for scan in [mumdia_io::table::ScanOptions::default()] {
                 for batch in [1usize, 3, 16_384] {
                     let from_batches = SidecarPaths {
                         handoff: scratch(if use_pq { "b.parquet" } else { "b.pin" }),

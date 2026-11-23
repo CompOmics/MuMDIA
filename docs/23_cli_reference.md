@@ -59,8 +59,6 @@ Commands:
   run              Orchestrate the full pipeline on one run and write a manifest. Given several --mzml, the files are searched as ONE pooled experiment (`run-experiment`: one combined rescore, per-run quant, cross-run LFQ), which is the default treatment of a multi-file input; use `run-experiment` directly for run names
   run-experiment   Experiment-wide orchestrator: run the per-file search chain over N runs, then one combined rescore, optional rescuable MBR transfer, per-run quant, and cross-run LFQ. Pass --mzml once per run (>= 2)
   build-library    Build the spectral library of a FASTA search without spectra: digest -> peptidoforms -> predict-frag, restored from or stored into `predict_frag.library_cache` under the key a `run --fasta` uses. Writes the two library tables, manifest.json and library.json (counts, models, cache key and the commands that search with it) into --out-dir
-  align            Cross-run RT alignment (experiment-level) -> alignment.parquet
-  mbr              Match-between-runs identification transfer (Stage D3) -> transferred.parquet
   inspect          Print schema, head sample, and row count for any artifact
   peak-census      Peaks per MS2 spectrum for an mzML or a diaPASEF `.d`, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard
   audit            Candidate audit: reconstruct per-candidate stage flags + earliest rejection reason across the artifact chain and write candidate_audit.parquet (sensitivity program, P0.3/P0.4). Non-destructive; reruns no compute
@@ -182,8 +180,6 @@ first sentence of the description, with the full text in the section below.
 | [`run`](#run) | yes | Orchestrate the full pipeline on one run and write a manifest. |
 | [`run-experiment`](#run-experiment) | yes | Experiment-wide orchestrator: run the per-file search chain over N runs, then one combined rescore, optional rescuable MBR transfer, per-run quant, and cross-run LFQ. |
 | [`build-library`](#build-library) | yes | Build the spectral library of a FASTA search without spectra: digest -> peptidoforms -> predict-frag, restored from or stored into `predict_frag.library_cache` under the key a `run --fasta` uses. |
-| [`align`](#align) | yes | Cross-run RT alignment (experiment-level) -> alignment.parquet |
-| [`mbr`](#mbr) | yes | Match-between-runs identification transfer (Stage D3) -> transferred.parquet |
 | [`inspect`](#inspect) | no | Print schema, head sample, and row count for any artifact |
 | [`peak-census`](#peak-census) | yes | Peaks per MS2 spectrum for an mzML or a diaPASEF `.d`, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard |
 | [`audit`](#audit) | no | Candidate audit: reconstruct per-candidate stage flags + earliest rejection reason across the artifact chain and write candidate_audit.parquet (sensitivity program, P0.3/P0.4). |
@@ -192,8 +188,8 @@ first sentence of the description, with the full text in the section below.
 | [`doctor`](#doctor) | yes | Check that the configured Python sidecar environments are usable |
 | `help` | n/a | Print this message or the help of the given subcommand(s) |
 
-27 of the 31 documented subcommands accept `--config`:
- `align`, `build-library`, `cache`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `localise`, `mbr`, `mobilogram`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `prescreen`, `quant`, `quant-normalise`, `report`, `rescore`, `retrace`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
+25 of the 29 documented subcommands accept `--config`:
+ `build-library`, `cache`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `localise`, `mobilogram`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `prescreen`, `quant`, `quant-normalise`, `report`, `rescore`, `retrace`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
 
 4 do not, so every setting they use comes from their own flags:
  `audit`, `inspect`, `pool`, `quant-lfq`.
@@ -331,9 +327,6 @@ Options:
       --run-windows <RUN_WINDOWS>
           Per-candidate RT bounds (candidate_id, rt_lo, rt_hi). Omitted: whole gradient
 
-      --ms1 <MS1>
-          MS1 spectra, for `prescreen.mass_hypotheses.ms1` only
-
       --out <OUT>
 
       --config <CONFIG>
@@ -344,16 +337,8 @@ Options:
       --target <TARGET>
           Override `prescreen.target` (implies preset custom)
 
-      --top-peaks <TOP_PEAKS>
-          Override `prescreen.top_peaks` (0 = uncapped)
-
       --write-scores
           Also write `<out>.scores.parquet`
-
-      --sample-candidates <SAMPLE_CANDIDATES>
-          Evaluation only: score a seeded sample of about N candidates (survivors then cover the sample only and are not an extract allowlist)
-
-          [default: 0]
 
       --tags-only
           The database-free tag prefilter only: keep the candidates with an observed trimer in their isolation window (no fragment score; pass no --run-windows for the retention-time-free prefilter)
@@ -463,7 +448,7 @@ Options:
           The library row that `--lib-precursors` row 0 came from, when that table is one isolation-window band of a larger library (`groups.window_groups` writes such bands, with ids rebased to `0..n`). The band's fragments are then read from the shared `--lib-fragments` table by that id range, selectively when the table is sorted by `candidate_id`, so a band needs no fragment table of its own
 
       --q1-cal <Q1_CAL>
-          The run's `cal.json` with its Q1 calibration (`rt_im_train.q1_calibrate`), which `extract.q1_fragments` decides with and `extract.q1_deconvolved` / `features.q1_deconvolved` read their tolerance from
+          The run's `cal.json` with its Q1 calibration (`rt_im_train.q1_calibrate`), which `extract.q1_fragments` decides with and `features.q1_deconvolved` reads its tolerance from
 
       --config <CONFIG>
 ```
@@ -935,51 +920,6 @@ Options:
 
           [default: off]
           [possible values: off, on]
-```
-
-Plus the 7 repeated flags removed above: see "Global flags".
-
-## align
-
-```text
-Cross-run RT alignment (experiment-level) -> alignment.parquet
-
-Usage: mumdia align [OPTIONS] --out <OUT>
-
-Options:
-      --seed-psms <SEED_PSMS>...
-          One seed_psms.parquet per run; the first is the reference
-
-      --out <OUT>
-
-      --config <CONFIG>
-```
-
-Plus the 7 repeated flags removed above: see "Global flags".
-
-## mbr
-
-```text
-Match-between-runs identification transfer (Stage D3) -> transferred.parquet
-
-Usage: mumdia mbr [OPTIONS] --psms-scored <PSMS_SCORED> --out <OUT>
-
-Options:
-      --psms-scored <PSMS_SCORED>
-          Experiment-wide scored_combined.parquet (has the `source` column)
-
-      --psms-extracted <PSMS_EXTRACTED>...
-          Per-run psms.parquet in `source` order (one per run)
-
-      --out <OUT>
-
-      --out-psms-scored <OUT_PSMS_SCORED>
-          Optional augmented scored table: input scored with accepted transfers' q_value lowered + is_transferred flag (for quant/report with q_filter=psm_q)
-
-      --frag [<FRAG>...]
-          Optional per-run fragment_quant.parquet (source order) for the fragment-consensus guard (needs mbr.consensus_corr_min > 0)
-
-      --config <CONFIG>
 ```
 
 Plus the 7 repeated flags removed above: see "Global flags".

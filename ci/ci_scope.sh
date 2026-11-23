@@ -23,7 +23,7 @@
 # Run locally to see what a branch would run, or what a list of paths would:
 #   GITHUB_EVENT_NAME=push PUSH_BEFORE=$(git merge-base origin/main HEAD) \
 #       RUNNER_OS=Windows bash ci/ci_scope.sh build-test
-#   CI_SCOPE_FILES=$'docs/04_convert.md\nscripts/mbr_worker.py' bash ci/ci_scope.sh smoke
+#   CI_SCOPE_FILES=$'docs/04_convert.md\nscripts/nn_rescore_worker.py' bash ci/ci_scope.sh smoke
 set -euo pipefail
 
 job="${1:?usage: ci/ci_scope.sh <job>}"

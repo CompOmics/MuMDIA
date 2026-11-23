@@ -1,4 +1,7 @@
 #!/bin/bash
+# The arms below use prescreen components and flags removed in 0.15.0 (docs/34 section 4);
+# only X_OX53 runs on a current binary. Rerun the others with binary 391dca1, adding
+# --ms1 "$S/spectra_ms1.parquet" to the prescreen call for S_MASS.
 # Extension arms of the prescreen validation, after ps_val.sh finished in ROOT.
 #   ps_ext.sh ROOT BIN LIBF CFG THREADS [OXMOD]
 # X_* arms: full chain (extract -> features -> compete -> rescore x seeds) on the screen's survivors.
@@ -54,7 +57,7 @@ screen() {  # screen ARM OVERRIDES [extra args]
   local arm=$1 o=$2; shift 2
   mkdir -p "$ROOT/$arm"; mkcfg "$ROOT/$arm/cfg.json" "$o"
   T "${arm}_screen" "$BIN" --threads "$THREADS" prescreen --ms2 "$S/spectra_ms2.parquet" \
-    --ms1 "$S/spectra_ms1.parquet" --lib-precursors "$LIB" --run-windows "$B/run_windows.parquet" \
+    --lib-precursors "$LIB" --run-windows "$B/run_windows.parquet" \
     --out "$ROOT/$arm/survivors.parquet" --config "$ROOT/$arm/cfg.json" --write-scores "$@"
 }
 log "EXT START bin=$(sha256sum "$BIN" | cut -c1-16)"

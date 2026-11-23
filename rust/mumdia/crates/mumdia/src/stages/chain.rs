@@ -403,7 +403,7 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
     // the `cal.json` just written. Like retrace, the RT bootstrap pass, which only collects
     // anchors, skips it, unless that pass's extract decides per fragment
     // (`extract.q1_fragments`), which reads the calibration and the tolerances it learns.
-    let q1_dec = cfg.extract.q1_deconvolved || cfg.features.q1_deconvolved.on();
+    let q1_dec = cfg.features.q1_deconvolved.on();
     if cfg.rt_im_train.q1_calibrate.on()
         && (retrace_allowed || cfg.extract.q1_fragments.on() || q1_dec)
     {
@@ -422,8 +422,7 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
         })?;
     }
 
-    let survivors =
-        prescreen::run_if_enabled(cfg, ch, &co.ms2, Some(&co.ms1), lib_p, &windows, out_dir)?;
+    let survivors = prescreen::run_if_enabled(cfg, ch, &co.ms2, lib_p, &windows, out_dir)?;
     // Counted and hashed only when there is a manifest to record them in.
     if let (Some(s), Some(m)) = (&survivors, manifest.as_deref_mut()) {
         m.record(record_artifact(
@@ -564,8 +563,6 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
         out: &feats,
         out_pin: &d("run.pin"),
         cfg: &cfg.features,
-        // Retrace's `imc_ref_w`, when this pass retraced under `retrace.apex_features`.
-        imc_ref_w: raw.is_some() && cfg.retrace.apex_features,
         // The tolerances extract decided with, for `features.q1_consistency`.
         q1_tolerances: ext_cfg.q1_model.as_ref().map(|m| m.tolerances),
     })?;

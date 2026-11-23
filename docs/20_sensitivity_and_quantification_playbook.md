@@ -420,9 +420,7 @@ slice with that run's chromatograms. Quant has no source selector;
 `run_psm_q` setting is therefore not evidence that it is the optimal single-run
 precursor filter.
 
-`peak_window_mode=per_candidate` remains the default. Consensus half-widths are
-estimated separately inside each quant invocation; they are not currently
-shared across runs. Median-ratio normalization uses positive complete-case
+`peak_window_mode = consensus` was removed in 0.15.0. Median-ratio normalization uses positive complete-case
 features. If none exist, factors fall back to `1.0`; inspect the logged
 `size_factors` before interpreting normalized ratios.
 

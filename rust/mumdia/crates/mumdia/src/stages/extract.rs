@@ -139,8 +139,9 @@ pub struct ExtractParams<'a> {
     ///
     /// Borrowed, never owned, and the stage only reads them. What makes that safe is not
     /// that nothing here corrects the observed m/z -- the per-peak mass recalibration
-    /// corrects exactly that, `peak.mz / mass_off.factor_at(peak.mz)`, and each band
-    /// applies its own factor under `groups.calibration = per_group`. It is safe because
+    /// corrects exactly that, `peak.mz / mass_off.factor_at(peak.mz)`, and the bands need
+    /// not share one factor (the removed `groups.calibration = per_group` gave each band its
+    /// own). It is safe because
     /// the corrected value is computed into a LOCAL (`q_mz`) at every one of those call
     /// sites and never written back, the scans arrive as a shared slice that no stage can
     /// write through, and the loaders have already sorted by retention time so no stage
@@ -339,9 +340,6 @@ struct Guard<'a> {
     im_gate: bool,
     /// The trace pad in seconds (`ExtractParams::trace_pad`), 0 without one.
     pad: f64,
-    /// `extract.q1_deconvolved`: the per-peak Q1 centroids and each candidate's expected
-    /// centre (`stages::q1dec`); `None` with the key off, when every peak passes.
-    q1: Option<&'a crate::stages::q1dec::Q1Gate>,
 }
 
 impl<'a> Guard<'a> {
@@ -362,14 +360,6 @@ impl<'a> Guard<'a> {
         self.win.admits(c, rt, pim)
     }
 
-    /// `extract.q1_deconvolved`: whether peak `j` of `scan` sits on the Q1 sweep where
-    /// fragment `frag` of candidate `c` is expected (its trace's centroid within the learned
-    /// tolerance of the fragment's calibrated centre). Always true with the key off.
-    #[inline]
-    fn q1_admits(&self, c: usize, frag: u16, scan: &Ms2Scan, j: usize) -> bool {
-        self.q1.is_none_or(|g| g.admits_frag(c, frag, scan, j))
-    }
-
     /// A peak the window does not admit but the trace pad does: it goes into the candidate's
     /// traces with its full intensity and takes no part in a peak claim, so the in-window
     /// hits of every candidate are what they are without the pad. Always false without one.
@@ -378,21 +368,12 @@ impl<'a> Guard<'a> {
         self.pad > 0.0 && self.win.admits_padded(c, rt, pim, self.pad)
     }
 
-    /// Whether candidate `c` claims peak `j` of `scan` (its fragment `frag`) on the two-pass
-    /// paths: the window admits the peak, the Q1 decision admits it, and the allowlist holds
-    /// the candidate.
+    /// Whether candidate `c` claims peak `j` of `scan` on the two-pass paths: the window
+    /// admits the peak and the allowlist holds the candidate.
     #[inline]
-    fn claims(
-        &self,
-        restrict: Option<&CandMask>,
-        c: u32,
-        frag: u16,
-        scan: &Ms2Scan,
-        j: usize,
-    ) -> bool {
+    fn claims(&self, restrict: Option<&CandMask>, c: u32, scan: &Ms2Scan, j: usize) -> bool {
         let cu = c as usize;
         self.admits(cu, scan.rt_seconds, self.scan_im(scan).map(|v| v[j]))
-            && self.q1_admits(cu, frag, scan, j)
             && restrict.is_none_or(|s| s.contains(c))
     }
 }
@@ -1489,9 +1470,6 @@ fn demix_solve_scan(
                 if !guard.admits(cc, apex_rt, pim) {
                     return;
                 }
-                if !guard.q1_admits(cc, frag, scan, j) {
-                    return;
-                }
                 claimants.push((c, frag, pi));
             };
             pr.probe(None, q_mz, lo, hi, &mut push);
@@ -1837,9 +1815,9 @@ fn coelution_gate_score(groups: &ScanGroups, distinct: &[u16], sig: &[u16], fint
 /// A group qualifies when it holds a matched fragment and its smoothed distinct-fragment
 /// count (`smoothed`, `apex_count_window`) is at least `thresh` (the maximum less
 /// `apex_count_tol`). The qualifying group with the highest score wins, the earliest on a
-/// tie: `(count + sig / (sig + 1)) * prior` under `apex_evidence_rank`, so the count
+/// tie: `(count + sig / (sig + 1)) * prior` (`apex_evidence_rank`), so the count
 /// dominates and the signature intensity (`sig_at`, the observed intensity of the top
-/// predicted fragments) breaks ties within a count, and the legacy `sig * prior` without it.
+/// predicted fragments) breaks ties within a count.
 /// `prior_at` is the RT prior (`apex_rt_prior_s`), 1 when off. The score is f32: once `sig`
 /// passes about 2e6 to 8e6 (by count), `count + sig / (sig + 1)` rounds to `count + 1`,
 /// equal-count groups tie, and without the prior the earliest of them wins.
@@ -1853,7 +1831,6 @@ fn pick_apex(
     thresh: f64,
     sig_at: impl Fn(usize) -> f32,
     prior_at: impl Fn(usize) -> f32,
-    evidence_rank: bool,
     refine_reach: Option<usize>,
 ) -> Option<usize> {
     let qualifies = |i: usize| counts[i] > 0 && smoothed[i] >= thresh;
@@ -1861,11 +1838,7 @@ fn pick_apex(
     let mut best = f32::NEG_INFINITY;
     for i in (0..counts.len()).filter(|&i| qualifies(i)) {
         let (sig, prior) = (sig_at(i), prior_at(i));
-        let score = if evidence_rank {
-            (counts[i] as f32 + sig / (sig + 1.0)) * prior
-        } else {
-            sig * prior
-        };
+        let score = (counts[i] as f32 + sig / (sig + 1.0)) * prior;
         if score > best {
             best = score;
             apex = Some(i);
@@ -2022,9 +1995,6 @@ fn window_groups(lib: &Library, scans: &[Ms2Scan]) -> Vec<WinGroup> {
 pub(crate) const Q1_MIN_WINDOWS: usize = 50;
 pub(crate) const Q1_MAX_STEP: f64 = 1.5;
 pub(crate) const Q1_MIN_OVERLAP: f64 = 1.5;
-/// Cycles on each side of the apex cycle the Q1 profile reads: the five cycles around it, as
-/// the window gates read the apex +-2 scans.
-const Q1_PROFILE_CYCLES: u32 = 2;
 /// Fewest fragments that belong at the chosen peak for `retrace.q1_repick` to move the apex:
 /// a candidate with fewer has no 2D apex of its own to move to.
 const Q1_REPICK_MIN_BELONG: usize = 3;
@@ -2058,303 +2028,6 @@ fn group_at(groups: &ScanGroups, rt: f64) -> Option<usize> {
         }
     }
     (lo < groups.len() && groups.rt(lo).to_bits() == rt.to_bits()).then_some(lo)
-}
-
-/// The Q1 sweep of scanning-quadrupole spectra (`extract.q1_cycles`, `extract.q1_profile`):
-/// every distinct isolation window is one Q1 bin, the windows in [`WindowKey`] order (by
-/// lower m/z), and a cycle is one sweep over them.
-///
-/// Cycles are read off the scans in acquisition (RT) order: a new cycle starts where a bin's
-/// target falls back by more than half a step below the bin before it, which is where the
-/// sweep restarts. Each window has at most one scan in a cycle; a second one in the same
-/// cycle (which a regular sweep never writes) starts a new cycle as well.
-struct Q1Layout {
-    /// Window index of every scan.
-    scan_win: Vec<u32>,
-    /// Cycle of every scan.
-    scan_cycle: Vec<u32>,
-    n_cycles: usize,
-    /// Per window: lower and upper m/z and target.
-    win: Vec<(f64, f64, f64)>,
-    /// `win_scan[w * n_cycles + c]`: the scan of window `w` in cycle `c`, `u32::MAX` where it
-    /// has none.
-    win_scan: Vec<u32>,
-    /// Per window, the RT of its scans, ascending.
-    win_rts: Vec<Vec<f64>>,
-    /// Median step between consecutive targets, and the widest window, m/z.
-    step: f64,
-    max_width: f64,
-}
-
-/// What [`Q1Layout::build`] found when the windows are not a scanning quadrupole's.
-fn q1_layout_refusal(n: usize, step: f64, width: f64) -> anyhow::Error {
-    anyhow::anyhow!(
-        "extract: extract.q1_cycles and extract.q1_profile model a scanning quadrupole (SCIEX \
-         ZT Scan DIA read with convert.isolation_half_width): at least {Q1_MIN_WINDOWS} \
-         overlapping isolation windows whose targets step less than {Q1_MAX_STEP} m/z. These \
-         spectra have {n} windows, a median step of {step:.4} m/z and a median width of \
-         {width:.4} m/z; unset both keys for them"
-    )
-}
-
-impl Q1Layout {
-    fn build(scans: &[Ms2Scan]) -> Result<Q1Layout> {
-        let mut keys: BTreeMap<WindowKey, u32> = BTreeMap::new();
-        for s in scans {
-            keys.entry(s.window.key()).or_insert(0);
-        }
-        let mut win: Vec<(f64, f64, f64)> = Vec::with_capacity(keys.len());
-        for (i, (_, v)) in keys.iter_mut().enumerate() {
-            *v = i as u32;
-        }
-        // The target of a window is the target of its first scan.
-        let mut seen = vec![false; keys.len()];
-        win.resize(keys.len(), (0.0, 0.0, 0.0));
-        let scan_win: Vec<u32> = scans
-            .iter()
-            .map(|s| {
-                let w = keys[&s.window.key()];
-                if !seen[w as usize] {
-                    seen[w as usize] = true;
-                    win[w as usize] = (s.window.lower_mz, s.window.upper_mz, s.window.target_mz);
-                }
-                w
-            })
-            .collect();
-        let median = |mut v: Vec<f64>| -> f64 {
-            v.sort_by(f64::total_cmp);
-            v.get(v.len() / 2).copied().unwrap_or(0.0)
-        };
-        let step = median(win.windows(2).map(|p| p[1].2 - p[0].2).collect());
-        let width = median(win.iter().map(|w| w.1 - w.0).collect());
-        if win.len() < Q1_MIN_WINDOWS
-            || !(step > 0.0 && step < Q1_MAX_STEP)
-            || width < Q1_MIN_OVERLAP * step
-        {
-            return Err(q1_layout_refusal(win.len(), step, width));
-        }
-        let max_width = win.iter().map(|w| w.1 - w.0).fold(0.0f64, f64::max);
-        // Cycles, in acquisition order (the loaders sort the scans by RT).
-        let mut scan_cycle = vec![0u32; scans.len()];
-        let mut in_cycle = vec![u32::MAX; win.len()];
-        let mut cycle = 0u32;
-        let mut prev_target = f64::NEG_INFINITY;
-        for si in 0..scans.len() {
-            let w = scan_win[si] as usize;
-            let t = win[w].2;
-            if (si > 0 && t < prev_target - 0.5 * step) || in_cycle[w] == cycle {
-                cycle += 1;
-            }
-            in_cycle[w] = cycle;
-            scan_cycle[si] = cycle;
-            prev_target = t;
-        }
-        let n_cycles = if scans.is_empty() {
-            0
-        } else {
-            cycle as usize + 1
-        };
-        let mut win_scan = vec![u32::MAX; win.len() * n_cycles];
-        let mut win_rts: Vec<Vec<f64>> = vec![Vec::new(); win.len()];
-        for (si, s) in scans.iter().enumerate() {
-            let (w, c) = (scan_win[si] as usize, scan_cycle[si] as usize);
-            win_scan[w * n_cycles + c] = si as u32;
-            win_rts[w].push(s.rt_seconds);
-        }
-        Ok(Q1Layout {
-            scan_win,
-            scan_cycle,
-            n_cycles,
-            win,
-            win_scan,
-            win_rts,
-            step,
-            max_width,
-        })
-    }
-
-    /// The windows whose m/z range covers `pm`, ascending.
-    fn covering(&self, pm: f64) -> Vec<u32> {
-        let s = self.win.partition_point(|w| w.0 < pm - self.max_width);
-        let e = self.win.partition_point(|w| w.0 <= pm);
-        (s..e)
-            .filter(|&w| self.win[w].0 <= pm && pm <= self.win[w].1)
-            .map(|w| w as u32)
-            .collect()
-    }
-
-    /// The covering window whose target is nearest `pm` (the lower on a tie): where a
-    /// candidate's cycle points sit.
-    fn anchor_for(&self, pm: f64, cover: &[u32]) -> Option<u32> {
-        cover.iter().copied().min_by(|&a, &b| {
-            let da = (self.win[a as usize].2 - pm).abs();
-            let db = (self.win[b as usize].2 - pm).abs();
-            da.total_cmp(&db).then(a.cmp(&b))
-        })
-    }
-
-    /// The share of a precursor at `pm` a bin transmits: a window of half-width `h` swept
-    /// over one step `s` during the bin passes it whole while `|pm - target| <= h - s / 2`,
-    /// not at all beyond `h + s / 2`, and linearly in between.
-    fn transmission(&self, w: u32, pm: f64) -> f64 {
-        let (lo, hi, t) = self.win[w as usize];
-        let h = 0.5 * (hi - lo);
-        let d = (pm - t).abs();
-        let s = self.step;
-        if d <= h - 0.5 * s {
-            1.0
-        } else if d >= h + 0.5 * s {
-            0.0
-        } else {
-            (h + 0.5 * s - d) / s
-        }
-    }
-}
-
-/// A candidate's hits with its Q1 bins of one cycle summed into one point
-/// (`extract.q1_cycles`): each hit moves to the scan of window `anchor` in its own cycle, the
-/// intensities of one fragment at one point are summed (in f64, in hit order, so the sum is
-/// deterministic), and its observed m/z is their intensity-weighted mean. A hit in a cycle
-/// where the anchor window has no scan, which a regular sweep has only at its ends, is
-/// dropped. The result is ascending in scan, then fragment.
-fn q1_merge(hits: &[Hit], layout: &Q1Layout, anchor: u32) -> Vec<Hit> {
-    let base = anchor as usize * layout.n_cycles;
-    let mut keyed: Vec<(u32, u16, usize)> = hits
-        .iter()
-        .enumerate()
-        .filter_map(|(i, h)| {
-            let c = layout.scan_cycle[h.scan as usize] as usize;
-            let rep = layout.win_scan[base + c];
-            (rep != u32::MAX).then_some((rep, h.frag, i))
-        })
-        .collect();
-    keyed.sort_by_key(|&(rep, frag, i)| (rep, frag, i));
-    let mut out: Vec<Hit> = Vec::with_capacity(keyed.len());
-    let mut k = 0;
-    while k < keyed.len() {
-        let (rep, frag, _) = keyed[k];
-        let (mut sum, mut wmz) = (0.0f64, 0.0f64);
-        let first_mz = hits[keyed[k].2].obs_mz;
-        while k < keyed.len() && keyed[k].0 == rep && keyed[k].1 == frag {
-            let h = &hits[keyed[k].2];
-            sum += h.inten as f64;
-            wmz += h.inten as f64 * h.obs_mz as f64;
-            k += 1;
-        }
-        out.push(Hit {
-            scan: rep,
-            frag,
-            inten: sum as f32,
-            obs_mz: if sum > 0.0 {
-                (wmz / sum) as f32
-            } else {
-                first_mz
-            },
-            im: 0,
-        });
-    }
-    out
-}
-
-/// The Q1-profile evidence of one row (`extract.q1_profile`, psms_extracted v5). Zero for a
-/// row without signal in its apex cycles.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct Q1Profile {
-    /// Pearson correlation, over the covering windows, of the matched intensity in each and
-    /// the transmission expected for the precursor.
-    corr: f64,
-    /// Observed minus expected intensity-weighted centroid of the window targets, in
-    /// half-widths of the Q1 window.
-    offset: f64,
-    /// Intensity-weighted spread of the fragments' own centroids around the observed one, in
-    /// half-widths.
-    frag_sd: f64,
-    /// Share of the covering windows with signal.
-    bin_frac: f64,
-}
-
-/// [`Q1Profile`] from a candidate's unmerged hits over the cycles `c0 - 2 ..= c0 + 2`.
-fn q1_profile_of(hits: &[Hit], layout: &Q1Layout, cover: &[u32], pm: f64, c0: u32) -> Q1Profile {
-    if cover.is_empty() {
-        return Q1Profile::default();
-    }
-    let (lo_c, hi_c) = (c0.saturating_sub(Q1_PROFILE_CYCLES), c0 + Q1_PROFILE_CYCLES);
-    let mut per_win = vec![0.0f64; cover.len()];
-    // Per fragment: summed intensity and intensity-weighted target. An ordered map, so the
-    // spread is summed in fragment order.
-    let mut per_frag: BTreeMap<u16, (f64, f64)> = BTreeMap::new();
-    for h in hits {
-        let si = h.scan as usize;
-        let c = layout.scan_cycle[si];
-        if c < lo_c || c > hi_c {
-            continue;
-        }
-        let w = layout.scan_win[si];
-        let Ok(k) = cover.binary_search(&w) else {
-            continue;
-        };
-        let (v, t) = (h.inten as f64, layout.win[w as usize].2);
-        per_win[k] += v;
-        let e = per_frag.entry(h.frag).or_default();
-        e.0 += v;
-        e.1 += v * t;
-    }
-    let expected: Vec<f64> = cover.iter().map(|&w| layout.transmission(w, pm)).collect();
-    let targets: Vec<f64> = cover.iter().map(|&w| layout.win[w as usize].2).collect();
-    let total: f64 = per_win.iter().sum();
-    let e_total: f64 = expected.iter().sum();
-    if total <= 0.0 || e_total <= 0.0 {
-        return Q1Profile::default();
-    }
-    let half = {
-        let a = layout.anchor_for(pm, cover).unwrap_or(cover[0]) as usize;
-        0.5 * (layout.win[a].1 - layout.win[a].0)
-    };
-    let centroid: f64 = per_win
-        .iter()
-        .zip(&targets)
-        .map(|(v, t)| v * t)
-        .sum::<f64>()
-        / total;
-    let expected_centroid: f64 = expected
-        .iter()
-        .zip(&targets)
-        .map(|(v, t)| v * t)
-        .sum::<f64>()
-        / e_total;
-    let corr = if cover.len() >= 3 {
-        let r = crate::stats::pearson(&per_win, &expected);
-        if r.is_finite() {
-            r
-        } else {
-            0.0
-        }
-    } else {
-        0.0
-    };
-    let (mut ss, mut sw) = (0.0f64, 0.0f64);
-    for &(v, vt) in per_frag.values() {
-        if v > 0.0 {
-            let d = vt / v - centroid;
-            ss += v * d * d;
-            sw += v;
-        }
-    }
-    let frag_sd = if sw > 0.0 && half > 0.0 {
-        (ss / sw).sqrt() / half
-    } else {
-        0.0
-    };
-    Q1Profile {
-        corr,
-        offset: if half > 0.0 {
-            (centroid - expected_centroid) / half
-        } else {
-            0.0
-        },
-        frag_sd,
-        bin_frac: per_win.iter().filter(|&&v| v > 0.0).count() as f64 / cover.len() as f64,
-    }
 }
 
 /// Bytes a fragment-peak match costs while a probing task holds it: the 16-byte [`Hit`]
@@ -2787,9 +2460,6 @@ impl ProbeTask<'_> {
                 trace_only.clear();
                 ix.probe_binned(q_mz, bin, |cid, _pmz, pint, frag| {
                     let c = cid as usize;
-                    if !guard.q1_admits(c, frag, scan, j) {
-                        return;
-                    }
                     let inside = guard.admits(c, rt, pim);
                     if !inside && !guard.pads(c, rt, pim) {
                         return;
@@ -3033,9 +2703,9 @@ fn accumulate_groups(
     // The memory-cheap version of that hoist -- writing the corrected value back into
     // `scan.peaks` instead of into a side buffer -- is now FORBIDDEN, not merely
     // unmeasured. Under `groups.window_groups > 1` the scans are one buffer lent to every
-    // band (`ExtractParams::scans`), and under `groups.calibration = per_group` each band
-    // applies its own `MassOffset` to it, so band g00's factor would be baked into the
-    // peaks band g01 reads. The borrow checker stops it today, because `scans` arrives as
+    // band (`ExtractParams::scans`), and a band that applied its own `MassOffset` to it
+    // (as the removed `groups.calibration = per_group` did) would bake band g00's factor
+    // into the peaks band g01 reads. The borrow checker stops it today, because `scans` arrives as
     // a shared slice; do not reach for `&mut` to get around that.
     let (tx, rx) = std::sync::mpsc::channel::<(usize, usize, HitStore)>();
     {
@@ -3234,7 +2904,7 @@ fn extract_twopass_windows(
                     claimants.clear();
                     {
                         let mut push = |cid: u32, frag: u16, pi: f32| {
-                            if guard.claims(restrict, cid, frag, scan, j) {
+                            if guard.claims(restrict, cid, scan, j) {
                                 claimants.push((cid, frag, pi));
                             }
                         };
@@ -3282,7 +2952,7 @@ fn extract_twopass_windows(
                         claimants.clear();
                         {
                             let mut push = |cid: u32, frag: u16, pi: f32| {
-                                if guard.claims(restrict, cid, frag, scan, j) {
+                                if guard.claims(restrict, cid, scan, j) {
                                     claimants.push((cid, frag, pi));
                                 }
                             };
@@ -3350,7 +3020,7 @@ fn extract_twopass_windows(
                         claimants.clear();
                         {
                             let mut push = |cid: u32, frag: u16, pi: f32| {
-                                if guard.claims(restrict, cid, frag, scan, j) {
+                                if guard.claims(restrict, cid, scan, j) {
                                     claimants.push((cid, frag, pi));
                                 }
                             };
@@ -3464,7 +3134,7 @@ fn extract_twopass_windows(
                         claimants.clear();
                         {
                             let mut push = |cid: u32, frag: u16, pi: f32| {
-                                if guard.claims(restrict, cid, frag, scan, j) {
+                                if guard.claims(restrict, cid, scan, j) {
                                     claimants.push((cid, frag, pi));
                                 }
                             };
@@ -3532,7 +3202,7 @@ fn extract_twopass_windows(
                     claimants.clear();
                     {
                         let mut push = |cid: u32, frag: u16, pi: f32| {
-                            if guard.claims(restrict, cid, frag, scan, j) {
+                            if guard.claims(restrict, cid, scan, j) {
                                 claimants.push((cid, frag, pi));
                             }
                         };
@@ -3974,7 +3644,7 @@ fn apex_im_stats(
         None
     } else {
         let s1 = &ms1_scans[nearest_index(ms1_rts, apex_rt)];
-        let target = prec_mz * cfg.ms1_shift(prec_mz, apex_rt);
+        let target = prec_mz * cfg.ms1_shift();
         crate::spectra::ms1_peak_near(s1, target, cfg.prec_tol_ppm, med)
             .and_then(|k| s1.im.as_ref().map(|v| v[k] as f64))
     };
@@ -4036,12 +3706,8 @@ struct CandOut {
     deconv_shadow: f32,
     /// The 1/K0 evidence (psms_extracted v4); all `None` on 3D data.
     im: ApexIm,
-    /// The Q1-profile evidence (psms_extracted v5, `extract.q1_profile`); zero otherwise.
-    q1: Q1Profile,
     /// The per-fragment Q1 decision (psms_extracted v6, `extract.q1_fragments`).
     q1f: Option<q1frag::Q1fRow>,
-    /// The MS1 isotope-envelope evidence (psms_extracted v7, `features.ms1_envelope`).
-    ms1e: Option<crate::stages::ms1env::Ms1Env>,
     /// (cid, frag_name, frag_mz, frag_obs_mz, predicted_intensity, rt, intensity, im)
     chrom: Vec<ChromOutputRow>,
     /// Under `extract.q1_traces`: the same rows on Q1 cycles (`chromatograms_q1.parquet`), and
@@ -4110,12 +3776,8 @@ struct PsmRows {
     deconv_share: Vec<f32>,
     deconv_collin: Vec<f32>,
     deconv_shadow: Vec<f32>,
-    /// One per row under `extract.q1_profile`, empty otherwise.
-    q1: Vec<Q1Profile>,
     /// One per row under `extract.q1_fragments`, empty otherwise.
     q1f: Vec<q1frag::Q1fRow>,
-    /// One per row under `features.ms1_envelope`, empty otherwise.
-    ms1e: Vec<crate::stages::ms1env::Ms1Env>,
 }
 
 impl PsmRows {
@@ -4170,14 +3832,8 @@ impl PsmRows {
             self.deconv_collin.push(r.deconv_collin);
             self.deconv_shadow.push(r.deconv_shadow);
         }
-        if cfg.q1_profile {
-            self.q1.push(r.q1);
-        }
         if cfg.q1_fragments.on() {
             self.q1f.push(r.q1f.unwrap_or_default());
-        }
-        if cfg.ms1_envelope {
-            self.ms1e.push(r.ms1e.unwrap_or_default());
         }
     }
 
@@ -4284,26 +3940,11 @@ impl PsmRows {
                 take(&mut self.deconv_shadow),
             ));
         }
-        // psms_extracted v5: the Q1-profile evidence, appended last, only under
-        // `extract.q1_profile`.
-        if cfg.q1_profile {
-            let q1 = take(&mut self.q1);
-            let col = |f: fn(&Q1Profile) -> f64| -> Vec<f64> { q1.iter().map(f).collect() };
-            cols.push(Col::F64("q1_corr".into(), col(|q| q.corr)));
-            cols.push(Col::F64("q1_offset".into(), col(|q| q.offset)));
-            cols.push(Col::F64("q1_frag_sd".into(), col(|q| q.frag_sd)));
-            cols.push(Col::F64("q1_bin_frac".into(), col(|q| q.bin_frac)));
-        }
         // The unfragmented-precursor and multi-scale Q1 values of the rows (v8), taken out of
         // the decision rows below and written last.
         let mut q1p_rows: Vec<Vec<f64>> = Vec::new();
         let mut q1m_rows: Vec<Vec<f64>> = Vec::new();
         let mut q1d_rows: Vec<Vec<f64>> = Vec::new();
-        // The separable model's values and lists (v9), taken out the same way.
-        let sep = cfg.q1_separable && cfg.q1_fragments.on();
-        let mut sep_rows: Vec<Vec<f64>> = Vec::new();
-        let (mut sep_el, mut sep_rt, mut sep_amp, mut sep_r2, mut sep_if) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         // psms_extracted v6: the per-fragment Q1 decision, appended last, only under
         // `extract.q1_fragments`: the row's summary, then one list per decision with an entry
         // per library fragment.
@@ -4369,30 +4010,11 @@ impl PsmRows {
                 if cfg.q1_dec_features {
                     q1d_rows.push(r.q1d);
                 }
-                if sep {
-                    sep_rows.push(r.q1s);
-                    sep_el.push(r.q1s_elution);
-                    sep_rt.push(r.q1s_cycle_rt);
-                    sep_amp.push(r.q1s_amp);
-                    sep_r2.push(r.q1s_r2);
-                    sep_if.push(r.q1s_interf);
-                }
             }
             cols.push(Col::ListF32("q1f_frag_class".into(), cl));
             cols.push(Col::ListF32("q1f_frag_offset".into(), of));
             cols.push(Col::ListF32("q1f_frag_resid".into(), rs));
             cols.push(Col::ListF32("q1f_frag_corr2d".into(), cr));
-        }
-        // psms_extracted v7: the MS1 isotope-envelope evidence, appended last, only under
-        // `features.ms1_envelope`.
-        if cfg.ms1_envelope {
-            let e = take(&mut self.ms1e);
-            for (k, name) in crate::stages::ms1env::EVIDENCE_COLUMNS.iter().enumerate() {
-                cols.push(Col::F64(
-                    (*name).into(),
-                    e.iter().map(|x| x.columns()[k]).collect(),
-                ));
-            }
         }
         // psms_extracted v8: the unfragmented-precursor evidence and the multi-scale Q1
         // scores, appended last, each only under its key (`stages::q1score`).
@@ -4420,21 +4042,6 @@ impl PsmRows {
                     q1d_rows.iter().map(|v| v[k]).collect(),
                 ));
             }
-        }
-        // psms_extracted v9: the separable model of each row's Q1 patch, appended last, only
-        // under `features.q1_separable` (`stages::q1trace`).
-        if sep {
-            for (k, name) in q1trace::Q1S_COLUMNS.iter().enumerate() {
-                cols.push(Col::F64(
-                    (*name).into(),
-                    sep_rows.iter().map(|v| v[k]).collect(),
-                ));
-            }
-            cols.push(Col::ListF32("q1s_elution".into(), sep_el));
-            cols.push(Col::ListF32("q1s_cycle_rt".into(), sep_rt));
-            cols.push(Col::ListF32("q1s_frag_amp".into(), sep_amp));
-            cols.push(Col::ListF32("q1s_frag_r2".into(), sep_r2));
-            cols.push(Col::ListF32("q1s_frag_interf".into(), sep_if));
         }
         cols
     }
@@ -4775,20 +4382,20 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     }
     // The sweep's Q1 grid, built once for the gate below and the per-fragment decision.
     let mut q1_grid: Option<q1frag::Q1Grid> = None;
-    // `extract.q1_deconvolved`: every MS2 peak's Q1 centroid (`stages::q1dec`) and each
-    // candidate's calibrated expected centre; a hit counts only within the learned tolerance.
-    let q1_gate: Option<crate::stages::q1dec::Q1Gate> = if p.cfg.q1_deconvolved
-        || (p.cfg.q1_dec_features && p.cfg.q1_fragments.on())
+    // `features.q1_deconvolved`: every MS2 peak's Q1 centroid (`stages::q1dec`) and each
+    // candidate's calibrated expected centre, which the evidence at each row's apex reads.
+    let q1_gate: Option<crate::stages::q1dec::Q1Gate> = if p.cfg.q1_dec_features
+        && p.cfg.q1_fragments.on()
     {
         if has_im {
             anyhow::bail!(
-                "extract: extract.q1_deconvolved and features.q1_deconvolved read a scanning \
-                 quadrupole's Q1 steps, and these spectra carry 1/K0 (diaPASEF); unset them"
+                "extract: features.q1_deconvolved reads a scanning \
+                 quadrupole's Q1 steps, and these spectra carry 1/K0 (diaPASEF); unset it"
             );
         }
         let (Some(m), Some(tol_steps)) = (p.cfg.q1_model.as_ref(), p.cfg.q1_dec_tol_steps) else {
             anyhow::bail!(
-                "extract: extract.q1_deconvolved needs the run's Q1 calibration with its \
+                "extract: features.q1_deconvolved needs the run's Q1 calibration with its \
                  deconvolution tolerance (cal.json q1_calibration.deconvolution, from \
                  rt_im_train.q1_calibrate); `mumdia run` reads it, `mumdia extract` takes it \
                  as --q1-cal"
@@ -4796,7 +4403,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         };
         let sweep = crate::spectra::load_q1_sweep(p.ms2)?.ok_or_else(|| {
             anyhow::anyhow!(
-                "extract: extract.q1_deconvolved needs the Q1 sweep spectra_ms2 v3 records \
+                "extract: features.q1_deconvolved needs the Q1 sweep spectra_ms2 v3 records \
                  (q1_cycle, q1_step), and {} has none: convert it again with \
                  convert.isolation_half_width",
                 p.ms2
@@ -4870,34 +4477,9 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         win: &win,
         im_gate,
         pad: trace_pad_s,
-        // Only `extract.q1_deconvolved` gates the hits; `features.q1_deconvolved` reads the
-        // centroids at each row's apex instead.
-        q1: q1_gate.as_ref().filter(|_| p.cfg.q1_deconvolved),
     };
     // The per-point 1/K0 of the traces is written only on 4D data with a consumer on.
     let chrom_im = has_im && p.chrom_im;
-    // Scanning-quadrupole spectra (`extract.q1_cycles`, `extract.q1_profile`): the Q1 sweep,
-    // read off the scans' isolation windows. With both keys off nothing below reads it.
-    let q1_layout: Option<Q1Layout> = if p.cfg.q1_cycles || p.cfg.q1_profile {
-        if has_im {
-            anyhow::bail!(
-                "extract: extract.q1_cycles and extract.q1_profile model a scanning quadrupole, \
-                 and these spectra carry 1/K0 (diaPASEF); unset both keys for them"
-            );
-        }
-        let l = Q1Layout::build(scans)?;
-        info!(
-            windows = l.win.len(),
-            cycles = l.n_cycles,
-            step_mz = l.step,
-            q1_cycles = p.cfg.q1_cycles,
-            q1_profile = p.cfg.q1_profile,
-            "extract: scanning-quadrupole layout"
-        );
-        Some(l)
-    } else {
-        None
-    };
 
     // Isolation-window -> sorted scan RTs, for zero-filled chromatogram grids. An ordered
     // map on the window key ([`IsolationWindow::key`]), so the windows come out ascending
@@ -4962,13 +4544,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         }
     }
 
-    // `features.ms1_envelope` reads the MS1 of spectra without 1/K0 only.
-    if p.cfg.ms1_envelope && has_im {
-        anyhow::bail!(
-            "extract: features.ms1_envelope reads the MS1 isotope envelope of spectra without \
-             1/K0, and these carry it (diaPASEF); unset it for them"
-        );
-    }
     // The unfragmented-precursor and multi-scale Q1 scores (`features.q1_precursor`,
     // `features.q1_multiscale`) are read on the per-fragment decision's patches.
     if (p.cfg.q1_precursor || p.cfg.q1_multiscale) && !p.cfg.q1_fragments.on() {
@@ -5032,10 +4607,10 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     });
     // `extract.q1_traces` (`stages::q1trace`): every accepted candidate's traces once more on Q1
     // cycles, into `chromatograms_q1.parquet`, collapsed with the decision's calibrated model
-    // and grid; `features.q1_separable` fits the decision's patches.
-    if (p.cfg.q1_traces.on() || p.cfg.q1_separable) && q1f_ctx.is_none() {
+    // and grid.
+    if p.cfg.q1_traces.on() && q1f_ctx.is_none() {
         anyhow::bail!(
-            "extract: extract.q1_traces and features.q1_separable read the Q1 sweep through the \
+            "extract: extract.q1_traces reads the Q1 sweep through the \
              per-fragment decision's grid and calibrated model; set extract.q1_fragments as well"
         );
     }
@@ -5141,9 +4716,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                     {
                         let mut push = |cid: u32, frag: u16, pi: f32| {
                             let c = cid as usize;
-                            if !guard.q1_admits(c, frag, scan, j) {
-                                return;
-                            }
                             let inside = guard.admits(c, rt, pim);
                             if !inside && !guard.pads(c, rt, pim) {
                                 return;
@@ -5397,25 +4969,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             // the co-elution run see MISSING acquisition scans (count 0, and they
             // break a run) rather than only scans that happened to carry a hit. When
             // no covering-window grid is available, fall back to the sparse groups.
-            // Merged cycles (`extract.q1_cycles`): one point a cycle, at the anchor window's
-            // scans, which every merged hit sits on.
-            let q1_grid = match (&q1_layout, p.cfg.q1_cycles && !windows.is_empty()) {
-                (Some(l), true) => {
-                    let pm = lib.prec_mz[cid as usize];
-                    l.anchor_for(pm, &l.covering(pm)).map(|a| {
-                        let rts = &l.win_rts[a as usize];
-                        let (i, j) = (
-                            rts.partition_point(|&r| r < lo),
-                            rts.partition_point(|&r| r <= hi),
-                        );
-                        rts[i..j].to_vec()
-                    })
-                }
-                _ => None,
-            };
-            let grid: Vec<f64> = if let Some(g) = q1_grid {
-                g
-            } else if !windows.is_empty() {
+            let grid: Vec<f64> = if !windows.is_empty() {
                 let pm = lib.prec_mz[cid as usize];
                 // `windows` is sorted by lower m/z, so a covering window has
                 // `lower_mz <= pm` AND, since its width is at most `window_max_width`,
@@ -5499,37 +5053,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             (&mut inner[..], Some(hits))
         } else {
             (hits, None)
-        };
-        // Scanning-quadrupole spectra: the windows covering the precursor, its anchor bin, the
-        // unmerged hits the Q1 profile reads, and under `q1_cycles` the merged hits every
-        // score and trace below reads instead.
-        let q1_cover: Vec<u32> = match &q1_layout {
-            Some(l) => l.covering(lib.prec_mz[cid as usize]),
-            None => Vec::new(),
-        };
-        let q1_anchor = q1_layout
-            .as_ref()
-            .and_then(|l| l.anchor_for(lib.prec_mz[cid as usize], &q1_cover));
-        let q1_raw: Vec<Hit> = if p.cfg.q1_profile {
-            hits.to_vec()
-        } else {
-            Vec::new()
-        };
-        let mut q1_merged: Vec<Hit>;
-        let mut q1_merged_pad: Vec<Hit>;
-        let (hits, padded_hits): (&mut [Hit], Option<&mut [Hit]>) = match (&q1_layout, q1_anchor) {
-            (Some(l), Some(a)) if p.cfg.q1_cycles => {
-                q1_merged = q1_merge(hits, l, a);
-                let pad = match padded_hits {
-                    Some(h) => {
-                        q1_merged_pad = q1_merge(h, l, a);
-                        Some(&mut q1_merged_pad[..])
-                    }
-                    None => None,
-                };
-                (&mut q1_merged[..], pad)
-            }
-            _ => (hits, padded_hits),
         };
         // distinct matched fragments (tier b), as a bitmask over the candidate's local
         // fragment ordinals rather than a sorted, deduplicated `u16` per hit.
@@ -5642,7 +5165,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             thresh,
             |i| sig.iter().map(|&o| groups.or_zero(i, o)).sum(),
             prior_at,
-            p.cfg.apex_evidence_rank,
             p.cfg.apex_refine_intensity.then_some(r),
         ) {
             // The apex reports the group's full intensity.
@@ -5689,9 +5211,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             let z = c.charge as f64;
             let sp = ISOTOPE_SPACING / z;
             let tol = p.cfg.prec_tol_ppm;
-            // The one offset, or the surface's at this m/z and retention time.
-            let at =
-                |mz: f64| Some(ms1_near(ms1_scans, j, h, mz * p.cfg.ms1_shift(mz, rt), tol) as f64);
+            let at = |mz: f64| Some(ms1_near(ms1_scans, j, h, mz * p.cfg.ms1_shift(), tol) as f64);
             (
                 at(c.precursor_mz - sp),
                 at(c.precursor_mz),
@@ -5864,39 +5384,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             }
         }
 
-        // The Q1-profile evidence of a row with its apex at `rt` (`extract.q1_profile`): the
-        // cycle of the unmerged hit nearest the apex, and the unmerged hits of the five cycles
-        // around it. Zero with the key off.
-        let q1_at = |rt: f64| -> Q1Profile {
-            match &q1_layout {
-                Some(l) if p.cfg.q1_profile => {
-                    let c0 = q1_raw
-                        .iter()
-                        .min_by(|a, b| {
-                            (hit_rt(scans, a) - rt)
-                                .abs()
-                                .total_cmp(&(hit_rt(scans, b) - rt).abs())
-                        })
-                        .map(|h| l.scan_cycle[h.scan as usize]);
-                    match c0 {
-                        Some(c0) => {
-                            q1_profile_of(&q1_raw, l, &q1_cover, lib.prec_mz[cid as usize], c0)
-                        }
-                        None => Q1Profile::default(),
-                    }
-                }
-                _ => Q1Profile::default(),
-            }
-        };
-        let q1_0 = q1_at(apex_rt);
-        // The Q1 gate (`extract.q1_gate_max_offset`): the profile's centroid too far from
-        // where the precursor m/z puts it.
-        if let Some(g) = p.cfg.q1_gate_max_offset {
-            if q1_0.offset.abs() > g {
-                return Vec::new();
-            }
-        }
-
         // The per-fragment Q1 decision (`extract.q1_fragments`, `stages::q1frag`): the
         // candidate's library fragments as the decision reads them, and the decision of a row
         // with its apex at `rt` (the patch, the decision and the apex scan). `None` with the
@@ -5965,31 +5452,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                     if p.cfg.q1_multiscale {
                         row.q1m = q1score::multiscale(pt, cand, d, x.model, env.as_deref());
                     }
-                    // `features.q1_separable`: the separable model of the patch
-                    // (`stages::q1trace`), with the retention time of each patch cycle (its
-                    // step nearest the expected centre).
-                    if p.cfg.q1_separable {
-                        let s = q1trace::fit(pt, d, cand, x.model);
-                        let c0 = x.grid.scan_cycle[*si];
-                        let aci = pt.cycles.iter().position(|&c| c == c0).unwrap_or(d.apex_ci);
-                        row.q1s = q1trace::values(&s, d, cand, aci);
-                        let mid = x.grid.nearest_step(cand.centre);
-                        row.q1s_cycle_rt = pt
-                            .cycles
-                            .iter()
-                            .map(|&c| {
-                                x.grid
-                                    .scan(c, mid)
-                                    .map_or(f32::NAN, |k| x.scans[k].rt_seconds as f32)
-                            })
-                            .collect();
-                        let f32s =
-                            |v: &[f64]| -> Vec<f32> { v.iter().map(|&y| y as f32).collect() };
-                        row.q1s_elution = f32s(&s.elution);
-                        row.q1s_amp = f32s(&s.amp);
-                        row.q1s_r2 = f32s(&s.r2);
-                        row.q1s_interf = f32s(&s.interf);
-                    }
                     // `features.q1_deconvolved`: the deconvolved evidence at the apex scan.
                     if let (true, Some(g)) = (p.cfg.q1_dec_features, q1_gate.as_ref()) {
                         let targets: Vec<f64> = cand.frags.iter().map(|f| f.target_mz).collect();
@@ -6019,56 +5481,11 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                     if p.cfg.q1_dec_features {
                         row.q1d = crate::stages::q1dec::empty_evidence();
                     }
-                    if p.cfg.q1_separable {
-                        let n = cand.frags.len();
-                        row.q1s = q1trace::empty_values();
-                        row.q1s_amp = vec![f32::NAN; n];
-                        row.q1s_r2 = vec![f32::NAN; n];
-                        row.q1s_interf = vec![f32::NAN; n];
-                    }
                     row
                 }
             })
         };
         let q1f_0 = q1f_at(apex_rt);
-        // `features.ms1_envelope` (`stages::ms1env`): the MS1 isotope-envelope evidence of a
-        // row with its apex at `rt`, at the calibrated MS1 m/z of each scan read, and under
-        // `extract.q1_fragments` the agreement of the row's fitted Q1 centre (when the row has
-        // a fit) with the centre its observed envelope predicts. `None` with the key off.
-        let ms1e_at =
-            |rt: f64, q1f: Option<&q1frag::Q1fRow>| -> Option<crate::stages::ms1env::Ms1Env> {
-                if !p.cfg.ms1_envelope {
-                    return None;
-                }
-                let tol = crate::stages::ms1env::search_tol(p.cfg.prec_tol_ppm);
-                if ms1_scans.is_empty() {
-                    return Some(crate::stages::ms1env::Ms1Env {
-                        tol_ppm: tol,
-                        ..Default::default()
-                    });
-                }
-                let j = nearest_index(&ms1_rts, rt);
-                let mut e = crate::stages::ms1env::read(
-                    ms1_scans,
-                    j,
-                    c.precursor_mz,
-                    c.charge,
-                    tol,
-                    &|mz, r| p.cfg.ms1_shift(mz, r),
-                );
-                if let (Some(q), Some(x)) = (q1f, q1f_ctx.as_ref()) {
-                    if q.summary.fit_resid < 1.0 {
-                        e.q1_agree = crate::stages::ms1env::q1_agree(
-                            &e,
-                            c.precursor_mz,
-                            c.charge,
-                            q.summary.centre,
-                            x.model.step_mz,
-                        );
-                    }
-                }
-                Some(e)
-            };
         // `retrace.q1_repick`: extract's apex and the next peaks of the count profile (those
         // whose envelope does not hold the apex) are scored by the fragments that belong at
         // each (`q1frag::repick_score`), and the apex moves to the best one's 2D apex: the
@@ -6077,7 +5494,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         // them belong there. The apex scalars are read again there.
         let (mut row_apex_rt, mut row_apex_sum) = (apex_rt, apex_sum);
         let mut row_ms1 = (o_ms1_m1, o_ms1_mono, o_ms1_i1, o_ms1_i2);
-        let mut row_q1 = q1_0;
         let mut q1f_out = q1f_row(q1f_0.as_ref());
         if p.cfg.q1_repick {
             if let (Some(x), Some(cand), Some(gi0), Some(own)) =
@@ -6123,7 +5539,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                         row_apex_rt = rt;
                         row_apex_sum = groups.sum(gi);
                         row_ms1 = ms1_at(rt);
-                        row_q1 = q1_at(rt);
                         // The decision at the new apex (the patch centred on it).
                         let at_new = q1f_at(rt);
                         q1f_out = q1f_row(at_new.as_ref().or(Some(chosen)));
@@ -6347,12 +5762,9 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         if !ms1_scans.is_empty() && !t_grid.is_empty() {
             let sp = ISOTOPE_SPACING / c.charge as f64;
             let tol = p.cfg.prec_tol_ppm;
-            // Under `ms1_calibrate = "surface"` each point reads at the offset of its own
-            // retention time, and the row's m/z is the one at the apex.
-            let varies = p.cfg.ms1_shift_varies();
             for (nm, dmz) in [("ms1_mono", 0.0), ("ms1_iso1", sp), ("ms1_iso2", 2.0 * sp)] {
                 let lib_mz = c.precursor_mz + dmz;
-                let mz = lib_mz * p.cfg.ms1_shift(lib_mz, apex_rt);
+                let mz = lib_mz * p.cfg.ms1_shift();
                 // A row the retrace skeleton zeroes is rebuilt by retrace from the raw events
                 // and its centroid values are never read, so they are not summed: the MS1
                 // reads of these XICs were about half of extract's busy time on a HYE
@@ -6370,12 +5782,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                         .iter()
                         .map(|&r| {
                             let j = nearest_index(&ms1_rts, r);
-                            let at = if varies {
-                                lib_mz * p.cfg.ms1_shift(lib_mz, r)
-                            } else {
-                                mz
-                            };
-                            ms1_near(ms1_scans, j, p.cfg.ms1_scan_halfwidth, at, tol)
+                            ms1_near(ms1_scans, j, p.cfg.ms1_scan_halfwidth, mz, tol)
                         })
                         .collect()
                 };
@@ -6459,23 +5866,17 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                     if !ms1_scans.is_empty() {
                         let sp = ISOTOPE_SPACING / c.charge as f64;
                         let tol = p.cfg.prec_tol_ppm;
-                        let varies = p.cfg.ms1_shift_varies();
                         for (nm, dmz) in
                             [("ms1_mono", 0.0), ("ms1_iso1", sp), ("ms1_iso2", 2.0 * sp)]
                         {
                             let lib_mz = c.precursor_mz + dmz;
-                            let mz = lib_mz * p.cfg.ms1_shift(lib_mz, apex_rt);
+                            let mz = lib_mz * p.cfg.ms1_shift();
                             let ints: Vec<f32> = cg
                                 .rt
                                 .iter()
                                 .map(|&r| {
                                     let j = nearest_index(&ms1_rts, r);
-                                    let at = if varies {
-                                        lib_mz * p.cfg.ms1_shift(lib_mz, r)
-                                    } else {
-                                        mz
-                                    };
-                                    ms1_near(ms1_scans, j, p.cfg.ms1_scan_halfwidth, at, tol)
+                                    ms1_near(ms1_scans, j, p.cfg.ms1_scan_halfwidth, mz, tol)
                                 })
                                 .collect();
                             chrom_q1.push((
@@ -6569,8 +5970,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             deconv_collin: deconv_collin as f32,
             deconv_shadow: deconv_shadow as f32,
             im: im0,
-            q1: row_q1,
-            ms1e: ms1e_at(row_apex_rt, q1f_out.as_ref()),
             q1f: q1f_out,
             chrom: chrom_rows,
             chrom_q1,
@@ -6631,7 +6030,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             let alt_apex_int: f32 = groups.sum(pk.apex_idx);
             let (a_m1, a_mono, a_i1, a_i2) = ms1_at(alt_apex_rt);
             let a_q1f = q1f_row(q1f_at(alt_apex_rt).as_ref());
-            let a_ms1e = ms1e_at(alt_apex_rt, a_q1f.as_ref());
             out.push(CandOut {
                 cid,
                 peak_rank: rank,
@@ -6669,9 +6067,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 deconv_collin: 0.0,
                 deconv_shadow: 0.0,
                 im: im_at(alt_apex_rt),
-                q1: q1_at(alt_apex_rt),
                 q1f: a_q1f,
-                ms1e: a_ms1e,
                 chrom: Vec::new(), // shared per-candidate via the rank-0 row
                 chrom_q1: Vec::new(),
                 chrom_q1_class: Vec::new(),
@@ -7180,12 +6576,12 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             p.out_psms,
             artifact::psms_extracted_sep(
                 has_im,
-                p.cfg.q1_profile,
+                false,
                 p.cfg.q1_fragments.on(),
-                p.cfg.ms1_envelope,
+                false,
                 p.cfg.q1_fragments.on()
                     && (p.cfg.q1_precursor || p.cfg.q1_multiscale || p.cfg.q1_dec_features),
-                p.cfg.q1_fragments.on() && p.cfg.q1_separable,
+                false,
             ),
             psms_written,
         ),
@@ -7216,18 +6612,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             if let Some(obj) = params.as_object_mut() {
                 obj.insert("reader".into(), json!(crate::instrument::READER_TIMSRUST));
                 obj.insert("im_gate".into(), json!(im_gate));
-            }
-        }
-        // The scanning-quadrupole keys, only when one is on, so a report without them is
-        // unchanged.
-        if let Some(l) = &q1_layout {
-            if let Some(obj) = params.as_object_mut() {
-                obj.insert("q1_cycles".into(), json!(p.cfg.q1_cycles));
-                obj.insert("q1_profile".into(), json!(p.cfg.q1_profile));
-                obj.insert("q1_gate_max_offset".into(), json!(p.cfg.q1_gate_max_offset));
-                obj.insert("q1_windows".into(), json!(l.win.len()));
-                obj.insert("q1_cycles_found".into(), json!(l.n_cycles));
-                obj.insert("q1_step_mz".into(), json!(l.step));
             }
         }
         // The per-fragment Q1 decision's model, only under `extract.q1_fragments`, so a report
@@ -7264,16 +6648,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                         }),
                     );
                 }
-                // The separable model (`features.q1_separable`), only when on.
-                if p.cfg.q1_separable {
-                    obj.insert(
-                        "q1_separable".into(),
-                        json!({
-                            "iterations": q1trace::SEP_ITERS,
-                            "bound_frac": q1trace::SEP_BOUND_FRAC,
-                        }),
-                    );
-                }
                 // The cycle-trace table (`extract.q1_traces`), only when on.
                 if q1t {
                     obj.insert(
@@ -7287,14 +6661,15 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 }
             }
         }
-        // The Q1-deconvolved evidence (`extract.q1_deconvolved`, `features.q1_deconvolved`),
+        // The Q1-deconvolved evidence (`features.q1_deconvolved`),
         // only then.
         if let Some(g) = &q1_gate {
             if let Some(obj) = params.as_object_mut() {
                 obj.insert(
                     "q1_deconvolved".into(),
                     json!({
-                        "gate": p.cfg.q1_deconvolved,
+                        // The hard count went in 0.15.0; the key stays so reports keep their bytes.
+                        "gate": false,
                         "features": p.cfg.q1_dec_features,
                         "tol_mz": g.tol_mz,
                         "step_mz": g.dec.step_mz,
@@ -7302,29 +6677,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                         "evidence_cycles": 2 * crate::stages::q1dec::EVIDENCE_CYCLES + 1,
                     }),
                 );
-            }
-        }
-        // The MS1 isotope-envelope evidence (`features.ms1_envelope`), only then, so a report
-        // without it is unchanged.
-        if p.cfg.ms1_envelope {
-            if let Some(obj) = params.as_object_mut() {
-                obj.insert(
-                    "ms1_envelope".into(),
-                    json!({
-                        "tol_ppm": crate::stages::ms1env::search_tol(p.cfg.prec_tol_ppm),
-                        "scans_either_side": crate::stages::ms1env::ENV_SCANS,
-                        "isotopes": "M-1 to M+4, and the half-spacing positions above M0 and M+1",
-                    }),
-                );
-            }
-        }
-        // The MS1 calibration of `ms1_calibrate = "surface"` / `prec_tol_auto`, only then,
-        // so a report without either is unchanged.
-        if let Some(cal) = &p.cfg.ms1_cal {
-            if let Some(obj) = params.as_object_mut() {
-                obj.insert("ms1_calibration".into(), json!(cal));
-                obj.insert("ms1_ppm_offset".into(), json!(p.cfg.ms1_ppm_offset));
-                obj.insert("prec_tol_ppm".into(), json!(p.cfg.prec_tol_ppm));
             }
         }
         // The support gate, only when it is on, so a report without it is unchanged.
@@ -7875,48 +7227,30 @@ mod apex_gate_tests {
 
     /// [`pick_apex`] on unsmoothed counts (`apex_count_window` 1), within `tol` of the
     /// largest count, without an RT prior.
-    fn apex(
-        counts: &[usize],
-        tol: usize,
-        sig: &[f32],
-        evidence_rank: bool,
-        refine: Option<usize>,
-    ) -> Option<usize> {
+    fn apex(counts: &[usize], tol: usize, sig: &[f32], refine: Option<usize>) -> Option<usize> {
         let smoothed: Vec<f64> = counts.iter().map(|&c| c as f64).collect();
         let thresh = (smoothed.iter().copied().fold(0.0, f64::max) - tol as f64).max(0.0);
-        pick_apex(
-            counts,
-            &smoothed,
-            thresh,
-            |i| sig[i],
-            |_| 1.0,
-            evidence_rank,
-            refine,
-        )
+        pick_apex(counts, &smoothed, thresh, |i| sig[i], |_| 1.0, refine)
     }
 
     #[test]
     fn the_count_picks_the_apex_and_intensity_breaks_its_ties() {
         // Equal counts: the signature intensity.
-        assert_eq!(
-            apex(&[3, 3, 3], 0, &[10.0, 50.0, 20.0], true, None),
-            Some(1)
-        );
-        // One fragment more outweighs any intensity; the legacy rule reads intensity only.
-        assert_eq!(apex(&[3, 4], 1, &[1e3, 1.0], true, None), Some(1));
-        assert_eq!(apex(&[3, 4], 1, &[1e3, 1.0], false, None), Some(0));
+        assert_eq!(apex(&[3, 3, 3], 0, &[10.0, 50.0, 20.0], None), Some(1));
+        // One fragment more outweighs any intensity.
+        assert_eq!(apex(&[3, 4], 1, &[1e3, 1.0], None), Some(1));
         // Below the count tolerance a scan does not qualify, however bright.
-        assert_eq!(apex(&[2, 4, 4], 1, &[1e6, 5.0, 6.0], true, None), Some(2));
+        assert_eq!(apex(&[2, 4, 4], 1, &[1e6, 5.0, 6.0], None), Some(2));
         // Saturated f32: 6 + 5e6/(5e6 + 1) and 6 + 1e7/(1e7 + 1) both round to 7, so the
         // earlier scan wins at half the intensity. Pinned as it is: an f64 score would pick
         // the later one, and that change waits for its own measurement.
-        assert_eq!(apex(&[6, 6], 0, &[5e6, 1e7], true, None), Some(0));
+        assert_eq!(apex(&[6, 6], 0, &[5e6, 1e7], None), Some(0));
         // No qualifying scan.
-        assert_eq!(apex(&[0, 0], 0, &[0.0, 0.0], true, None), None);
+        assert_eq!(apex(&[0, 0], 0, &[0.0, 0.0], None), None);
         // The RT prior decides between equal counts and intensities.
         let prior = [0.2f32, 0.9, 0.5];
         assert_eq!(
-            pick_apex(&[3; 3], &[3.0; 3], 3.0, |_| 10.0, |i| prior[i], true, None),
+            pick_apex(&[3; 3], &[3.0; 3], 3.0, |_| 10.0, |i| prior[i], None),
             Some(1)
         );
     }
@@ -7927,16 +7261,16 @@ mod apex_gate_tests {
         // is 2; the region's most intense scan, 1, takes it.
         let counts = [0, 3, 4, 4, 3, 0];
         assert_eq!(
-            apex(&counts, 1, &[0.0, 9.0, 2.0, 1.0, 0.0, 0.0], true, None),
+            apex(&counts, 1, &[0.0, 9.0, 2.0, 1.0, 0.0, 0.0], None),
             Some(2)
         );
         assert_eq!(
-            apex(&counts, 1, &[0.0, 9.0, 2.0, 1.0, 0.0, 0.0], true, Some(0)),
+            apex(&counts, 1, &[0.0, 9.0, 2.0, 1.0, 0.0, 0.0], Some(0)),
             Some(1)
         );
         // No signature fragment seen in the region: the count's apex stands (the region's
         // first scan used to take it).
-        assert_eq!(apex(&counts, 1, &[0.0; 6], true, Some(0)), Some(2));
+        assert_eq!(apex(&counts, 1, &[0.0; 6], Some(0)), Some(2));
     }
 
     #[test]
@@ -8120,7 +7454,6 @@ mod accumulate_tests {
                 win: &win,
                 im_gate,
                 pad: 0.0,
-                q1: None,
             };
             pool.install(|| {
                 // `bound = 0` flushes nothing, so the comparison is over the accumulator.
@@ -8244,7 +7577,6 @@ mod accumulate_tests {
             win: &win,
             im_gate: false,
             pad: 0.0,
-            q1: None,
         };
         let mass_off = MassOffset {
             scalar_ppm: 0.0,
@@ -8368,7 +7700,6 @@ mod accumulate_tests {
             win: &win,
             im_gate: false,
             pad: 0.0,
-            q1: None,
         };
         let mass_off = MassOffset {
             scalar_ppm: 0.0,
@@ -8453,7 +7784,6 @@ mod accumulate_tests {
             win: &win,
             im_gate: false,
             pad: 0.0,
-            q1: None,
         };
         let mass_off = MassOffset {
             scalar_ppm: 0.0,
@@ -8933,9 +8263,7 @@ mod psms_stream_tests {
                 ms1_apex_im: (!i.is_multiple_of(6)).then_some(0.9 - f * 1e-5),
                 im_pred_cal: (!i.is_multiple_of(13)).then_some(1.0 + f * 1e-6),
             },
-            q1: Q1Profile::default(),
             q1f: None,
-            ms1e: None,
             chrom: Vec::new(),
             chrom_q1: Vec::new(),
             chrom_q1_class: Vec::new(),
@@ -9261,106 +8589,6 @@ mod q1_tests {
         out
     }
 
-    #[test]
-    fn the_sweep_is_recognised_and_its_cycles_counted() {
-        let scans = sweep(4, 60);
-        let l = Q1Layout::build(&scans).unwrap();
-        assert_eq!(l.win.len(), 60);
-        assert_eq!(l.n_cycles, 4);
-        assert!((l.step - STEP).abs() < 1e-9);
-        for (si, &c) in l.scan_cycle.iter().enumerate() {
-            assert_eq!(c as usize, si / 60);
-            assert_eq!(l.scan_win[si] as usize, si % 60);
-        }
-        // Every window has one scan a cycle, its own.
-        for w in 0..60 {
-            for c in 0..4 {
-                assert_eq!(l.win_scan[w * 4 + c] as usize, c * 60 + w);
-            }
-        }
-    }
-
-    #[test]
-    fn fixed_windows_are_refused() {
-        // 40 windows of 25 m/z: a fixed-window method.
-        let mut scans = Vec::new();
-        for c in 0..3 {
-            for w in 0..40 {
-                let t = 412.5 + 25.0 * w as f64;
-                scans.push(Ms2Scan {
-                    scan_index: scans.len() as u32,
-                    rt_seconds: 3.0 * c as f64 + 0.05 * w as f64,
-                    window: IsolationWindow {
-                        target_mz: t,
-                        lower_mz: t - 12.5,
-                        upper_mz: t + 12.5,
-                        im_lower: None,
-                        im_upper: None,
-                    },
-                    peaks: Vec::new(),
-                    im: None,
-                });
-            }
-        }
-        let e = Q1Layout::build(&scans).err().expect("refused").to_string();
-        assert!(e.contains("40 windows"), "{e}");
-    }
-
-    #[test]
-    fn covering_anchor_and_transmission() {
-        let l = Q1Layout::build(&sweep(2, 60)).unwrap();
-        let pm = target(20) + 0.1;
-        let cover = l.covering(pm);
-        // +-1.9 m/z around 0.7614 m/z steps: five bins, 18 to 22.
-        assert_eq!(cover, vec![18, 19, 20, 21, 22]);
-        assert_eq!(l.anchor_for(pm, &cover), Some(20));
-        // Whole transmission at the centre, a ramp at the edges, nothing beyond.
-        assert_eq!(l.transmission(20, pm), 1.0);
-        let edge = l.transmission(18, pm);
-        assert!(edge > 0.0 && edge < 1.0, "{edge}");
-        assert_eq!(l.transmission(10, pm), 0.0);
-    }
-
-    fn hit(scan: usize, frag: u16, inten: f32, mz: f32) -> Hit {
-        Hit {
-            scan: scan as u32,
-            frag,
-            inten,
-            obs_mz: mz,
-            im: 0,
-        }
-    }
-
-    #[test]
-    fn the_bins_of_one_cycle_merge_into_the_anchor_point() {
-        let l = Q1Layout::build(&sweep(3, 60)).unwrap();
-        // Fragment 0 in bins 19, 20, 21 of cycle 1 and bin 20 of cycle 2; fragment 1 in bin 18
-        // of cycle 1.
-        let s = |c: usize, b: usize| c * 60 + b;
-        let hits = vec![
-            hit(s(1, 19), 0, 1.0, 300.0),
-            hit(s(1, 20), 0, 2.0, 300.2),
-            hit(s(1, 21), 0, 1.0, 300.0),
-            hit(s(1, 18), 1, 5.0, 400.0),
-            hit(s(2, 20), 0, 3.0, 300.0),
-        ];
-        let m = q1_merge(&hits, &l, 20);
-        assert_eq!(m.len(), 3);
-        assert_eq!(
-            (m[0].scan as usize, m[0].frag, m[0].inten),
-            (s(1, 20), 0, 4.0)
-        );
-        assert!((m[0].obs_mz - 300.1).abs() < 1e-4, "{}", m[0].obs_mz);
-        assert_eq!(
-            (m[1].scan as usize, m[1].frag, m[1].inten),
-            (s(1, 20), 1, 5.0)
-        );
-        assert_eq!(
-            (m[2].scan as usize, m[2].frag, m[2].inten),
-            (s(2, 20), 0, 3.0)
-        );
-    }
-
     /// The re-pick's lookups: the scan at an exact retention time whose window covers the
     /// precursor (the first at that time otherwise, none off the axis), and the scan group at
     /// an exact retention time.
@@ -9382,52 +8610,6 @@ mod q1_tests {
         assert_eq!(group_at(&g, 3.5), Some(2));
         assert_eq!(group_at(&g, 2.5), None);
         assert_eq!(group_at(&g, 9.0), None);
-    }
-
-    #[test]
-    fn the_profile_centres_on_its_own_precursor_and_off_on_a_neighbour() {
-        let l = Q1Layout::build(&sweep(5, 60)).unwrap();
-        let pm = target(20);
-        let cover = l.covering(pm);
-        let s = |c: usize, b: usize| c * 60 + b;
-        // Own precursor: intensity across the covering bins as the transmission has it.
-        let own: Vec<Hit> = cover
-            .iter()
-            .map(|&w| {
-                hit(
-                    s(2, w as usize),
-                    0,
-                    100.0 * l.transmission(w, pm) as f32,
-                    300.0,
-                )
-            })
-            .collect();
-        let q = q1_profile_of(&own, &l, &cover, pm, 2);
-        assert!(q.corr > 0.99, "{q:?}");
-        assert!(q.offset.abs() < 1e-9, "{q:?}");
-        assert_eq!(q.bin_frac, 1.0);
-        // A fragment shared with a precursor 1.5 m/z higher: its signal sits in the upper
-        // bins, so the centroid moves up by most of a half-width.
-        let other = pm + 1.5;
-        let shared: Vec<Hit> = cover
-            .iter()
-            .map(|&w| {
-                hit(
-                    s(2, w as usize),
-                    0,
-                    100.0 * l.transmission(w, other) as f32,
-                    300.0,
-                )
-            })
-            .collect();
-        let q = q1_profile_of(&shared, &l, &cover, pm, 2);
-        assert!(q.offset > 0.3, "{q:?}");
-        // Hits outside the five cycles around the apex cycle are not read.
-        assert_eq!(q1_profile_of(&own, &l, &cover, pm, 0).bin_frac, 1.0);
-        assert_eq!(
-            q1_profile_of(&own, &l, &cover, pm, 4 + Q1_PROFILE_CYCLES + 1),
-            Q1Profile::default()
-        );
     }
 
     /// `extract.q1_traces`: a candidate's groups on the covering steps of every cycle become one

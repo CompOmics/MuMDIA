@@ -518,6 +518,63 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Removed
 
+Options that measured neutral or worse, or that nothing read, are removed. A configuration,
+saved desktop setup or manifest that sets a removed key at its old default still loads (the
+key is dropped before parsing); any other value, and a removed value of a kept key, is refused
+with the release and the reason. Removing the keys that were written at their defaults moves
+the configuration hash of every run once (`features.bound_from_confident`,
+`features.bound_confident_pct`, `features.prec_tol_ppm`, four never-read keys and the
+prescreen keys below); no table of a default, diaPASEF or ZT Scan search changes.
+
+- **The Q1 sweep model (`extract.q1_cycles`, `extract.q1_profile`,
+  `extract.q1_gate_max_offset`, `features.q1_features`).** Summed cycles lost 11-14% of the
+  precursors and the profile family stayed inside seed noise (docs/09 section 10).
+- **`features.ms1_envelope`, `features.q1_separable`.** Both feature families measured inside
+  the four-seed spread on a ZT Scan run (docs/37).
+- **`extract.q1_deconvolved`, `search_seed.q1_deconvolved`.** Counting only Q1-consistent
+  peaks lost 2.5-38% of the precursors; `features.q1_deconvolved` stays.
+- **`extract.apex_evidence_rank = false`.** The legacy apex, which fell back to the lowest-RT
+  scan, pushed 27.6% more candidates through extract for 1.0% fewer peptides; `false` is
+  refused.
+- **`quant.q1_integration`, `quant.q1_step_weights`.** The elution fit measured a worse
+  replicate CV than the trapezoid (0.133 against 0.120) and uniform weights equalled the
+  transmission; `quant.q1_fragments` stays.
+- **`MUMDIA_QUANT_SELECTIVE_READ` and the page-selective chromatogram read.** Every page of
+  the measured tables held an accepted row, so it skipped nothing. Outputs are unchanged.
+- **`quant.peak_window_mode = consensus`.** It changed no quantity under the default fixed
+  window; the value is refused.
+- **`features.bound_from_confident`, `features.bound_confident_pct`.** One learned elution
+  half-width measured 2.20% fewer peptides than per-candidate bounds (#162, docs/10).
+- **`features.prec_tol_ppm`.** It was never read; `extract.prec_tol_ppm` sets the tolerance.
+- **`groups.calibration = per_group`, `groups.rt_adaptation = per_band`.** Per-group
+  calibration was kept only for comparison and stopped on bands without anchors; per-band
+  adaptation was slower than `once_per_run` at the same peptides (docs/33).
+- **`extract.ms1_calibrate = "surface"`, `extract.prec_tol_auto`.** Inside seed noise on the
+  one acquisition measured (docs/09 section 11). The default one-offset calibration stays.
+- **`mumdia align`.** Nothing read `alignment.parquet`.
+- **`mbr.rt_window_s`, `mbr.decoy_transfer`, `mbr.requant_all`, `rescore.percolator_bin`.**
+  No stage read them. `mbr.strategy = empirical_library` and `full` are read as
+  `rt_transfer`.
+- **`retrace.apex_features`, `localise.neutral_loss`.** The apex features added peptides at
+  about 2.7% FDP (docs/35 section 6); neutral-loss ions localised no more peaks (docs/36).
+- **`MUMDIA_WIDE_SCAN` and the coalesced span-cache reader.** From the page cache: plain
+  1.54 s, row groups 1.58 s, coalesced 2.50 s (docs/03). The default reader is unchanged.
+- **The rescuable-tier MBR transfer: `mbr.strategy = rt_transfer` (and `empirical_library`,
+  `full`), `mumdia mbr`, `scripts/mbr_worker.py`, `MUMDIA_PYTHON_MBR`.** Its transfers
+  measured 2.3-2.7% entrapment FDP; the default `second_pass` replaces it (docs/12). The
+  strategy is refused; the other `mbr` keys still load and do nothing, and the TSV columns
+  `is_transferred` and `transfer_q` stay.
+- **`scripts/merge_libraries.py` and the desktop "spectral library + predicted library"
+  input.** The merged library reported 1% at a measured FDP of 1.43% and found no more at a
+  matched FDP (docs/13).
+- **The experimental prescreen components (docs/34 section 5):** the evidence bonuses
+  (`prescreen.complement_bonus`, `tag_bonus`, `fasta_bonus`, `flank_bonus`),
+  `prescreen.mass_hypotheses.*` and `--ms1`, `prescreen.trace.*`, `prescreen.retrieval`,
+  `rescue`, `delayed_modforms`, `prescreen.localization`, `prescreen.tags.gap_edges`,
+  `positioned`, `positioned_residues`, `rms_sigma_da`, `prescreen.top_peaks` and
+  `--top-peaks`, and `--sample-candidates`. None kept more references than the plain
+  fragment-rarity score. `configs/examples/prescreen-components.json` is gone.
+
 - **`deeplc_finetune.py --predict-limit` and `--skip-predict`, and the per-shard refit of
   `mh_shard_predict.py predict`.** The two flags were hand-run smoke-test options nothing
   passes. `predict` now requires `--calibration`: a refit per shard repeated the fit and
@@ -533,8 +590,8 @@ than a number. Both are recorded in every run's `manifest.json`.
   already refused it ("rescore.classifier=percolator is not wired"), so no configuration
   that loaded could select it. A configuration naming it now fails to parse with an
   unknown-variant error instead, and the desktop application, which builds its options from
-  `configs/config-schema.json`, no longer offers it. `rescore.percolator_bin` stays a dead
-  field.
+  `configs/config-schema.json`, no longer offers it. `rescore.percolator_bin` is removed
+  as well (see below).
 - **The index form of the per-run q for a source column that decreases**, which `rescore`
   never builds (it refuses such inputs, and its row gathers keep the order); such a column
   is now a panic rather than a second code path. Also the per-row percolator reference
@@ -677,11 +734,9 @@ than a number. Both are recorded in every run's `manifest.json`.
 - **Interpreter discovery asks for what the workers import.** The MS2PIP role probed pandas,
   which `ms2pip_worker.py` does not import, and not pyarrow or psm_utils, which it does; the
   entrapment classifier required mokapot, which `entrapment_worker.py` never imports.
-- **Every Python worker runs with UTF-8 I/O.** MS2PIP, AlphaPeptDeep and the MBR worker ran
+- **Every Python worker runs with UTF-8 I/O.** MS2PIP and AlphaPeptDeep ran
   without `PYTHONUTF8`, so with its output piped (the desktop) a worker on Windows could stop
   on a printed path the code page cannot encode.
-- **The MBR transfer refuses a run table path with a comma.** The worker splits its lists on
-  commas, so such a path became two wrong ones.
 
 - **`run-experiment`: a first run without seed anchors no longer makes every run adapt its own
   retention-time library.** Under `rt_library_scope = first_run_only` the first run adapts the
@@ -690,10 +745,6 @@ than a number. Both are recorded in every run's `manifest.json`.
   its own calibration, one at a time. The first run whose seed has the anchors now adapts for
   every run, the first included, sequentially and overlapped; the experiment manifest reads that
   run's anchor choice. Outputs change only in that case.
-- **`run-experiment` refuses `mbr.consensus_corr_min > 0` with a transfer strategy.** The
-  fragment-consensus guard reads each run's `fragment_quant.parquet`, which quant writes after
-  the transfer, so under `run-experiment` it never ran and nothing said so. `mumdia mbr --frag`
-  on a finished experiment is the path that applies it (docs/12).
 - **CI: the applied second pass is tested.** A smoke arm whose second pass applies (a noisier
   second fixture and gate 0) asserts that every quantified candidate id is an empirical-library
   row with a second-pass chromatogram; stub arms cover a near-blank first run, sequential and

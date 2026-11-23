@@ -1,4 +1,4 @@
-# Python sidecars (18 scripts + four shared modules) + conda envs
+# Python sidecars (16 scripts + four shared modules) + conda envs
 > Part of the MuMDIA developer documentation (see docs/README.md).
 
 ## Purpose
@@ -19,17 +19,17 @@ only the rescore sidecars fall back to a native rescorer, and only when
 strict gate, so a crashed MS2PIP, AlphaPeptDeep, DeepLC, IM2Deep, or DeepLC fine-tune aborts the
 whole run. The matrix in **Failure behavior** below is authoritative.
 
-The 18 scripts split into six groups. Nine are launched by the engine:
+The 16 scripts split into five groups. Eight are launched by the engine:
 **predictors** (`ms2pip_worker`, `peptdeep_worker`, `deeplc_worker`, `deeplc_finetune`,
 `im2deep_worker`) feed the run-independent library; **rescorers** (`mokapot_worker`,
-`nn_rescore_worker`, `entrapment_worker`) score the competed PSMs in Stage F; **MBR**
-(`mbr_worker`) transfers identifications across runs (Stage D3). Nine are run by hand:
+`nn_rescore_worker`, `entrapment_worker`) score the competed PSMs in Stage F. The MBR
+transfer worker (`mbr_worker`) was removed in 0.15.0. Eight are run by hand:
 the **DIA-NN recipe** (`import_diann_lib`, `make_reverse_decoys`, `predict_decoys`,
-`remap_library`, `merge_libraries`) is an offline,
+`remap_library`) is an offline,
 one-time toolchain that builds MuMDIA's target+decoy library schema from a user-produced
 DIA-NN library, with `remap_library` mapping any
-library's peptides to the proteins of another FASTA, and `merge_libraries` merging an
-empirical library with a predicted one; the **library-scale recipes**
+library's peptides to the proteins of another FASTA (`merge_libraries`, which merged an
+empirical library with a predicted one, was removed in 0.15.0); the **library-scale recipes**
 (`sort_fragments`, `mz_range_survivors`,
 `mh_shard_predict`) reshape very large tables (docs/32); the **post-run tool**
 (`prune_outputs`) reduces a finished output directory to a retention tier (docs/01, "Output
@@ -54,7 +54,6 @@ that `Err` aborts or is caught.
 | deeplc_worker (predict-frag) | aborts run | none | none: `run_deeplc(...)?` propagates (`predict_frag.rs:291`) |
 | im2deep_worker (predict-frag) | aborts run | none | none: `run_im2deep(...)?` propagates (`predict_frag.rs`, `ImRequest::call`) |
 | deeplc_finetune (run) | aborts run | none | none: `run_deeplc_finetune(...)?` propagates (`run.rs:253-263`) |
-| mbr_worker (`mumdia mbr`) | aborts command | none | none: `run_mbr(...)?` propagates (`main.rs:697-710`) |
 | mokapot_worker (rescore) | falls back / bails | `rescore.strict` | `native_tda` when `strict=false`, else bail (`strict_or_warn`) |
 | nn_rescore_worker (rescore) | falls back / bails | `rescore.strict` | `native_tda` when `strict=false`, else bail (`strict_or_warn`) |
 | entrapment_worker (rescore) | falls back / bails | `rescore.strict` | native linear entrapment rescorer (still `QMode::Entrapment`) when `strict=false`, else bail (`strict_or_warn`) |
@@ -77,11 +76,10 @@ the column it keys the readback on.
 | deeplc_finetune | `<lib_in> <seed> <lib_out> --epochs --patience --q-train --batch --window-holdout-frac --seed --predict-threads [--shards K]` (`sidecar.rs`, `run_deeplc_finetune`; `--shards` only when `rt_im_train.deeplc_predict_shards` is not 1, for all three modes) | `<lib_out>` (= `fragment_library_precursors_ft.parquet`) | `peptidoform` (new table with replaced `predicted_irt`; input unchanged) |
 | mokapot_worker / nn_rescore_worker | `<handoff> <out.parquet>`: a PIN (mokapot), or for nn_torch a raw f32 matrix (`.features.raw.json` + `.npy`, the default) or a features parquet; env `MUMDIA_NN_*` from `rescore.*`, among them `MUMDIA_NN_FOLD_KEYS` (`run_pin_sidecar`) | `rescore_<tag>_out.parquet` | `candidate_id` (echoes the flat row index) |
 | entrapment_worker | `<in.parquet> <out.parquet> <folds>` (`run_entrapment_gbm`) | `entrapment_out.parquet` | `row_id` |
-| mbr_worker | `<scored> <psms_csv> <out> --q-anchor --min-anchor-runs --q-transfer --seed [--out-scored] [--frag-csv --consensus-corr-min]` (`sidecar.rs:193-211`) | `<out>.parquet` | `candidate_id` |
 
 For the mapping from each conda environment to the config field that points at it
 (`predict_frag.ms2pip_python`, `predict_frag.deeplc_python`,
-`predict_frag.im2deep_python`, `rescore.python`, `mbr.python`) and the interpreter paths on this machine, see
+`predict_frag.im2deep_python`, `rescore.python`) and the interpreter paths on this machine, see
 `docs/19_getting_started.md`.
 
 ## Files
@@ -98,21 +96,19 @@ For the mapping from each conda environment to the config field that points at i
 | `scripts/mokapot_worker.py` | Rescorer: mokapot brew over a PIN (model env-switchable: logreg/nn/xgb/percolator) |
 | `scripts/nn_rescore_worker.py` | Rescorer: PyTorch semi-supervised MLP over a PIN, in-memory or streaming memmap |
 | `scripts/entrapment_worker.py` | Rescorer: GBM/NN on real-target-vs-spike-in negatives, out-of-fold by base peptide |
-| `scripts/mbr_worker.py` | MBR (Stage D3): cross-run RT transfer + permuted-RT decoy-transfer FDR |
 | `scripts/import_diann_lib.py` | Recipe: DIA-NN fragment-level parquet -> MuMDIA target `lib_precursors`+`lib_fragments`; streams the input row group by row group (two passes), so peak memory is the precursor table, not the fragment table |
 | `scripts/make_reverse_decoys.py` | Recipe: reverse-sequence decoys with no-target-overlap invariant; their intensities are copied, so `predict_decoys.py` runs on its output before a search |
 | `scripts/predict_decoys.py` | Recipe (default since 2026-10-09): replace the reverse decoys' copied intensities with DIA-NN's prediction for their sequences |
 | `scripts/remap_library.py` | Recipe: map a library's peptides to the proteins of another FASTA (I/L-aware, cleavage-specific, Met excision and protein N-terminal groups as the digest), decoys following their targets; drops or keeps as `UNASSIGNED` what the FASTA lacks (#319) |
-| `scripts/merge_libraries.py` | Recipe: merge an empirical library with a predicted one (empirical spectrum and RT where both have an entry, RT calibrated onto the predicted scale), then rebuild and predict the decoys of the merged targets (#320) |
 | `scripts/sort_fragments.py` | Recipe: rewrite a fragment table in `candidate_id` order (streaming bucket sort, in place); the writers above do this themselves since the range load, this is for tables written before |
 | `scripts/mz_range_survivors.py` | Recipe: candidate ids inside the run's isolation range, as a prescan-style survivors table (docs/32) |
 | `scripts/prune_outputs.py` | Post-run: reduce a finished output directory to the `results` or `viewer` retention tier (dry run by default, `--apply`, record in `pruned.json`; docs/01) |
 | `scripts/mh_shard_predict.py` | Recipe: deduplicated, sharded multi-head DeepLC calibration of a very large precursor table (`uniq` / `fit` / `predict --calibration` / `merge`; reuses `deeplc_finetune.py`). The engine shards the same prediction itself under `rt_im_train.deeplc_predict_shards`; the recipe streams the library by row group, which matters at 1e8 rows |
-| `rust/mumdia/crates/mumdia/src/sidecar.rs` | Rust clients: `resolve_script`, `run_ms2pip`, `run_peptdeep`, `run_deeplc`, `run_im2deep`, `run_deeplc_finetune`, `run_mbr`, `run_worker`; the shared `fragment_request` (the `id, peptidoform, charge` request, with an optional extra column) and `read_fragment_intensities` the intensity predictors use; and `read_id_scalars`, the one `id -> value` reader behind DeepLC and IM2Deep |
+| `rust/mumdia/crates/mumdia/src/sidecar.rs` | Rust clients: `resolve_script`, `run_ms2pip`, `run_peptdeep`, `run_deeplc`, `run_im2deep`, `run_deeplc_finetune`, `run_worker`; the shared `fragment_request` (the `id, peptidoform, charge` request, with an optional extra column) and `read_fragment_intensities` the intensity predictors use; and `read_id_scalars`, the one `id -> value` reader behind DeepLC and IM2Deep |
 | `rust/mumdia/crates/mumdia/src/stages/predict_frag.rs` | Call sites for MS2PIP, AlphaPeptDeep, DeepLC and IM2Deep (Stage C) |
 | `rust/mumdia/crates/mumdia/src/stages/run.rs` | Call site for DeepLC fine-tune (between search-seed and rt-im-train) |
 | `rust/mumdia/crates/mumdia/src/stages/rescore.rs` | Call sites for mokapot/nn_torch (PIN) + entrapment (Parquet) sidecars |
-| `rust/mumdia/crates/mumdia/src/main.rs` | Call site for MBR (`Cmd::Mbr`) + `doctor` env probe |
+| `rust/mumdia/crates/mumdia/src/main.rs` | `doctor` env probe |
 | `env/docker-rescore.yml` | Docker env `rescore`: mokapot 0.10.0 + ms2pip 4.2.0 (py3.11) |
 | `env/docker-deeplc.yml` | Docker env `deeplc`: `deeplc==4.5.0` (PyPI; the engine's floor) + `im2deep>=2.0.0` + CPU torch (py3.11) |
 | `env/mumdia-rescore.yml` | Minimal portable env for the mokapot logreg rescore path (py3.12) |
@@ -217,24 +213,6 @@ code.
   then one f32 column per feature (`run_entrapment_gbm`; the worker widens them to f64).
 - OUT `entrapment_out.parquet`: `row_id` u32, `candidate_id` u32, `score` f64.
   Rust maps back by `row_id` (`align_sidecar_scores`).
-
-**mbr_worker** (`sidecar.rs:162` `run_mbr`)
-- IN `<scored_combined>`: experiment-wide scored table, columns read =
-  `candidate_id, source, label, q_value, peptidoform, charge, protein_group`
-  (`mbr_worker.py:81-82`). `<psms_csv>`: comma-joined per-run psms.parquet paths
-  in `source` order, each read for `candidate_id, apex_rt` (`mbr_worker.py:96`).
-  Optional `--frag-csv`: per-run fragment_quant paths
-  (`candidate_id, fragment_name, quantity`).
-- OUT `<out>.parquet`: one row per accepted transfer with
-  `candidate_id, source, peptidoform, charge, protein_group, label, expected_rt,
-  observed_rt, rt_delta, transfer_q` (`mbr_worker.py:254-265`). Optional
-  `--out-scored` writes the scored table with accepted transfers' PSM q columns
-  lowered to `transfer_q`, an `is_transferred` flag and a `transfer_q` column (NaN
-  on non-transferred rows) added; with no transfer candidates the transfer table has
-  its ten columns and zero rows and the augmented table is the input, unflagged. Optional
-  `--emit-transfer-targets` writes per-run `run_windows`-format tables
-  (`candidate_id, rt_pred_cal, rt_lo, rt_hi, im_*`) plus a permuted-RT decoy file
-  for the re-extraction tier (`mbr_worker.py:142-151`).
 
 **import_diann_lib** (offline; no Rust caller)
 - IN `<diann_lib.parquet>`: DIA-NN fragment-level speclib (columns
@@ -349,35 +327,12 @@ desktop import call its `remap_files`)
   the output that is not the input's is removed. `--summary <json>` writes the counts. A
   0.85M-target library against a 31,470-protein FASTA takes about 30 s.
 
-**merge_libraries** (offline; the desktop's "Spectral library + predicted library" input
-runs it)
-- IN two MuMDIA libraries, `--empirical-precursors/--empirical-fragments` (an empirical
-  library imported with `import_diann_lib`, such as the `report-lib.parquet` a DIA-NN search
-  writes) and `--predicted-precursors/--predicted-fragments` (imported or FASTA-built). Only
-  their targets are read; the decoys are rebuilt for the merged targets.
-- Entries are keyed on `(peptidoform, charge)`. An entry in both takes the spectrum,
-  retention time and 1/K0 of `--precedence` (`empirical`, the default, or `predicted`) and
-  the predicted library's protein; an empirical-only entry is kept (`--empirical-only drop`
-  removes it) with its own protein. `remap_library.py` maps the result to one FASTA when the
-  proteins disagree.
-- `--rt calibrate` (default) maps the empirical iRT onto the predicted scale with the
-  monotone binned-median curve of the second-pass consensus (docs/12), fitted on the shared
-  entries (`--rt-min-shared`, default 50), and reports the median and p95 absolute residual;
-  `--rt keep` leaves it. Under the default `rt_im_train.library_irt = auto` with a DeepLC
-  interpreter the search re-predicts every entry's retention time anyway, so only the
-  spectra differ; `library_irt = library` keeps the merged values.
-- Intensities max-normalised per precursor, `base_peptide_id` from the stripped sequence and
-  `peptidoform_id` from the peptidoform over the merged set, `candidate_id` contiguous in
-  `precursor_mz` order, `n_fragments` and `cardinality` recomputed.
-- Decoys: `--decoys diann --diann <exe>` (default) runs `make_reverse_decoys.py` and
-  `predict_decoys.py build`; there is no copied-intensity path. `--decoy-fragments match`
-  (default) then trims each decoy to its target's fragment count (most intense first), so an
-  empirical target with few observed fragments and its predicted decoy keep equal counts;
-  `all` keeps every predicted decoy fragment. `--decoys none` writes the targets only.
-- Memory: both target tables are held in pandas (fragments included), which is fine for
-  libraries of a few million precursors and not for the 1e8-row libraries of docs/32. The
-  merge of a 12.6k-entry empirical library into the 1.21M-target entrapment library took
-  10.4 min at a 6.9 GB peak, most of it the DIA-NN prediction of the 1.21M decoys.
+**merge_libraries** (removed in 0.15.0)
+- `scripts/merge_libraries.py` merged an empirical library with a predicted one: every
+  predicted entry, with the empirical spectrum and retention time where the empirical library
+  had the entry, and the decoys of the merged targets predicted again. The desktop offered it
+  as the "Spectral library + predicted library" input. It was removed because the merged
+  library made the reported 1% optimistic, with no gain at a matched FDP:
 - Measured 2026-11-16 (single run `LFQ_Orbitrap_AIF_Ecoli_01`, the E. coli + human
   entrapment library `ecoli-human-entrap_tryp_diann-2.7_revpred_mz390-1010` of the benchmark
   collection, NN seeds 0-2, default configuration; empirical library: a DIA-NN search of the
@@ -403,9 +358,7 @@ runs it)
   its 12,618 targets are entrapment peptides) with spectra and retention times observed for
   them, while their decoys are predicted and were never selected; the target-decoy null then
   underestimates the false entries among the empirical ones. The decoy trim does not change
-  this (1.47% without it), and keeping the library retention times makes it worse. The merge
-  is therefore opt-in and not a sensitivity default; compare its counts at a measured FDP,
-  and prefer an empirical library from a stricter search (a lower q) or from other samples.
+  this (1.47% without it), and keeping the library retention times makes it worse.
 
 ## How it works
 
@@ -588,7 +541,7 @@ to 21:04 with the peptides inside the seed spread, which is why `K = 0` is the d
 since 2026-09-27 (`docs/08_rt_im_train.md`, "Sharded whole-library prediction").
 
 **Band lists** (`groups.rt_adaptation = once_per_run`, `--bands <tsv>`). A grouped run
-under global calibration can adapt all its bands in one call:
+adapts all its bands in one call:
 `deeplc_finetune.py - <seed|-> - --bands <tsv> (--multihead N | --no-finetune)`, where
 each TSV line is `lib_in<TAB>lib_out` and the positional `lib_in` and `lib_out` are `-`.
 The worker reads each band's `peptidoform` column, fits the calibration once, predicts the
@@ -841,51 +794,11 @@ reported IDs are the real targets only (spike-in excluded, `is_reported`).
 The report also records `entrapment_peptides_at_1pct`, a leak check on spike-in
 peptides passing the 1% gate (`count_distinct`).
 
-### MBR (Stage D3)
+### MBR (Stage D3, removed in 0.15.0)
 
-`mbr_worker.py` (`Cmd::Mbr`, `sidecar.rs` `run_mbr`). The standalone `mumdia mbr`
-runs only the rescuable-tier transfer: it refuses any `mbr.strategy` other than
-`empirical_library`, `rt_transfer` or `full`, and requires `>= 2` runs and
-`mbr.python`. The default `second_pass` is run by `run-experiment` itself and does
-not use this worker (docs/12, "Second pass"). Reads the experiment-wide scored table and per-run apex RTs.
-It builds per-run to-reference / from-reference RT maps by monotone binned-median
-calibration against run 0 (`binned_map`, `mbr_worker.py:31-43`, needs >= 200
-shared anchors else identity). For a precursor confident (target, `q<=q_anchor`)
-in `>= min_anchor_runs` OTHER runs but sub-threshold in a target run where it was
-still extracted (the **rescuable** tier), it predicts RT as the from-ref map of
-the median of the other runs' to-ref-mapped apex RTs (`expected_rt`,
-`mbr_worker.py:116-121`). The false-transfer FDR uses a **permuted-RT
-decoy-transfer null**: each candidate is assigned a shuffled candidate's predicted
-RT, and transfer q is standard target/decoy competition on `|observed - predicted|`
-(`mbr_worker.py:190-199`). An optional fragment-consensus cosine guard
-(`--frag-csv`/`--consensus-corr-min`) rejects RT-concordant interference
-(`mbr_worker.py:209-241`). `--emit-transfer-targets` instead emits per-run
-`run_windows` for the **absent** set (confident elsewhere, not extracted here) so
-`extract --restrict-candidates --run-windows` can re-extract them (the
-re-extraction tier). `run_mbr` (`sidecar.rs:162-213`) drives only the **rescuable
-tier**: it passes `<scored> <psms_csv> <out>`, the `--q-anchor/--min-anchor-runs/
---q-transfer/--seed` values, and optionally `--out-scored` and (only when `frag`
-paths are given and `consensus_corr_min > 0`) `--frag-csv/--consensus-corr-min`.
-It never passes `--emit-transfer-targets` or `--rt-window`, so the re-extraction
-tier is a manual worker invocation. `--seed` receives the engine-wide
-`rng_seed` (`main.rs:709`), not an MBR-specific field. Note the MBR sidecar is
-validated as a prototype but Stage D3 is a stub in the engine (config hooks only;
-not in the `run` chain).
-
-Every lookup the worker makes is for a candidate that is a confident target of some
-run (`allc`, the union of the per-run confident sets), so the per-run apex maps and
-the per-candidate metadata hold only those candidates, and rescore's selected-peak
-lookup is built only for a run whose competed table has several peaks of one
-candidate (never under the default `extract.promote_top_peaks = 1`). The accepted
-transfers are flagged in the augmented scored table by one sorted-key lookup on
-`(source, candidate_id)` instead of a Python loop over every row (`flag_transfers`),
-and the frames the flagging no longer needs are released before the whole scored
-table is loaded. On the 258.75M-row pooled immunopeptidomics experiment the
-survey estimated about 100 GB of worker memory and 4-6 minutes of Python loops for
-what these replace. The confident sets, and so the iteration order of `allc` that the
-permuted-RT null depends on, are built from the same rows in the same order as before;
-`test_the_worker_writes_the_reference_workers_bytes` compares every output, with and
-without retained top-K peaks, byte for byte against the worker before the change.
+`mbr_worker.py`, the `mumdia mbr` command and `sidecar::run_mbr` were removed in 0.15.0,
+with `mbr.strategy = rt_transfer`. Their transfers measured 2.3-2.7% entrapment FDP at a 1%
+cut; the second pass of `run-experiment` replaces them (docs/12, "Second pass").
 
 ### DIA-NN recipe (offline, license-clean)
 
@@ -934,22 +847,19 @@ search.
 | `read_id_scalars` | `sidecar.rs` | Read a worker's `id -> value` table: requested ids only, each once, an optional finite-positive check |
 | `model_identity` | `sidecar.rs` | `<module>-<version>-<suffix>` for a sidecar model; `deeplc_identity` is its DeepLC case |
 | `run_deeplc_finetune` | `sidecar.rs:111` | Run `deeplc_finetune.py <lib_in> <seed> <lib_out> --epochs --patience --q-train --batch --window-holdout-frac --seed --predict-threads` (`utf8=true`) |
-| `run_mbr` | `sidecar.rs:162` | Run `mbr_worker.py <scored> <psms_csv> <out> [--out-scored] [--frag-csv --consensus-corr-min] --q-anchor --min-anchor-runs --q-transfer --seed` |
 | `run_pin_sidecar` | `rescore.rs` | Write PIN keyed by row index, run mokapot/nn worker, map `score` back by row index |
 | `run_entrapment_gbm` | `rescore.rs` | Write features+meta Parquet, run entrapment worker, map `score` back by `row_id` |
 | `align_sidecar_scores` | `rescore.rs` | Validate + align a sidecar's `(row_id, score)`: exact, unique, finite coverage or bail |
 | `make_model` | `mokapot_worker.py:35` | Build the mokapot model from `MUMDIA_RESCORE_MODEL` (nn/logreg/xgb/percolator) |
 | `tda_q` | `nn_rescore_worker.py:77` | Target-decoy q: `(decoys+1)/max(1,targets)`, running min from the tail |
 | `one_pass` | `nn_rescore_worker.py:225` | One CV pass -> OOF scores; per fold iterate positive re-selection + MLP retrain |
-| `binned_map` | `mbr_worker.py:31` | Monotone binned-median RT calibration x->y (80 bins) |
-| `expected_rt` | `mbr_worker.py:116` | Cross-run predicted RT of a candidate in a run from the other runs' anchors |
 | `frag_mz` / `reverse_keep_cterm` / `stable_seed` / `splitmix` | `make_reverse_decoys.py:58/56/74/65` | Residue-mass b/y m/z; C-term-fixed reversal; process-independent FNV-1a seed; seeded PRNG for scramble |
 
 ## Interpreter resolution
 
 Each sidecar role has one config field naming the Python that runs it:
 `rescore.python`, `predict_frag.deeplc_python`, `predict_frag.ms2pip_python`,
-`predict_frag.peptdeep_python`, `predict_frag.im2deep_python`, `mbr.python`. Implemented in `rust/mumdia/crates/mumdia/src/python.rs`.
+`predict_frag.peptdeep_python`, `predict_frag.im2deep_python`. Implemented in `rust/mumdia/crates/mumdia/src/python.rs`.
 
 A field may hold an absolute path, which is used as given and never
 second-guessed, or the string `"auto"` (or be absent), which asks the engine to
@@ -957,7 +867,7 @@ find one. Discovery order, from `python.rs`:
 
 | order | source | provenance reported |
 |---|---|---|
-| 1 | `MUMDIA_PYTHON_RESCORE` / `_DEEPLC` / `_MS2PIP` / `_PEPTDEEP` / `_IM2DEEP` / `_MBR` | the variable name |
+| 1 | `MUMDIA_PYTHON_RESCORE` / `_DEEPLC` / `_MS2PIP` / `_PEPTDEEP` / `_IM2DEEP` | the variable name |
 | 2 | `MUMDIA_PYTHON` (all roles) | `MUMDIA_PYTHON` |
 | 3 | `CONDA_PREFIX`: `bin/python`, `python.exe`, `Scripts/python.exe` | `CONDA_PREFIX` |
 | 4 | `VIRTUAL_ENV`, same three layouts | `VIRTUAL_ENV` |
@@ -975,7 +885,6 @@ stage hours later. The module lists live on `Role::modules` and are the same one
 | `DeepLc` | deeplc, numpy, pandas, pyarrow, torch, psm_utils |
 | `Ms2pip` | ms2pip, numpy, pandas |
 | `Peptdeep` | peptdeep, alphabase, torch, numpy, pandas, pyarrow |
-| `Mbr` | numpy, pyarrow |
 | `Im2deep` | im2deep, psm_utils, torch, numpy, pyarrow |
 
 Discovery reuses no other role's interpreter on its own: IM2Deep is found where the
@@ -989,7 +898,7 @@ with a log line rather than an error.
 A role is resolved only when the configuration actually uses it
 (`Role::required_by`): the rescorer classifier for `Rescore`;
 `rt_predictor`, `finetune_deeplc`, `library_irt = deeplc` or an explicit multi-head head
-count for `DeepLc`; `predictor` for `Ms2pip` and `Peptdeep`; `mbr.strategy` for `Mbr`; and
+count for `DeepLc`; `predictor` for `Ms2pip` and `Peptdeep`; and
 `im_predictor = im2deep` for `Im2deep`. A role can also be wanted without being required
 (`Role::wanted_by`: DeepLC under `library_irt = auto`, IM2Deep under `im_predictor = auto`),
 in which case a miss is a log line, not an error. A default native run therefore
@@ -1045,13 +954,7 @@ configured.
 | `rescore.entrapment_exclude` | `None` | substring that un-marks the sample's own species |
 | `rescore.entrapment_contaminant_markers` | `[]` | substrings for genuine contaminants (kept as real targets) |
 | `rescore.entrapment_ratio` | `1.0` | `N_real_lib / N_entrap_lib` scaling of the entrapment FDR |
-| `mbr.strategy` | `second_pass` | `run-experiment` searches every run again on the first pass's empirical library; `empirical_library`/`rt_transfer`/`full` engage `mbr_worker.py` |
-| `mbr.python` | `None` | interpreter for `mbr_worker.py` (required by the transfer strategies) |
-| `mbr.q_anchor` / `min_anchor_runs` / `q_transfer` | `0.01` / `2` / `0.01` | `--q-anchor` / `--min-anchor-runs` / `--q-transfer` (anchor/transfer FDR + min supporting runs) |
-| `mbr.consensus_corr_min` | `0.0` | `--consensus-corr-min` fragment-consensus guard threshold (0 = off; only passed when `frag` paths are also supplied, `sidecar.rs:209`) |
-| `mbr.rt_window_s` | `20.0` | transfer half-window (>= p95 M2 residual ~17 s) for the `--emit-transfer-targets` re-extraction tier. **Not wired through `run_mbr`** (`sidecar.rs:193-211` passes neither `--rt-window` nor `--emit-transfer-targets`); the worker uses its own `--rt-window` default of 20.0 when run by hand. |
-| `mbr.decoy_transfer` | `permuted_rt` | `DecoyTransfer` enum (`permuted_rt`/`reverse_sequence`/`both`, `config.rs:857-869`) selecting the false-transfer null. **Unwired**: `run_mbr` never passes it and the worker implements only the permuted-RT null (`mbr_worker.py:176-199`). |
-| `mbr.requant_all` | `false` | requantify already-identified precursors, not only transfers; only meaningful for `strategy = full`. **Unwired** in the current `mbr_worker.py`. |
+| `mbr.python` | `None` | read by nothing since the MBR transfer worker was removed in 0.15.0; an `"auto"` is still cleared to null |
 
 **Worker-only env knobs** (not config fields; set in the process environment).
 `mokapot_worker.py`: `MUMDIA_RESCORE_MODEL` (default `logreg`; accepts `nn` and the aliases
@@ -1406,8 +1309,6 @@ model as `mokapot-<MUMDIA_RESCORE_MODEL or logreg>`.
   content hash, but training is only approximately reproducible (use
   `rescore.seeds > 1` to average out variance). `entrapment_worker.py` GBM is
   reproducible (`early_stopping=False`, `random_state=0`); the NN variant is not.
-  `mbr_worker.py` is deterministic given `--seed` (`np.random.default_rng(seed)`
-  for the permuted-RT null).
 - **make_reverse_decoys scramble is deterministic and process-independent.** The
   re-scramble PRNG for the collision/palindrome path is a SplitMix64 (`splitmix`,
   `make_reverse_decoys.py:65`) seeded from a process-independent FNV-1a hash of the

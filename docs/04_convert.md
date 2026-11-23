@@ -826,9 +826,9 @@ model the quadrupole sweep: each bin is an independent fixed window, and a candi
 chromatogram interleaves the bins that cover its precursor. Since 0.12.0 a ZT Scan search runs
 the analysis below by default (docs/37_ztscan.md, "Automatic for ZT Scan files").
 Search the precursor range the method scanned with a library restricted to it. Three
-opt-in keys model the sweep (`extract.q1_cycles`, `extract.q1_profile`,
-`features.q1_features`; docs/09_extract.md, section 10): summing the bins of a cycle lost
-about 14%, and the Q1-profile features gained 0.4%, so all three stay off.
+opt-in keys that modelled the sweep (`extract.q1_cycles`, `extract.q1_profile`,
+`features.q1_features`; docs/09_extract.md, section 10) were removed in 0.15.0: summing the
+bins of a cycle lost about 14%, and the Q1-profile features gained 0.4%, inside seed noise.
 
 With the key, convert also records the sweep itself (spectra_ms2 v3, `q1_cycle` and
 `q1_step`, section "`spectra_ms2.parquet`" above): on REP01 3,238 cycles of 663 steps, every
@@ -840,8 +840,8 @@ keys calibrate what the sweep and the MS1 scans measure, before anything decides
   isotope-envelope model to a median of 0.003 steps (MAD 0.16 steps; 0.11 steps early
   before the calibration); the window is wider and softer than 3.8 m/z, whole within 0.57
   m/z of its centre and nothing beyond 4.56 m/z. Written to `cal.json` only.
-- `extract.ms1_calibrate = "surface"` and `extract.prec_tol_auto` (docs/09_extract.md, section
-  11): the ZenoTOF's MS1 error is +2.84 ppm with a robust SD of 2.67 ppm and drifts by about
+- `extract.ms1_calibrate = "surface"` and `extract.prec_tol_auto` (removed in 0.15.0;
+  docs/09_extract.md, section 11): the ZenoTOF's MS1 error is +2.84 ppm with a robust SD of 2.67 ppm and drifts by about
   1 ppm over the gradient; the 3 ppm default tolerance holds two thirds of the anchors' MS1
   peaks, and the rule of three robust SD sets 7.2 ppm.
 
@@ -859,8 +859,8 @@ compared on its own host):
 
 The calibration changes the count by little: +0.46% precursors over four seeds on the human
 library, +0.19% human precursors on the entrapment library at the same combined FDP. Each
-single key moves seed 0 by -0.1% to +0.5%, inside the seed spread. The two MS1 keys stay off
-(benchmark-gated, one acquisition); `q1_calibrate` is automatic for ZT Scan searches since
+single key moves seed 0 by -0.1% to +0.5%, inside the seed spread. The two MS1 keys were
+removed in 0.15.0; `q1_calibrate` is automatic for ZT Scan searches since
 0.12.0, because the per-fragment decisions below decide with it.
 
 The per-fragment Q1 decisions read the recorded sweep (spectra_ms2 v3 is required:

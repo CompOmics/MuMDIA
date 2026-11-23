@@ -48,7 +48,7 @@ contracts); the citations below point there.
 | `rust/mumdia/crates/mumdia/src/main.rs` | CLI: one `clap` subcommand per stage (`Cmd` enum, `main.rs:20`); each arm loads config, hashes it, and calls the stage `run`. |
 | `rust/mumdia/crates/mumdia/src/stages/run.rs` | `run` orchestrator: preflight, library-source branch, per-run chain, manifest assembly (`run.rs:85`). |
 | `rust/mumdia/crates/mumdia/src/stages/mod.rs` | Re-exports every stage module. |
-| `rust/mumdia/crates/mumdia/src/stages/*.rs` | The stage implementations (`convert`, `digest`, `peptidoforms`, `predict_frag`, `prescan`, `search_seed`, `rt_im_train`, `extract`, `features`, `compete`, `rescore`, `quant`, `report`, `align`, `audit`). |
+| `rust/mumdia/crates/mumdia/src/stages/*.rs` | The stage implementations (`convert`, `digest`, `peptidoforms`, `predict_frag`, `prescan`, `search_seed`, `rt_im_train`, `extract`, `features`, `compete`, `rescore`, `quant`, `report`, `audit`). |
 | `rust/mumdia/crates/mumdia/src/stages/run_experiment.rs` | `run-experiment` orchestrator: N per-run chains, one combined rescore, optional MBR, per-run quant, cross-run LFQ, `experiment_manifest.json` (`run_experiment.rs:267`). |
 | `rust/mumdia/crates/mumdia/src/lib.rs` | Crate lib root (bin+lib split, `lib.rs:5-16`): re-exports the pipeline modules so integration tests can drive stages directly. Public modules: `stages`, `matchers` (fragment matchers, doc 06), `index` (`Library` + inverted index, doc 06), `predict` (predictor traits + native fallbacks, doc 06), `rescoring` (`percolator_lite` + native NN, doc 11), `calibrate` (LOESS/linear/percentile, doc 08), `peaks` (peak enumeration, doc 09), `spectra` (in-memory spectrum model + loaders), `sidecar` (Python worker dispatch, doc 13), `stats` (pearson/cosine/spectral_angle kernel), `fdr` (target-decoy + entrapment q, doc 11). |
 | `rust/mumdia/crates/mumdia-core/src/schema.rs` | Frozen `(logical name, schema version)` for every artifact (`artifact` module, `schema.rs:6`). |
@@ -318,8 +318,8 @@ Measured on the two experiments above (sizes count hard links once):
 
 `main.rs` is a thin `clap` layer: the `Cmd` enum (`main.rs:20`) defines one
 subcommand per stage plus the single-run `run` orchestrator, the experiment-wide
-`run-experiment` orchestrator (`main.rs:238`), the experiment-level
-`align`/`mbr`, and the utilities `inspect`/`report`/`doctor`. Each stage arm
+`run-experiment` orchestrator (`main.rs:238`), and
+the utilities `inspect`/`report`/`doctor`. Each stage arm
 loads the config, hashes its canonical JSON into a `config_hash`, and calls the
 stage `run`; every stage command is runnable standalone on prior outputs. Flags
 are `--kebab-case`; a `num_args = 1..` flag accepts several values.
@@ -328,7 +328,7 @@ Which subcommands read `--config` (verified against `main.rs`):
 
 | Takes `--config` | No `--config` |
 |---|---|
-| `convert`, `digest`, `peptidoforms`, `predict-frag`, `search-seed`, `rt-im-train`, `extract`, `features`, `compete`, `rescore`, `quant`, `run`, `run-experiment`, `align`, `mbr`, `doctor` (optional), `report` (optional) | `quant-lfq`, `inspect`, `audit` |
+| `convert`, `digest`, `peptidoforms`, `predict-frag`, `search-seed`, `rt-im-train`, `extract`, `features`, `compete`, `rescore`, `quant`, `run`, `run-experiment`, `doctor` (optional), `report` (optional) | `quant-lfq`, `inspect`, `audit` |
 
 `quant-lfq` takes typed string flags instead; `inspect` and `audit` load no
 config. The table below covers the main stage commands. The complete subcommand
@@ -352,8 +352,6 @@ binary.
 | `quant-lfq` (`main.rs:184`) | `--inputs` (1+ per-run tables), `--method` (`maxlfq` default / `directlfq`), `--normalize` (`median_ratio` default / `median` / `none`) | `--out` = protein-by-run matrix; no `--config` |
 | `run` (`main.rs:199`) | `--mzml`, `--out-dir`; `--fasta` xor (`--lib-precursors` + `--lib-fragments`); `--config`, `--profile`, `--max-spectra`, `--top-peaks-ms2` | the full chain + `manifest.json` |
 | `run-experiment` (`main.rs:238`) | `--mzml` once per run (>=2), `--run-names` (opt, default the input file names, `experiment.run_naming`; docs/12 "Run names"), `--condition` once per run and `--sample-sheet` (opt; docs/12 "Normalisation scope"), `--out-dir`; `--fasta` xor (`--lib-precursors` + `--lib-fragments`); `--config`, `--profile`, `--max-spectra`, `--top-peaks-ms2` | per-run chains under `<out-dir>/<run>/`, one `scored_combined.parquet`, optional MBR tables, per-run `scored`/quant splits, `lfq_maxlfq.parquet`, `lfq_size_factors.tsv`, `experiment_manifest.json`, the experiment-wide `peptides.tsv`, `precursors.tsv` and `proteins.tsv` |
-| `align` (`main.rs:230`) | `--seed-psms` (1+ `seed_psms`, first = reference), `--config` | `--out` = `alignment.parquet` |
-| `mbr` (`main.rs:240`) | `--psms-scored` (experiment-wide `scored_combined`), `--psms-extracted` (1+ per-run in `source` order), `--frag` (0+ per-run `fragment_quant`), `--config` | `--out` = `transferred.parquet`, `--out-psms-scored` (opt augmented scored) |
 | `inspect` (`main.rs:261`) | positional `artifact` (any parquet) | schema + head + row count to stdout; no `--config` |
 | `audit` (`main.rs:265`) | `--lib-precursors`, `--psms-extracted`, `--competed`, `--psms-scored`, `--q` (0.01), `--run-id` (`run`), `--entrapment-substr` (`""`) | `--out` = `candidate_audit.parquet`; no `--config` |
 | `report` (`main.rs:292`) | `--psms-scored`, `--peptide-quant` (opt), `--protein-quant` (opt), `--q` (0.01), `--config` (opt) | `peptides.tsv` + `precursors.tsv` + `proteins.tsv` in `--out-dir` |
@@ -403,16 +401,6 @@ Per-subcommand specifics that are easy to miss:
   per-run counts from the per-run split `scored.parquet` on `run_psm_q`.
   `mumdia report --experiment-dir` rewrites the three from the experiment
   manifest.
-- `align` uses `rt_im_train.q_train` for its training set and a hardcoded 100-knot
-  grid (`main.rs:666-667`); it needs >=2 seeds and is not part of the `run` chain.
-- `mbr` is a wired standalone command, not part of `run`. It runs only the
-  rescuable-tier transfer: it refuses any `mbr.strategy` other than
-  `empirical_library`, `rt_transfer` or `full` (so also the default
-  `second_pass`, which `run-experiment` runs itself), and it errors when fewer than two
-  `--psms-extracted` are supplied (`main.rs:685`), or when `mbr.python` is unset
-  (`main.rs:688`), then runs the `mbr_worker.py` sidecar with the `mbr.*`
-  thresholds (`main.rs:697`). It transfers identifications across a run set
-  (Stage D3).
 - `doctor` (`main.rs:313`) probes three interpreters and prints `[ ok ]` /
   `[FAIL]` / `[skip]` per line, exiting nonzero if any fail: `rescore.python`
   (packages depend on the classifier: `torch,numpy,pandas,pyarrow` for `nn_torch`,
@@ -653,11 +641,11 @@ config (`main.rs:607`) before `run`. The fields this overview area touches:
 | `predict_frag.predictor` | `native` | `native` or `ms2pip` fragment intensities. |
 | `predict_frag.deeplc_python` | `None` | Interpreter for DeepLC; required if `finetune_deeplc`; probed by `doctor`. |
 | `predict_frag.ms2pip_python` | `None` | Interpreter for MS2PIP; probed by `doctor` (`main.rs:332`). |
-| `predict_frag.sidecar_script_dir` | `"scripts"` | Where sidecar workers are resolved from (used by `rescore`/`mbr`). |
+| `predict_frag.sidecar_script_dir` | `"scripts"` | Where sidecar workers are resolved from. |
 | `search_seed.top_n_peaks` | `300` | Seed-only, non-destructive peak cap; keep the default. Not the conversion cap `--top-peaks-ms2` (docs/04). |
 | `extract.bucket_size` | (see `ExtractConfig`) | Fragment-index bucket width; `search-seed` reads it too (`main.rs:473`). |
 | `rt_im_train.calibration_method` | `loess` | RT calibration; `none` is rejected by validation. |
-| `rt_im_train.q_train` | (see `RtImTrainConfig`) | Confident-seed q cutoff for the DeepLC fine-tune and the `align` reference set. |
+| `rt_im_train.q_train` | (see `RtImTrainConfig`) | Confident-seed q cutoff for the DeepLC fine-tune. |
 | `rt_im_train.finetune_deeplc` | `false` | Enables the per-run DeepLC fine-tune of iRT. |
 | `rt_im_train.finetune_epochs` / `finetune_patience` | (see config) | DeepLC fine-tune schedule (`run.rs:259-260`). |
 | `rt_im_train.finetune_batch` | `0` | `0` auto-scales the fine-tune batch to seed size. |
@@ -670,8 +658,7 @@ config (`main.rs:607`) before `run`. The fields this overview area touches:
 | `compete.mode` | `winner_take_all` | Within-group competition resolution (`CompetitionMode`). |
 | `rescore.classifier` | `native_tda` | Rescorer; `nn_torch` is the best lever, needs `rescore.python`. |
 | `rescore.python` | `None` | Interpreter for mokapot / nn_torch / entrapment sidecars. |
-| `mbr.strategy` | `second_pass` | MBR mode; `run-experiment` searches every run again on the first pass's empirical library (docs/12, "Second pass"). The standalone `mumdia mbr` command refuses every strategy but `empirical_library`, `rt_transfer` and `full`. |
-| `mbr.python` | `None` | `mbr_worker.py` interpreter; required by the transfer strategies (`empirical_library`, `rt_transfer`, `full`). |
+| `mbr.strategy` | `second_pass` | Match-between-runs under `run-experiment`: `second_pass` or `none` (`rt_transfer` was removed in 0.15.0). |
 | `quant.q_threshold` | `0.01` (`QuantConfig`) | q-value threshold for the human-readable report. |
 
 The config surface was recently pruned of dead or unwired fields (see
@@ -682,9 +669,8 @@ scan_scale, scan_window_mode}` + `ScanWindowMode`, `digest.decoy.{ratio, source}
 `CompetitionMode::from_token` were removed. Do not reintroduce them. Kept
 deliberately as documented hooks: `DecoyStrategy::DiannShift` (deferred,
 license-checked; rejected by validation), `CalibrationMethod::None` (rejected by
-validation with a clear message), and the whole `mbr` section, which is wired to
-the standalone `mumdia mbr` command (`main.rs:671`, calls `mbr_worker.py`) but is
-not part of the `run` chain and needs >=2 runs.
+validation with a clear message), and the `mbr` section, which `run-experiment`
+reads for its second pass and which is not part of the single-run chain.
 
 ## Invariants, determinism, gotchas
 
@@ -739,6 +725,5 @@ not part of the `run` chain and needs >=2 runs.
 - To wire a new sidecar: follow the positional-CLI file contract
   (`sidecar::resolve_script` + a worker in `scripts/`), gate it behind a config
   field, and check its prerequisites in `preflight` and `doctor`.
-- Standalone-only areas: `align` is a standalone command and is not in the `run`
-  chain (needs >=2 runs). For ion mobility / 4D (diaPASEF) see
-  docs/35_diapasef.md (IM columns are null on 3D runs).
+- For ion mobility / 4D (diaPASEF) see docs/35_diapasef.md (IM columns are null on 3D
+  runs).

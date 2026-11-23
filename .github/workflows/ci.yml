@@ -1081,9 +1081,8 @@ jobs:
       # The workers are invoked over a positional-file contract that nothing else
       # checks. Tests needing torch, mokapot, deeplc or ms2pip skip here rather
       # than fail, which is honest but means CI covers the contracts that need only
-      # numpy and pyarrow: the whole mbr_worker suite, including the regression for
-      # the q-column bug that left 34,280 of 34,664 transfers unquantified, the
-      # library-recipe encoding contracts, and the import-order checks.
+      # numpy and pyarrow: the library-recipe encoding contracts and the import-order
+      # checks.
       - name: Sidecar contract tests
         run: |
           python -m pip install --quiet -r tests/python/requirements.txt

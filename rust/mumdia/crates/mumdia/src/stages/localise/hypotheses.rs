@@ -10,18 +10,6 @@
 
 use mumdia_core::mass::{parse_peptidoform, unimod_mass, ParsedPeptidoform};
 
-/// Modification siblings: same residues, charge, label and modification composition (the
-/// sorted deltas, terminal ones included), so they differ only in localisation. Shared by
-/// the prescreen's localisation policy and this stage.
-pub(crate) fn sibling_key(pf: &str, charge: i32, label: u32) -> Option<String> {
-    let p = parse_peptidoform(pf).ok()?;
-    Some(format!(
-        "{}/{charge}/{label}/{:?}",
-        String::from_utf8_lossy(&p.residues),
-        deltas(&p)
-    ))
-}
-
 /// The modification composition of a peptidoform, without its residues: the sorted deltas
 /// in 1e-4 Da, terminal ones included. Positional isomers share it, and so do a target and
 /// its paired decoy, which is what the picked isomer-group competition keys on.
@@ -467,15 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn sibling_and_composition_keys_ignore_the_position() {
-        assert_eq!(
-            sibling_key("S[Phospho]TK", 2, 0),
-            sibling_key("ST[Phospho]K", 2, 0)
-        );
-        assert_ne!(
-            sibling_key("S[Phospho]TK", 2, 0),
-            sibling_key("S[Phospho]TK", 3, 0)
-        );
+    fn composition_keys_ignore_the_position() {
         assert_eq!(
             composition_key("S[Phospho]TK"),
             composition_key("KT[Phospho]S")

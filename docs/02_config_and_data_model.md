@@ -197,11 +197,10 @@ poor setting is detectable. Defaults always pass.
 10. Entrapment without `rescore.entrapment_marker` -> `Invalid`
     (`config.rs:1396-1404`).
 
-`validate()` also emits two non-fatal warnings (`config.rs:1405-1437`), because
-erroring would break configs that already parse: one when `mbr.rt_window_s`,
-`mbr.decoy_transfer`, or `mbr.requant_all` is moved off its default (no stage
-reads those fields), and one when `mbr.strategy` is any non-`none` variant (only
-`none` vs not-`none` is distinguished in code).
+`validate()` also warns, without failing, when `mbr.strategy` selects the
+rescuable-tier transfer. `mbr.rt_window_s`, `mbr.decoy_transfer`, `mbr.requant_all`
+and `rescore.percolator_bin` were removed in 0.15.0 because no stage read them; a file that sets
+one at its old default still loads.
 
 `canonical_json` (`config.rs:1464-1466`) serializes the fully-resolved config;
 `run` hashes it with `blake3_str` into `config_hash` (`run.rs:89`) and stores the
@@ -404,11 +403,10 @@ listed with its default and effect. Fields marked **default-off**, **inert**, or
 | `CompetitionMode` | config.rs:873-890 | **`winner_take_all`**, `none`, `unique_evidence`, `margin_gated` | within-group resolution |
 | `CompeteGroupBy` | config.rs:894-901 | `base_peptide`, `apex`, **`peptidoform_charge`** | competition grouping key; `peptidoform_charge` (precursor-level) is the default since 2026-09-06, `base_peptide` was renamed from `precursor`, which named stripped-peptide grouping inaccurately (see below) |
 | `RollupMethod` | config.rs:905-911 | **`top_n_sum`**, `sum` | protein rollup |
-| `PeakWindowMode` | config.rs:916-928 | **`per_candidate`**, `consensus` | quant integration window |
+| `PeakWindowMode` | config.rs:916-928 | **`per_candidate`** (`consensus` removed in 0.15.0) | quant integration window |
 | `NormalizeMethod` | config.rs:936-949 | `none`, **`median_ratio`**, `median` | cross-run LFQ normalization; `from_token` at 953-960 |
 | `QuantQColumn` | config.rs:971-988 | **`peptide_q`**, `precursor_q`, `psm_q`, `run_psm_q` | which q column quant filters on |
-| `MbrStrategy` | config.rs:1058-1068 | **`none`**, `empirical_library`, `rt_transfer`, `full` | only `none` vs not-`none` is distinguished in code; the three non-`none` variants behave identically and `validate()` warns |
-| `DecoyTransfer` | config.rs:1077-1082 | **`permuted_rt`**, `reverse_sequence`, `both` | MBR false-transfer null; **not read by any stage** (`validate()` warns if changed) |
+| `MbrStrategy` | config.rs:1058-1068 | `none`, **`second_pass`** | `rt_transfer` (and `empirical_library`, `full`, read as it) was removed in 0.15.0 and is refused; the variant stays so the type serialises as before |
 | `RtLibraryScope` | config.rs | **`first_run_only`**, `per_run` | `run-experiment` only: how many DeepLC fine-tunes an experiment pays for |
 | `Handoff` | config.rs | `tsv`, `parquet`, **`raw`** | how the feature matrix crosses into a sidecar rescorer; `parquet` and `raw` are nn_torch only (mokapot falls back to `tsv` with a warning) |
 
@@ -497,18 +495,10 @@ else keep it (conservative removal for the low-FDR region). Target/decoy labels
 stay in the competition key in every mode, so a target never competes against its
 own decoy.
 
-**`MbrStrategy`** (1043-1068) and **`DecoyTransfer`** (1070-1082) are the recorded
-MBR design ladder, not four (respectively three) distinct behaviors. Only
-`strategy == None` vs `!= None` is ever tested in the tree, so `RtTransfer` and
-`Full` behave exactly like `EmpiricalLibrary` today, and `validate()` warns when
-any non-`None` variant is selected. `DecoyTransfer` is read by no stage at all
-and `validate()` warns when it is moved off its default. The intended staging is:
-`None` (default) reproduces the chain byte-for-byte; `EmpiricalLibrary` builds
-the cross-run consensus anchor library only (M1); `RtTransfer` adds cross-run
-expected-RT transfer extraction (M2/M3); `Full` adds requantification (M5). The
-intended null (M4) is `PermutedRt` (default), transferring real precursors to a
-decoupled wrong expected RT, `ReverseSequence`, transferring reverse/scramble
-decoys at the same expected RT, or `Both`. All require >= 2 runs.
+**`MbrStrategy`** (1043-1068). `SecondPass` is the default and `None` turns
+match-between-runs off. `RtTransfer`, the rescuable-tier transfer, was removed in 0.15.0:
+`rt_transfer` and its old spellings `empirical_library` and `full` are refused at load and
+by `validate()`. The variant still parses, so the canonical configuration does not move.
 
 **`CompeteGroupBy`**. The default is `PeptidoformCharge` (since 2026-09-06).
 `BasePeptide` (renamed from `precursor`, which is no longer accepted) is the
@@ -757,7 +747,7 @@ selection dominate.
 | `alt_peak_min_area_frac` | 0.10 | min integrated area of a promoted alternate as a fraction of the rank-0 peak; only used when `promote_top_peaks > 1` |
 | `alt_peak_min_separation_s` | 5.0 | min apex-RT separation of a promoted alternate from the rank-0 apex; only used when `promote_top_peaks > 1` |
 | `emit_candidate_audit` | `false` | **default-off**; in a single-file `run` gates the separate `audit` stage that writes `candidate_audit.parquet`; extract writes no per-candidate table; no-op for standalone `mumdia extract` and for `run-experiment`, which warns (P0.3) |
-| `apex_evidence_rank` | `true` | evidence-count apex. On by default: the legacy signature-intensity score is 0.0 at every qualifying scan when none of the top-K predicted fragments is observed, which silently selects the lowest-RT qualifying scan |
+| `apex_evidence_rank` | `true` | evidence-count apex; `false` was removed in 0.15.0 and is refused: the legacy signature-intensity score is 0.0 at every qualifying scan when none of the top-K predicted fragments is observed, which silently selects the lowest-RT qualifying scan |
 | `emit_gate_diagnostics` | `false` | **default-off** four gate-score columns |
 | `gate_mode` | `window_mean` | which spectral score `gate_min_score` thresholds |
 | `gate_coelution_min` | 0.5 | second threshold for `gate_mode = combined` |
@@ -774,12 +764,9 @@ requiring entrapment/target-decoy FDR validation before use.
 | `set` | `minimal` | feature set (minimal / rich / extended) |
 | `emit_pin` | `false` | write the Percolator-style `.pin` text file requested by `--out-pin`. Off by default: no MuMDIA stage consumes it (`rescore` builds its own PIN) and at 1.5M rows by 387 features it is a ~5.4 GB text write, so set it true only when an external tool needs the file |
 | `coelution_corr_threshold` | 0.9 | co-elution correlation cutoff |
-| `prec_tol_ppm` | 20.0 | precursor tolerance for MS1 features |
 | `bound_features` | `true` | restrict trace features to the elution peak |
 | `bound_peak_fraction` | 1/3 | peak-boundary descent fraction of apex height |
 | `bound_peak_grace` | 0 | consecutive sub-threshold scans to bridge |
-| `bound_from_confident` | `false` | `true` learns one global peak width from confident seed PSMs; per-candidate bounds are the default since 2026-10-04 (docs/10) |
-| `bound_confident_pct` | 50.0 | percentile of confident half-widths as the shared width |
 | `ms1_precursor_features` | `false` | **default-off** MS1 apex-isotope feature `ms1_isotope_height_corr`; it overlaps the existing `ms1_isotope_cosine_apex`, so it is opt-in. The name stays in the battery either way and returns 0.0 when off, so the vector length does not change |
 | `chrom_loaders` | 3 | chromatogram decode threads in the main feature pass, capped by `--threads` and by the chunk count. Changes time and memory only, never a value or a byte of the features table. The pass holds up to `chrom_loaders + 1` decoded chunks (about 0.92 GiB of traces each at the HYE shape, docs/27 section 3.4); `1` restores the previous single loader and its two resident chunks |
 
@@ -805,8 +792,8 @@ requiring entrapment/target-decoy FDR validation before use.
 | `bound_peak` | `true` | integrate only over the detected peak window |
 | `peak_fraction` | 1/6 | descent threshold for the peak-window walk |
 | `peak_grace` | 1 | zig-zag grace (bridge N sub-threshold scans) |
-| `peak_window_mode` | `per_candidate` | per-candidate vs consensus window |
-| `reliable_q` | 0.001 | confident-set q for the consensus width |
+| `peak_window_mode` | `per_candidate` | the only value since `consensus` was removed in 0.15.0 |
+| `reliable_q` | 0.001 | read by nothing since `consensus` was removed in 0.15.0 |
 | `q_filter` | `peptide_q` | `peptide_q`, `precursor_q` (single-run only), `psm_q`, or `run_psm_q` |
 | `interference_envelope` | `false` | apex-outward interference envelope on fragment traces before integration (opt-in, benchmark-gated) |
 
@@ -819,7 +806,6 @@ requiring entrapment/target-decoy FDR validation before use.
 | `train_fdr` | 0.01 | positive-selection FDR |
 | `num_iter` | 10 | semi-supervised iterations (native) |
 | `python` | `None` | interpreter for a Python rescorer (mokapot/nn_torch/entrapment) |
-| `percolator_bin` | `None` | percolator.exe path |
 | `entrapment_marker` | `None` | protein substring marking spike-in negatives (required for `entrapment`) |
 | `entrapment_exclude` | `None` | substring that de-marks (own-species) |
 | `entrapment_contaminant_markers` | `[]` | substrings that keep a spike-in hit as a real target |
@@ -837,13 +823,13 @@ requiring entrapment/target-decoy FDR validation before use.
 
 ### `MbrConfig` (config.rs:1084-1129), partly inert
 
-The MBR stage (D3) is not wired into the run chain. Fields: `strategy` (`none`
-default), `q_anchor` 0.01, `min_anchor_runs` 2, `q_transfer` 0.01, `rt_window_s`
-20.0, `decoy_transfer` `permuted_rt`, `consensus_corr_min` 0.0, `requant_all`
-`false`, `python` `None`. Of these, `rt_window_s`, `decoy_transfer`, and
-`requant_all` are read by no stage at all and `validate()` warns when any is
-moved off its default, because a config that sets them looks configured but
-changes nothing. With `strategy = none` the chain is byte-identical to no MBR.
+Read by `run-experiment` only. Fields: `strategy` (`second_pass` default), `q_anchor` 0.01,
+`min_anchor_runs` 2, `q_transfer` 0.01, `consensus_corr_min` 0.0, `python` `None`,
+`second_pass_prefilter_keep_decoys`, `first_pass_flag`. `min_anchor_runs`, `q_transfer`,
+`consensus_corr_min` and `python` configured the rescuable-tier transfer, removed in 0.15.0:
+they still parse, so the configuration hash does not move, and `validate()` warns that they
+do nothing. `rt_window_s`, `decoy_transfer` and `requant_all` were removed in 0.15.0
+because no stage read them.
 
 ### `ExperimentConfig` (config.rs:1247-1272)
 

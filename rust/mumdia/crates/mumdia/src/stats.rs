@@ -267,7 +267,7 @@ pub fn weighted_mean_sd(pts: &[(f64, f64)]) -> Option<(f64, f64)> {
 pub enum LooRef<'a> {
     /// `total[t] - w[f] * traces[f][t]` over the points the two share, `total` unchanged
     /// beyond them, where `total` is the weighted sum of every member, built by the caller:
-    /// the co-elution family's `frag_loo_ref_corr_*` and retrace's `imc_ref_w`.
+    /// the co-elution family's `frag_loo_ref_corr_*`.
     Subtract(&'a [f64]),
     /// The weighted sum over `set` of every member but `f`, `len` points long, a member's
     /// trace cut at `len` and a member past the end of `traces` skipped: the interference
@@ -306,7 +306,7 @@ pub fn loo_reference<T: AsRef<[f64]>>(traces: &[T], w: &[f64], f: usize, r: LooR
 /// The leave-one-out reference correlation of member `f`: the [`pearson`] correlation of
 /// its trace with its leave-one-out reference ([`loo_reference`]). The one kernel every
 /// leave-one-out reference correlation goes through: the co-elution and interference
-/// families on elution traces, and retrace's `imc_ref_w` on 1/K0 profiles.
+/// families on elution traces.
 pub fn loo_ref_corr<T: AsRef<[f64]>>(traces: &[T], w: &[f64], f: usize, r: LooRef) -> f64 {
     pearson(traces[f].as_ref(), &loo_reference(traces, w, f, r))
 }

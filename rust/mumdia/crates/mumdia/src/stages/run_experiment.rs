@@ -114,7 +114,6 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
             cfg.predict_frag.deeplc_python.as_deref(),
         ),
         ("rescore.python", cfg.rescore.python.as_deref()),
-        ("mbr.python", cfg.mbr.python.as_deref()),
     ] {
         if let Some(exe) = path {
             if crate::python::interpreter_missing(exe) {
@@ -136,21 +135,6 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
     // the run count cannot carry used to fail there and leave no report.
     if !cfg.quant.normalisation.is_off() {
         crate::stages::quant_norm::check_rank(cfg.quant.normalisation_rank, p.mzmls.len())?;
-    }
-    refuse_unapplied_consensus_guard(cfg)
-}
-
-/// Refuse `mbr.consensus_corr_min > 0` with a transfer strategy: the guard reads the runs'
-/// fragment tables, which quant writes after the transfer here, so it would not run.
-fn refuse_unapplied_consensus_guard(cfg: &Config) -> Result<()> {
-    if cfg.mbr.strategy.transfers() && cfg.mbr.consensus_corr_min > 0.0 {
-        anyhow::bail!(
-            "mbr.consensus_corr_min = {} has no effect under run-experiment: its \
-             fragment-consensus guard reads each run's fragment_quant.parquet, which quant \
-             writes after the transfer. Set it to 0 here; `mumdia mbr --frag` on the finished \
-             experiment's fragment tables is the only path that applies it",
-            cfg.mbr.consensus_corr_min
-        );
     }
     Ok(())
 }
@@ -2505,48 +2489,9 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         .clone()
         .unwrap_or_else(|| actual_rescorer.clone());
 
-    // --- optional rescuable-tier MBR transfer ---
-    let scored_for_quant = if cfg.mbr.strategy.transfers() {
-        let python = cfg.mbr.python.as_deref().expect("preflight");
-        let script =
-            crate::sidecar::resolve_script(&cfg.predict_frag.sidecar_script_dir, "mbr_worker.py");
-        let transferred = d("mbr_transferred.parquet");
-        let scored_mbr = d("scored_mbr.parquet");
-        // A previous run's table in the same --out-dir must never stand in for this one.
-        if std::path::Path::new(&scored_mbr).exists() {
-            std::fs::remove_file(&scored_mbr).with_context(|| {
-                format!("removing a previous run's {scored_mbr} before running MBR")
-            })?;
-        }
-        // The competed tables carry candidate_id + apex_rt in `source` order, one per run:
-        // match-between-runs keeps a grouped run's competed table pooled (`run_groups`).
-        if !one_table_per_run {
-            anyhow::bail!(
-                "match-between-runs reads one competed table per run, and a grouped run left \
-                 its competed rows per band"
-            );
-        }
-        let mbr_competed: Vec<String> = competed.iter().map(|t| t[0].clone()).collect();
-        crate::sidecar::run_mbr(
-            python,
-            &script,
-            &scored_combined,
-            &mbr_competed,
-            &transferred,
-            Some(&scored_mbr),
-            &[],
-            cfg.mbr.q_anchor,
-            cfg.mbr.min_anchor_runs,
-            cfg.mbr.q_transfer,
-            cfg.mbr.consensus_corr_min,
-            cfg.rng_seed,
-        )?;
-        // The worker writes this table on every successful return, its accepted transfers
-        // flagged (it logs how many, none included).
-        scored_mbr
-    } else {
-        scored_combined.clone()
-    };
+    // The rescuable-tier transfer that could replace this table was removed in 0.15.0;
+    // the manifest keeps `scored_for_quant`, which `mumdia report --experiment-dir` reads.
+    let scored_for_quant = scored_combined.clone();
 
     // --- split by source, per-run quant (psm_q filter), cross-run LFQ ---
     let split_paths: Vec<String> = (0..n_runs)
@@ -3236,18 +3181,6 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             None,
         ));
     }
-    // Only when MBR actually produced a different table; otherwise
-    // `scored_for_quant` IS `scored_combined` and recording it twice would claim two
-    // artifacts where one file exists.
-    if scored_for_quant != scored_combined {
-        artifacts.push((
-            "scored_for_quant".to_string(),
-            artifact::PSMS_SCORED,
-            scored_for_quant.clone(),
-            "mbr",
-            None,
-        ));
-    }
     for (i, name) in names.iter().enumerate() {
         artifacts.push((
             format!("scored[{name}]"),
@@ -3505,21 +3438,6 @@ mod tests {
         // Without the multi-head calibration nothing is skipped: the first run adapts.
         assert_eq!(pick(0, &[&short, &enough]), Some(0));
         assert_eq!(pick(80, &[]), None);
-    }
-
-    #[test]
-    fn the_consensus_guard_is_refused_where_it_cannot_run() {
-        for (json, ok) in [
-            (r#"{"mbr":{"strategy":"rt_transfer"}}"#, true),
-            (r#"{"mbr":{"consensus_corr_min":0.8}}"#, true),
-            (
-                r#"{"mbr":{"strategy":"rt_transfer","consensus_corr_min":0.8}}"#,
-                false,
-            ),
-        ] {
-            let cfg = Config::from_json(json).unwrap();
-            assert_eq!(refuse_unapplied_consensus_guard(&cfg).is_ok(), ok, "{json}");
-        }
     }
 
     fn names(xs: &[&str]) -> Vec<String> {

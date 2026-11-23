@@ -418,9 +418,9 @@ group per chunk. Three parts:
   `HashMap<&str, Vec<f64>>`, and the PIN is written row by row as chunks are
   computed.
 
-Cost: `bound_from_confident` (when on; off by default since 2026-10-04) needs the global elution half-widths
-before the first feature, so it takes one extra streaming pass, which decodes but
-never copies the rows of non-confident candidates.
+Cost: `bound_from_confident` (removed in 0.15.0) needed the global elution half-widths
+before the first feature, so it took one extra streaming pass, which decoded but
+never copied the rows of non-confident candidates.
 
 Measured on the artifacts of the arm in section 0, against the features table
 that arm wrote: peak RSS 86.6 -> 3.03 GiB, 38 chunks, largest chunk 0.92 GiB of

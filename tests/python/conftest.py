@@ -98,7 +98,7 @@ def run_worker(script, *args, env=None, cwd=None, timeout=900):
 def run_worker_ok(script, *args, env=None, cwd=None, timeout=900):
     """`run_worker` plus the exit-code assertion, with stderr in the message.
 
-    A nonzero exit from a predictor or MBR worker aborts the whole engine run
+    A nonzero exit from a predictor worker aborts the whole engine run
     (`docs/13_sidecars.md`, "Failure behavior"), so a failing assertion here
     stands for an aborted production run; the captured stderr is the only
     diagnostic the engine itself would surface.
@@ -449,59 +449,6 @@ def write_features_parquet(path, psms):
         ["-.{}.-".format(p) for p in psms["peptidoform"]], pa.string()
     )
     cols["Proteins"] = pa.array(psms["protein"], pa.string())
-    pq.write_table(pa.table(cols), str(path), compression="snappy")
-    return path
-
-
-# ---------------------------------------------------------------------------
-# synthetic scored / psms tables: the MBR contract
-# ---------------------------------------------------------------------------
-
-
-def write_scored_table(path, rows, extra_q=None, extra_int=None):
-    """Write an experiment-wide scored_combined table for `mbr_worker.py`.
-
-    `rows` holds equal-length sequences for the columns MBR reads
-    (`mbr_worker.py:81-82`): candidate_id, source, label, q_value, peptidoform,
-    charge, protein_group. `extra_q` adds further PSM-level q columns
-    (`run_psm_q`, `experiment_psm_q`) that the M5 augmentation must also lower;
-    `extra_int` adds int32 columns such as `selected_peak_rank`.
-    """
-    cols = {
-        "candidate_id": pa.array(
-            np.asarray(rows["candidate_id"], dtype=np.uint32), pa.uint32()
-        ),
-        "source": pa.array(np.asarray(rows["source"], dtype=np.uint32), pa.uint32()),
-        "label": pa.array(list(rows["label"]), pa.string()),
-        "q_value": pa.array(np.asarray(rows["q_value"], dtype=np.float64), pa.float64()),
-        "peptidoform": pa.array(list(rows["peptidoform"]), pa.string()),
-        "charge": pa.array(np.asarray(rows["charge"], dtype=np.int32), pa.int32()),
-        "protein_group": pa.array(list(rows["protein_group"]), pa.string()),
-    }
-    for name, values in (extra_q or {}).items():
-        cols[name] = pa.array(np.asarray(values, dtype=np.float64), pa.float64())
-    for name, values in (extra_int or {}).items():
-        cols[name] = pa.array(np.asarray(values, dtype=np.int32), pa.int32())
-    pq.write_table(pa.table(cols), str(path), compression="snappy")
-    return path
-
-
-def write_psms_table(path, candidate_ids, apex_rts, extra_cols=None):
-    """Write a per-run psms.parquet: the columns MBR reads (`mbr_worker.py`).
-
-    `extra_cols` adds the optional top-K columns (`peak_rank` int32, `prelim_score`
-    float64) a competed table carries when `extract.retain_top_peaks` is above 1.
-    """
-    cols = {
-        "candidate_id": pa.array(np.asarray(candidate_ids, dtype=np.uint32), pa.uint32()),
-        "apex_rt": pa.array(np.asarray(apex_rts, dtype=np.float64), pa.float64()),
-    }
-    for name, values in (extra_cols or {}).items():
-        arr = np.asarray(values)
-        if np.issubdtype(arr.dtype, np.integer):
-            cols[name] = pa.array(arr.astype(np.int32), pa.int32())
-        else:
-            cols[name] = pa.array(arr.astype(np.float64), pa.float64())
     pq.write_table(pa.table(cols), str(path), compression="snappy")
     return path
 

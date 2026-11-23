@@ -28,7 +28,7 @@ pub type FragmentIntensityMap = HashMap<u32, HashMap<(u8, u16, u8), f32>>;
 /// the relative `"scripts"`, which both sidecar example configs carry, so unpacking a
 /// dataset archive, `cd`-ing into it and running with an example config executed any
 /// worker the archive happened to contain. That resolver only claims a directory holding
-/// `mbr_worker.py` or `deeplc_worker.py`, so a directory with any of the other ten
+/// `deeplc_worker.py`, so a directory with any of the other
 /// workers reached this function still relative, and this function ran it (docs/31 F3).
 /// An absolute directory is taken as given: naming one is how a user is unambiguous.
 pub fn resolve_script(dir: &str, worker: &str) -> String {
@@ -787,71 +787,6 @@ fn push_shards<'a>(args: &mut Vec<&'a str>, shards: usize, rendered: &'a str) {
     }
 }
 
-/// MBR transfer (Stage D3): match-between-runs identification transfer over the
-/// experiment-wide scored table + per-run psms. Positional contract:
-/// `mbr_worker.py <scored_combined> <psms_csv> <out_transferred> [flags]`, where
-/// `psms_csv` is the per-run psms paths joined by ',' in `source` order.
-#[allow(clippy::too_many_arguments)]
-pub fn run_mbr(
-    python: &str,
-    script: &str,
-    scored: &str,
-    psms: &[String],
-    out: &str,
-    out_scored: Option<&str>,
-    frag: &[String],
-    q_anchor: f64,
-    min_anchor_runs: usize,
-    q_transfer: f64,
-    consensus_corr_min: f64,
-    seed: u64,
-) -> Result<()> {
-    // mbr_worker.py splits both lists on ','.
-    if let Some(p) = psms.iter().chain(frag).find(|p| p.contains(',')) {
-        bail!(
-            "the MBR worker takes its run tables as one comma-separated list, and {p} contains \
-             a comma; use an output directory without one"
-        );
-    }
-    let psms_csv = psms.join(",");
-    info!(
-        scored,
-        out,
-        runs = psms.len(),
-        q_anchor,
-        min_anchor_runs,
-        q_transfer,
-        consensus_corr_min,
-        "sidecar: running MBR transfer"
-    );
-    let qa = q_anchor.to_string();
-    let mar = min_anchor_runs.to_string();
-    let qt = q_transfer.to_string();
-    let sd = seed.to_string();
-    let cm = consensus_corr_min.to_string();
-    let frag_csv = frag.join(",");
-    let mut args: Vec<&str> = vec![
-        scored,
-        &psms_csv,
-        out,
-        "--q-anchor",
-        &qa,
-        "--min-anchor-runs",
-        &mar,
-        "--q-transfer",
-        &qt,
-        "--seed",
-        &sd,
-    ];
-    if let Some(os) = out_scored {
-        args.extend_from_slice(&["--out-scored", os]);
-    }
-    if !frag.is_empty() && consensus_corr_min > 0.0 {
-        args.extend_from_slice(&["--frag-csv", &frag_csv, "--consensus-corr-min", &cm]);
-    }
-    run_worker(python, script, &args).context("MBR transfer worker failed")
-}
-
 /// Invoke a Python worker: `python script arg...`, with UTF-8 I/O for every worker. On
 /// Windows a worker whose output is piped (the desktop) writes the ANSI code page otherwise,
 /// and fails on a printed path that code page cannot encode; DeepLC/Keras crashed on the
@@ -977,7 +912,6 @@ mod failure_diagnosis_tests {
             torch_modules_of("scripts/im2deep_worker.py"),
             &["im2deep", "torch"]
         );
-        assert!(torch_modules_of("scripts/mbr_worker.py").is_empty());
         assert!(torch_modules_of("scripts/ms2pip_worker.py").is_empty());
     }
 
@@ -1243,10 +1177,10 @@ mod resolve_tests {
         };
         let exe = scratch("abs");
         std::fs::create_dir_all(exe.join("scripts")).unwrap();
-        std::fs::write(exe.join("scripts").join("mbr_worker.py"), b"# shipped").unwrap();
+        std::fs::write(exe.join("scripts").join("deeplc_worker.py"), b"# shipped").unwrap();
         assert_eq!(
-            resolve_script_in(abs, "mbr_worker.py", Some(&exe)),
-            format!("{abs}/mbr_worker.py"),
+            resolve_script_in(abs, "deeplc_worker.py", Some(&exe)),
+            format!("{abs}/deeplc_worker.py"),
             "naming a directory outright is how a user is unambiguous"
         );
         let _ = std::fs::remove_dir_all(&exe);

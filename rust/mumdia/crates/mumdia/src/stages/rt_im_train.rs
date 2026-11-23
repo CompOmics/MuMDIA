@@ -687,7 +687,7 @@ fn note_window_choice(cfg: &RtImTrainConfig) {
 }
 
 pub fn run(p: RtImTrainParams) -> Result<u64> {
-    run_impl(p, false, |_| Ok(())).map(|(written, _)| written.rows)
+    run_impl(p, false).map(|(written, _)| written.rows)
 }
 
 /// [`run`], returning the output's row count and the content hash its report records, so
@@ -696,25 +696,10 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
 /// having `extract` decode the table it just wrote. `None` only when the table holds a NaN
 /// bound (see [`RtWindows`]).
 pub fn run_in_memory(p: RtImTrainParams) -> Result<(Written, Option<RtWindows>)> {
-    run_impl(p, true, |_| Ok(()))
+    run_impl(p, true)
 }
 
-/// [`run_in_memory`], with `check` called on the fit before anything is written. An error
-/// from `check` is returned as it is, and neither the windows nor `cal.json` are written:
-/// a grouped run under `groups.calibration = per_group` refuses a band whose own anchors
-/// leave the windows unbounded this way (`groups.allow_unbounded_rt`).
-pub fn run_in_memory_checked(
-    p: RtImTrainParams,
-    check: impl FnOnce(&RtFit) -> Result<()>,
-) -> Result<(Written, Option<RtWindows>)> {
-    run_impl(p, true, check)
-}
-
-fn run_impl(
-    p: RtImTrainParams,
-    keep_windows: bool,
-    check: impl FnOnce(&RtFit) -> Result<()>,
-) -> Result<(Written, Option<RtWindows>)> {
+fn run_impl(p: RtImTrainParams, keep_windows: bool) -> Result<(Written, Option<RtWindows>)> {
     let t0 = Instant::now();
     // `--out` must not be one of this stage's own inputs: every input is read
     // before the output is published, so writing over one replaces it and exits 0
@@ -753,7 +738,6 @@ fn run_impl(
     )?;
     // Its hash-map form has drop glue, so end it here explicitly.
     drop(join);
-    check(&fit)?;
     write_windows(
         &fit,
         &ApplyParams {
@@ -3238,73 +3222,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `run_in_memory_checked` hands the fit to its check before anything is written. A check
-    /// that refuses leaves neither the windows nor `cal.json`, and one that accepts writes what
-    /// `run` writes. The per-group refusal of unbounded windows in `run_groups` rests on this.
-    #[test]
-    fn a_refused_fit_check_writes_nothing_and_an_accepted_one_writes_what_run_writes() {
-        fn params<'a>(
-            seed: &'a str,
-            lib: &'a str,
-            windows: &'a str,
-            cal: &'a str,
-            cfg: &'a RtImTrainConfig,
-        ) -> RtImTrainParams<'a> {
-            RtImTrainParams {
-                precursor_span: None,
-                seed_psms: seed,
-                library_precursors: lib,
-                out_windows: windows,
-                out_cal: cal,
-                cfg,
-                config_hash: "h",
-                im_window_floor: None,
-                im_anchor_q: None,
-                anchor_irt_from_seed: false,
-            }
-        }
-        let dir = std::env::temp_dir().join(format!("mumdia_rt_checked_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // One target anchor: the decoy and the unconfident row of the helper do not count.
-        let (seed, lib) = anchors_and_library(&dir, 1);
-        let out = |name: &str| dir.join(name).to_str().unwrap().to_string();
-        let cfg = RtImTrainConfig::default();
-
-        let (w_ref, c_ref) = (out("w_refused.parquet"), out("cal_refused.json"));
-        let refused = run_in_memory_checked(params(&seed, &lib, &w_ref, &c_ref, &cfg), |fit| {
-            assert_eq!(fit.n_train(), 1);
-            if windows_unbounded(fit.n_train()) {
-                anyhow::bail!("refused: {} anchor", fit.n_train());
-            }
-            Ok(())
-        });
-        let Err(err) = refused else {
-            panic!("the check's error was not returned");
-        };
-        assert_eq!(err.to_string(), "refused: 1 anchor");
-        assert!(!std::path::Path::new(&w_ref).exists(), "windows written");
-        assert!(!std::path::Path::new(&c_ref).exists(), "cal.json written");
-
-        let (w_ok, c_ok) = (out("w_accepted.parquet"), out("cal_accepted.json"));
-        let (written, _) =
-            run_in_memory_checked(params(&seed, &lib, &w_ok, &c_ok, &cfg), |_| Ok(())).unwrap();
-        let (w_run, c_run) = (out("w_run.parquet"), out("cal_run.json"));
-        let rows = run(params(&seed, &lib, &w_run, &c_run, &cfg)).unwrap();
-        assert_eq!(written.rows, rows);
-        assert_eq!(
-            std::fs::read(&w_ok).unwrap(),
-            std::fs::read(&w_run).unwrap()
-        );
-        assert_eq!(
-            std::fs::read(&c_ok).unwrap(),
-            std::fs::read(&c_run).unwrap()
-        );
-        let cal: serde_json::Value = mumdia_io::json::read_json(&c_ok).unwrap();
-        assert_eq!(cal["calibration_status"], INSUFFICIENT_ANCHORS_STATUS);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// `seed_anchor_bound` counts what `plan_anchors` counts at `q_train`, and the fit never
     /// keeps more: it also drops anchors without a finite iRT. The grouped run's early
     /// refusal of unbounded windows rests on this bound, so it can never refuse a seed whose
@@ -3336,27 +3253,21 @@ mod tests {
                 out(&format!("w_{tag}.parquet")),
                 out(&format!("c_{tag}.json")),
             );
-            let mut n_train = usize::MAX;
-            run_in_memory_checked(
-                RtImTrainParams {
-                    precursor_span: None,
-                    seed_psms: &seed,
-                    library_precursors: lib,
-                    out_windows: &w,
-                    out_cal: &c,
-                    cfg: &cfg,
-                    config_hash: "h",
-                    im_window_floor: None,
-                    im_anchor_q: None,
-                    anchor_irt_from_seed: false,
-                },
-                |fit| {
-                    n_train = fit.n_train();
-                    Ok(())
-                },
-            )
+            run_in_memory(RtImTrainParams {
+                precursor_span: None,
+                seed_psms: &seed,
+                library_precursors: lib,
+                out_windows: &w,
+                out_cal: &c,
+                cfg: &cfg,
+                config_hash: "h",
+                im_window_floor: None,
+                im_anchor_q: None,
+                anchor_irt_from_seed: false,
+            })
             .unwrap();
-            n_train
+            let cal: serde_json::Value = mumdia_io::json::read_json(&c).unwrap();
+            cal["n_train"].as_u64().unwrap() as usize
         };
         // The helper's library has no finite iRT for candidate 3: the fit keeps five.
         assert_eq!(fit_on(&lib, "lib"), 5);

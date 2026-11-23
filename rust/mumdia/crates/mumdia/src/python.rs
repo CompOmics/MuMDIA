@@ -44,8 +44,6 @@ pub enum Role {
     Ms2pip,
     /// `predict_frag.peptdeep_python`: `peptdeep_worker.py`.
     Peptdeep,
-    /// `mbr.python`: `mbr_worker.py`.
-    Mbr,
     /// `predict_frag.im2deep_python`: `im2deep_worker.py`.
     Im2deep,
 }
@@ -57,7 +55,6 @@ impl Role {
             Role::DeepLc => "predict_frag.deeplc_python",
             Role::Ms2pip => "predict_frag.ms2pip_python",
             Role::Peptdeep => "predict_frag.peptdeep_python",
-            Role::Mbr => "mbr.python",
             Role::Im2deep => "predict_frag.im2deep_python",
         }
     }
@@ -69,7 +66,7 @@ impl Role {
         match self {
             Role::DeepLc => Some(("deeplc", mumdia_core::constants::MIN_DEEPLC_VERSION)),
             Role::Im2deep => Some(("im2deep", mumdia_core::constants::MIN_IM2DEEP_VERSION)),
-            Role::Rescore | Role::Ms2pip | Role::Peptdeep | Role::Mbr => None,
+            Role::Rescore | Role::Ms2pip | Role::Peptdeep => None,
         }
     }
 
@@ -80,7 +77,6 @@ impl Role {
             Role::DeepLc => "MUMDIA_PYTHON_DEEPLC",
             Role::Ms2pip => "MUMDIA_PYTHON_MS2PIP",
             Role::Peptdeep => "MUMDIA_PYTHON_PEPTDEEP",
-            Role::Mbr => "MUMDIA_PYTHON_MBR",
             Role::Im2deep => "MUMDIA_PYTHON_IM2DEEP",
         }
     }
@@ -113,7 +109,6 @@ impl Role {
                 "pandas",
                 "pyarrow",
             ],
-            Role::Mbr => &["numpy", "pyarrow"],
             // `im2deep_worker.py` builds a `psm_utils.PSMList` and sizes torch's thread pool.
             Role::Im2deep => &["im2deep", "psm_utils", "torch", "numpy", "pyarrow"],
         }
@@ -130,7 +125,6 @@ impl Role {
             Role::DeepLc => &["deeplc_worker.py", "deeplc_finetune.py"],
             Role::Ms2pip => &["ms2pip_worker.py"],
             Role::Peptdeep => &["peptdeep_worker.py"],
-            Role::Mbr => &["mbr_worker.py"],
             Role::Im2deep => &["im2deep_worker.py"],
         }
     }
@@ -142,7 +136,6 @@ impl Role {
             Role::DeepLc => &mut cfg.predict_frag.deeplc_python,
             Role::Ms2pip => &mut cfg.predict_frag.ms2pip_python,
             Role::Peptdeep => &mut cfg.predict_frag.peptdeep_python,
-            Role::Mbr => &mut cfg.mbr.python,
             Role::Im2deep => &mut cfg.predict_frag.im2deep_python,
         }
     }
@@ -176,7 +169,6 @@ impl Role {
             }
             Role::Ms2pip => cfg.predict_frag.predictor == FragPredictorKind::Ms2pip,
             Role::Peptdeep => cfg.predict_frag.predictor == FragPredictorKind::Peptdeep,
-            Role::Mbr => cfg.mbr.strategy.transfers(),
             Role::Im2deep => cfg.predict_frag.im_predictor == ImPredictorKind::Im2deep,
         }
     }
@@ -208,12 +200,11 @@ impl Role {
     }
 }
 
-pub const ALL_ROLES: [Role; 6] = [
+pub const ALL_ROLES: [Role; 5] = [
     Role::Rescore,
     Role::DeepLc,
     Role::Ms2pip,
     Role::Peptdeep,
-    Role::Mbr,
     Role::Im2deep,
 ];
 
@@ -657,6 +648,16 @@ pub fn resolve(cfg: &mut Config) -> Result<Vec<Resolution>> {
 
 pub fn resolve_with(cfg: &mut Config, strictness: Strictness) -> Result<Vec<Resolution>> {
     let mut out = Vec::new();
+    // `mbr.python` named the interpreter of the transfer worker removed in 0.15.0. An
+    // "auto" is still cleared, as it was for that unused role, so the manifest records null.
+    if cfg
+        .mbr
+        .python
+        .as_deref()
+        .is_some_and(|v| v.eq_ignore_ascii_case(AUTO))
+    {
+        cfg.mbr.python = None;
+    }
     for role in ALL_ROLES {
         let required = role.required_by(cfg);
         let configured = role.slot(cfg).clone();
@@ -800,8 +801,7 @@ pub fn resolve_with(cfg: &mut Config, strictness: Strictness) -> Result<Vec<Reso
 /// release-archive layout), then the configured value unchanged so the eventual
 /// error names what was asked for.
 pub fn resolve_script_dir(configured: &str, config_path: Option<&str>) -> String {
-    let has_workers =
-        |dir: &Path| dir.join("mbr_worker.py").exists() || dir.join("deeplc_worker.py").exists();
+    let has_workers = |dir: &Path| dir.join("deeplc_worker.py").exists();
 
     // An ABSOLUTE configured path is taken as given: the user named a directory, and
     // naming one is the way to be unambiguous.
@@ -979,7 +979,7 @@ mod tests {
         cfg.rt_im_train.library_irt = LibraryIrt::Deeplc;
         assert!(Role::DeepLc.required_by(&cfg) && !Role::DeepLc.wanted_by(&cfg));
         cfg.rt_im_train.library_irt = LibraryIrt::Auto;
-        for role in [Role::Rescore, Role::Ms2pip, Role::Mbr] {
+        for role in [Role::Rescore, Role::Ms2pip] {
             assert!(!role.wanted_by(&cfg), "{:?} has no optional state", role);
         }
 
@@ -1017,9 +1017,6 @@ mod tests {
         // the state the automatic multi-head default rides on.
         cfg.rt_im_train.library_irt = LibraryIrt::Auto;
         assert!(!Role::DeepLc.required_by(&cfg) && Role::DeepLc.wanted_by(&cfg));
-
-        cfg.mbr.strategy = mumdia_core::config::MbrStrategy::RtTransfer;
-        assert!(Role::Mbr.required_by(&cfg));
     }
 
     #[test]
@@ -1094,7 +1091,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("mumdia_pyres_{}", std::process::id()));
         let real = tmp.join("scripts");
         std::fs::create_dir_all(&real).unwrap();
-        std::fs::write(real.join("mbr_worker.py"), b"# test\n").unwrap();
+        std::fs::write(real.join("deeplc_worker.py"), b"# test\n").unwrap();
 
         // Configured value that exists and holds workers is used unchanged.
         let got = resolve_script_dir(&real.to_string_lossy(), None);
@@ -1105,7 +1102,7 @@ mod tests {
         std::fs::write(&cfg_file, b"{}").unwrap();
         let got = resolve_script_dir("scripts", Some(&cfg_file.to_string_lossy()));
         assert!(
-            Path::new(&got).join("mbr_worker.py").exists(),
+            Path::new(&got).join("deeplc_worker.py").exists(),
             "expected the config-relative scripts dir, got {got}"
         );
 
@@ -1121,14 +1118,11 @@ mod tests {
         // resolution left the literal "auto" in place for a role this configuration
         // never uses, and the experiment preflight then stat'ed it. After resolution an
         // unused role must be None: no interpreter was selected, because none is needed.
+        // `mbr.python` has no role since 0.15.0 and is still cleared the same way.
         let mut cfg = Config::default();
         cfg.rt_im_train.library_irt = LibraryIrt::Library;
         cfg.mbr.python = Some(AUTO.to_string());
         cfg.rescore.python = Some(AUTO.to_string());
-        assert!(
-            !Role::Mbr.required_by(&cfg),
-            "default config must not need MBR"
-        );
         assert!(
             !Role::Rescore.required_by(&cfg),
             "default classifier must be native"
@@ -1181,9 +1175,9 @@ mod tests {
         // An explicit path is not discovery, so it is preserved rather than cleared --
         // the run still warns that it is unused, which is the useful signal.
         let mut cfg = Config::default();
-        cfg.mbr.python = Some("/some/explicit/python".to_string());
+        cfg.rescore.python = Some("/some/explicit/python".to_string());
         resolve(&mut cfg).expect("an unused explicit path must not be validated");
-        assert_eq!(cfg.mbr.python.as_deref(), Some("/some/explicit/python"));
+        assert_eq!(cfg.rescore.python.as_deref(), Some("/some/explicit/python"));
     }
 
     #[test]

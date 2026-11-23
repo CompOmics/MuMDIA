@@ -91,14 +91,6 @@ fn diann_import(
     diann::import(Arc::clone(&state.diann), req)
 }
 
-/// Merge an empirical library with a predicted one into the two tables a search consumes,
-/// with DIA-NN predicting the decoys of the merged targets (#320). Progress is the library
-/// build's (`diann_build_state`).
-#[tauri::command(async)]
-fn diann_merge(state: tauri::State<'_, AppState>, req: diann::MergeRequest) -> Result<(), String> {
-    diann::merge(Arc::clone(&state.diann), req)
-}
-
 /// Progress of the library build, polled while it runs.
 #[tauri::command]
 fn diann_build_state(state: tauri::State<'_, AppState>) -> diann::BuildState {
@@ -1195,7 +1187,6 @@ fn main() {
             diann_acknowledge,
             diann_build,
             diann_import,
-            diann_merge,
             diann_build_state,
             thermo_status,
             thermo_install,

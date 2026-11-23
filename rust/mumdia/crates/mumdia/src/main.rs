@@ -214,9 +214,6 @@ enum Cmd {
         /// Per-candidate RT bounds (candidate_id, rt_lo, rt_hi). Omitted: whole gradient.
         #[arg(long)]
         run_windows: Option<String>,
-        /// MS1 spectra, for `prescreen.mass_hypotheses.ms1` only.
-        #[arg(long)]
-        ms1: Option<String>,
         #[arg(long)]
         out: String,
         #[arg(long)]
@@ -227,16 +224,9 @@ enum Cmd {
         /// Override `prescreen.target` (implies preset custom).
         #[arg(long)]
         target: Option<f64>,
-        /// Override `prescreen.top_peaks` (0 = uncapped).
-        #[arg(long)]
-        top_peaks: Option<usize>,
         /// Also write `<out>.scores.parquet`.
         #[arg(long)]
         write_scores: bool,
-        /// Evaluation only: score a seeded sample of about N candidates (survivors then cover
-        /// the sample only and are not an extract allowlist).
-        #[arg(long, default_value_t = 0)]
-        sample_candidates: usize,
         /// The database-free tag prefilter only: keep the candidates with an observed trimer
         /// in their isolation window (no fragment score; pass no --run-windows for the
         /// retention-time-free prefilter).
@@ -330,8 +320,8 @@ enum Cmd {
         #[arg(long)]
         fragment_offset: Option<u32>,
         /// The run's `cal.json` with its Q1 calibration (`rt_im_train.q1_calibrate`), which
-        /// `extract.q1_fragments` decides with and `extract.q1_deconvolved` /
-        /// `features.q1_deconvolved` read their tolerance from.
+        /// `extract.q1_fragments` decides with and `features.q1_deconvolved`
+        /// reads its tolerance from.
         #[arg(long)]
         q1_cal: Option<String>,
         #[arg(long)]
@@ -782,37 +772,6 @@ enum Cmd {
         /// spectra finds the library in the cache; `off` for every other acquisition.
         #[arg(long, value_enum, default_value_t = OnOff::Off)]
         ion_mobility: OnOff,
-    },
-    /// Cross-run RT alignment (experiment-level) -> alignment.parquet.
-    Align {
-        /// One seed_psms.parquet per run; the first is the reference.
-        #[arg(long, num_args = 1..)]
-        seed_psms: Vec<String>,
-        #[arg(long)]
-        out: String,
-        #[arg(long)]
-        config: Option<String>,
-    },
-    /// Match-between-runs identification transfer (Stage D3) -> transferred.parquet.
-    Mbr {
-        /// Experiment-wide scored_combined.parquet (has the `source` column).
-        #[arg(long)]
-        psms_scored: String,
-        /// Per-run psms.parquet in `source` order (one per run).
-        #[arg(long, num_args = 1..)]
-        psms_extracted: Vec<String>,
-        #[arg(long)]
-        out: String,
-        /// Optional augmented scored table: input scored with accepted transfers'
-        /// q_value lowered + is_transferred flag (for quant/report with q_filter=psm_q).
-        #[arg(long)]
-        out_psms_scored: Option<String>,
-        /// Optional per-run fragment_quant.parquet (source order) for the
-        /// fragment-consensus guard (needs mbr.consensus_corr_min > 0).
-        #[arg(long, num_args = 0..)]
-        frag: Vec<String>,
-        #[arg(long)]
-        config: Option<String>,
     },
     /// Print schema, head sample, and row count for any artifact.
     Inspect { artifact: String },
@@ -2410,9 +2369,6 @@ fn real_main() -> Result<()> {
                 out: &out,
                 out_pin: &out_pin,
                 cfg: &cfg.features,
-                // `retrace.apex_features` names the column a retraced psms_extracted
-                // carries; it is read only while the ion-mobility family is on.
-                imc_ref_w: cfg.retrace.apex_features,
                 q1_tolerances,
             })?;
         }
@@ -2440,14 +2396,11 @@ fn real_main() -> Result<()> {
             ms2,
             lib_precursors,
             run_windows,
-            ms1,
             out,
             config,
             preset,
             target,
-            top_peaks,
             write_scores,
-            sample_candidates,
             tags_only,
         } => {
             let mut cfg = load_config(&config)?;
@@ -2458,9 +2411,6 @@ fn real_main() -> Result<()> {
             if let Some(t) = target {
                 cfg.prescreen.preset = mumdia_core::config::PrescreenPreset::Custom;
                 cfg.prescreen.target = t;
-            }
-            if let Some(n) = top_peaks {
-                cfg.prescreen.top_peaks = n;
             }
             cfg.prescreen.write_scores |= write_scores;
             cfg.validate()?;
@@ -2475,11 +2425,9 @@ fn real_main() -> Result<()> {
                 ms2: &ms2,
                 library_precursors: &lib_precursors,
                 run_windows: run_windows.as_deref(),
-                ms1: ms1.as_deref(),
                 out: &out,
                 config: &cfg,
                 config_hash: &ch,
-                sample_candidates,
                 tags_only,
             })?;
         }
@@ -2937,68 +2885,6 @@ fn real_main() -> Result<()> {
                 cfg: &cfg.quant,
                 config_hash: &ch,
             })?;
-        }
-        Cmd::Align {
-            seed_psms,
-            out,
-            config,
-        } => {
-            let cfg = load_config(&config)?;
-            let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
-            stages::align::run(stages::align::AlignParams {
-                seeds: &seed_psms,
-                out: &out,
-                q_train: cfg.rt_im_train.q_train,
-                grid_n: 100,
-                config_hash: &ch,
-            })?;
-        }
-        Cmd::Mbr {
-            psms_scored,
-            psms_extracted,
-            out,
-            out_psms_scored,
-            frag,
-            config,
-        } => {
-            let cfg = load_config(&config)?;
-            if !cfg.mbr.strategy.transfers() {
-                anyhow::bail!(
-                    "`mumdia mbr` runs the rescuable-tier transfer, and mbr.strategy is {:?}; set \
-                     rt_transfer to run it. The default second_pass is run by `run-experiment`, \
-                     which searches every run again.",
-                    cfg.mbr.strategy
-                );
-            }
-            if psms_extracted.len() < 2 {
-                anyhow::bail!(
-                    "MBR needs >= 2 runs; got {} psms path(s)",
-                    psms_extracted.len()
-                );
-            }
-            let python = cfg.mbr.python.as_deref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "mbr.python (sidecar interpreter) is required when mbr.strategy != none"
-                )
-            })?;
-            let script = mumdia::sidecar::resolve_script(
-                &cfg.predict_frag.sidecar_script_dir,
-                "mbr_worker.py",
-            );
-            mumdia::sidecar::run_mbr(
-                python,
-                &script,
-                &psms_scored,
-                &psms_extracted,
-                &out,
-                out_psms_scored.as_deref(),
-                &frag,
-                cfg.mbr.q_anchor,
-                cfg.mbr.min_anchor_runs,
-                cfg.mbr.q_transfer,
-                cfg.mbr.consensus_corr_min,
-                cfg.rng_seed,
-            )?;
         }
         Cmd::Inspect { artifact } => {
             print!("{}", mumdia_io::inspect(&artifact)?);

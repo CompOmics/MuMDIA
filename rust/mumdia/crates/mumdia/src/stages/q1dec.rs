@@ -1,15 +1,16 @@
-//! Q1-deconvolved evidence of scanning-quadrupole spectra (`search_seed.q1_deconvolved`,
-//! `extract.q1_deconvolved`).
+//! Q1-deconvolved evidence of scanning-quadrupole spectra (`features.q1_deconvolved`).
 //!
 //! In a SCIEX ZT Scan DIA run the quadrupole sweeps the precursor range once a cycle in steps
 //! far smaller than its window, so a fragment ion shows up at one m/z in a run of consecutive
 //! steps of a cycle, centred where its precursor sits on the sweep. A peak can therefore be
 //! given a Q1 position of its own, before any candidate is considered: the centroid of the
 //! trace it belongs to along the Q1 axis. This module computes that position for every MS2
-//! peak of a run ([`Q1Dec::build`]), and the search stages then count a peak for a candidate
-//! only when its position lies within a tolerance of the candidate's expected Q1 centre, so a
-//! fragment m/z that another precursor shares, transmitted around that precursor's Q1 position,
-//! no longer counts for this one.
+//! peak of a run ([`Q1Dec::build`]), and a peak is consistent with a candidate when its
+//! position lies within a tolerance of the candidate's expected Q1 centre, so a fragment m/z
+//! that another precursor shares, transmitted around that precursor's Q1 position, is told
+//! apart ([`row_evidence`]). The hard counts that kept only the consistent peaks
+//! (`extract.q1_deconvolved`, `search_seed.q1_deconvolved`) lost identifications and were
+//! removed in 0.15.0 (docs/37_ztscan.md, section 10.3).
 //!
 //! **Traces.** Within one cycle, a peak of step `s` and a peak of step `s + 1` are linked when
 //! each is the other's nearest within the fragment tolerance (mutual nearest neighbours, so a
@@ -28,10 +29,9 @@
 //!
 //! **The expected centre** of a candidate ([`expected_centre`]) is the mean m/z of its
 //! precursor's averagine isotope envelope (the quadrupole transmits the whole envelope)
-//! less the calibrated window offset (`rt_im_train.q1_calibrate`, in extract) or the nominal
-//! zero offset (in the seed, which runs before the calibration). Extract's tolerance is
-//! learned from the confident seed PSMs by the Q1 calibration (`q1_calibration.deconvolution`,
-//! [`learn_tolerance`]); the seed's is [`SEED_TOL_STEPS`].
+//! less the calibrated window offset (`rt_im_train.q1_calibrate`). The tolerance is learned
+//! from the confident seed PSMs by the Q1 calibration (`q1_calibration.deconvolution`,
+//! [`learn_tolerance`]), with [`SEED_TOL_STEPS`] as the nominal fallback.
 //!
 //! Deterministic: links, splits and centroids run in step and m/z order; ties keep the lower
 //! index.
@@ -49,10 +49,10 @@ use crate::calibrate::{percentile, MAD_TO_SIGMA};
 pub const UNITS_PER_STEP: f64 = 8.0;
 /// A trace is split where it falls below this share of the smaller of the maxima either side.
 pub const VALLEY: f64 = 0.5;
-/// The seed's tolerance (steps) on a peak's Q1 centroid against the candidate's nominal
-/// expected centre. The seed runs before the Q1 calibration, so it reads the nominal window
-/// (no offset); the calibrated offset of the K562 ZT Scan runs stays within 0.4 steps of it
-/// across the precursor range (docs/08, section 4h).
+/// The nominal tolerance (steps) on a peak's Q1 centroid against the candidate's expected
+/// centre, which the Q1 calibration falls back to when it cannot learn one. The calibrated
+/// offset of the K562 ZT Scan runs stays within 0.4 steps of the nominal window across the
+/// precursor range (docs/08, section 4h).
 pub const SEED_TOL_STEPS: f64 = 2.0;
 /// The fallback tolerance rule without decoys: median plus this many robust standard
 /// deviations of the anchors' peaks' centroid offsets.
@@ -341,15 +341,14 @@ pub fn encode_shift(dx: f64, step: f64) -> i8 {
 }
 
 /// The admission of a peak for a candidate under the deconvolved evidence: its Q1 centroid
-/// within `tol_mz` of the expected centre of the candidate's matched fragment (extract), or of
-/// the candidate's envelope (the seed, which probes without fragment ordinals).
+/// within `tol_mz` of the expected centre of the candidate's matched fragment.
 pub struct Q1Gate {
     pub dec: Q1Dec,
     /// Per candidate of the stage (local ids), its expected centre.
     pub centre: Vec<f32>,
     /// Per candidate, the index of its first library fragment in `frag_shift`, and per
     /// library fragment its expected centre against its candidate's, in
-    /// 1/[`SHIFT_UNITS_PER_STEP`] steps; empty in the seed.
+    /// 1/[`SHIFT_UNITS_PER_STEP`] steps.
     pub frag_first: Vec<u32>,
     pub frag_shift: Vec<i8>,
     pub tol_mz: f64,
@@ -369,13 +368,6 @@ impl Q1Gate {
             None => 0.0,
         };
         (x - (self.centre[c] as f64 + shift)).abs() <= self.tol_mz
-    }
-
-    /// Whether peak `j` of `scan` counts for candidate `c`, against its envelope's centre.
-    #[inline]
-    pub fn admits(&self, c: usize, scan: &Ms2Scan, j: usize) -> bool {
-        let x = self.dec.centroid(scan, j);
-        (x - self.centre[c] as f64).abs() <= self.tol_mz
     }
 }
 

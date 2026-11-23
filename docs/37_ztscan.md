@@ -11,7 +11,7 @@ gate on the fragments that belong that was measured and not added, section 8 whe
 memory go, section 9 what is refused, section 10 the unfragmented precursor, multi-scale Q1
 scores and Q1-deconvolved evidence, section 11 the library, section 12 the recipe as released,
 measured, section 13 why deamidation must be left out, section 14 what is open, and section 15
-the cycle traces and the separable model of the RT x step patch, measured and kept opt-in. Since 0.12.0
+the cycle traces and the separable model of the RT x step patch, as measured. Since 0.12.0
 a search of ZT Scan files reads them with the half-width their isolation census suggests and
 runs the ZT Scan analysis, the keys of section 3 that measured positive, by default, whatever
 configuration it starts from; no other search does, and every other search runs exactly as
@@ -52,8 +52,8 @@ column unless the configuration rules it out, and on every other search it is of
 | key | on a ZT Scan search | held off when |
 |---|---|---|
 | `convert.isolation_half_width` | the census's suggestion: 2.5 steps, rounded to 0.05 m/z (1.9 for the K562 method) | (a value set is kept) |
-| `rt_im_train.q1_calibrate` | on | `groups.window_groups > 1`; nothing reads it (`extract.q1_fragments = false`, or `extract.q1_cycles`, and `extract.q1_deconvolved` off) |
-| `extract.q1_fragments` | on | the calibration is off; `extract.q1_cycles` |
+| `rt_im_train.q1_calibrate` | on | `groups.window_groups > 1`; nothing reads it (`extract.q1_fragments = false`) |
+| `extract.q1_fragments` | on | the calibration is off |
 | `extract.q1_traces` (the cycle-trace table `chromatograms_q1.parquet`, section 15) | on | `extract.q1_fragments` is off |
 | `features.q1_fragment_features`, `q1_precursor`, `q1_multiscale`, `q1_deconvolved`, `q1_consistency` | on | `extract.q1_fragments` is off; `features.set` other than `extended` |
 | `retrace.q1_repick` (`q1_repick_peaks` stays 5) | on | `extract.q1_fragments` is off; `extract.promote_top_peaks > 1`, `extract.apex_refine_intensity` or `retrace.repick` |
@@ -65,10 +65,10 @@ When a key is held off on ZT Scan input the log says which and why. These are th
 recipe (`configs/examples/diann-library.json`) resolved on a ZT Scan run has exactly the
 canonical configuration of `ztscan.json`, and so the same configuration hash and the same
 tables (section 12). What stays opt-in, as before: the classifier's sensitivity settings
-(section 4), the counts of Q1-consistent peaks (`extract.q1_deconvolved`,
-`search_seed.q1_deconvolved`, section 10.3), `features.ms1_envelope`, `quant.q1_fragments`,
-`extract.q1_cycles`, `extract.q1_profile`, `features.q1_features`, the separable model
-(`features.q1_separable`) of section 15, and the MS1 calibration keys of docs/09 section 11.
+(section 4), `quant.q1_fragments`. The MS1 calibration keys of docs/09 section 11 and the Q1 sweep keys (`extract.q1_cycles`, `extract.q1_profile`,
+`extract.q1_gate_max_offset`, `features.q1_features`), `features.ms1_envelope` and the separable model of section 15
+(`features.q1_separable`) were removed in 0.15.0, as were the counts of Q1-consistent peaks
+(`extract.q1_deconvolved`, `search_seed.q1_deconvolved`, section 10.3).
 
 **Spelling, and the configuration hash.** Each switch takes `"auto"`, `true` or `false`;
 `quant.q1_cycle_halfwidth` a number of cycles (0 is off), `"auto"` or `null`;
@@ -220,9 +220,9 @@ files"). The others stay opt-in.
 | layer | key | canonical section | measured | in the recipe (automatic) |
 |---|---|---|---|---|
 | read each step as a window, record the sweep | `convert.isolation_half_width` | docs/04, "SCIEX ZT Scan DIA" | required to read the file at all | yes (1.9; automatically the census's suggestion) |
-| sum a cycle's steps, a Q1-profile family, a gate on it | `extract.q1_cycles`, `extract.q1_profile`, `extract.q1_gate_max_offset`, `features.q1_features` | docs/09, section 10 | summing -13.7%; the profile family +0.4% inside seed noise; the gate cuts targets and decoys alike | no |
+| sum a cycle's steps, a Q1-profile family, a gate on it | `extract.q1_cycles`, `extract.q1_profile`, `extract.q1_gate_max_offset`, `features.q1_features` | docs/09, section 10 | summing -13.7%; the profile family +0.4% inside seed noise; the gate cuts targets and decoys alike | removed in 0.15.0 |
 | calibrate the Q1 window from the seed | `rt_im_train.q1_calibrate` | docs/08, section 4h | the target is the window centre; an effective window wider and softer than nominal; changes no identification by itself | yes (the decisions need it) |
-| MS1 error surface and an MS1 tolerance from the seed | `extract.ms1_calibrate = "surface"`, `extract.prec_tol_auto` | docs/09, section 11 | +0.46% precursors, inside seed noise | no |
+| MS1 error surface and an MS1 tolerance from the seed | `extract.ms1_calibrate = "surface"`, `extract.prec_tol_auto` | docs/09, section 11 | +0.46% precursors, inside seed noise | no (removed in 0.15.0) |
 | decide per fragment whether it belongs | `extract.q1_fragments` | docs/09, section 12 | with its features: +1.26% human precursors at the base arm's measured FDP | yes |
 | the decisions as features | `features.q1_fragment_features` | docs/10 | (with the decisions, above) | yes |
 | re-pick the apex in RT x Q1 | `retrace.q1_repick` | docs/09, section 12 | +1.64 points on top, the largest single lever | yes |
@@ -230,17 +230,17 @@ files"). The others stay opt-in.
 | the Q1 term of shadow demotion | `rescore.shadow_q1` | docs/11, "shadow demotion and its Q1 term" | counts within noise; lowers the entrapment precursors at 1% (the measured FDP at a reported 1%: 1.29% to 1.22%) | yes |
 | quantify from the fragments that belong | `quant.q1_fragments` | docs/12, "Quantification from the fragments that belong" | replicate CV 0.120 against 0.273; restricting to belonging fragments costs precision against the collapse alone; the known-ratio gate is open | no |
 | the quantification window in Q1 cycles | `quant.q1_cycle_halfwidth` | section 6 below | replicate CV 0.102 at 4 cycles against 0.273, the identifications unchanged | yes (4) |
-| an MS1 isotope-envelope family | `features.ms1_envelope` | docs/10 | within noise (+0.01% at matched FDP) | no |
+| an MS1 isotope-envelope family | `features.ms1_envelope` | docs/10 | within noise (+0.01% at matched FDP) | removed in 0.15.0 |
 | the unfragmented precursor's Q1 profile in MS2 | `features.q1_precursor` | docs/09, section 14 | +0.13% precursors, +0.65% human precursors at matched FDP, inside the seed spread; in the three-family set it carries 0.16% | yes |
 | multi-scale Q1 scores (3, 7, 11 steps) | `features.q1_multiscale` | docs/09, section 14 | +0.32% / +0.09%, inside the seed spread; nothing on top of the other two | yes |
 | Q1-deconvolved evidence as features | `features.q1_deconvolved` | docs/09, section 14 | +0.51% precursors, +0.64% at matched FDP, just beyond the seed spread | yes |
 | the three together | (the three keys) | section 10 below | +0.76% precursors, +1.38% human precursors at matched FDP, beyond the seed spread on both libraries | |
-| count only Q1-consistent peaks in the seed, in extract | `search_seed.q1_deconvolved`, `extract.q1_deconvolved` | docs/07, docs/09 section 14 | -2.5% (seed), -25.6% (extract), -38% (both) | no |
+| count only Q1-consistent peaks in the seed, in extract | `search_seed.q1_deconvolved`, `extract.q1_deconvolved` | docs/07, docs/09 section 14 | -2.5% (seed), -25.6% (extract), -38% (both) | removed in 0.15.0 |
 | score each fragment's Q1 centre against its expected one | `features.q1_consistency` | docs/10, "q1_consistency" | on top of the four: +2.97% human precursors at the measured FDP and +2.48% precursors on the human library (the family alone, its columns kept out of the rescore prefilter: +2.28% and +1.85%) | yes |
 | the library's search space: charges 1-4, lengths 6-40, protein N-terminal acetylation, two variable modifications | the library build (`digest.*`, `peptidoforms.*`, or the predictor of an imported library) | section 11 below | +3.47% precursors, +4.09% human precursors at matched FDP, the measured FDP 1.18% against 1.22%; two missed cleavages -1.0% | the desktop sets it with the analysis; `run` names what differs for a FASTA library |
 | the sensitivity rescore | `rescore.folds` 5, `rescore.train_margin_frac` 0.75, `rescore.seeds` 3 | docs/28, section 21; section 11 below | on the section 11 library +1.24% / +0.57% at matched FDP; on top of the released recipe +0.82% / +0.78% (section 12), for 2-6x the rescore time | no (an option for a final pass, section 4) |
 | write the traces once more on Q1 cycles, beside the chromatograms | `extract.q1_traces` | docs/09, section 15; section 15 below | no identification changes (no stage reads the table), +2.9% wall, +7.7 GB; in place of the interleaved traces -1.2% to -4.7% | yes (for drawing; since 2026-11-13) |
-| the separable model of the RT x step patch (one elution profile, each fragment's transmission) | `features.q1_separable` | docs/09, section 15; section 15 below | +0.34% human precursors at matched FDP, -0.17% precursors, inside the seed spread; quantifying from its amplitudes: replicate CV 0.165 against 0.104 (dropped) | no |
+| the separable model of the RT x step patch (one elution profile, each fragment's transmission) | `features.q1_separable` | docs/09, section 15; section 15 below | +0.34% human precursors at matched FDP, -0.17% precursors, inside the seed spread; quantifying from its amplitudes: replicate CV 0.165 against 0.104 (dropped) | removed in 0.15.0 |
 | N/Q deamidation in the library | the library build | section 13 below | precursors +80%, half of them isotope aliases of co-eluting unmodified peptides, at a decoy and entrapment FDP that read as valid; peptides -11%, protein groups -7% | no (leave it out; the desktop warns) |
 
 The four decision keys of the recipe are the phase-2 set, measured together: +3.0%
@@ -668,24 +668,20 @@ byte; 2 is the setting to take when extract's time matters more than half a perc
   Scan run read as one all-ion window does (`extract.max_footprint_gib`, docs/09).
 - Every sweep key on a layout that is not a scanning quadrupole, on spectra with 1/K0, and,
   through `rt_im_train.q1_calibrate`, with `groups.window_groups > 1`.
-- `extract.q1_fragments` without `rt_im_train.q1_calibrate`, with `extract.q1_cycles`, and on
+- `extract.q1_fragments` without `rt_im_train.q1_calibrate`, and on
   spectra_ms2 that is not v3 or whose recorded step is not the rank of its target.
 - `features.q1_fragment_features`, `retrace.q1_repick` and `rescore.shadow_q1` without
   `extract.q1_fragments`; `retrace.q1_repick` with `promote_top_peaks > 1`,
   `retrace.repick` or `extract.apex_refine_intensity`; `rescore.shadow_q1` with
   `shadow_min_shared = 0`; `retrace.q1_repick_peaks` without `retrace.q1_repick`.
 - `quant.q1_fragments` without `extract.q1_fragments` or with `fragment_selection =
-  cross_run`; `q1_min_belonging = 0`; `q1_integration = elution_fit` without the scan form of
-  the fixed window; its three companions without it.
+  cross_run`; `q1_min_belonging = 0`; `q1_min_belonging` without it.
 - `quant.q1_cycle_halfwidth` without the scan form of the fixed window or with
   `fixed_scan_halfwidth_scale`; `mumdia quant` with it and no `--spectra-ms2`.
-- `features.ms1_envelope` on spectra with 1/K0 and with window groups.
-- `extract.q1_traces` set to `true` and `features.q1_separable` on any input that is not a ZT
-  Scan run, and either without `extract.q1_fragments`.
+- `extract.q1_traces` set to `true` on any input that is not a ZT Scan run, and without
+  `extract.q1_fragments`.
 - `features.q1_precursor`, `features.q1_multiscale` and `features.q1_deconvolved` without
-  `extract.q1_fragments`; `extract.q1_deconvolved` without `rt_im_train.q1_calibrate` or with
-  `extract.q1_cycles`; `search_seed.q1_deconvolved` with `count_fragments_once`; both
-  `q1_deconvolved` keys with `groups.window_groups > 1`, on spectra with 1/K0 and on
+  `extract.q1_fragments`; `features.q1_deconvolved` on spectra with 1/K0 and on
   spectra_ms2 without the recorded sweep.
 
 ## 10. The unfragmented precursor, multi-scale Q1 scores and Q1-deconvolved evidence
@@ -781,8 +777,8 @@ is cleaner, but a quarter of the real precursors no longer meet the presence rul
 entrapment library the extract form keeps 73,653 human precursors at the matched FDP
 (73,476-73,868, -24.5%) and both forms 61,671 (-36.7%), at a lower measured FDP at a reported
 1% (1.09-1.19% and 1.05-1.13% against 1.25-1.31%): a smaller pool, not a better ranking. The
-hard forms stay off: they are a speed lever (extract 209 s against 559 s) with an
-identification loss no tolerance removed. The 2-step arm was run with a development build that
+hard forms were a speed lever (extract 209 s against 559 s) with an identification loss no
+tolerance removed, and 0.15.0 removed them. The 2-step arm was run with a development build that
 overrode the learned tolerance; the shipped keys have no such override.
 
 The same evidence as features (`features.q1_deconvolved`, the extraction unchanged) separates
@@ -889,8 +885,8 @@ their features are label-blind. So `configs/examples/ztscan.json` sets `features
 `features.q1_multiscale` and `features.q1_deconvolved`. All three, rather than the two that
 carry most of it: leaving the multi-scale family out costs 0.34% on the entrapment library, and
 the set was measured as a whole. The keys that count only Q1-consistent peaks
-(`search_seed.q1_deconvolved`, `extract.q1_deconvolved`) lose identifications at every
-tolerance and stay off and out of the recipe. The three families are automatic for ZT Scan
+(`search_seed.q1_deconvolved`, `extract.q1_deconvolved`) lost identifications at every
+tolerance and were removed in 0.15.0. The three families are automatic for ZT Scan
 files since 0.12.0, as the rest of the recipe is ("Automatic for ZT Scan files").
 
 ## 11. The library for a ZT Scan search
@@ -1236,7 +1232,7 @@ A = targets at a precursor q of 1%, D = decoys, L = targets scored below the dec
   (one elution profile shared by the fragments that belong, each fragment's calibrated transmission
   at the shared centre, an amplitude and a floor per fragment), ten `q1s_*` features and, per row,
   the profile, its cycles' retention times and each fragment's amplitude, R^2 and interference share
-  (psms_extracted v9).
+  (psms_extracted v9). Removed in 0.15.0.
 
 **Measured.** REP01, the section 11 libraries, the v0.12.0 release binary as the base (its runs
 reproduce the released arms of section 12 byte for byte: 105,788 precursors on the human library
@@ -1322,7 +1318,7 @@ their place, because in their place they cost identifications. It is automatic f
 7.7 GB, and change no identification); `false` turns it off, and the desktop application's "ZT Scan
 analysis" box, cleared, writes it off with the other keys. A ZT Scan search with the automatic
 analysis therefore writes the same tables as 0.12.0 plus `chromatograms_q1.parquet`, and its
-configuration hash changes (the resolved key is part of it). `features.q1_separable` is opt-in
-(inside the seed spread). Quantifying
+configuration hash changes (the resolved key is part of it). `features.q1_separable` stayed opt-in
+(inside the seed spread) and was removed in 0.15.0. Quantifying
 from the separable amplitudes, the apex, gate and re-pick on cycles and the separable elution window
 were measured, lost, and are not in the code.

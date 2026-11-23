@@ -67,9 +67,7 @@ competition columns default to 0.0 when absent: `contested_frac`,
 With the ion-mobility family on (see `ion_mobility` below), the 1/K0 evidence of
 `psms_extracted` v4 is read as well (`opt_f64`, all `None` when absent): `apex_im`,
 `apex_im_mad`, `ms1_apex_im`, `im_pred_cal`. With the family off they are not read.
-Under `retrace.apex_features` (`FeaturesParams::imc_ref_w`) the family also reads
-retrace's `imc_ref_w` (f64), which must then be present; a table without it is an error,
-not a column of zeros. After a retrace the apex scalars this stage reads
+After a retrace the apex scalars this stage reads
 (`apex_rt`, `apex_im`, `apex_intensity`, `n_matched_fragments`, `ms1_mono`, `ms1_iso1`,
 `ms1_iso2`) are the patched raw-trace values (docs/09 section 9).
 
@@ -85,27 +83,20 @@ Either chromatogram layout is read (docs/15_data_dictionary.md, "Layout v2").
 `ChromStream` passes every v2 row through a `chromatograms::Decoder` before the row
 is stored, so a chunk holds exactly the v1 rows and every feature is the same. The
 main pass starts each chunk at a candidate's first row, where the decoder needs
-nothing earlier. The confident-bounds pass reads sub-chunks on the absolute
-`chunk_rows` grid, which can start inside a row group and inside a candidate. There
-`ChromStream::open_at` opens the table at that row group's first row and follows the
-rows before the sub-chunk through the decoder without keeping them, so the samples
-are v1's in order, bit for bit.
+nothing earlier.
 
 With the ion-mobility family on, the main pass also reads each row's per-point 1/K0
 list where the table has one (`im` in chromatograms v3, `im_trimmed` in v4):
 `ChromStream::open(ch, want_im)` projects it, the decoder rebuilds a v4 list with the
 trace's `+0.0` margins (`Decoder::row_im`), and the chunk stores it on the intensities'
-offsets (`RowSet::im_vals`, `ChromRow::im`). `want_im` is the resolved family switch;
-the confident-bounds pass (`open_at`) never reads it. On a 4D run the list roughly
+offsets (`RowSet::im_vals`, `ChromRow::im`). `want_im` is the resolved family switch. On a 4D run the list roughly
 doubles the resident trace memory of a chunk. With the family off, and on any table
 without the list, the projection and the stored chunk are what they were.
 
 ### Consumed: seed PSMs (optional, `features.rs:620`-`652`)
 
 `candidate_id` (u32), `score` (f64), `spectrum_q` (f64), `label` (str). Builds
-the `candidate_id -> seed score` and `-> identified flag` maps, and the
-confident-target set (`spectrum_q <= 0.01` and `label == "target"`) used for
-`bound_from_confident`.
+the `candidate_id -> seed score` and `-> identified flag` maps.
 
 ### Produced: features Parquet (`features.rs:912`-`931`)
 
@@ -147,12 +138,8 @@ Control flow of `run` (`features.rs:548`):
    splitting off `ms1_*` rows into `ms1x` (`features.rs:591`-`618`). A
    `ChromRow` (`features.rs:279`) holds `frag_name`, `frag_mz`, `frag_obs_mz`,
    `pred_int`, and the `rt`/`inten` vectors.
-3. Build the seed maps and confident-target set from the optional seed table
-   (`features.rs:620`-`652`).
-4. If `bound_from_confident` is set, learn a global elution half-width
-   (see "bound_from_confident" below), producing `Option<(L, R)>` in seconds
-   (`features.rs:658`-`702`).
-5. Compute the gradient as `max(apex_rt).max(1.0)` (`features.rs:704`); this is
+3. Build the seed maps from the optional seed table (`features.rs:620`-`652`).
+4. Compute the gradient as `max(apex_rt).max(1.0)` (`features.rs:704`); this is
    the run length used to normalize RT errors.
 6. Compute the three cross-charge corroboration columns by grouping rows by
    `peptidoform` (`features.rs:714`-`734`).
@@ -287,7 +274,7 @@ section). It mirrors the alignment and peak-bounding of
 
 In the chunked pass the parts are built once per PSM and shared with
 `fragment_features`: `apex_intensities` (the nearest-apex intensity per row),
-`peak_window` (the elution-peak window; global half-widths or the walk down the
+`peak_window` (the elution-peak window: the walk down the
 smoothed top-3 profile), and `PeakTraces` (the window, the sliced traces, both
 reference profiles and a `PairStats`). `evidence_from` then assembles the
 Evidence from them. `build_evidence` is a test-only (`#[cfg(test)]`) wrapper
@@ -331,15 +318,12 @@ The registry the battery reads is `families(im)`, three layers deep:
    on by default since 2026-10-08 and left out by `MUMDIA_WINDOW_FEATURES=0` or
    `MUMDIA_RTW_FEATURES=0` (which restores the previous schema). It is read once
    per process: its `OnceLock` holds only these environment-gated families;
-3. `families(im)`, which appends `ion_mobility` when `im` is on, and after it the
-   one-name family of `imc_ref_w` under `ImFamily::WithImcRefW`. `im` is an
-   `ImFamily` (`Off`, `On`, `WithImcRefW`; a `bool` converts to the first two):
-   `features.im_features` as the run or experiment resolved it, with `imc_ref_w` when
-   `retrace.apex_features` is on in a pass that retraced. It is passed into
+3. `families(im)`, which appends `ion_mobility` when `im` is on. `im` is an `ImFamily` (`Off`, `On`; a `bool` converts to it): `features.im_features`
+   as the run or experiment resolved it. It is passed into
    `active_features(set, im)`, `extended_name_refs(im)`, `extended_value_plan(im)`
    and `extended_values(e, im)`. Nothing latches it, so the schema id an orchestrator
    records (`active_features_of(config, has_im)`), the features stage and the rescore
-   projection read one list. Each of the three resulting lists is built once.
+   projection read one list. Each of the two resulting lists is built once.
 
 Deduplication (`extended_name_refs`, `features.rs:84`): a name that already
 appears in `MINIMAL_FEATURES` or `RICH_EXTRA` (`reserved_names`,
@@ -349,8 +333,8 @@ collisions: `spectral_angle` (similarity vs Minimal), `rt_error_abs` (rt vs
 Minimal), `peptide_length` and `seed_identified` (novel vs Minimal/Rich). So the
 380 raw family names of the default registry (sixteen families plus `window` and
 `rt_window`) reduce to 376 unique Extended names, the nine `ion_mobility` names
-make 385 when the family is on, and `imc_ref_w` makes 386 under
-`retrace.apex_features`.
+make 385 when the family is on (`retrace.apex_features` added `imc_ref_w` as a 386th
+until it was removed in 0.15.0).
 
 ## The three feature sets
 
@@ -669,7 +653,7 @@ window is `psms_extracted`'s `rt_lo`/`rt_hi` (`extract.emit_rt_window`) and the 
 half-width the smallest over all rows; all 0 without them. Appended after `window`
 by `env_families()`; `MUMDIA_RTW_FEATURES=0` leaves it out.
 
-### ion_mobility (9, or 10 with `imc_ref_w`; `im.rs`)
+### ion_mobility (9; `im.rs`)
 
 The 1/K0 evidence of a diaPASEF run (docs/35_diapasef.md). In the battery only when
 `features.im_features` resolves on (`off` by default; `auto` is on when the spectra
@@ -691,13 +675,9 @@ from `psms_extracted` v4 and three from the per-point 1/K0 of the chromatograms:
   and the SD of the per-fragment mean 1/K0 weighted by each fragment's summed
   intensity (0 with fewer than two fragments). `stats::weighted_mean_sd` is the
   kernel;
-- `imc_ref_w` (`im::APEX_NAMES`), the tenth, only under `retrace.apex_features`:
-  retrace's apex 1/K0 agreement of the fragments, the predicted-intensity-weighted
-  mean leave-one-out reference correlation of each fragment's raw 1/K0 profile at the
-  apex (`stats::loo_ref_corr`, the kernel of `frag_loo_ref_corr_*` and of the
-  interference family's prune; docs/09 section 9). Measured on the IM branch: +1.3%
-  peptides alone on E. coli (three seeds), and the added peptides carried about 2.7%
-  FDP, so it stays off until an entrapment recheck.
+- `imc_ref_w`, a tenth feature under `retrace.apex_features`, was removed in 0.15.0:
+  measured on the IM branch, +1.3% peptides alone on E. coli (three seeds), and the added
+  peptides carried about 2.7% FDP.
 
 A missing input gives 0.0, so the columns are constant on a 3D run, and there is no
 data gate on column presence: the switch alone decides whether the columns exist.
@@ -717,18 +697,12 @@ branch's 1/K0 width and peak-shape block (P7) lost 0.9% and is not ported, and a
 shared-Gaussian co-elution fit separated no better than `xcorr_shape` (docs/35 section 12).
 The diaPASEF recipe (`configs/examples/diapasef.json`) sets `im_features = on`.
 
-### q1_profile (4; `features.q1_features`)
+### q1_profile (removed in 0.15.0)
 
-Scanning-quadrupole spectra (SCIEX ZT Scan DIA) only. In the battery only when
-`features.q1_features` is on (`false` by default), which needs `extract.q1_profile`:
-`q1_corr`, `q1_offset`, `q1_frag_sd` and `q1_bin_frac`, read under the same names from
-psms_extracted v5 and appended after every other column of the `extended` set
-(`Q1_FEATURES`); `minimal` and `rich` ignore the switch. They describe how the matched
-intensity of the five apex cycles is spread over the Q1 bins that cover the precursor,
-against the transmission profile its m/z predicts (docs/09_extract.md, section 10). The
-switch comes from the configuration, as the schema id the orchestrators record does, so
-a psms_extracted table without the columns is an error rather than zeros. Nothing reads
-a label. Measured on one ZT Scan run: +0.4% precursors (mean of four NN seeds, inside
+`features.q1_features` appended `q1_corr`, `q1_offset`, `q1_frag_sd` and `q1_bin_frac` from
+psms_extracted v5 (`extract.q1_profile`): how the matched intensity of the five apex cycles
+spread over the Q1 bins that cover the precursor, against the transmission profile its m/z
+predicts (docs/09_extract.md, section 10). 0.15.0 removed it. Measured on one ZT Scan run: +0.4% precursors (mean of four NN seeds, inside
 the seed range), +0.4% in a three-run experiment, +0.1% human precursors on an
 entrapment library at a combined FDP of 1.32% against 1.39%.
 
@@ -738,8 +712,7 @@ Scanning-quadrupole spectra (SCIEX ZT Scan DIA) only. In the battery only when
 `features.q1_fragment_features` is on (`false` by default), which needs
 `extract.q1_fragments`: the per-candidate summary of the per-fragment Q1 decision
 (docs/09_extract.md, section 12), read under the same names from psms_extracted v6 and
-appended after every other column of the `extended` set, after the `q1_profile` family when
-both are on (`Q1F_FEATURES`); `minimal` and `rich` ignore the switch.
+appended after every other column of the `extended` set (`Q1F_FEATURES`); `minimal` and `rich` ignore the switch.
 
 | feature | meaning |
 |---|---|
@@ -761,62 +734,33 @@ Scan run with `extract.q1_fragments`: +1.45% precursors (mean of four NN seeds, 
 seed range), +1.26% human precursors on an entrapment library at the base arm's measured FDP;
 with `retrace.q1_repick` +2.96%.
 
-### ms1_envelope (9; `features.ms1_envelope`)
+### ms1_envelope (removed in 0.15.0)
 
-In the battery only when `features.ms1_envelope` is on (`false` by default), appended after
-every other column of the `extended` set, after both Q1 families when they are on
-(`MS1E_FEATURES`, `stages/ms1env.rs`); `minimal` and `rich` ignore the switch. The `ms1`
-family reads the precursor at the apex alone: three isotopes and M-1, each the summed
-intensity within `extract.prec_tol_ppm` in the nearest MS1 scan, and no m/z, so an
-interfering peak inside the tolerance counts as the precursor's. This family reads, in the
-MS1 scans around the apex (the nearest one and two either side), the peak NEAREST each of the
-isotopes M-1 to M+4 and the half-spacing positions above M0 and M+1, at the calibrated MS1 m/z
-of each scan (`extract.ms1_calibrate`, the per-m/z and per-retention-time surface under
-`"surface"`), within twice `extract.prec_tol_ppm` and at least 10 ppm, so the m/z error is
-measured rather than cut at the tolerance. Extract writes that evidence to psms_extracted v7
-(docs/09_extract.md, section 13; `ExtractConfig::ms1_envelope`, which `run`,
-`run-experiment` and `mumdia extract` set from this key), and the features stage derives:
-
-| feature | meaning |
-|---|---|
-| `ms1e_env_r2` | the share of the observed M0..M+4 envelope (summed over the scans) the averagine envelope explains, `1 - |o - a e|^2 / |o|^2` at the least-squares scale `a >= 0`; 0 without signal |
-| `ms1e_env_n` | isotopes found in a row from M0 (0 to 5) |
-| `ms1e_m1_share` | M-1 against M-1 plus M0: another envelope one spacing below, or a monoisotopic peak assigned too high |
-| `ms1e_half_share` | the half-spacing positions against them plus M0 and M+1: a species of twice the charge, or a charge assigned too low |
-| `ms1e_spacing_ppm` | the intensity-weighted mean of `|ppm(k + 1) - ppm(k)|` over consecutive isotopes found among M0..M+4, the deviation of their spacing from `1.00335 / z` in ppm of the precursor m/z; 10 without a pair |
-| `ms1e_mono_ppm` | the M0 error after the calibration, intensity-weighted over the scans, signed; 0 when M0 is not found |
-| `ms1e_mono_ppm_abs` | its absolute value; 10 when M0 is not found |
-| `ms1e_ibar_dev` | the observed envelope's mean isotope index over M0..M+4 against the averagine one |
-| `ms1e_q1_agree` | under `extract.q1_fragments`, the distance in Q1 steps between the fitted Q1 centre of the candidate's fragments (`q1f_centre`) and the centre its OBSERVED MS1 envelope predicts, `|mu + sp (ibar_averagine - ibar_observed) / step|`; 0 without a fit or without the decisions |
-
-The envelope model is the Poisson averagine envelope (the shared
-`constants::averagine_isotopes`), not the peptide's own composition. No existing feature reads
-an MS1 m/z: `precursor_mass_error_ppm` was left out of `mass_accuracy` for want of one. The
-overlap with the `ms1` family is `ms1e_env_r2` and `ms1e_m1_share` against
-`ms1_isotope_cosine_apex` and `iso_minus_one_fraction`, which this family reads over five scans,
-five isotopes and the nearest peak rather than the apex scan's summed window. Refused on
-spectra with 1/K0 and with `groups.window_groups > 1`. The schema id changes only with the
-family on. Every value is read from the spectra and the library; nothing reads a label.
+`features.ms1_envelope` appended nine `ms1e_*` features derived from the MS1 isotope envelope
+that extract read around the apex (psms_extracted v7, docs/09_extract.md, section 13): the
+envelope's agreement with averagine, the isotopes found, the M-1 and half-spacing shares, the
+spacing and monoisotopic m/z errors, the mean isotope index and, under `extract.q1_fragments`,
+the Q1 centre the envelope predicts. 0.15.0 removed it on this measurement.
 
 Measured on ZT Scan REP01 (ZenoTOF 8600 K562, the phase-2 keys on in every arm, four NN seeds
 per arm, one binary and one host per library): with the family, human precursors at the base
 arm's measured entrapment FDP (1.22%) +0.01% (97,236 against 97,225; seed ranges 96,987-97,518
 and 96,992-97,540), precursors on the human library +0.05% (99,855 against 99,804; 99,635-100,068
 and 99,661-100,034), combined FDP at a reported 1% 1.25% against 1.22%; with
-`extract.ms1_calibrate = "surface"` under it -0.26% and +0.19%, the surface alone -0.19% and
+`extract.ms1_calibrate = "surface"` (removed in 0.15.0) under it -0.26% and +0.19%, the surface alone -0.19% and
 -0.33%. Within the seed spread everywhere: the family adds nothing the classifier did not
 have. Among the rows whose untrained `prelim_score` is below the decoys' median, the
 Kolmogorov-Smirnov statistic of decoys against targets is 0.0007-0.0050 for every `ms1e_*`
 feature (0.0005-0.0054 for `n_matched_fragments`, `frag_corr`, `log_apex_intensity`,
 `coelution_mean`, `rt_error_abs`), while the accepted targets differ (`ms1e_env_r2` median 0.60
 against 0.26, `ms1e_mono_ppm_abs` 3.5 against 7.9 ppm, `ms1e_q1_agree` 0.42 against 3.2 steps).
-Extract +0.6% wall on the entrapment library. Off by default.
+Extract +0.6% wall on the entrapment library.
 
 ### q1_precursor (8; `features.q1_precursor`)
 
 Scanning-quadrupole spectra only. In the battery only when `features.q1_precursor` is on
 (`false` by default), which needs `extract.q1_fragments`; appended after every other column of
-the `extended` set, after the `ms1_envelope` family when that is on (`Q1P_FEATURES`). The
+the `extended` set (`Q1P_FEATURES`). The
 unfragmented precursor's isotopes M0, M+1 and M+2 read in the MS2 steps of the per-fragment
 decision's patch, each at its own Q1 position (docs/09_extract.md, section 14), under the same
 names from psms_extracted v8: `q1p_n_iso`, `q1p_share`, `q1p_offset`, `q1p_resid`,
@@ -841,8 +785,8 @@ calibration, which learns the tolerance); appended after `q1_multiscale`, before
 centroid along the sweep against the expected Q1 centre of the library fragment it matches, in
 the apex cycle and the two either side: `q1d_n_frag`, `q1d_n_incons`, `q1d_share`,
 `q1d_pred_share`, `q1d_apex_share` (docs/09_extract.md, section 14). The extraction is not
-changed; `extract.q1_deconvolved`, which counts only the consistent peaks, is the hard form of
-the same evidence.
+changed; `extract.q1_deconvolved`, which counted only the consistent peaks, was the hard form of
+the same evidence and was removed in 0.15.0.
 
 For all three the switch comes from the configuration, so a psms_extracted table without the
 columns is an error rather than zeros, and the schema id changes only with a family on. Every
@@ -851,17 +795,13 @@ untrained `prelim_score` is below the decoys' median the Kolmogorov-Smirnov stat
 against targets is at most 0.008 for every one of the 25 features (the reference features
 0.0005-0.006). What they measured, alone and together, is in docs/37_ztscan.md, section 10.
 
-### q1_separable (10; `features.q1_separable`)
+### q1_separable (removed in 0.15.0)
 
-Scanning-quadrupole spectra only, opt-in (`false` by default, refused on any other input), needs
-`extract.q1_fragments`; appended after `q1_deconvolved`, before `q1_consistency` when that is on
-(`Q1SEP_FEATURES`): the psms_extracted v9 columns of each row's separable model
-(docs/09_extract.md, section 15): `q1s_r2`, `q1s_r2_pred`, `q1s_interf_pred`, `q1s_explained`,
-`q1s_bg_share`, `q1s_amp_cos`, `q1s_amp_corr`, `q1s_n_fit`, `q1s_fwhm`, `q1s_apex_offset`
-(docs/15_data_dictionary.md). Label-blind (low-score decoys against low-score targets, KS
-0.0010-0.0053); measured inside the seed spread on both ZT Scan libraries (+0.34% human precursors
-at the matched entrapment FDP, -0.17% precursors on the human library; docs/37_ztscan.md, section
-15), so not automatic.
+`features.q1_separable` appended ten `q1s_*` features of each row's separable RT x step model
+(psms_extracted v9, docs/09_extract.md, section 15). Label-blind (low-score decoys against
+low-score targets, KS 0.0010-0.0053); measured inside the seed spread on both ZT Scan libraries
+(+0.34% human precursors at the matched entrapment FDP, -0.17% precursors on the human library;
+docs/37_ztscan.md, section 15), so 0.15.0 removed it.
 
 ### q1_consistency (16; `features.q1_consistency`)
 
@@ -870,7 +810,7 @@ Scanning-quadrupole spectra (SCIEX ZT Scan DIA) only. In the battery only when
 the per-fragment Q1 decisions of psms_extracted v6 (`q1f_frag_class`, `q1f_frag_offset`,
 `q1f_frag_corr2d`, library order) read against each fragment's EXPECTED Q1 centre rather
 than the centre its candidate's fragments share (`stages/q1consist.rs`), appended after every
-other column of the `extended` set (`Q1C_FEATURES`, after `ms1_envelope`, `q1_precursor`,
+other column of the `extended` set (`Q1C_FEATURES`, after `q1_precursor`,
 `q1_multiscale` and `q1_deconvolved` when they are on);
 `minimal` and `rich` ignore the switch.
 
@@ -955,33 +895,22 @@ another. Because the family registry order is frozen and append-only, appending
 a new family or feature at the end changes the id predictably while leaving all
 prior positions stable.
 
-## bound_from_confident (elution-boundary calibration, `features.rs:658`)
+## Elution-peak bounds
 
-`bound_from_confident` defaults to false since 2026-10-04: every candidate detects
-its own bounds with `elution_peak_rt_bounds`. Measured 2026-10-03 (doxy, 5 NN seeds per arm, benchmark config): per-candidate bounds gave Astral REP1 on the HYE library +2.20% peptides at 1% (Welch t +15.7) and the Orbitrap AIF entrapment run +0.17% (t +0.9) at an unchanged entrapment FDP (0.989% -> 1.000%, 2 SE 0.039); the share of IDs whose above-half-maximum peak extends past the bounds fell from 20% / 26% (left / right) to 2% / 6% on Astral.
-
-When `bound_from_confident` is true, the stage learns one pair of
-elution half-widths `(L, R)` in seconds from the confident-target seed set
-(`spectrum_q <= 0.01`, `label == "target"`; the same anchor set used for RT
-calibration and DeepLC fine-tune). For each confident candidate it detects the
-per-candidate peak with `elution_peak_rt_bounds` (`features.rs:1141`, which
-returns `None` for a candidate with fewer than 3 distinct scans, so it does not
-contribute an anchor) and records `apex - lo` and `hi - apex`. If at least 20
-anchors resolve, it takes the `bound_confident_pct` percentile of the left and
-right half-widths (median by default) and returns `Some((L, R))`; every
-candidate is then bounded on `[apex - L, apex + R]` via `global_bound_indices`
-(`features.rs:1114`), which falls back to the single apex-nearest scan
-`(ai, ai)` when the mapped window collapses between grid points (sparse grid or
-a half-width below one cycle). This
-removes per-candidate boundary manipulation, so a chimeric decoy is scored over
-a real-peptide-width window centred on its apex rather than one it can widen or
-narrow. With fewer than 20 anchors the stage logs a warning and falls back to
-per-candidate boundary detection for that run. When the flag is false, every
-candidate detects its own peak boundary from its top-3-predicted-fragment
-profile (the legacy path). The same `global_bounds` argument threads into
-`peak_window`, which sets the window of both `fragment_features` (under
+Every candidate detects its own elution-peak bounds from its top-3-predicted-fragment
+profile (`peak_window`), which sets the window of both `fragment_features` (under
 `bound_features`) and the Extended Evidence, so Minimal/Rich and Extended see the
 identical window.
+
+`features.bound_from_confident` and `features.bound_confident_pct` were removed in
+0.15.0. They learned one pair of left and right half-widths from the confident seed
+anchors and applied it to every candidate. It was off by default from 2026-10-04 after
+this measurement (2026-10-03, doxy, 5 NN seeds per arm, benchmark config): per-candidate
+bounds gave Astral REP1 on the HYE library +2.20% peptides at 1% (Welch t +15.7) and the
+Orbitrap AIF entrapment run +0.17% (t +0.9) at an unchanged entrapment FDP (0.989% ->
+1.000%, 2 SE 0.039); the share of IDs whose above-half-maximum peak extends past the
+bounds fell from 20% / 26% (left / right) to 2% / 6% on Astral. A configuration that
+sets either key at its old default still loads.
 
 ## The shared stats kernel (`stats.rs`)
 
@@ -1041,20 +970,15 @@ variant no longer exists).
 |---|---|---|
 | `set` | `Minimal` | which set `active_features` returns (Minimal 14 / Rich 44 / Extended 426 under the defaults) |
 | `coelution_corr_threshold` | 0.9 | threshold for `n_coelution_above` (count of pairwise fragment correlations at or above it) |
-| `prec_tol_ppm` | 20.0 | precursor tolerance carried for feature bookkeeping |
 | `bound_features` | true | restrict trace-based features to the elution peak instead of the whole extracted window; **gates only the Minimal/Rich `fragment_features` path** (the Extended Evidence always peak-bounds, see gotchas) |
 | `bound_peak_fraction` | 1/3 | peak-boundary threshold as a fraction of apex height (DIA-NN-style; matched DIA-NN RT bounds best) |
 | `bound_peak_grace` | 0 | consecutive sub-threshold scans to bridge before stopping (0 = stop at first miss; 1 bridges a single-scan dip) |
-| `bound_from_confident` | false | true = learn one global left/right half-width from the confident seed set and apply it to every candidate; false (default since 2026-10-04) = per-candidate detection |
-| `bound_confident_pct` | 50.0 | percentile of the confident-set half-widths taken as the global half-width (50 = median) |
 | `chrom_loaders` | 3 | chromatogram decode threads in the main pass, an upper bound that `--threads` and the chunk count also cap (see "The chunked pass" below); changes time and memory only, never a value or a byte of the features table |
-| `q1_features` | false | the `q1_profile` family of scanning-quadrupole spectra, which needs `extract.q1_profile`; appended last under `extended`. Omitted from the canonical configuration at its default |
-| `q1_fragment_features` | `"auto"` | the `q1_fragments` family (eight `q1f_*` features of the per-fragment Q1 decision), which needs `extract.q1_fragments`; appended last under `extended`, after `q1_profile`; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
-| `ms1_envelope` | false | the `ms1_envelope` family (nine `ms1e_*` features of the MS1 isotope envelope around the apex), whose evidence extract reads under the same key (psms_extracted v7); appended last under `extended`, after the Q1 families. Refused on 1/K0 spectra and grouped runs. Omitted from the canonical configuration at its default |
-| `q1_precursor` | `"auto"` | the `q1_precursor` family (eight `q1p_*` features of the unfragmented precursor in the MS2 steps), whose evidence extract reads under the same key (psms_extracted v8); needs `extract.q1_fragments`; appended after `ms1_envelope`; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
+| `q1_fragment_features` | `"auto"` | the `q1_fragments` family (eight `q1f_*` features of the per-fragment Q1 decision), which needs `extract.q1_fragments`; appended last under `extended`; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
+| `q1_precursor` | `"auto"` | the `q1_precursor` family (eight `q1p_*` features of the unfragmented precursor in the MS2 steps), whose evidence extract reads under the same key (psms_extracted v8); needs `extract.q1_fragments`; appended after `q1_fragment_features`; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
 | `q1_multiscale` | `"auto"` | the `q1_multiscale` family (nine `q1m*` features at 3, 7 and 11 Q1 steps, twelve with `q1_precursor`), psms_extracted v8; needs `extract.q1_fragments`; appended after `q1_precursor`; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
 | `q1_deconvolved` | `"auto"` | the `q1_deconvolved` family (five `q1d_*` features of the per-peak Q1 centroids at the apex), psms_extracted v8; needs `extract.q1_fragments`; appended after `q1_multiscale`; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
-| `q1_consistency` | `"auto"` | the `q1_consistency` family (sixteen `q1c_*` features: the per-fragment Q1 decisions read against each fragment's expected Q1 centre), which needs `extract.q1_fragments` and the run's Q1 calibration tolerances (`mumdia features --q1-cal`); appended last under `extended`, after `ms1_envelope` and the other Q1 families; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
+| `q1_consistency` | `"auto"` | the `q1_consistency` family (sixteen `q1c_*` features: the per-fragment Q1 decisions read against each fragment's expected Q1 centre), which needs `extract.q1_fragments` and the run's Q1 calibration tolerances (`mumdia features --q1-cal`); appended last under `extended`, after the other Q1 families; `"auto"` turns it on for a ZT Scan search and off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from the canonical configuration unless on |
 | `im_features` | `off` | the `ion_mobility` family (`off`, `on`, `auto` = on when the spectra carry 1/K0). `run` and `run-experiment` resolve it once (`Config::resolve_im_features`) and hand every stage `on` or `off`; a standalone `mumdia features` resolves `auto` from the reader extract recorded in the chromatograms report. On a 4D run it also makes extract write the chromatograms' per-point 1/K0 (v3/v4). Omitted from the canonical configuration at its default |
 
 Note that the fragment tolerance used inside `mass_accuracy` is a hardcoded
@@ -1162,8 +1086,7 @@ set `chrom_loaders: 1` there if that matters.
   `evidence_from`) takes no such flag
   and always peak-bounds `axis`/`traces` while still retaining
   `axis_full`/`traces_full`, so Extended families read whichever window they
-  name regardless of `bound_features`, and `global_bounds` from
-  `bound_from_confident` always applies to them.
+  name regardless of `bound_features`.
 - The peptidoform grouping for cross-charge features uses the ProForma string,
   which is charge-independent and keeps `DECOY_` peptidoforms grouped among
   themselves, so it is not a target/decoy label leak (`features.rs:714`).

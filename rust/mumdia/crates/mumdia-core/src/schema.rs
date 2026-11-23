@@ -76,20 +76,20 @@ pub mod artifact {
     /// and meaning are the IM branch's v4; v3 (`apex_im` filled alone) is never written. A
     /// 3D extract writes v2, byte for byte. Readers select columns by name.
     pub const PSMS_EXTRACTED_V4: (&str, u32) = ("psms_extracted", 4);
-    /// v5, written only under `extract.q1_profile` (scanning-quadrupole spectra, which carry
-    /// no 1/K0): v2 plus the Q1-profile evidence `q1_corr`, `q1_offset`, `q1_frag_sd` and
+    /// v5, written only under `extract.q1_profile` until 0.15.0 removed it (scanning-quadrupole
+    /// spectra, which carry no 1/K0): v2 plus the Q1-profile evidence `q1_corr`, `q1_offset`, `q1_frag_sd` and
     /// `q1_bin_frac` (Float64), appended last. Readers select columns by name.
     pub const PSMS_EXTRACTED_V5: (&str, u32) = ("psms_extracted", 5);
     /// v6, written only under `extract.q1_fragments` (scanning-quadrupole spectra, which
-    /// carry no 1/K0): v2 (with v5's Q1-profile columns when `extract.q1_profile` is on as
-    /// well) plus the per-fragment Q1 decision: the row's summary `q1f_*` (Float64) and one
+    /// carry no 1/K0): v2 (before 0.15.0 with v5's Q1-profile columns when
+    /// `extract.q1_profile` was on as well) plus the per-fragment Q1 decision: the row's summary `q1f_*` (Float64) and one
     /// Float32 list per decision, `q1f_frag_class` (0 absent, 1 belongs, 2 interfered),
     /// `q1f_frag_offset` (steps), `q1f_frag_resid` and `q1f_frag_corr2d`, each with one entry
     /// per library fragment in the library's order, appended last. Readers select columns
     /// by name.
     pub const PSMS_EXTRACTED_V6: (&str, u32) = ("psms_extracted", 6);
-    /// v7, written only under `features.ms1_envelope` (spectra without 1/K0): the table of
-    /// v2, v5 or v6 plus the MS1 isotope-envelope evidence, appended last: per row the
+    /// v7, written only under `features.ms1_envelope` until 0.15.0 removed it (spectra
+    /// without 1/K0): the table of v2, v5 or v6 plus the MS1 isotope-envelope evidence, appended last: per row the
     /// summed intensity and the intensity-weighted ppm error of the isotopes M-1 to M+4 over
     /// the MS1 scans around the apex (`ms1e_i_m1`, `ms1e_i_0` .. `ms1e_i_4`, `ms1e_ppm_m1`,
     /// `ms1e_ppm_0` .. `ms1e_ppm_4`; NaN error where an isotope is not found), the summed
@@ -102,9 +102,10 @@ pub mod artifact {
     /// and the multi-scale Q1 scores `q1m3_*`, `q1m7_*` and `q1m11_*` (Float64), each
     /// family only under its key. Readers select columns by name.
     pub const PSMS_EXTRACTED_V8: (&str, u32) = ("psms_extracted", 8);
-    /// v9, written only under `features.q1_separable` (scanning-quadrupole spectra under
-    /// `extract.q1_fragments`, which carry no 1/K0): the table of v6, v7 or v8 plus, appended
-    /// last, the separable model of each row's Q1 patch (`stages::q1trace`): the `q1s_*` feature
+    /// v9, written only under `features.q1_separable` until 0.15.0 removed it
+    /// (scanning-quadrupole spectra under `extract.q1_fragments`, which carry no 1/K0): the
+    /// table of v6, v7 or v8 plus, appended last, the separable model of each row's Q1 patch
+    /// (`stages::q1trace` before 0.15.0): the `q1s_*` feature
     /// values (Float64) and five Float32 lists, `q1s_elution` and `q1s_cycle_rt` (the elution
     /// profile, maximum 1, and the retention time of each patch cycle), and `q1s_frag_amp`,
     /// `q1s_frag_r2` and `q1s_frag_interf` with one entry per library fragment in the library's

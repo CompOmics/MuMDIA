@@ -430,13 +430,9 @@ from the rebuilt fragment traces at the apex; `ms1_mono`, `ms1_iso1` and `ms1_is
 from the rebuilt MS1 traces at the apex, null only where extract had none and the raw trace
 is 0 there. `ms1_isom1`, `apex_im_mad` and `ms1_apex_im` keep extract's values. A row whose
 candidate has no rebuilt rows keeps all of extract's values. The table's report records
-the patch under `params.retrace` (`patched_columns` and the row counts). One optional
-column, read by name and written only under `retrace.apex_features` (as `rt_lo`/`rt_hi`
-are only under `extract.emit_rt_window`):
-
-| column | Arrow type | nullable | units | meaning |
-|---|---|---|---|---|
-| `imc_ref_w` | Float64 | no | correlation | retrace's apex 1/K0 agreement: over the rebuilt fragment rows with signal, the predicted-intensity-weighted mean leave-one-out reference correlation of each fragment's raw 1/K0 profile (`apex_im +/- 0.04`, 40 bins, MS2 frames within 1.5 s of the apex); 0.0 with no such fragment or no rebuilt rows |
+the patch under `params.retrace` (`patched_columns` and the row counts). Before 0.15.0,
+`retrace.apex_features` also appended a column `imc_ref_w`; a table that carries it still
+reads.
 
 Conditional columns, appended only when `extract.emit_contested_features`
 (`extract.rs:1498-1501`):
@@ -459,7 +455,8 @@ and the columns are not written, so the default schema stays byte-identical:
 | `gate_spectral_entropy` | Float32 | no | similarity | apex spectral-entropy similarity (sqrt) |
 
 Conditional columns of v7, appended last only under `features.ms1_envelope` (spectra without
-1/K0; docs/09_extract.md, section 13). The MS1 scan nearest the row's apex and two either side
+1/K0; docs/09_extract.md, section 13), which 0.15.0 removed; tables written before it still
+read. The MS1 scan nearest the row's apex and two either side
 are read at the calibrated MS1 m/z, within twice `extract.prec_tol_ppm` and at least 10 ppm:
 
 | column | Arrow type | nullable | units | meaning |
@@ -495,8 +492,9 @@ whose apex is not in the sweep carries the "no evidence" values given.
 | `q1d_apex_share` | Float64 | no | fraction | the consistent share in the apex cycle alone |
 
 Conditional columns of v9, appended last under `features.q1_separable` (scanning-quadrupole
-spectra under `extract.q1_fragments`; docs/09_extract.md, section 15): the separable model of each
-row's Q1 patch (`stages::q1trace::fit`). A row whose apex is not in the sweep carries the values of no
+spectra under `extract.q1_fragments`; docs/09_extract.md, section 15), which 0.15.0 removed; tables
+written before it still read. The separable model of each
+row's Q1 patch. A row whose apex is not in the sweep carries the values of no
 fit (0, a prediction-weighted interference share of 1) and NaN lists.
 
 | column | Arrow type | nullable | units | meaning |
@@ -1152,30 +1150,6 @@ in run-index order, with a header.
 
 ---
 
-## Stage D2: `align` (`stages/align.rs`)
-
-Experiment-level cross-run stage that prepares MBR. It puts every run on a common
-RT coordinate: the first input seed is the reference, and for each run it fits a
-monotone LOESS mapping from the run's observed RT to the reference RT over
-confidently shared peptides, then emits that mapping on a `grid_n`-point grid.
-The reference run (or a run with fewer than four shared peptides) uses the
-identity mapping. This artifact is written with an inline `alignment` (v1)
-`ArtifactReport` (`align.rs:141-153`); it is not registered in the frozen
-`schema.rs` artifact table.
-
-### alignment (`align.rs:130-138`)
-
-One row per (run, grid point).
-
-| column | Arrow type | nullable | units | meaning |
-|---|---|---|---|---|
-| `run_id` | UInt32 | no | - | 0-based input run index (position in the seed list); run 0 is the reference |
-| `source_rt` | Float64 | no | s | grid point in this run's own observed RT coordinate |
-| `reference_rt` | Float64 | no | s | RT mapped onto the reference coordinate; identity for the reference run or when fewer than four peptides are shared with the reference |
-| `residual_spread` | Float64 | no | s | 95th-percentile absolute LOESS residual on shared peptides for this run; 0.0 for the reference or an unfit run; bounds how tight an MBR window can be |
-
----
-
 ## Match-between-runs second pass (`stages/second_pass.rs`, `run-experiment`)
 
 The default `mbr.strategy = second_pass` adds these to an experiment directory
@@ -1345,13 +1319,12 @@ Each file selects on a different q column, and its `q_value` column is that one:
 `peptide_q_value` in `peptides.tsv`, `precursor_q` in `precursors.tsv`, `pg_q_value`
 in `proteins.tsv`. Name the file and the column when quoting a count.
 
-**Acceptance rule, every writer.** A row is written when it is a target and either
-its grouped q is at or under the threshold or it is flagged `is_transferred` by
-`mumdia mbr`. The two columns `is_transferred` and `transfer_q` export that basis
-(docs/29 #19): a transferred row keeps its grouped q, which is usually 1.0, and a
-tighter `--q` does not revoke a transfer that already passed `mbr.q_transfer`. A
-transfer is a peptide-level acceptance, not protein-group confidence; a protein group
-admitted through a transferred row carries the flag so the reader can tell.
+**Acceptance rule, every writer.** A row is written when it is a target and its grouped
+q is at or under the threshold. The columns `is_transferred` and `transfer_q` are `false`
+and empty: they exported the basis of the match-between-runs transfer (`mumdia mbr`),
+removed in 0.15.0, and stay so the header does not change. A scored table an older engine
+wrote with transfers is still read: a transferred row is written, keeps its grouped q
+(usually 1.0), and is not revoked by a tighter `--q` (docs/29 #19).
 
 **Protein annotation columns, every writer.** Each file ends with three more columns, after
 every other one so that a reader addressing the existing columns by position is unaffected:
@@ -1387,8 +1360,8 @@ the best q (`report.rs:90,105-108`). Targets only, filtered on
 | `q_value` | `peptide_q_value` | **base-peptide** q, six decimals |
 | `score` | `score` | rescorer score, four decimals |
 | `quantity` | `peptide_quant.parquet` joined on `(peptidoform, charge)` | empty when the precursor was not quantifiable or no `--peptide-quant` was passed (`report.rs:39-45,61-72`) |
-| `is_transferred` | `is_transferred` (`mumdia mbr`), `false` without it | `true` when the row was admitted as a match-between-runs transfer rather than on its q |
-| `transfer_q` | `transfer_q` (`mumdia mbr`) | the transfer q the row was accepted at, six decimals; empty on every other row |
+| `is_transferred` | `is_transferred` of a scored table written before 0.15.0, `false` otherwise | `true` when the row was admitted as a match-between-runs transfer (removed in 0.15.0) rather than on its q |
+| `transfer_q` | `transfer_q` of such a table | the transfer q the row was accepted at, six decimals; empty on every other row |
 | `protein_ids`, `protein_names`, `genes` | `protein_annotations` joined on `protein` | after every other column (the localisation columns included); empty without annotations |
 
 The row unit and the filter column deliberately disagree, and this is the single

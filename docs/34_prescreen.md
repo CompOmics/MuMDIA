@@ -80,36 +80,28 @@ candidates the filter is bypassed, every candidate kept and the reason written t
 The modifications defining filter eligibility are separate from the ones allowed in tags: an
 oxidation-scoped filter never requires an oxidation-carrying tag.
 
-## 4. Optional components
+## 4. Optional settings
 
-All are off by default. The prototype measured none of them as an improvement on the score of
-section 1 near 50% reduction, so they are for experiments.
+All are off by default.
 
-| Setting | Component |
+| Setting | Effect |
 |---|---|
-| `retrieval = "tags"`, `rescue` | Database-free tag discovery (`tags.rs`) then retrieval: a candidate is retrieved when one of its trimers, in its own residue states and at a fragment charge it can carry, was observed in an eligible spectrum. `rescue = true` (default) scores the unretrieved candidates anyway; `false` drops them. The report separates `retrieval_losses` (unretrieved candidates the score would have kept) from `scoring_losses`. |
-| `delayed_modforms` | Retrieve backbone families on backbone states first and examine forms only in retrieved families. Same retrieved set as form-by-form retrieval (tested); `retrieval_forms_skipped_by_family` counts the saving. `retrieval::forms_with_tag` is the delayed generator, equal as a set to enumeration-first generation filtered on the tag (tested with two modification types). |
-| `tags.*` | Edge tolerance 0.005 Da neutral (0.005/z m/z), fragment charges 1-2, whole-path RMS sigma 0.003 Da, optional `gap_edges` (two-residue steps, every compatible pair kept, three-peak ladders keyed separately from four-peak ones), `extra_mods`. The alphabet comes from `peptidoforms.fixed_mods`/`variable_mods`: I and L merged, a fixed modification replaces its residue's state, a variable one adds a state, a terminal rule adds none; positions the alphabet cannot express break the trimers covering them and are never substituted. There is no peak, degree or path-count cap. |
-| `complement_bonus` | Complementary-ion support of observed tag paths: complements of the four path peaks for the candidate's neutral mass, on distinct peaks off the path, never reused; 2/3/4 complements give 1/3, 2/3, 1 times the path fit, times spectrum tag information, divided by `sqrt(L)`. |
-| `tag_bonus`, `fasta_bonus` | Spectrum-side tag information times path fit, and the library-side information from the backbone/position index (`retrieval::BackboneIndex`), kept as separate columns. Each distinct trimer counts once. |
-| `flank_bonus` | Positioned ladders whose endpoints sit at the candidate's own b or y masses. |
-| `mass_hypotheses.*` | Blind neutral-mass hypotheses from tag paths and two or more complementary peaks, per 0.01 Da bin, from a seeded sample of spectra, written to `<out>.mass_hypotheses.parquet` before any candidate is consulted; optional MS1 mono/+1 isotope links within 2 s and max(0.005 Da, 10 ppm); `require_ms1` is a hard gate and off. |
-| `trace.*` | Seven-scan same-window pools, bounded 0.01 Da clusters (max - min), intensity-weighted centroids, summed intensity, detection counts and unit per-scan profiles; `merged` (two or more detections) or `unmerged`; `tag_coherence` (minimum pairwise trace cosine of the four path features times fit) or `coherent_fragments` (matched fragments whose trace is compatible with the most intense matched feature, so ladders need not be connected). The single-scan score is unaffected. |
-| `localization` | `own` (default), `family_support` (every localization sibling, same residues, charge, label and modification composition, takes the family best; ties and alternatives pass together) or `best_site` (keeps only the best site, ties kept; measured to lose modified references in the prototype). |
+| `tags.*` | Tag discovery for the tag prefilter (`tags.rs`): edge tolerance 0.005 Da neutral (0.005/z m/z), fragment charges 1-2, `extra_mods`. The alphabet comes from `peptidoforms.fixed_mods`/`variable_mods`: I and L merged, a fixed modification replaces its residue's state, a variable one adds a state, a terminal rule adds none; positions the alphabet cannot express break the trimers covering them and are never substituted. There is no peak, degree or path-count cap. |
 | `crowding_exponent` | Divides each spectrum's score by `(n_peaks / mean n_peaks of the window) ^ exponent`, the ratio clamped to [0.25, 4]. It uses the observed peak counts only, no predicted intensity, and corrects the advantage a dense spectrum gives every candidate when there is no retention-time window to restrict the spectra. `0.25` is the value measured in section 5b; default `0`. |
 | `repeat_bonus` | Adds `w * R / q95(R)` to `D / q95(D)`, where `R` is, per matched peak, the smaller of its weight and the best weight of the same fragment within two eligible scans and 8 s. Rewards fragments seen in neighbouring scans. Default `0`. |
-| `tags.positioned`, `tags.positioned_residues` | For the tag prefilter: a candidate's trimer must sit at the candidate's own b or y position (a ladder anchored at its own fragment masses) rather than anywhere in the spectrum; `positioned_residues` 2 or 3 sets the ladder length. Stricter and measured to lose identifications (section 5b). |
 
-With any component weight positive, the combined score is `base / q95(base) + sum_k w_k c_k /
-q95(c_k)` over the calibration half, the prototype's scaling, and the cutoff is calibrated on it.
-`write_scores` writes every candidate's base score, combined score, retrieval flag and component
-values to `<out>.scores.parquet`.
+`write_scores` writes every candidate's score, scope, calibration and kept flags (and, under the
+tag prefilter, its retrieval flag) to `<out>.scores.parquet`.
 
-The complement and flank components re-walk the tag paths per candidate and spectrum, which the
-prototype afforded on 5,500 candidates per run but which does not scale to a 10.9M-candidate
-library. `mumdia prescreen --sample-candidates N` scores a seeded, label-blind sample of about N
-candidates for such measurements; its survivors cover the sample only and are not an extract
-allowlist.
+The experimental components of the prototype port were removed in 0.15.0, because none measured
+as an improvement on the score of section 1 (section 5 keeps their measurements): tag retrieval
+inside the scored prescreen (`retrieval`, `rescue`, `delayed_modforms`), the evidence bonuses
+(`complement_bonus`, `tag_bonus`, `fasta_bonus`, `flank_bonus`), blind mass hypotheses
+(`mass_hypotheses.*` and the `--ms1` flag), fragment-trace pooling (`trace.*`), `localization`,
+the tag variants `tags.gap_edges`, `tags.positioned` and `tags.positioned_residues`, the path-fit
+width `tags.rms_sigma_da`, the peak cap `top_peaks` (`--top-peaks`) and the evaluation flag
+`--sample-candidates`. A configuration that sets one of these keys at its old default still
+loads; any other value is refused with the reason. The last binary with them is `391dca1`.
 
 ## 5. Validation
 
@@ -128,15 +120,15 @@ Astral REP1 (HYE library, 10,881,402 candidates, thestral, 128 cores):
 |---|---:|---:|---:|---:|---:|---:|---:|
 | OFF | 0% | 100% | 100% | 100% | 83,020 (sd 273) | | 680,218 |
 | existing prescan (`anchor_all`, 150 peaks) | 23.3% | 99.10% | 98.14% | 98.68% | 82,304 | -0.86% | 674,202 |
-| capped 300, target 0.54 | 54.0% | 98.26% | 94.52% | 96.48% | 82,247 | -0.93% | 560,739 |
+| capped 300, target 0.54 (removed in 0.15.0) | 54.0% | 98.26% | 94.52% | 96.48% | 82,247 | -0.93% | 560,739 |
 | sensitive 0.52 | 52.0% | 99.50% | 98.41% | 99.51% | 82,377 | -0.77% | 623,122 |
 | **balanced 0.54** | **54.0%** | **99.39%** | **98.04%** | **99.34%** | **82,508 (sd 139)** | **-0.62%** | 611,852 |
 | stringent 0.75 | 75.0% | 95.78% | 88.95% | 95.08% | 80,578 | -2.94% | 429,048 |
 | aggressive 0.90 | 90.0% | 86.75% | 70.56% | 83.65% | 74,890 | -9.79% | 230,882 |
-| family support 0.54 | 54.0% | 99.33% | 97.88% | 99.37% | 82,426 | -0.72% | 609,778 |
-| best site 0.54 | 54.0% | 99.19% | 97.83% | 90.90% | 82,649 | -0.45% | 608,200 |
+| family support 0.54 (removed in 0.15.0) | 54.0% | 99.33% | 97.88% | 99.37% | 82,426 | -0.72% | 609,778 |
+| best site 0.54 (removed in 0.15.0) | 54.0% | 99.19% | 97.83% | 90.90% | 82,649 | -0.45% | 608,200 |
 | oxidation scope 0.53 | 12.4% total, 53.1% of class | 99.98% | 99.93% | 99.44% | 82,854 | -0.20% | 666,508 |
-| tag retrieval, no rescue, 0.54 | 54.0% | 99.21% | 97.47% | 99.13% | 82,258 | -0.92% | 611,786 |
+| tag retrieval, no rescue, 0.54 (removed in 0.15.0) | 54.0% | 99.21% | 97.47% | 99.13% | 82,258 | -0.92% | 611,786 |
 
 Orbitrap AIF entrapment run (E. coli plus a human entrapment, 5,828,348 candidates, hippogriff,
 128 cores); FDP is the combined entrapment estimate at 1% peptide q (ratio 0.560632):
@@ -148,9 +140,9 @@ Orbitrap AIF entrapment run (E. coli plus a human entrapment, 5,828,348 candidat
 | capped 300 / sensitive / balanced | 56.5% | 100% | 100% | 10,189 | 0.00% | 1.001% |
 | stringent 0.75 | 75.0% | 99.73% | 98.92% | 10,162 | -0.26% | 0.992% |
 | aggressive 0.90 | 90.0% | 97.29% | 89.45% | 9,975 | -2.10% | 0.941% |
-| family support / oxidation scope | 56.4% / 18.9% | 100% | 100% | 10,189 | 0.00% | 1.001% |
-| best site 0.54 | 57.9% | 99.99% | 99.97% | 10,187 | -0.02% | 0.994% |
-| tag retrieval, no rescue | 63.7% | 98.59% | 95.53% | 10,108 | -0.80% | 1.009% |
+| family support (removed in 0.15.0) / oxidation scope | 56.4% / 18.9% | 100% | 100% | 10,189 | 0.00% | 1.001% |
+| best site 0.54 (removed in 0.15.0) | 57.9% | 99.99% | 99.97% | 10,187 | -0.02% | 0.994% |
+| tag retrieval, no rescue (removed in 0.15.0) | 63.7% | 98.59% | 95.53% | 10,108 | -0.80% | 1.009% |
 
 On the AIF run 56.5% of the candidates match no fragment within 0.005 Da in any eligible
 spectrum, so at targets 0.52 and 0.54 the cutoff is exactly 0: the filter removes only those,
@@ -165,7 +157,7 @@ Target and decoy survival are close but not equal: 46.2% against 45.8% at 0.54 o
 against 9.2% at 0.90; identical (43.5%) at 0.54 on AIF, 10.1% against 9.9% at 0.90. The
 entrapment FDP does not rise (1.001% OFF, 0.941% to 1.009% across arms).
 
-Retrieval and scoring losses (`bench/prescreen/ps_losses.py`, tag retrieval at 0.54): on Astral
+Retrieval and scoring losses (`bench/prescreen/ps_losses.py`, tag retrieval at 0.54, removed in 0.15.0): on Astral
 retrieval drops 22.9% of the library and misses 196 OFF precursors (0.21%), 167 of which the
 score alone would have kept; the score then loses 542 retrieved ones (0.58%). On AIF retrieval
 drops 63.7% of the library, more than the target, which sets the calibrated cutoff to -inf (the
@@ -176,7 +168,8 @@ family had no backbone tag, with the same retrieved set. Tag discovery walked 35
 293,271 Astral spectra in about 47 s at 9.8 GB, and 23M on AIF.
 
 Optional components on seeded 100,000-candidate samples (864 Astral OFF precursors in the
-sample, 215 on AIF; one reference is 0.12 pp on Astral), all at about 54% reduction:
+sample, 215 on AIF; one reference is 0.12 pp on Astral), all at about 54% reduction. Every
+component in this table was removed in 0.15.0:
 
 | Astral sample | OFF IDs kept | Weak kept | Component time |
 |---|---:|---:|---:|
@@ -244,7 +237,7 @@ precursors whose candidate survives; "removed" is the share of the library or pe
 
 It works where spectra are sparse relative to the library and does nothing on dense
 immunopeptidomics spectra, where almost every trimer occurs somewhere in each window. Positioned
-tags (standalone) remove more and lose identifications: three residues AIF 85% / 85% kept, Astral
+tags (standalone; removed in 0.15.0) remove more and lose identifications: three residues AIF 85% / 85% kept, Astral
 31.8% / 95.9%, immunopeptidomics 16.1% / 99.1%; two residues AIF 63.8% / 98.9%, Astral 17.1% /
 99.96%, immunopeptidomics 0.5%.
 
@@ -339,11 +332,11 @@ mumdia prescreen --ms2 RUN/spectra/spectra_ms2.parquet \
 mumdia extract ... --restrict-candidates survivors.parquet
 ```
 
-`--preset`, `--target` and `--top-peaks` override the configuration. `configs/examples/
-prescreen-oxidation.json` is the oxidation-only filter; `prescreen-components.json` enables tag
-retrieval with rescue, the 0.25 complementary bonus and family support.
+`--preset` and `--target` override the configuration. `configs/examples/
+prescreen-oxidation.json` is the oxidation-only filter.
 
 The validation campaign is reproducible with `bench/prescreen/ps_val.sh` (baseline run, then
 paired arms that share the baseline's spectra, run windows, adapted library and mass
-calibration), `bench/prescreen/ps_ext.sh` (component arms), `bench/prescreen/ps_agg.py`
+calibration), `bench/prescreen/ps_ext.sh` (component arms; the removed components need binary
+`391dca1`), `bench/prescreen/ps_agg.py`
 (summary) and `bench/prescreen/ps_plot.py` (figures).

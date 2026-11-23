@@ -748,61 +748,7 @@ pub enum PrescreenScopeMatch {
     All,
 }
 
-/// Which candidates the prescreen scores (`prescreen.retrieval`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PrescreenRetrieval {
-    /// Score every candidate (the measured recommended mode).
-    #[default]
-    All,
-    /// Retrieve candidates through database-free tags first: a candidate is retrieved when
-    /// one of its trimers, in its own residue states, was observed in an eligible spectrum.
-    /// Candidates without such evidence take the rescue route when `rescue` is on.
-    Tags,
-}
-
-/// How modification siblings share evidence (`prescreen.localization`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PrescreenLocalization {
-    /// Every form keeps its own score.
-    #[default]
-    Own,
-    /// Family support: every form of one backbone with the same modification composition,
-    /// charge and label takes the family's best score, so compatible localizations and ties
-    /// pass or fail together. Support is kept separate from localization; no site is chosen.
-    FamilySupport,
-    /// Keep only forms whose own score equals the family best (ties kept). Measured to lose
-    /// modified references in the prototype; available for comparison only.
-    BestSite,
-}
-
-/// Fragment-trace pooling mode (`prescreen.trace.pooling`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PrescreenPooling {
-    /// Bounded mass clusters over the pooled scans (max - min <= `cluster_da`), kept when seen
-    /// in at least `min_detections` scans.
-    #[default]
-    Merged,
-    /// Every pooled peak as its own feature, for comparison with merging.
-    Unmerged,
-}
-
-/// Which trace evidence the trace component scores (`prescreen.trace.score`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PrescreenTraceScore {
-    /// Tag coherence: for each candidate trimer, the best (minimum pairwise trace cosine of the
-    /// four path features x whole-path fit) in a pool; summed over distinct trimers.
-    #[default]
-    TagCoherence,
-    /// Disconnected ladders: candidate fragments matched to pooled features, counted when their
-    /// trace is compatible (cosine >= `min_quality`) with the most intense matched feature.
-    CoherentFragments,
-}
-
-/// Database-free tag discovery used by retrieval and the optional evidence components.
+/// Database-free tag discovery used by the tag prefilter.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PrescreenTagsConfig {
@@ -810,97 +756,15 @@ pub struct PrescreenTagsConfig {
     pub edge_tol_da: f64,
     /// Highest fragment charge of a tag edge: 1 or 2, the charges a tag key holds.
     pub max_charge: i32,
-    /// Also allow two-residue gap steps; every compatible residue pair is kept as an
-    /// alternative and gapped three-peak ladders are keyed separately from four-peak ones.
-    pub gap_edges: bool,
-    /// Sigma of the whole-path soft weight `exp(-0.5 (rms / sigma)^2)` (Da).
-    pub rms_sigma_da: f64,
     /// Variable states added to the chemistry configuration's alphabet, `RESIDUE:Name`.
     pub extra_mods: Vec<String>,
-    /// Positioned retrieval: a candidate is retrieved only by a tag whose ladder starts at one
-    /// of its own b or y fragment masses (+/- 0.01 Da), not by the same trimer anywhere in the
-    /// spectrum. Much more specific in dense spectra.
-    pub positioned: bool,
-    /// Residue steps of a positioned ladder: 3 (four consecutive fragments, the default) or 2
-    /// (three consecutive fragments, more permissive).
-    pub positioned_residues: usize,
 }
 impl Default for PrescreenTagsConfig {
     fn default() -> Self {
         Self {
             edge_tol_da: 0.005,
             max_charge: 2,
-            gap_edges: false,
-            rms_sigma_da: 0.003,
             extra_mods: Vec::new(),
-            positioned: false,
-            positioned_residues: 3,
-        }
-    }
-}
-
-/// Blind neutral-mass hypotheses from tag paths and complementary peaks, with optional MS1.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PrescreenMassConfig {
-    /// Infer hypotheses and write `<out>.mass_hypotheses.parquet`.
-    pub enabled: bool,
-    /// Spectra sampled for inference (seeded); 0 = every spectrum (expensive).
-    pub sample_spectra: usize,
-    /// Look for the monoisotopic and +1 isotope peaks in MS1 scans within `ms1_rt_s`.
-    pub ms1: bool,
-    pub ms1_rt_s: f64,
-    /// MS1 tolerance: max(0.005 Da, this many ppm).
-    pub ms1_ppm: f64,
-    /// Drop hypotheses without an MS1 link. A hard gate; off by default.
-    pub require_ms1: bool,
-    /// Weight of the candidate mass-support component in the combined score; 0 = report only.
-    pub bonus: f64,
-}
-impl Default for PrescreenMassConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            sample_spectra: 512,
-            ms1: false,
-            ms1_rt_s: 2.0,
-            ms1_ppm: 10.0,
-            require_ms1: false,
-            bonus: 0.0,
-        }
-    }
-}
-
-/// Fragment traces over consecutive same-window scans.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PrescreenTraceConfig {
-    /// Compute the trace component (reported in the scores table).
-    pub enabled: bool,
-    /// Consecutive same-window scans per pool.
-    pub scans: usize,
-    /// Maximum m/z range (max - min) of one merged cluster.
-    pub cluster_da: f64,
-    /// Scans a merged cluster must be detected in.
-    pub min_detections: usize,
-    pub pooling: PrescreenPooling,
-    pub score: PrescreenTraceScore,
-    /// Trace cosine counted as compatible by `coherent_fragments`.
-    pub min_quality: f64,
-    /// Weight of the trace component in the combined score; 0 = report only.
-    pub bonus: f64,
-}
-impl Default for PrescreenTraceConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            scans: 7,
-            cluster_da: 0.01,
-            min_detections: 2,
-            pooling: PrescreenPooling::Merged,
-            score: PrescreenTraceScore::TagCoherence,
-            min_quality: 0.6,
-            bonus: 0.0,
         }
     }
 }
@@ -936,9 +800,6 @@ pub struct PrescreenConfig {
     /// `RESIDUE:UniModName` entries defining `scope = "modified"`, e.g. `M:Oxidation`.
     pub scope_mods: Vec<String>,
     pub scope_match: PrescreenScopeMatch,
-    /// Most intense peaks per MS2 used for both the rarity histogram and the matching; 0 (the
-    /// default) uses every positive peak. 300 is the capped comparison setting.
-    pub top_peaks: usize,
     /// Candidate fragment matching tolerance, absolute m/z (Da).
     pub frag_tol_da: f64,
     /// Highest fragment charge; each candidate uses `1..=min(this, precursor charge)`.
@@ -961,29 +822,7 @@ pub struct PrescreenConfig {
     pub repeat_bonus: f64,
     /// Write the per-candidate scores beside the survivors (`<out>.scores.parquet`).
     pub write_scores: bool,
-    /// Candidate retrieval before scoring. `all` (default) scores every candidate.
-    pub retrieval: PrescreenRetrieval,
-    /// With `retrieval = "tags"`, score candidates without tag evidence anyway (the permissive
-    /// rescue route) instead of dropping them. Default true.
-    pub rescue: bool,
-    /// With `retrieval = "tags"`, retrieve backbone families first and examine forms only in
-    /// retrieved families (delayed modification enumeration). Same retrieved set.
-    pub delayed_modforms: bool,
     pub tags: PrescreenTagsConfig,
-    /// Weight of the complementary-ion component (prototype 0.25 measured); 0 = off.
-    pub complement_bonus: f64,
-    /// Weight of the tag-evidence component (spectrum rarity x path fit, each distinct trimer
-    /// once); 0 = off.
-    pub tag_bonus: f64,
-    /// Weight of the FASTA/library-side tag information, kept separate from the spectrum
-    /// side; 0 = off.
-    pub fasta_bonus: f64,
-    /// Weight of positioned flank support (an observed tag whose ladder endpoints sit at the
-    /// candidate's b/y masses); 0 = off.
-    pub flank_bonus: f64,
-    pub mass_hypotheses: PrescreenMassConfig,
-    pub trace: PrescreenTraceConfig,
-    pub localization: PrescreenLocalization,
     /// Database-free tag prefilter before any prediction, without retention times. Tags are
     /// discovered from the spectra alone (`prescreen.tags`); a candidate is kept when one of its
     /// trimers, in its own residue states and at a fragment charge it can carry, was observed in
@@ -1016,7 +855,6 @@ impl Default for PrescreenConfig {
             scope: PrescreenScope::All,
             scope_mods: Vec::new(),
             scope_match: PrescreenScopeMatch::Any,
-            top_peaks: 0,
             frag_tol_da: 0.005,
             max_frag_charge: 2,
             low_mz_threshold: 300.0,
@@ -1026,17 +864,7 @@ impl Default for PrescreenConfig {
             crowding_exponent: 0.0,
             repeat_bonus: 0.0,
             write_scores: false,
-            retrieval: PrescreenRetrieval::All,
-            rescue: true,
-            delayed_modforms: false,
             tags: t(),
-            complement_bonus: 0.0,
-            tag_bonus: 0.0,
-            fasta_bonus: 0.0,
-            flank_bonus: 0.0,
-            mass_hypotheses: t(),
-            trace: t(),
-            localization: PrescreenLocalization::Own,
             tag_prefilter: false,
             score_before_prediction: false,
         }
@@ -1569,18 +1397,6 @@ pub struct SearchSeedConfig {
     /// configuration at its default.
     #[serde(skip_serializing_if = "is_false")]
     pub count_fragments_once: bool,
-    /// Scanning-quadrupole spectra (SCIEX ZT Scan DIA read with
-    /// `convert.isolation_half_width`, spectra_ms2 v3): count a peak for a candidate only
-    /// when its Q1 centroid lies within 2 steps of the candidate's nominal expected Q1 centre
-    /// (`stages::q1dec`). Every MS2 peak is given the centroid of its trace along the Q1 axis
-    /// (mutual-nearest peaks of adjacent steps of one cycle, split at valleys), so a fragment
-    /// m/z another precursor shares, transmitted around that precursor's position, no longer
-    /// counts for this one. The seed runs before the Q1 calibration, so the centre is the
-    /// precursor's isotope envelope with no window offset. Refused on spectra that carry 1/K0
-    /// and with window groups. Default false. Benchmark-gated (docs/37_ztscan.md). Omitted
-    /// from the canonical configuration at its default.
-    #[serde(skip_serializing_if = "is_false")]
-    pub q1_deconvolved: bool,
     /// Size the learned fragment tolerance from the robust spread of the calibrant
     /// deviations, `frag_tol_mad_k x 1.4826 x MAD`, instead of `1.5 x p95`, where MAD is
     /// the median of `|deviation - median|`. Still floored at `frag_tol_floor_ppm`. Under
@@ -1624,7 +1440,6 @@ impl Default for SearchSeedConfig {
             mass_cal_loess: false,
             frag_tol_floor_ppm: 5.0,
             count_fragments_once: false,
-            q1_deconvolved: false,
             frag_tol_mad_k: 0.0,
             widen_tol_below: DEFAULT_WIDEN_TOL_BELOW,
             widen_tol_factor: DEFAULT_WIDEN_TOL_FACTOR,
@@ -2165,11 +1980,11 @@ pub struct RtImTrainConfig {
     /// fragment m/z and retention time when they reduce the residuals), with the effective
     /// half-width and edge width, and written to `cal.json` (`q1_calibration`), with the
     /// residual distribution in steps before and after and which reading of the target
-    /// (centre or edge) fits; `extract.q1_fragments` and the Q1-deconvolved keys decide with
-    /// it. Refused on any other layout, on spectra with 1/K0 and with
+    /// (centre or edge) fits; `extract.q1_fragments` and `features.q1_deconvolved` decide
+    /// with it. Refused on any other layout, on spectra with 1/K0 and with
     /// `groups.window_groups > 1`. `"auto"` (the default since 0.12.0): on for a ZT Scan
-    /// search unless `groups.window_groups > 1` or `extract.q1_fragments = false` (and
-    /// `extract.q1_deconvolved` off) leave nothing to read it, off for every other search
+    /// search unless `groups.window_groups > 1` or `extract.q1_fragments = false` leave
+    /// nothing to read it, off for every other search
     /// ([`ZtSwitch`], docs/37_ztscan.md, "Automatic for ZT Scan files"; docs/08_rt_im_train.md,
     /// section 4h). Omitted from the canonical configuration unless on.
     #[serde(skip_serializing_if = "ZtSwitch::omitted")]
@@ -2364,33 +2179,6 @@ pub struct ExtractConfig {
     /// changes whether the stage runs, not what it computes.
     #[serde(skip_serializing)]
     pub max_footprint_gib: Option<f64>,
-    /// Scanning-quadrupole spectra (SCIEX ZT Scan DIA read with
-    /// `convert.isolation_half_width`): sum a candidate's matches in the Q1 bins of one cycle
-    /// into one chromatogram point, placed at the bin whose target is nearest its precursor
-    /// m/z, instead of keeping every bin a point of its own. The about five bins that
-    /// transmit a precursor are 1.3 ms apart, so without it the traces interleave them, each
-    /// at its own transmission. Refused on any other isolation layout and on spectra that
-    /// carry 1/K0. Default false. Benchmark-gated (docs/09_extract.md, "Scanning-quadrupole
-    /// data"). Omitted from the canonical configuration at its default.
-    #[serde(skip_serializing_if = "is_false")]
-    pub q1_cycles: bool,
-    /// Scanning-quadrupole spectra: write each accepted candidate's Q1-profile evidence
-    /// (psms_extracted v5): how the matched fragment intensity of its apex cycles is spread
-    /// over the Q1 bins that cover its precursor, against the trapezoid the quadrupole's
-    /// window, swept across a bin, transmits a precursor at that m/z with. `q1_corr` is their
-    /// Pearson correlation, `q1_offset` the shift of the observed centroid from the expected
-    /// one in half-widths, `q1_frag_sd` the spread of the fragments' own centroids in
-    /// half-widths, `q1_bin_frac` the share of covering bins with signal. A fragment shared
-    /// with a precursor at another m/z pulls its centroid that way. `features.q1_features`
-    /// gives them to the classifier. Refused as `q1_cycles` is. Default false.
-    /// Benchmark-gated. Omitted from the canonical configuration at its default.
-    #[serde(skip_serializing_if = "is_false")]
-    pub q1_profile: bool,
-    /// Reject a candidate whose Q1-profile centroid is further than this many half-widths
-    /// from the expected one (`|q1_offset|`). Needs `q1_profile`. Unset: no gate. Must be
-    /// finite and > 0. Benchmark-gated. Omitted from the canonical configuration while unset.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub q1_gate_max_offset: Option<f64>,
     /// Scanning-quadrupole spectra: decide for every library fragment of an accepted
     /// candidate whether its signal belongs to the candidate's precursor (`stages::q1frag`,
     /// psms_extracted v6). For each fragment the matched intensity is read in every Q1 step
@@ -2405,9 +2193,9 @@ pub struct ExtractConfig {
     /// library fragment (`q1f_frag_*` lists) and its summary (`q1f_*`), which
     /// `features.q1_fragment_features`, `retrace.q1_repick` and `rescore.shadow_q1` read.
     /// Needs `rt_im_train.q1_calibrate` and spectra_ms2 v3 (a run converted with
-    /// `convert.isolation_half_width`); refused with `q1_cycles`, on any other layout and on
-    /// spectra that carry 1/K0. `"auto"` (the default since 0.12.0): on for a ZT Scan search
-    /// with the Q1 calibration on and `q1_cycles` off, off for every other search
+    /// `convert.isolation_half_width`); refused on any other layout and on spectra that
+    /// carry 1/K0. `"auto"` (the default since 0.12.0): on for a ZT Scan search with the Q1
+    /// calibration on, off for every other search
     /// ([`ZtSwitch`]; docs/09_extract.md, "Per-fragment Q1 decisions"). Omitted from the
     /// canonical configuration unless on.
     #[serde(skip_serializing_if = "ZtSwitch::omitted")]
@@ -2440,25 +2228,7 @@ pub struct ExtractConfig {
     /// configuration file.
     #[serde(skip)]
     pub q1_repick_peaks: usize,
-    /// `features.ms1_envelope`, handed to extract by the same callers: extract reads the MS1
-    /// isotope-envelope evidence that family derives its features from (psms_extracted v7,
-    /// `stages::ms1env`). Never read from a configuration file.
-    #[serde(skip)]
-    pub ms1_envelope: bool,
-    /// Scanning-quadrupole spectra: count a peak for a candidate only when its Q1 centroid
-    /// (the intensity-weighted mean step target of its trace along the Q1 axis within one
-    /// cycle, `stages::q1dec`) lies within the tolerance the Q1 calibration learns from the
-    /// confident seed PSMs (`q1_calibration.deconvolution`) of the candidate's calibrated
-    /// expected Q1 centre. Applies to every hit extract collects (the traces, the apex, the
-    /// presence rules, the gate and the features read them), not to the per-fragment
-    /// decision's patches, which read the spectra directly. Needs
-    /// `rt_im_train.q1_calibrate` (which then learns the tolerance) and spectra_ms2 v3;
-    /// refused with `q1_cycles`, on spectra that carry 1/K0 and with window groups. Default
-    /// false. Benchmark-gated (docs/37_ztscan.md). Omitted from the canonical configuration
-    /// at its default.
-    #[serde(skip_serializing_if = "is_false")]
-    pub q1_deconvolved: bool,
-    /// What extract read from the run's `cal.json` under `q1_deconvolved`: the tolerance
+    /// What extract read from the run's `cal.json` under `features.q1_deconvolved`: the tolerance
     /// (steps) the Q1 calibration learned. Set by `run` / `run-experiment` (and `mumdia
     /// extract --q1-cal`). Never read from a configuration file.
     #[serde(skip)]
@@ -2478,11 +2248,6 @@ pub struct ExtractConfig {
     /// psms_extracted v8). Never read from a configuration file.
     #[serde(skip)]
     pub q1_dec_features: bool,
-    /// `features.q1_separable`, handed to extract by the same callers: extract fits the
-    /// separable model of each row's Q1 patch (`stages::q1trace::fit`, psms_extracted v9).
-    /// Never read from a configuration file.
-    #[serde(skip)]
-    pub q1_separable: bool,
     /// Fewest consecutive scan groups over which `presence_min_coelution` fragments must be
     /// present (the co-elution run) for a candidate to be accepted; values below 1 read as 1.
     /// `min_coelution_run` floors the same run, so the larger of the two applies.
@@ -2658,33 +2423,11 @@ pub struct ExtractConfig {
     /// Learn the MS1 precursor mass offset from the confident seed anchors before extract
     /// and centre every MS1 isotope read on it (`stages::ms1cal`). On by default since 2026-10-08.
     /// `true` (the default) learns one offset, the median signed ppm error of the anchors;
-    /// `false` reads at the library m/z. `"surface"` fits the error as a smooth function of
-    /// precursor m/z and retention time instead (an additive robust LOESS of the anchors'
-    /// errors, sampled on grids), and every MS1 read of extract takes the offset at its
-    /// own m/z and retention time; the residuals before and after are logged and recorded in
-    /// the extract report. Measured on a ZenoTOF 8600 run: the error drifted by about 1 ppm
-    /// over the gradient and 0.8 ppm over m/z (docs/09_extract.md, "MS1 mass calibration").
-    /// `"surface"` is opt-in until it is measured on entrapment and a second acquisition.
-    /// `true` and `false` keep the configuration hash they had.
+    /// `false` reads at the library m/z.
     pub ms1_calibrate: Ms1Calibrate,
     /// MS1 precursor mass offset in ppm (observed - theoretical) applied to every MS1
     /// isotope read. Set by `ms1_calibrate` in `run` / `run-experiment`; 0 by default.
     pub ms1_ppm_offset: f64,
-    /// Set `prec_tol_ppm` from the anchors' MS1 errors after the calibration of
-    /// `ms1_calibrate` (its offset or its surface): `3` times their robust standard deviation
-    /// (1.4826 times the median absolute deviation, refined once on the residuals within
-    /// four of them), clamped to 1-15 ppm. The fixed 3 ppm default suits an Orbitrap, whose
-    /// residuals sit near 1 ppm; a ZenoTOF's are about 2.5 ppm. Needs `ms1_calibrate`; with
-    /// too few anchors the configured `prec_tol_ppm` stays. Default false. Benchmark-gated.
-    /// Omitted from the canonical configuration at its default.
-    #[serde(skip_serializing_if = "is_false")]
-    pub prec_tol_auto: bool,
-    /// What `stages::ms1cal` learned under `ms1_calibrate = "surface"` or `prec_tol_auto`:
-    /// the fitted surface and the anchors' residuals, set by `run` / `run-experiment` before
-    /// extract, which reads with the surface and records the rest in its report. Never read
-    /// from a file.
-    #[serde(skip)]
-    pub ms1_cal: Option<Ms1Cal>,
     /// Number of chromatographic peak hypotheses to enumerate per candidate.
     /// `K>1` writes up to K local maxima to the diagnostic
     /// `<out-psms>.peaks.parquet` sidecar. The primary PSM still contains only the
@@ -2720,13 +2463,11 @@ pub struct ExtractConfig {
     /// signature-ion intensity only as a sub-integer tiebreak. In wide-window DIA a
     /// single fragment m/z channel is chimeric, so the tallest scan is often a
     /// co-isolated interferent; the scan where the most of the peptide's own
-    /// predicted transitions co-elute is a more reliable apex. Default `true`, on
-    /// correctness grounds rather than a count: `false` keeps the legacy
-    /// signature-intensity apex, whose score is 0.0 at every qualifying scan when none
-    /// of the top-K predicted fragments is observed, so the strict `>` never replaces
-    /// the first candidate and the apex silently becomes the LOWEST-RT qualifying scan.
-    /// The rolling distinct-fragment count (`apex_count_window`) still gates which scans
-    /// qualify in both modes.
+    /// predicted transitions co-elute is a more reliable apex. Must be `true`: `false`, the
+    /// legacy signature-intensity apex, was removed in 0.15.0 and is refused. Its score was
+    /// 0.0 at every qualifying scan when none of the top-K predicted fragments is observed,
+    /// so the apex silently became the LOWEST-RT qualifying scan. The rolling
+    /// distinct-fragment count (`apex_count_window`) gates which scans qualify.
     pub apex_evidence_rank: bool,
     /// Choose the apex by intensity INSIDE the region the fragment count selects. The
     /// qualifying scans (rolling distinct-fragment count within `apex_count_tol` of its
@@ -2863,7 +2604,7 @@ impl ImFeatures {
     }
 }
 
-/// `extract.ms1_calibrate`: `false`, `true` or `"surface"`. See
+/// `extract.ms1_calibrate`: `false` or `true`. See
 /// [`ExtractConfig::ms1_calibrate`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Ms1Calibrate {
@@ -2872,19 +2613,12 @@ pub enum Ms1Calibrate {
     /// One offset, the anchors' median ppm error (`true`, the default).
     #[default]
     Offset,
-    /// A smooth surface of m/z and retention time (`"surface"`).
-    Surface,
 }
 
 impl Ms1Calibrate {
     /// Whether any calibration runs.
     pub fn is_on(self) -> bool {
         self != Self::Off
-    }
-
-    /// `"surface"`.
-    pub fn is_surface(self) -> bool {
-        self == Self::Surface
     }
 }
 
@@ -2893,7 +2627,6 @@ impl Serialize for Ms1Calibrate {
         match self {
             Self::Off => s.serialize_bool(false),
             Self::Offset => s.serialize_bool(true),
-            Self::Surface => s.serialize_str("surface"),
         }
     }
 }
@@ -2904,7 +2637,7 @@ impl<'de> Deserialize<'de> for Ms1Calibrate {
         impl serde::de::Visitor<'_> for V {
             type Value = Ms1Calibrate;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("true, false or \"surface\"")
+                f.write_str("true or false")
             }
             fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
                 Ok(if v {
@@ -2913,49 +2646,9 @@ impl<'de> Deserialize<'de> for Ms1Calibrate {
                     Ms1Calibrate::Off
                 })
             }
-            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                match v {
-                    "surface" => Ok(Ms1Calibrate::Surface),
-                    _ => Err(E::invalid_value(serde::de::Unexpected::Str(v), &self)),
-                }
-            }
         }
         d.deserialize_any(V)
     }
-}
-
-/// The MS1 mass-error surface of `extract.ms1_calibrate = "surface"` (`stages::ms1cal`): an
-/// additive model, ppm(m/z, rt) = m/z term + retention-time term, each sampled on an
-/// ascending grid, linearly interpolated and held constant beyond its ends. An empty
-/// retention-time grid contributes nothing.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct Ms1Surface {
-    pub mz_grid: Vec<f64>,
-    pub mz_ppm: Vec<f64>,
-    pub rt_grid: Vec<f64>,
-    pub rt_ppm: Vec<f64>,
-}
-
-/// The MS1 calibration `stages::ms1cal` hands extract under `extract.ms1_calibrate =
-/// "surface"` or `extract.prec_tol_auto` ([`ExtractConfig::ms1_cal`]): the surface, when one
-/// was fitted, and the anchors' errors before and after, for the extract report.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct Ms1Cal {
-    /// `"offset"` or `"surface"`.
-    pub mode: String,
-    pub surface: Option<Ms1Surface>,
-    /// Anchors with an MS1 peak within the search window.
-    pub n_anchors: usize,
-    /// The anchors' errors (ppm) as read: median and robust standard deviation.
-    pub raw_median_ppm: f64,
-    pub raw_sd_ppm: f64,
-    /// Their robust standard deviation after the one offset (`ms1_ppm_offset`).
-    pub offset_sd_ppm: f64,
-    /// After the surface, when one was fitted.
-    pub surface_sd_ppm: Option<f64>,
-    /// The robust standard deviation `prec_tol_auto` used, and the tolerance it set.
-    pub tol_sd_ppm: Option<f64>,
-    pub prec_tol_ppm: Option<f64>,
 }
 
 /// The calibrated Q1 window and the per-fragment decision tolerances of a scanning-
@@ -2995,53 +2688,33 @@ pub struct Q1FragTolerances {
 }
 
 impl ExtractConfig {
-    /// The factor an MS1 read of library m/z `mz` near retention time `rt` multiplies the
-    /// m/z by: `1 + ppm * 1e-6`, ppm from the fitted surface under `ms1_calibrate =
-    /// "surface"`, else the one `ms1_ppm_offset` (exactly the expression every read used
-    /// before the surface).
+    /// The factor an MS1 read multiplies the library m/z by: `1 + ms1_ppm_offset * 1e-6`.
     #[inline]
-    pub fn ms1_shift(&self, mz: f64, rt: f64) -> f64 {
-        match self.ms1_cal.as_ref().and_then(|c| c.surface.as_ref()) {
-            Some(s) => 1.0 + s.ppm_at(mz, rt) * 1e-6,
-            None => 1.0 + self.ms1_ppm_offset * 1e-6,
-        }
+    pub fn ms1_shift(&self) -> f64 {
+        1.0 + self.ms1_ppm_offset * 1e-6
     }
 
     /// Copy the `features` and `retrace` keys extract reads into their mirror fields
-    /// (`ms1_envelope`, `q1_precursor`, `q1_multiscale`, `q1_dec_features`, `q1_separable`,
+    /// (`q1_precursor`, `q1_multiscale`, `q1_dec_features`,
     /// and `q1_repick` / `q1_repick_peaks` under `q1_fragments`). The orchestrated chain and
     /// the standalone `mumdia extract` both reach it through `q1frag::configure_extract`, so
     /// the two write the same evidence.
     /// `q1_model` and `q1_dec_tol_steps` come from the run's `cal.json` and stay with the
     /// callers.
     pub fn set_search_keys(&mut self, cfg: &Config) {
-        self.ms1_envelope = cfg.features.ms1_envelope;
         self.q1_precursor = cfg.features.q1_precursor.on();
         self.q1_multiscale = cfg.features.q1_multiscale.on();
         self.q1_dec_features = cfg.features.q1_deconvolved.on();
-        self.q1_separable = cfg.features.q1_separable;
         if self.q1_fragments.on() {
             self.q1_repick = cfg.retrace.q1_repick.on();
             self.q1_repick_peaks = cfg.retrace.q1_repick_peaks;
         }
     }
-
-    /// Whether the MS1 shift depends on m/z and retention time (a fitted surface).
-    pub fn ms1_shift_varies(&self) -> bool {
-        self.ms1_cal.as_ref().is_some_and(|c| c.surface.is_some())
-    }
-}
-
-impl Ms1Surface {
-    /// The calibrated MS1 error (observed - theoretical, ppm) at `mz` and `rt`.
-    pub fn ppm_at(&self, mz: f64, rt: f64) -> f64 {
-        interp_held(&self.mz_grid, &self.mz_ppm, mz) + interp_held(&self.rt_grid, &self.rt_ppm, rt)
-    }
 }
 
 /// `values` linearly interpolated at `x` over the ascending `grid`, held at the first and
-/// last value beyond its ends; 0 on an empty grid. The rule of [`Ms1Surface`] and of the Q1
-/// calibration's offset grids.
+/// last value beyond its ends; 0 on an empty grid. The rule of the Q1 calibration's offset
+/// grids.
 pub fn interp_held(grid: &[f64], values: &[f64], x: f64) -> f64 {
     match grid.len().min(values.len()) {
         0 => 0.0,
@@ -3069,21 +2742,15 @@ impl Default for ExtractConfig {
         Self {
             windows_in_flight: None,
             max_footprint_gib: None,
-            q1_cycles: false,
-            q1_profile: false,
-            q1_gate_max_offset: None,
             q1_fragments: ZtSwitch::Auto,
             q1_traces: ZtSwitch::Auto,
             q1_model: None,
             q1_repick: false,
             q1_repick_peaks: Q1_REPICK_PEAKS,
-            ms1_envelope: false,
-            q1_deconvolved: false,
             q1_dec_tol_steps: None,
             q1_precursor: false,
             q1_multiscale: false,
             q1_dec_features: false,
-            q1_separable: false,
             fixed_scan_window: 2,
             frag_tol_ppm: 20.0,
             prec_tol_ppm: 3.0,
@@ -3117,8 +2784,6 @@ impl Default for ExtractConfig {
             emit_rt_window: true,
             ms1_calibrate: Ms1Calibrate::Offset,
             ms1_ppm_offset: 0.0,
-            prec_tol_auto: false,
-            ms1_cal: None,
             retain_top_peaks: 1,            // legacy single-apex behaviour (K=1)
             promote_top_peaks: 1,           // top-K promotion off (only the selected apex is a row)
             alt_peak_min_area_frac: 0.10,   // alternate peak >= 10% of rank-0 area
@@ -3203,7 +2868,6 @@ pub struct FeaturesConfig {
     /// an external tool wants the file. Set true to get the artifact back.
     pub emit_pin: bool,
     pub coelution_corr_threshold: f64,
-    pub prec_tol_ppm: f64,
     /// Restrict trace-based features (co-elution, profile, xcorr, interference,
     /// base width) to the elution peak around the apex rather than the whole
     /// extracted RT window, so they are not diluted over large RT stretches.
@@ -3217,22 +2881,6 @@ pub struct FeaturesConfig {
     /// scan below `bound_peak_fraction` (brittle on jagged/gappy profiles); 1 bridges
     /// a single-scan dip (DIA sampling gap / noise), giving steadier boundaries.
     pub bound_peak_grace: usize,
-    /// Elution-peak boundary source. When false (default since 2026-10-04) each
-    /// candidate detects its own peak boundary from its top-3-predicted-fragment
-    /// profile. When true, a single set of left/right half-widths (seconds) is learned
-    /// once from the confident seed PSMs (`spectrum_q <= 0.01`, target-only, the set
-    /// that anchors RT calibration) and applied to EVERY candidate around its own apex,
-    /// so a peptide whose peak is wider than the median is cut short. The shared width
-    /// was introduced to stop a chimeric decoy from fitting its own boundaries; the
-    /// entrapment measurement below shows no FDR cost from per-candidate bounds.
-    /// Measured 2026-10-03 (doxy, 5 NN seeds per arm, benchmark config): per-candidate bounds gave Astral REP1 on the HYE library +2.20% peptides at 1% (Welch t +15.7) and the Orbitrap AIF entrapment run +0.17% (t +0.9) at an unchanged entrapment FDP (0.989% -> 1.000%, 2 SE 0.039); the share of IDs whose above-half-maximum peak extends past the bounds fell from 20% / 26% (left / right) to 2% / 6% on Astral. If the seed yields < 20 confident
-    /// anchors when true, the stage logs a warning and falls back to per-candidate
-    /// detection for that run.
-    pub bound_from_confident: bool,
-    /// Percentile (0-100) of the confident-set half-widths taken as the global left/
-    /// right elution half-width when `bound_from_confident` is true. 50 = median
-    /// (typical real peak width); higher percentiles widen the shared window.
-    pub bound_confident_pct: f64,
     /// Emit the MS1 apex-isotope precursor feature `ms1_isotope_height_corr`
     /// (Pearson of the observed apex isotope heights `[i0,i1,i2]` against the
     /// Poisson-averagine model). Default false (the feature is present in the
@@ -3272,13 +2920,6 @@ pub struct FeaturesConfig {
     /// (docs/35_diapasef.md). Omitted from the canonical configuration at its default.
     #[serde(skip_serializing_if = "ImFeatures::is_off")]
     pub im_features: ImFeatures,
-    /// The Q1-profile family of scanning-quadrupole spectra: `q1_corr`, `q1_offset`,
-    /// `q1_frag_sd` and `q1_bin_frac` from psms_extracted v5 (`extract.q1_profile`, which it
-    /// needs), appended after every other column of the `extended` set. Default false.
-    /// Benchmark-gated (docs/09_extract.md, "Scanning-quadrupole data"). Omitted from the
-    /// canonical configuration at its default.
-    #[serde(skip_serializing_if = "is_false")]
-    pub q1_features: bool,
     /// The per-fragment Q1 decision family of scanning-quadrupole spectra: `q1f_n_belong`,
     /// `q1f_belong_share` (predicted-intensity share of the fragments that belong),
     /// `q1f_interfered_share` (observed-intensity share of the interfered ones),
@@ -3293,24 +2934,6 @@ pub struct FeaturesConfig {
     /// configuration unless on.
     #[serde(skip_serializing_if = "ZtSwitch::omitted")]
     pub q1_fragment_features: ZtSwitch,
-    /// The MS1 isotope-envelope family (`ms1e_*`): extract reads the precursor's isotopes
-    /// M-1 to M+4 and the half-spacing positions in the MS1 scans around the apex (the
-    /// nearest one and two either side), at the calibrated MS1 m/z (`extract.ms1_calibrate`,
-    /// the surface under `"surface"`) within twice `extract.prec_tol_ppm` (at least 10 ppm),
-    /// and writes the evidence to psms_extracted v7; the features stage derives the envelope's
-    /// agreement with the averagine envelope over five isotopes (`ms1e_env_r2`), the isotopes
-    /// found in a row from M0 (`ms1e_env_n`), the M-1 share (`ms1e_m1_share`), the share at
-    /// the half-spacing positions (`ms1e_half_share`, a species of twice the charge), the
-    /// spacing error of the isotopes found (`ms1e_spacing_ppm`), the monoisotopic m/z error
-    /// after the calibration (`ms1e_mono_ppm`, signed, and `ms1e_mono_ppm_abs`), the observed
-    /// envelope's mean isotope index against averagine (`ms1e_ibar_dev`) and, under
-    /// `extract.q1_fragments`, the fitted Q1 centre against the centre the observed envelope
-    /// predicts (`ms1e_q1_agree`, steps; 0 without the decisions), appended after every other
-    /// column of the `extended` set. Refused on spectra that carry 1/K0. Default false.
-    /// Benchmark-gated (docs/10_features.md). Omitted from the canonical configuration at
-    /// its default.
-    #[serde(skip_serializing_if = "is_false")]
-    pub ms1_envelope: bool,
     /// The unfragmented-precursor family of scanning-quadrupole spectra (`q1p_*`): extract reads
     /// the precursor's own m/z (M0, M+1, M+2, at the calibrated fragment m/z) in every cell of the
     /// per-fragment decision's RT x step patch, where each isotope is transmitted at its own Q1
@@ -3346,8 +2969,7 @@ pub struct FeaturesConfig {
     #[serde(skip_serializing_if = "ZtSwitch::omitted")]
     pub q1_multiscale: ZtSwitch,
     /// The Q1-deconvolved evidence family of scanning-quadrupole spectra (`q1d_*`): every MS2 peak
-    /// is given the Q1 centroid of its trace along the sweep (`stages::q1dec`, the evidence of
-    /// `extract.q1_deconvolved`), and at each row's apex, over the scans of the apex cycle and the
+    /// is given the Q1 centroid of its trace along the sweep (`stages::q1dec`), and at each row's apex, over the scans of the apex cycle and the
     /// two either side whose window covers the precursor, extract reads for every library fragment
     /// the nearest peak and whether its centroid lies within the tolerance the Q1 calibration
     /// learns of the fragment's expected Q1 centre: the fragments with such a consistent match
@@ -3355,8 +2977,7 @@ pub struct FeaturesConfig {
     /// the matched intensity (`q1d_share`, and in the apex cycle alone `q1d_apex_share`) and the
     /// predicted-intensity share of the fragments with a consistent match (`q1d_pred_share`),
     /// written to psms_extracted v8 and appended after every other column of the `extended` set.
-    /// The extraction itself is unchanged (unlike `extract.q1_deconvolved`, which counts only the
-    /// consistent peaks). Needs `extract.q1_fragments`. `"auto"` (the default since 0.12.0): on for
+    /// The extraction itself is unchanged. Needs `extract.q1_fragments`. `"auto"` (the default since 0.12.0): on for
     /// a ZT Scan search under the `extended` set with `extract.q1_fragments` on, off for every
     /// other search ([`ZtSwitch`], docs/37_ztscan.md, "Automatic for ZT Scan files"). Omitted from
     /// the canonical configuration unless on.
@@ -3378,20 +2999,6 @@ pub struct FeaturesConfig {
     /// unless on.
     #[serde(skip_serializing_if = "ZtSwitch::omitted")]
     pub q1_consistency: ZtSwitch,
-    /// The separable model of scanning-quadrupole spectra (`q1s_*`, `stages::q1trace`): each
-    /// row's Q1 patch (the per-fragment decision's RT x step patch, which it needs) fitted as one
-    /// elution profile shared by the decision's fragments times each fragment's calibrated Q1
-    /// transmission, with an amplitude and a floor per fragment. Ten `q1s_*` columns (the set's
-    /// R^2, the predicted-intensity-weighted R^2 and interference share of the present fragments,
-    /// the explained and floor shares, the amplitudes' agreement with the prediction, the
-    /// fragments fitted, the profile's width and its apex against the row's) appended to the
-    /// `extended` set after the `q1d_*` columns (before `q1_consistency`'s), and per row the profile, its cycles' retention times
-    /// and each fragment's amplitude, R^2 and interference share as lists (psms_extracted v9).
-    /// Needs `extract.q1_fragments`; refused on any input that is not a ZT Scan run. Default
-    /// false: measured within the seed spread (docs/37_ztscan.md, section 15). Omitted from the
-    /// canonical configuration at its default.
-    #[serde(skip_serializing_if = "is_false")]
-    pub q1_separable: bool,
 }
 impl Default for FeaturesConfig {
     fn default() -> Self {
@@ -3404,23 +3011,17 @@ impl Default for FeaturesConfig {
             // external tool.
             emit_pin: false,
             coelution_corr_threshold: 0.9,
-            prec_tol_ppm: 20.0,
             bound_features: true,
             bound_peak_fraction: 1.0 / 3.0,
             bound_peak_grace: 0, // stop at first sub-threshold scan (legacy)
-            bound_from_confident: false, // per-candidate elution bounds (2026-10-04)
-            bound_confident_pct: 50.0, // median confident half-width
             ms1_precursor_features: false, // opt-in; overlaps ms1_isotope_cosine_apex
             chrom_loaders: 3,
             im_features: ImFeatures::Off,
-            q1_features: false,
             q1_fragment_features: ZtSwitch::Auto,
-            ms1_envelope: false,
             q1_precursor: ZtSwitch::Auto,
             q1_multiscale: ZtSwitch::Auto,
             q1_deconvolved: ZtSwitch::Auto,
             q1_consistency: ZtSwitch::Auto,
-            q1_separable: false,
         }
     }
 }
@@ -3533,12 +3134,6 @@ pub enum PeakWindowMode {
     /// (collapsed).
     #[default]
     PerCandidate,
-    /// Consensus window: the median left and right half-widths of confident
-    /// peptides (a near-constant instrument/gradient property) applied around
-    /// each candidate's apex. Robust to a single window being distorted. The
-    /// widths are estimated per quant invocation, not shared automatically
-    /// across runs.
-    Consensus,
 }
 
 /// Cross-run normalization applied to the feature-by-run matrix in the LFQ combine
@@ -3621,10 +3216,11 @@ pub struct QuantConfig {
     /// the peak-window walk; the boundary triggers on `peak_grace + 1` consecutive
     /// sub-threshold scans (1 = stop on 2 consecutive misses).
     pub peak_grace: usize,
-    /// Per-candidate window vs a consensus width derived from confident peptides.
+    /// The walked window of each candidate (`per_candidate`, the only value since
+    /// `consensus` was removed in 0.15.0). Kept so that the configuration hash does not move.
     pub peak_window_mode: PeakWindowMode,
-    /// Peptide q-value cutoff defining the "confident" set that calibrates the
-    /// consensus half-widths (Consensus mode only). Tighter than `q_threshold`.
+    /// Read by nothing since `peak_window_mode = consensus` was removed in 0.15.0. Kept so
+    /// that the configuration hash does not move.
     pub reliable_q: f64,
     /// Which q-value column to filter candidates on (`peptide_q` default;
     /// `precursor_q` is single-run only; use `run_psm_q` for per-run slices of an
@@ -3824,9 +3420,8 @@ pub struct QuantConfig {
     /// fragment trace of an accepted candidate is first collapsed to one value per cycle:
     /// the steps of a cycle (the interleaved samples of the windows that cover the
     /// precursor) are combined as the least-squares amplitude `sum(w x) / sum(w^2)` under
-    /// the weights `w` of `q1_step_weights` (the calibrated isotope-envelope transmission at
-    /// the precursor's calibrated expected Q1 centre, by default), at the mean retention time of
-    /// the cycle. On those cycle traces the fragments that do not belong (interfered or absent)
+    /// the weights `w` (the calibrated isotope-envelope transmission at the precursor's
+    /// calibrated expected Q1 centre), at the mean retention time of the cycle. On those cycle traces the fragments that do not belong (interfered or absent)
     /// are left out of the quantity when at least `q1_min_belonging` fragments belong: out of
     /// the profile that centres the window, out of the top-N ranking and out of the pattern
     /// fit in that run (the pattern set and its scale stay those of the experiment). With
@@ -3846,24 +3441,6 @@ pub struct QuantConfig {
     /// Omitted from the canonical configuration at its default.
     #[serde(skip_serializing_if = "is_default_q1_min_belonging")]
     pub q1_min_belonging: usize,
-    /// `q1_fragments`: how the steps of a cycle are weighted when they are collapsed.
-    /// `transmission` (default): the expected Q1 profile of the fragment (the calibrated
-    /// trapezoid transmission summed over the precursor's isotopes) at its calibrated expected
-    /// centre and width (the row's own fitted centre carries its fit noise into each run's
-    /// value); `uniform`: every step alike (the mean of the cycle's steps). The two measured
-    /// the same replicate precision on the ZT Scan K562 runs. Omitted from the canonical
-    /// configuration at its default.
-    #[serde(skip_serializing_if = "Q1StepWeights::is_transmission")]
-    pub q1_step_weights: Q1StepWeights,
-    /// `q1_fragments`: how a cycle trace is integrated over the fixed window. `trapezoid`
-    /// (default): the trapezoid rule over the window's cycles, as every other trace.
-    /// `elution_fit`: one Gaussian elution profile per candidate and run, fitted (a weighted
-    /// parabola of the log intensity) to the summed window samples of the fragments it
-    /// quantifies, and each fragment's area its least-squares amplitude under that profile
-    /// times the profile's area; the trapezoid where the fit fails. Needs the scan form of the
-    /// fixed window. Omitted from the canonical configuration at its default.
-    #[serde(skip_serializing_if = "Q1Integration::is_trapezoid")]
-    pub q1_integration: Q1Integration,
     /// Scanning-quadrupole spectra (SCIEX ZT Scan DIA, spectra_ms2 v3 written under
     /// `convert.isolation_half_width`): the fixed scan window's half-width in Q1 cycles rather
     /// than in samples. A ZT Scan trace interleaves the steps of every window that covers the
@@ -4135,14 +3712,6 @@ impl QuantConfig {
     pub fn lfq_reads_normalised(&self) -> bool {
         !self.normalisation.is_off() && self.normalisation_lfq
     }
-
-    /// Whether `peak_window_mode = consensus` is set where it changes no quantity: under a
-    /// fixed window every candidate with an apex integrates over that window, and the
-    /// consensus half-widths reach only the bounds reported for a candidate without one.
-    pub fn consensus_is_inert(&self) -> bool {
-        self.peak_window_mode == PeakWindowMode::Consensus
-            && (self.fixed_scan_halfwidth > 0 || self.fixed_window_s > 0.0)
-    }
 }
 
 /// Fragment ranking for the quant top-N sum. See [`QuantConfig::fragment_selection`].
@@ -4226,43 +3795,6 @@ fn is_default_q1_min_belonging(v: &usize) -> bool {
     *v == Q1_MIN_BELONGING
 }
 
-/// How the steps of a cycle are weighted when `quant.q1_fragments` collapses them. See
-/// [`QuantConfig::q1_step_weights`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum Q1StepWeights {
-    /// The fragment's expected Q1 profile at the calibrated expected centre (default).
-    #[default]
-    Transmission,
-    /// Every step alike.
-    Uniform,
-}
-
-impl Q1StepWeights {
-    /// The default, which the canonical configuration omits.
-    pub fn is_transmission(&self) -> bool {
-        *self == Q1StepWeights::Transmission
-    }
-}
-
-/// How a cycle trace of `quant.q1_fragments` is integrated. See
-/// [`QuantConfig::q1_integration`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum Q1Integration {
-    /// The trapezoid rule over the window's cycles (default).
-    #[default]
-    Trapezoid,
-    /// A Gaussian elution profile fitted per candidate and run.
-    ElutionFit,
-}
-
-impl Q1Integration {
-    /// The default, which the canonical configuration omits.
-    pub fn is_trapezoid(&self) -> bool {
-        *self == Q1Integration::Trapezoid
-    }
-}
 impl Default for QuantConfig {
     fn default() -> Self {
         Self {
@@ -4296,8 +3828,6 @@ impl Default for QuantConfig {
             fragment_detail: false,
             q1_fragments: false,
             q1_min_belonging: 3, // Q1_MIN_BELONGING
-            q1_step_weights: Q1StepWeights::Transmission,
-            q1_integration: Q1Integration::Trapezoid,
             q1_cycle_halfwidth: None,
             explicit: QuantExplicit::default(),
             resolved: Vec::new(),
@@ -4327,12 +3857,12 @@ impl Default for QuantConfig {
 /// where they are weak compress the ratios (CV 0.255 -> 0.245, median |error| 0.238 ->
 /// 0.252). That is a quantification limitation, not a false identification.
 ///
-/// `EmpiricalLibrary`, `RtTransfer` and `Full` are the earlier rescuable-tier transfer
-/// (`scripts/mbr_worker.py`), which needs `mbr.python`. No code distinguishes the three:
-/// each accepts an already extracted, sub-threshold candidate on retention-time agreement
-/// alone. On the same pools its transfers measured 2.3-2.7% entrapment FDP (ProteoBench) and
-/// about 4x the false-ID rate of the direct identifications (single cells), so it stays
-/// opt-in and `validate()` warns when it is selected.
+/// `RtTransfer` was the earlier rescuable-tier transfer, removed in 0.15.0. It accepted an
+/// already extracted, sub-threshold candidate on retention-time agreement alone. On the same
+/// pools its transfers measured 2.3-2.7% entrapment FDP (ProteoBench) and about 4x the
+/// false-ID rate of the direct identifications (single cells). The variant still parses and
+/// serialises, so the canonical configuration does not move, but [`RETIRED`] and
+/// `validate()` refuse it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MbrStrategy {
@@ -4341,36 +3871,10 @@ pub enum MbrStrategy {
     /// Search every run again on the empirical library of the first pass (default).
     #[default]
     SecondPass,
-    /// Rescuable-tier transfer; behaves as `RtTransfer`.
-    EmpiricalLibrary,
-    /// Rescuable-tier transfer on cross-run expected retention time (`mbr_worker.py`).
+    /// Removed in 0.15.0 and refused; kept so the type serialises as before.
+    /// `empirical_library` and `full`, which behaved the same, are read as this strategy.
+    #[serde(alias = "empirical_library", alias = "full")]
     RtTransfer,
-    /// Rescuable-tier transfer; behaves as `RtTransfer`.
-    Full,
-}
-
-impl MbrStrategy {
-    /// One of the rescuable-tier transfer variants, which run the `mbr_worker.py` sidecar.
-    pub fn transfers(self) -> bool {
-        matches!(
-            self,
-            MbrStrategy::EmpiricalLibrary | MbrStrategy::RtTransfer | MbrStrategy::Full
-        )
-    }
-}
-
-/// Decoy-transfer null for the MBR false-transfer FDR (M4). `ReverseSequence`
-/// transfers reverse/scramble decoys at the same expected RT; `PermutedRt` transfers
-/// real precursors to a decoupled (wrong) expected RT; `Both` combines them. The
-/// prototype's shuffled-RT null gave a ~0.6% in-window false rate vs 66.6% true
-/// (113x separation), so the transfer q-value is well-calibrated.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum DecoyTransfer {
-    #[default]
-    PermutedRt,
-    ReverseSequence,
-    Both,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -4379,37 +3883,17 @@ pub struct MbrConfig {
     pub strategy: MbrStrategy,
     /// The first-pass cut (validated at 0.01). Under `second_pass`, the experiment-wide
     /// `precursor_q` at which a target enters the empirical library, and the `run_psm_q` at
-    /// which one run's apex counts toward its consensus retention time. Under the transfer
-    /// variants, the q-value for a precursor to become a cross-run anchor.
+    /// which one run's apex counts toward its consensus retention time.
     pub q_anchor: f64,
-    /// Transfer variants only: minimum number of OTHER runs a precursor must be confident
-    /// in to transfer.
+    /// Read by nothing since the transfer was removed in 0.15.0; kept so the canonical
+    /// configuration does not move. `validate()` warns when it is set.
     pub min_anchor_runs: usize,
-    /// Transfer variants only: accept threshold for a transfer's q-value.
+    /// Read by nothing since 0.15.0, like `min_anchor_runs`.
     pub q_transfer: f64,
-    /// NOT YET WIRED. Transfer RT half-window (seconds) around the cross-run-predicted
-    /// RT. The M2 leave-target-out residual was ~17 s at p95, ~15x tighter than the search
-    /// window, which is where this default comes from -- but no code reads this field yet,
-    /// so setting it has no effect. Kept as the recorded design value for the MBR transfer
-    /// tier; `validate()` warns if it is changed from the default. See CLAUDE.md, "MBR
-    /// transfer/re-extraction remains benchmark-gated".
-    pub rt_window_s: f64,
-    /// NOT YET WIRED. Which decoy-transfer null would estimate the false-transfer rate
-    /// (M4). No code reads this field yet; `validate()` warns if it is changed.
-    pub decoy_transfer: DecoyTransfer,
-    /// Minimum correlation of the observed fragment pattern to the empirical
-    /// consensus for a transfer to be accepted (interference guard; 0 disables).
-    /// Applied by `mumdia mbr --frag` only: `run-experiment` refuses a value above 0
-    /// with a transfer strategy, because its quant writes the fragment tables after the
-    /// transfer.
+    /// Read by nothing since 0.15.0, like `min_anchor_runs`.
     pub consensus_corr_min: f64,
-    /// NOT YET WIRED. Would requantify already-identified precursors too (fill the
-    /// matrix), not only transferred ones, under `strategy = Full`. No code reads this
-    /// field yet; `validate()` warns if it is changed.
-    pub requant_all: bool,
-    /// Python interpreter for the `mbr_worker.py` sidecar (pandas/pyarrow/numpy;
-    /// e.g. the `py312_mumdia` env). Required by the transfer variants only; `second_pass`
-    /// and `none` run no sidecar.
+    /// Read by nothing since 0.15.0, like `min_anchor_runs`. Interpreter resolution still
+    /// clears an `"auto"` to null.
     pub python: Option<String>,
     /// Under `strategy = second_pass`: the `rescore.prefilter_keep_decoys` of the
     /// second-pass rescore only (0 = no prefilter there). Unset, the second pass uses
@@ -4439,10 +3923,7 @@ impl Default for MbrConfig {
             q_anchor: 0.01,
             min_anchor_runs: 2,
             q_transfer: 0.01,
-            rt_window_s: 20.0, // >= the p95 M2 residual (~17 s)
-            decoy_transfer: DecoyTransfer::PermutedRt,
             consensus_corr_min: 0.0,
-            requant_all: false,
             python: None,
             second_pass_prefilter_keep_decoys: None,
             first_pass_flag: false,
@@ -4504,13 +3985,6 @@ pub struct RescoreConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefilter_features: Option<Vec<String>>,
     pub python: Option<String>,
-    /// Path to an external `percolator` executable.
-    ///
-    /// Parsed and never read: no stage launches percolator, and `RescorerKind` has no
-    /// variant that would. It is the only silently inert config field in the tree, since
-    /// the three MBR ones warn (see `validate`). Kept rather than deleted because the
-    /// external-percolator path is still intended; `validate` now warns when it is set.
-    pub percolator_bin: Option<String>,
     /// Protein-accession substring marking spike-in (entrapment) negatives, e.g.
     /// "_HUMAN". Required when `classifier = entrapment`; PSMs whose protein
     /// contains it are the empirical false population.
@@ -4697,7 +4171,6 @@ impl Default for RescoreConfig {
             prefilter_min_psms: 1_000_000,
             prefilter_features: None,
             python: None,
-            percolator_bin: None,
             entrapment_marker: None,
             entrapment_exclude: None,
             entrapment_contaminant_markers: Vec::new(),
@@ -5077,11 +4550,9 @@ pub enum GroupCalibration {
     /// each group's LOESS and multi-head fit see the whole run's anchors. The default: a
     /// group holds a fraction of the anchors, and the fit quality is what sets the RT
     /// window that the extract of every group then pays for.
+    /// The only value since 0.15.0, which removed `per_group` (each group on its own seeds).
     #[default]
     Global,
-    /// Each group calibrates on its own seeds only. Cheaper by one pooling pass and fully
-    /// independent per group; kept for the comparison, not as a recommendation.
-    PerGroup,
 }
 
 /// What a grouped run's band plan balances.
@@ -5098,18 +4569,16 @@ pub enum GroupBalance {
 }
 
 /// How often a grouped run adapts the library's retention times (the multi-head calibration
-/// or the base-model re-prediction) under `groups.calibration = global`.
+/// or the base-model re-prediction).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum GroupRtAdaptation {
-    /// One DeepLC sidecar per band, each fitting the pooled anchors and predicting its own
-    /// band. The behaviour before this setting existed, and the default until 2026-09-27.
-    PerBand,
     /// One sidecar per run over the union of the bands: the calibration is fitted once, each
     /// unique sequence is predicted once, and every band's table is written under the name
     /// a per-band run gives it. A library the caller already re-predicted with the base
     /// model (`run-experiment` with the multi-head calibration off) is not re-predicted per
-    /// band again. The default since 2026-09-27.
+    /// band again. The default since 2026-09-27, and the only value since 0.15.0, which
+    /// removed `per_band` (one sidecar per band).
     #[default]
     OncePerRun,
 }
@@ -5150,15 +4619,14 @@ pub struct GroupsConfig {
     /// probing and the run deadlocks. A larger value is clamped to `threads - 1` with a
     /// warning rather than hanging.
     pub parallel: usize,
-    /// How often the library's retention times are adapted under `calibration = global`:
-    /// `once_per_run` (the default since 2026-09-27) runs one DeepLC sidecar per run over the
-    /// union of the bands, `per_band` (the previous default) one per band. `per_group`
-    /// calibration always adapts per band.
+    /// How often the library's retention times are adapted: `once_per_run` (the default
+    /// since 2026-09-27, and since 0.15.0 the only value) runs one DeepLC sidecar per run
+    /// over the union of the bands. `per_band`, one sidecar per band, was removed in 0.15.0.
     ///
-    /// Each per-band sidecar starts an interpreter, imports torch and DeepLC, reads the
-    /// pooled seed, refits the same heads on the same anchors (head 2503 in every band of
-    /// the HYE sweep) and predicts every sequence of its band, so a sequence whose charge
-    /// states fall in two bands is predicted twice (10.9M HYE rows are 4.91M unique
+    /// Each per-band sidecar started an interpreter, imported torch and DeepLC, read the
+    /// pooled seed, refitted the same heads on the same anchors (head 2503 in every band of
+    /// the HYE sweep) and predicted every sequence of its band, so a sequence whose charge
+    /// states fell in two bands was predicted twice (10.9M HYE rows are 4.91M unique
     /// sequences). On HYE Astral the multi-head step took about 13 min unbanded and 19-24
     /// min at 2-16 bands. `once_per_run` fits once, predicts the union once and writes each
     /// band's table under the name a per-band run gives it
@@ -5258,8 +4726,8 @@ pub struct GroupsConfig {
     /// before.
     pub pool_chromatograms: bool,
     /// Let the bands extract with unbounded retention-time windows. Default `false`: when the
-    /// fit a band extracts with has fewer than two target anchors (the pooled seed under
-    /// `calibration = global`, the band's own seed under `per_group`), the run stops with an
+    /// fit the bands extract with has fewer than two target anchors (on the pooled seed),
+    /// the run stops with an
     /// error before a band extracts with it. The seeds are counted right after `seed-pool`,
     /// before any DeepLC sidecar or extraction, and the fit itself is checked again before
     /// its windows are written. `true` keeps the previous behaviour and logs a warning that
@@ -5281,8 +4749,7 @@ pub struct GroupsConfig {
     /// Check the seed first: the library and its decoys, the seed's fragment tolerance and
     /// the input file. A run without a confident seed can be searched ungrouped
     /// (`window_groups = 1`), which keeps the unbounded fallback: on an ordinary library it
-    /// fits in memory, and single-cell blank wells are searched that way. Under `per_group`,
-    /// `calibration = global` fits one calibration on the anchors of every band. Omitted
+    /// fits in memory, and single-cell blank wells are searched that way. Omitted
     /// from the canonical configuration at its default, so the config hash of every
     /// configuration that does not set it is unchanged (`docs/33_window_groups.md` section
     /// 4c).
@@ -5343,13 +4810,6 @@ pub struct RetraceConfig {
     /// the prototype's +1.6%.
     #[serde(skip_serializing_if = "is_true")]
     pub ms1: bool,
-    /// Write `imc_ref_w` into `psms_extracted`, the agreement of the fragments' raw 1/K0
-    /// profiles at the apex, which the ion-mobility feature family then carries as its
-    /// tenth feature. Needs `enabled` and a `features.im_features` other than `off`.
-    /// Default false. Benchmark-gated: alone it measured +1.3% peptides, and the added
-    /// peptides carried about 2.7% FDP.
-    #[serde(skip_serializing_if = "is_false")]
-    pub apex_features: bool,
     /// The scanning-quadrupole analogue of `repick` (ZT Scan has no raw events beyond its
     /// centroids, so it needs neither `enabled` nor a `.d`): extract re-chooses each
     /// candidate's apex in RT x Q1 among its own apex and the next peaks of its count
@@ -5383,7 +4843,6 @@ impl Default for RetraceConfig {
             q1_repick_peaks: 5, // Q1_REPICK_PEAKS
             im_half_width: 0.015,
             ms1: true,
-            apex_features: false,
         }
     }
 }
@@ -5512,14 +4971,6 @@ pub struct LocaliseConfig {
     #[serde(deserialize_with = "de_localise_temperature")]
     #[serde(skip_serializing_if = "is_default_localise_temperature")]
     pub temperature: f64,
-    /// Neutral-loss ions as evidence: for Phospho, the loss of phosphoric acid (97.9769 Da)
-    /// from every b and y ion that carries a phosphoserine or -threonine (and the decoy
-    /// residue, which stands in for them), scored as four ion classes of their own with
-    /// their own detection and false-presence rates. Other modifications have no neutral
-    /// loss. Default false: on the synthetic phosphopeptides it localised no more peaks at a
-    /// given true false localisation rate (docs/36_ptm_localisation.md section 7).
-    #[serde(skip_serializing_if = "is_default_localise_neutral_loss")]
-    pub neutral_loss: bool,
     /// `run-experiment`: combine the runs into one site probability per consensus peak,
     /// summing the log-likelihoods of the runs whose peak of the same precursor matches it in
     /// aligned retention time, and write `localisation_experiment.parquet` and the
@@ -5552,7 +5003,6 @@ impl Default for LocaliseConfig {
             im_half_width: 0.05,
             prior_strength: 64.0,
             temperature: 0.0, // LOCALISE_TEMPERATURE_AUTO
-            neutral_loss: false,
             combine_runs: true,
             experiment_temperature: 0.0, // LOCALISE_TEMPERATURE_AUTO
         }
@@ -5631,9 +5081,6 @@ fn is_default_localise_peak_rule(v: &LocalisePeakRule) -> bool {
 }
 fn is_default_localise_peak_valley_ratio(v: &f64) -> bool {
     *v == LocaliseConfig::default().peak_valley_ratio
-}
-fn is_default_localise_neutral_loss(v: &bool) -> bool {
-    *v == LocaliseConfig::default().neutral_loss
 }
 fn is_default_localise_combine_runs(v: &bool) -> bool {
     *v == LocaliseConfig::default().combine_runs
@@ -5796,9 +5243,8 @@ impl Config {
 
     /// The keys that ask for the ZT Scan analysis explicitly: an automatic key set to `true`
     /// (a number above 0 for `quant.q1_cycle_halfwidth`, a count other than the default for
-    /// `retrace.q1_repick_peaks`), and the opt-in keys that read the Q1 sweep as well
-    /// (`extract.q1_cycles`, `extract.q1_profile`, `features.q1_features`,
-    /// `extract.q1_deconvolved`, `search_seed.q1_deconvolved`, `quant.q1_fragments`). Called
+    /// `retrace.q1_repick_peaks`), and the opt-in key that reads the Q1 sweep as well
+    /// (`quant.q1_fragments`). Called
     /// before [`Config::resolve_ztscan`], so on means asked for.
     pub fn ztscan_keys_on(&self) -> Vec<&'static str> {
         let (ex, f) = (&self.extract, &self.features);
@@ -5821,15 +5267,6 @@ impl Config {
             ),
             (self.rescore.shadow_q1.on(), "rescore.shadow_q1"),
             (self.quant.q1_cycles() > 0, "quant.q1_cycle_halfwidth"),
-            (ex.q1_cycles, "extract.q1_cycles"),
-            (ex.q1_profile, "extract.q1_profile"),
-            (f.q1_features, "features.q1_features"),
-            (ex.q1_deconvolved, "extract.q1_deconvolved"),
-            (f.q1_separable, "features.q1_separable"),
-            (
-                self.search_seed.q1_deconvolved,
-                "search_seed.q1_deconvolved",
-            ),
             (self.quant.q1_fragments, "quant.q1_fragments"),
         ]
         .into_iter()
@@ -5879,7 +5316,7 @@ impl Config {
     ///   ([`Config::ztscan_keys_on`]) is refused, because it reads the Q1 sweep.
     /// - Every input a ZT Scan run: `convert.isolation_half_width` the census's suggestion
     ///   unless set, and every automatic key on unless the configuration rules it out
-    ///   (window groups, `extract.q1_cycles`, a feature set other than `extended`, the
+    ///   (window groups, a feature set other than `extended`, the
     ///   re-pick's or the shadow test's exclusions, a fixed window other than the scan form,
     ///   an explicit `false` of a key it needs), with a warning naming what stayed off and
     ///   why.
@@ -5969,12 +5406,11 @@ impl Config {
             }
         };
         let grouped = self.groups.window_groups > 1;
-        // The Q1 calibration runs when something reads it: the per-fragment decisions, or
-        // the Q1-deconvolved count of `extract.q1_deconvolved`.
-        let decisions = !self.extract.q1_fragments.is_off() && !self.extract.q1_cycles;
+        // The Q1 calibration runs when something reads it: the per-fragment decisions.
+        let decisions = !self.extract.q1_fragments.is_off();
         let cal_why = if grouped {
             Some("groups.window_groups > 1: it calibrates the Q1 sweep of an ungrouped run")
-        } else if !decisions && !self.extract.q1_deconvolved {
+        } else if !decisions {
             Some("nothing reads it: extract.q1_fragments is off")
         } else {
             None
@@ -5987,9 +5423,7 @@ impl Config {
             );
         }
         self.rt_im_train.q1_calibrate.resolve(cal_why.is_none());
-        let frag_why = if self.extract.q1_cycles {
-            Some("extract.q1_cycles sums the Q1 steps it keeps apart")
-        } else if !self.rt_im_train.q1_calibrate.on() {
+        let frag_why = if !self.rt_im_train.q1_calibrate.on() {
             Some("it needs rt_im_train.q1_calibrate")
         } else {
             None
@@ -6121,8 +5555,11 @@ impl Config {
     /// quantification recipe it sets ([`QuantConfig::explicit`]), resolve the recipe's
     /// defaults against the rest of it ([`Config::resolve_quant_recipe`]), then validate.
     pub fn from_json(s: &str) -> Result<Self, crate::error::ConfigError> {
-        let mut c: Config =
+        let mut v: serde_json::Value =
             serde_json::from_str(s).map_err(|e| crate::error::ConfigError::Parse(e.to_string()))?;
+        strip_retired(&mut v, RETIRED)?;
+        let mut c: Config = serde_json::from_value(v)
+            .map_err(|e| crate::error::ConfigError::Parse(e.to_string()))?;
         c.quant.explicit = quant_explicit_keys(s);
         c.resolve_quant_recipe();
         c.validate()?;
@@ -6433,22 +5870,9 @@ impl Config {
                         .into(),
                 ));
             }
-            if q.q1_integration == Q1Integration::ElutionFit && !scan_window {
-                return Err(Invalid(
-                    "quant.q1_integration = elution_fit fits the cycles of the fixed scan \
-                     window, so it needs quant.fixed_scan_halfwidth > 0, \
-                     quant.fixed_window_s = 0 and quant.fixed_scan_halfwidth_scale = 0."
-                        .into(),
-                ));
-            }
-        } else if q.q1_min_belonging != Q1_MIN_BELONGING
-            || !q.q1_step_weights.is_transmission()
-            || !q.q1_integration.is_trapezoid()
-        {
+        } else if q.q1_min_belonging != Q1_MIN_BELONGING {
             return Err(Invalid(
-                "quant.q1_min_belonging, quant.q1_step_weights and quant.q1_integration act \
-                 only under quant.q1_fragments; set it as well"
-                    .into(),
+                "quant.q1_min_belonging acts only under quant.q1_fragments; set it as well".into(),
             ));
         }
         if q.q1_cycles() > 0 {
@@ -6605,48 +6029,24 @@ impl Config {
                     .into(),
             ));
         }
-        // MBR fields that are accepted and documented but not yet read by any stage. Setting
-        // them has NO effect, which is worse than rejecting them: the run looks configured.
-        // Warn rather than error so existing configs keep parsing (serde uses
-        // deny_unknown_fields, so deleting the fields outright would break them).
+        if self.mbr.strategy == MbrStrategy::RtTransfer {
+            return Err(Invalid(format!(
+                "mbr.strategy = rt_transfer was removed in {RETIRED_IN}: {MBR_TRANSFER_GONE}"
+            )));
+        }
+        let d = MbrConfig::default();
+        if self.mbr.min_anchor_runs != d.min_anchor_runs
+            || self.mbr.q_transfer != d.q_transfer
+            || self.mbr.consensus_corr_min != d.consensus_corr_min
+            || self
+                .mbr
+                .python
+                .as_deref()
+                .is_some_and(|v| !v.eq_ignore_ascii_case("auto"))
         {
-            let d = MbrConfig::default();
-            let mut inert: Vec<&str> = Vec::new();
-            if (self.mbr.rt_window_s - d.rt_window_s).abs() > f64::EPSILON {
-                inert.push("mbr.rt_window_s");
-            }
-            if self.mbr.decoy_transfer != d.decoy_transfer {
-                inert.push("mbr.decoy_transfer");
-            }
-            if self.mbr.requant_all != d.requant_all {
-                inert.push("mbr.requant_all");
-            }
-            if !inert.is_empty() {
-                tracing::warn!(
-                    fields = ?inert,
-                    "these MBR config fields are parsed but not read by any stage yet, so \
-                     setting them has no effect on this run"
-                );
-            }
-        }
-        // The fourth inert field, and the only one that used to warn about nothing. Under
-        // `deny_unknown_fields` a user reasonably reads an accepted key as an honoured
-        // one, so silence here means a run that looks configured for external percolator
-        // and is not.
-        if self.rescore.percolator_bin.is_some() {
             tracing::warn!(
-                "rescore.percolator_bin is parsed but no stage launches percolator, so \
-                 setting it has no effect. Use rescore.classifier = mokapot or nn_torch \
-                 for an external classifier."
-            );
-        }
-        if self.mbr.strategy.transfers() {
-            tracing::warn!(
-                strategy = ?self.mbr.strategy,
-                "mbr.strategy selects the rescuable-tier transfer (empirical_library, \
-                 rt_transfer and full behave identically): it accepts a transfer on retention-time \
-                 agreement alone, and its transfers measured 2.3-2.7% entrapment FDP at a 1% cut. \
-                 The default second_pass searches every run again instead (docs/12)."
+                "mbr.min_anchor_runs, mbr.q_transfer, mbr.consensus_corr_min and mbr.python \
+                 configured the rescuable-tier transfer, removed in 0.15.0: they do nothing"
             );
         }
         if self.mbr.strategy != MbrStrategy::SecondPass
@@ -6703,14 +6103,6 @@ impl Config {
                 "quant.fragment_selection = cross_run correlates each fragment over the fixed \
                  window, which is off (fixed_scan_halfwidth = 0 and fixed_window_s = 0), so \
                  every candidate takes equal weights"
-            );
-        }
-        if self.quant.consensus_is_inert() {
-            tracing::warn!(
-                "quant.peak_window_mode = consensus sets the half-widths of the walked window, \
-                 but a fixed window is set (fixed_scan_halfwidth or fixed_window_s) and every \
-                 candidate with an apex is integrated over it, so consensus changes no \
-                 quantity; set both to 0 to integrate over the consensus window"
             );
         }
         // ── numeric domains (docs/29 #18) ───────────────────────────────────────
@@ -6992,68 +6384,9 @@ impl Config {
                 "convert.tdf_mz_ppm must be finite and > 0, and convert.tdf_min_points >= 1".into(),
             ));
         }
-        let ex = &self.extract;
-        if let Some(g) = ex.q1_gate_max_offset {
-            if !(g.is_finite() && g > 0.0) {
-                return Err(Invalid(format!(
-                    "extract.q1_gate_max_offset must be finite and > 0 (got {g}), in \
-                     half-widths of the Q1 window"
-                )));
-            }
-            if !ex.q1_profile {
-                return Err(Invalid(
-                    "extract.q1_gate_max_offset gates on the Q1-profile evidence, which only \
-                     extract.q1_profile computes; set it as well"
-                        .into(),
-                ));
-            }
-        }
-        if self.features.q1_features && !ex.q1_profile {
-            return Err(Invalid(
-                "features.q1_features reads the Q1-profile columns that extract.q1_profile \
-                 writes; set it as well"
-                    .into(),
-            ));
-        }
         // What each key of the ZT Scan analysis reads (`validate_ztscan`), checked again
         // once `"auto"` is resolved.
         self.validate_ztscan()?;
-        if ex.q1_fragments.on() && ex.q1_cycles {
-            return Err(Invalid(
-                "extract.q1_fragments keeps every Q1 step of a cycle apart, and \
-                 extract.q1_cycles sums them; unset q1_cycles"
-                    .into(),
-            ));
-        }
-        if self.features.ms1_envelope && self.groups.window_groups > 1 {
-            return Err(Invalid(
-                "features.ms1_envelope reads its evidence in the extract of an ungrouped run; \
-                 it is not supported with groups.window_groups > 1"
-                    .into(),
-            ));
-        }
-        if ex.q1_deconvolved && ex.q1_cycles {
-            return Err(Invalid(
-                "extract.q1_deconvolved keeps every Q1 step of a cycle apart, and \
-                 extract.q1_cycles sums them; unset q1_cycles"
-                    .into(),
-            ));
-        }
-        if self.search_seed.q1_deconvolved && self.search_seed.count_fragments_once {
-            return Err(Invalid(
-                "search_seed.q1_deconvolved counts every matching peak near the candidate's Q1 \
-                 centre; it does not combine with search_seed.count_fragments_once (a diaPASEF \
-                 setting)"
-                    .into(),
-            ));
-        }
-        if (ex.q1_deconvolved || self.search_seed.q1_deconvolved) && self.groups.window_groups > 1 {
-            return Err(Invalid(
-                "search_seed.q1_deconvolved and extract.q1_deconvolved read the whole Q1 sweep \
-                 of an ungrouped run; they are not supported with groups.window_groups > 1"
-                    .into(),
-            ));
-        }
         if self.rescore.shadow_q1.on() && self.rescore.shadow_min_shared == 0 {
             return Err(Invalid(
                 "rescore.shadow_q1 is a term of the shadow test, which \
@@ -7167,14 +6500,6 @@ impl Config {
                     .into(),
             ));
         }
-        if self.extract.prec_tol_auto && !self.extract.ms1_calibrate.is_on() {
-            return Err(Invalid(
-                "extract.prec_tol_auto sets the MS1 tolerance from the residuals of the MS1 \
-                 calibration, and extract.ms1_calibrate = false turns it off. Set \
-                 ms1_calibrate to true or \"surface\"."
-                    .into(),
-            ));
-        }
 
         // `finetune_batch = 0` is the documented automatic batch size (see the field), so
         // only the epoch count has a lower bound. Rejecting the zero batch made simply
@@ -7235,16 +6560,7 @@ impl Config {
                 self.features.coelution_corr_threshold
             )));
         }
-        if !self.features.bound_confident_pct.is_finite()
-            || !(0.0..=100.0).contains(&self.features.bound_confident_pct)
-        {
-            return Err(Invalid(format!(
-                "features.bound_confident_pct is a percentile and must be in [0, 100] (got {})",
-                self.features.bound_confident_pct
-            )));
-        }
         for (name, value) in [
-            ("features.prec_tol_ppm", self.features.prec_tol_ppm),
             (
                 "extract.claim_cues.mz_close_sigma_ppm",
                 self.extract.claim_cues.mz_close_sigma_ppm,
@@ -7254,7 +6570,6 @@ impl Config {
                 self.extract.claim_cues.rt_prior_tau_s,
             ),
             ("extract.peak_claim_margin", self.extract.peak_claim_margin),
-            ("mbr.rt_window_s", self.mbr.rt_window_s),
         ] {
             if !value.is_finite() || value <= 0.0 {
                 return Err(Invalid(format!(
@@ -7299,14 +6614,8 @@ impl Config {
                 ));
             }
             for (name, value) in [
-                ("prescreen.complement_bonus", p.complement_bonus),
                 ("prescreen.crowding_exponent", p.crowding_exponent),
                 ("prescreen.repeat_bonus", p.repeat_bonus),
-                ("prescreen.tag_bonus", p.tag_bonus),
-                ("prescreen.fasta_bonus", p.fasta_bonus),
-                ("prescreen.flank_bonus", p.flank_bonus),
-                ("prescreen.mass_hypotheses.bonus", p.mass_hypotheses.bonus),
-                ("prescreen.trace.bonus", p.trace.bonus),
             ] {
                 if !value.is_finite() || value < 0.0 {
                     return Err(Invalid(format!(
@@ -7314,29 +6623,10 @@ impl Config {
                     )));
                 }
             }
-            for (name, value) in [
-                ("prescreen.tags.edge_tol_da", p.tags.edge_tol_da),
-                ("prescreen.tags.rms_sigma_da", p.tags.rms_sigma_da),
-                ("prescreen.trace.cluster_da", p.trace.cluster_da),
-                (
-                    "prescreen.mass_hypotheses.ms1_ppm",
-                    p.mass_hypotheses.ms1_ppm,
-                ),
-                (
-                    "prescreen.mass_hypotheses.ms1_rt_s",
-                    p.mass_hypotheses.ms1_rt_s,
-                ),
-            ] {
-                if !value.is_finite() || value <= 0.0 {
-                    return Err(Invalid(format!(
-                        "{name} must be finite and > 0 (got {value})"
-                    )));
-                }
-            }
-            if !(2..=3).contains(&p.tags.positioned_residues) {
+            let tol = p.tags.edge_tol_da;
+            if !tol.is_finite() || tol <= 0.0 {
                 return Err(Invalid(format!(
-                    "prescreen.tags.positioned_residues must be 2 or 3 (got {})",
-                    p.tags.positioned_residues
+                    "prescreen.tags.edge_tol_da must be finite and > 0 (got {tol})"
                 )));
             }
             if !(1..=2).contains(&p.tags.max_charge) {
@@ -7345,16 +6635,6 @@ impl Config {
                      fragment charges 1-2",
                     p.tags.max_charge
                 )));
-            }
-            if p.trace.scans < 1 || p.trace.min_detections < 1 {
-                return Err(Invalid(
-                    "prescreen.trace.scans and prescreen.trace.min_detections must be >= 1".into(),
-                ));
-            }
-            if p.delayed_modforms && p.retrieval != PrescreenRetrieval::Tags {
-                return Err(Invalid(
-                    "prescreen.delayed_modforms needs prescreen.retrieval = \"tags\"".into(),
-                ));
             }
             if p.max_frag_charge < 1 {
                 return Err(Invalid(format!(
@@ -7575,14 +6855,6 @@ impl Config {
                     .into(),
             ));
         }
-        if ex.q1_deconvolved && !calibrated {
-            return Err(Invalid(
-                "extract.q1_deconvolved compares each peak's Q1 centroid with the \
-                 calibrated expected centre, within the tolerance rt_im_train.q1_calibrate \
-                 learns from the seed; set it as well"
-                    .into(),
-            ));
-        }
         let decided = !ex.q1_fragments.is_off();
         if f.q1_fragment_features.on() && !decided {
             return Err(Invalid(
@@ -7607,20 +6879,6 @@ impl Config {
             return Err(Invalid(
                 "extract.q1_traces collapses each cycle's steps with the calibrated Q1 model of \
                  extract.q1_fragments; set it as well"
-                    .into(),
-            ));
-        }
-        if ex.q1_traces.on() && ex.q1_cycles {
-            return Err(Invalid(
-                "extract.q1_traces and extract.q1_cycles each put one point a cycle on the \
-                 traces; set one of them"
-                    .into(),
-            ));
-        }
-        if f.q1_separable && !decided {
-            return Err(Invalid(
-                "features.q1_separable fits the RT x step patch of extract.q1_fragments; set it \
-                 as well"
                     .into(),
             ));
         }
@@ -7691,16 +6949,12 @@ impl Config {
             }
         }
         if !r.enabled {
-            for (on, key) in [
-                (r.repick, "retrace.repick"),
-                (r.apex_features, "retrace.apex_features"),
-            ] {
-                if on {
-                    return Err(Invalid(format!(
-                        "{key} needs retrace.enabled: it works on the raw events the retrace \
-                         stage reads"
-                    )));
-                }
+            if r.repick {
+                return Err(Invalid(
+                    "retrace.repick needs retrace.enabled: it works on the raw events the \
+                     retrace stage reads"
+                        .into(),
+                ));
             }
             return Ok(());
         }
@@ -7735,13 +6989,6 @@ impl Config {
                         .into(),
                 ));
             }
-        }
-        if r.apex_features && self.features.im_features.is_off() {
-            return Err(Invalid(
-                "retrace.apex_features writes imc_ref_w, a feature of the ion-mobility family, \
-                 so it needs features.im_features = on or auto"
-                    .into(),
-            ));
         }
         Ok(())
     }
@@ -7798,6 +7045,409 @@ impl Config {
     }
 }
 
+/// The release that removed the entries of [`RETIRED`].
+const RETIRED_IN: &str = "0.15.0";
+
+/// Why the experimental prescreen components went (group F).
+const PRESCREEN_PART_GONE: &str = "an experimental prescreen component that measured no gain over the plain fragment-rarity score (docs/34 section 5)";
+
+/// Why `mbr.strategy = rt_transfer` (and its aliases `empirical_library` and `full`) went.
+const MBR_TRANSFER_GONE: &str = "mbr.strategy = second_pass, the default, replaces it; the transfers measured 2.3-2.7% entrapment FDP at a 1% cut (docs/12, \"Second pass\")";
+
+/// What [`RETIRED`] removed at a path.
+enum Gone {
+    /// The key, whose default was this JSON. That value is dropped; any other is refused.
+    Key(&'static str),
+    /// This JSON value of a key that stays: refused.
+    Value(&'static str),
+    /// A section whose every key is a `Key` entry listed before it: dropped once empty.
+    Section,
+}
+
+/// A removed configuration key, value or section, and why it went.
+struct Retired {
+    /// Dotted path of the key.
+    path: &'static str,
+    gone: Gone,
+    /// Why it went, for the refusal.
+    why: &'static str,
+}
+
+/// Keys and values removed because they measured neutral or worse, or did nothing. An old
+/// configuration, saved desktop setup or manifest (every manifest records every key) that sets
+/// a removed key at its old default still loads: [`strip_retired`] drops the key, which then
+/// changes nothing. Any other value, and every removed value of a kept key, is refused with
+/// the release and the reason.
+const RETIRED: &[Retired] = &[
+    // Entries are grouped by the change that removed them, one blank line between groups.
+    Retired {
+        path: "features.prec_tol_ppm",
+        gone: Gone::Key("20.0"),
+        why: "it was never read; extract.prec_tol_ppm sets the precursor tolerance",
+    },
+    // A: Q1 and MS1 families, hard Q1 counts, Q1 sweep, extract arms
+    Retired {
+        path: "extract.q1_cycles",
+        gone: Gone::Key("false"),
+        why: "summing the Q1 bins of a cycle lost 11-14% of precursors (docs/09_extract.md section 10)",
+    },
+    Retired {
+        path: "extract.q1_profile",
+        gone: Gone::Key("false"),
+        why: "the Q1-profile evidence measured inside seed noise (docs/09_extract.md section 10)",
+    },
+    Retired {
+        path: "extract.q1_gate_max_offset",
+        gone: Gone::Key("null"),
+        why: "the Q1-profile gate was not useful at any threshold measured (docs/09_extract.md section 10)",
+    },
+    Retired {
+        path: "features.q1_features",
+        gone: Gone::Key("false"),
+        why: "the Q1-profile family measured inside seed noise (docs/09_extract.md section 10)",
+    },
+    Retired {
+        path: "features.ms1_envelope",
+        gone: Gone::Key("false"),
+        why: "the MS1 isotope-envelope family measured inside seed noise (docs/10_features.md, ms1_envelope)",
+    },
+    Retired {
+        path: "features.q1_separable",
+        gone: Gone::Key("false"),
+        why: "the separable Q1 model measured inside the seed spread (docs/37_ztscan.md section 15)",
+    },
+    Retired {
+        path: "extract.q1_deconvolved",
+        gone: Gone::Key("false"),
+        why: "counting only Q1-consistent peaks lost 25.6% of precursors (docs/37_ztscan.md section 10.3)",
+    },
+    Retired {
+        path: "search_seed.q1_deconvolved",
+        gone: Gone::Key("false"),
+        why: "counting only Q1-consistent peaks in the seed lost 2.5% of precursors (docs/37_ztscan.md section 10.3)",
+    },
+    Retired {
+        path: "extract.apex_evidence_rank",
+        gone: Gone::Value("false"),
+        why: "the legacy signature-intensity apex fell back to the lowest-RT scan and measured 1.0% fewer peptides on HYE for 27.6% more candidates (bench/README.md)",
+    },
+
+    // B: quantification options
+    Retired {
+        path: "quant.peak_window_mode",
+        gone: Gone::Value("\"consensus\""),
+        why: "under the default fixed window it changed no quantity, and it refined only the \
+              walked window, which measured worse than the fixed window (docs/12, quantification \
+              phase 2)",
+    },
+    Retired {
+        path: "quant.q1_step_weights",
+        gone: Gone::Key("\"transmission\""),
+        why: "uniform step weights measured the same replicate CV as the transmission, 0.120 \
+              (docs/12, \"Quantification from the fragments that belong\")",
+    },
+    Retired {
+        path: "quant.q1_integration",
+        gone: Gone::Key("\"trapezoid\""),
+        why: "the elution fit measured a worse replicate CV than the trapezoid, 0.133 against \
+              0.120 (docs/12, \"Quantification from the fragments that belong\")",
+    },
+
+    // C: bound_from_confident, per-group calibration
+    Retired {
+        path: "features.bound_from_confident",
+        gone: Gone::Key("false"),
+        why: "one elution half-width learned from the confident anchors measured 2.20% fewer peptides than per-candidate bounds and cut 20-26% of peaks short (docs/10, elution-peak bounds)",
+    },
+    Retired {
+        path: "features.bound_confident_pct",
+        gone: Gone::Key("50.0"),
+        why: "it only set the percentile of features.bound_from_confident, which was removed",
+    },
+    Retired {
+        path: "groups.calibration",
+        gone: Gone::Value("\"per_group\""),
+        why: "calibrating each band on its own seed was kept only for comparison, and bands without anchors stopped the run (docs/33_window_groups.md section 4)",
+    },
+    Retired {
+        path: "groups.rt_adaptation",
+        gone: Gone::Value("\"per_band\""),
+        why: "one sidecar per band measured slower than once_per_run with the same peptides (docs/33_window_groups.md section 4b)",
+    },
+
+    // D: MS1 surface, never-read keys and refused choices
+    Retired {
+        path: "extract.ms1_calibrate",
+        gone: Gone::Value("\"surface\""),
+        why: "the MS1 error surface measured inside seed noise on one acquisition \
+              (docs/09_extract.md, \"MS1 mass calibration\")",
+    },
+    Retired {
+        path: "extract.prec_tol_auto",
+        gone: Gone::Key("false"),
+        why: "the MS1 tolerance from the anchors' residuals measured inside seed noise on one \
+              acquisition (docs/09_extract.md, \"MS1 mass calibration\")",
+    },
+    Retired {
+        path: "mbr.rt_window_s",
+        gone: Gone::Key("20.0"),
+        why: "no stage read it",
+    },
+    Retired {
+        path: "mbr.decoy_transfer",
+        gone: Gone::Key("\"permuted_rt\""),
+        why: "no stage read it",
+    },
+    Retired {
+        path: "mbr.requant_all",
+        gone: Gone::Key("false"),
+        why: "no stage read it",
+    },
+    Retired {
+        path: "rescore.percolator_bin",
+        gone: Gone::Key("null"),
+        why: "no stage launched it; rescore.classifier = mokapot or nn_torch is the external \
+              classifier",
+    },
+    Retired {
+        path: "retrace.apex_features",
+        gone: Gone::Key("false"),
+        why: "the apex 1/K0 agreement added peptides at about 2.7% FDP (docs/35_diapasef.md \
+              section 6)",
+    },
+    Retired {
+        path: "localise.neutral_loss",
+        gone: Gone::Key("false"),
+        why: "neutral-loss ions localised no more peaks at a given false localisation rate \
+              (docs/36_ptm_localisation.md section 7)",
+    },
+
+    // E: rt_transfer MBR tier
+    Retired {
+        path: "mbr.strategy",
+        gone: Gone::Value("\"rt_transfer\""),
+        why: MBR_TRANSFER_GONE,
+    },
+    Retired {
+        path: "mbr.strategy",
+        gone: Gone::Value("\"empirical_library\""),
+        why: MBR_TRANSFER_GONE,
+    },
+    Retired {
+        path: "mbr.strategy",
+        gone: Gone::Value("\"full\""),
+        why: MBR_TRANSFER_GONE,
+    },
+
+    // F: prescreen components
+    Retired {
+        path: "prescreen.top_peaks",
+        gone: Gone::Key("0"),
+        why: "a comparison setting; the 300-peak cap kept fewer references than the uncapped default (docs/34 section 5)",
+    },
+    Retired {
+        path: "prescreen.retrieval",
+        gone: Gone::Key("\"all\""),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.rescue",
+        gone: Gone::Key("true"),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.delayed_modforms",
+        gone: Gone::Key("false"),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.tags.gap_edges",
+        gone: Gone::Key("false"),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.tags.rms_sigma_da",
+        gone: Gone::Key("0.003"),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.tags.positioned",
+        gone: Gone::Key("false"),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.tags.positioned_residues",
+        gone: Gone::Key("3"),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.complement_bonus",
+        gone: Gone::Key("0.0"),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.tag_bonus",
+        gone: Gone::Key("0.0"),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.fasta_bonus",
+        gone: Gone::Key("0.0"),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.flank_bonus",
+        gone: Gone::Key("0.0"),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.mass_hypotheses.enabled",
+        gone: Gone::Key("false"),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.mass_hypotheses.sample_spectra",
+        gone: Gone::Key("512"),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.mass_hypotheses.ms1",
+        gone: Gone::Key("false"),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.mass_hypotheses.ms1_rt_s",
+        gone: Gone::Key("2.0"),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.mass_hypotheses.ms1_ppm",
+        gone: Gone::Key("10.0"),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.mass_hypotheses.require_ms1",
+        gone: Gone::Key("false"),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.mass_hypotheses.bonus",
+        gone: Gone::Key("0.0"),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.mass_hypotheses",
+        gone: Gone::Section,
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.trace.enabled",
+        gone: Gone::Key("false"),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.trace.scans",
+        gone: Gone::Key("7"),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.trace.cluster_da",
+        gone: Gone::Key("0.01"),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.trace.min_detections",
+        gone: Gone::Key("2"),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.trace.pooling",
+        gone: Gone::Key("\"merged\""),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.trace.score",
+        gone: Gone::Key("\"tag_coherence\""),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.trace.min_quality",
+        gone: Gone::Key("0.6"),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.trace.bonus",
+        gone: Gone::Key("0.0"),
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.trace",
+        gone: Gone::Section,
+        why: PRESCREEN_PART_GONE,
+    },
+    Retired {
+        path: "prescreen.localization",
+        gone: Gone::Key("\"own\""),
+        why: PRESCREEN_PART_GONE,
+    },
+];
+
+fn json_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    use serde_json::Value as V;
+    match (a, b) {
+        (V::Number(x), V::Number(y)) => x.as_f64() == y.as_f64(),
+        (V::Array(x), V::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| json_equal(p, q))
+        }
+        (V::Object(x), V::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, p)| y.get(k).is_some_and(|q| json_equal(p, q)))
+        }
+        _ => a == b,
+    }
+}
+
+/// Apply [`RETIRED`] (`table`) to a parsed configuration before it is deserialised.
+fn strip_retired(
+    v: &mut serde_json::Value,
+    table: &[Retired],
+) -> Result<(), crate::error::ConfigError> {
+    for r in table {
+        let (parent, key) = r.path.rsplit_once('.').unwrap_or(("", r.path));
+        let mut obj = Some(&mut *v);
+        for part in parent.split('.').filter(|p| !p.is_empty()) {
+            obj = obj.and_then(|o| o.get_mut(part));
+        }
+        let Some(serde_json::Value::Object(map)) = obj else {
+            continue;
+        };
+        let Some(got) = map.get(key) else { continue };
+        let refused = || {
+            crate::error::ConfigError::Invalid(format!(
+                "{} = {got} was removed in {RETIRED_IN}: {}; delete it from the configuration",
+                r.path, r.why
+            ))
+        };
+        let parse =
+            |j: &str| serde_json::from_str::<serde_json::Value>(j).expect("RETIRED holds JSON");
+        match r.gone {
+            Gone::Key(d) if json_equal(got, &parse(d)) => {
+                map.remove(key);
+            }
+            Gone::Key(_) => return Err(refused()),
+            Gone::Value(bad) if json_equal(got, &parse(bad)) => return Err(refused()),
+            Gone::Value(_) => {}
+            Gone::Section => {
+                if got.as_object().is_some_and(|m| m.is_empty()) {
+                    map.remove(key);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Which keys of the quantification recipe the JSON configuration `s` sets
 /// ([`QuantConfig::explicit`]). Called on text that already parsed as a [`Config`].
 fn quant_explicit_keys(s: &str) -> QuantExplicit {
@@ -7814,6 +7464,64 @@ fn quant_explicit_keys(s: &str) -> QuantExplicit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A retired key loads at its old default and is refused at any other value; a retired
+    /// value is refused; an emptied section is dropped.
+    #[test]
+    fn retired_keys_load_at_their_old_default_and_are_refused_otherwise() {
+        let table = [
+            Retired {
+                path: "a.x",
+                gone: Gone::Key("1.0"),
+                why: "w",
+            },
+            Retired {
+                path: "a",
+                gone: Gone::Section,
+                why: "w",
+            },
+            Retired {
+                path: "b.m",
+                gone: Gone::Value("\"old\""),
+                why: "w",
+            },
+        ];
+        let run = |j: &str| {
+            let mut v: serde_json::Value = serde_json::from_str(j).unwrap();
+            strip_retired(&mut v, &table).map(|()| v.to_string())
+        };
+        assert_eq!(
+            run(r#"{"a":{"x":1},"b":{"m":"new"}}"#).unwrap(),
+            r#"{"b":{"m":"new"}}"#
+        );
+        assert_eq!(run(r#"{"a":{"x":1.0,"y":2}}"#).unwrap(), r#"{"a":{"y":2}}"#);
+        let e = run(r#"{"a":{"x":2}}"#).unwrap_err().to_string();
+        assert!(e.contains("a.x = 2 was removed in 0.15.0: w"), "{e}");
+        assert!(run(r#"{"b":{"m":"old"}}"#).is_err());
+        // The shipped table: every old default loads, every other value is refused.
+        for r in RETIRED {
+            let nest = |leaf: &str| {
+                r.path
+                    .rsplit('.')
+                    .fold(leaf.to_string(), |acc, k| format!("{{\"{k}\":{acc}}}"))
+            };
+            match r.gone {
+                Gone::Key(d) => {
+                    Config::from_json(&nest(d)).unwrap_or_else(|e| panic!("{}: {e}", r.path));
+                    assert!(
+                        Config::from_json(&nest("\"__other__\"")).is_err(),
+                        "{}",
+                        r.path
+                    );
+                }
+                Gone::Value(bad) => {
+                    let e = Config::from_json(&nest(bad)).unwrap_err().to_string();
+                    assert!(e.contains(RETIRED_IN), "{}: {e}", r.path);
+                }
+                Gone::Section => {}
+            }
+        }
+    }
 
     /// `output.retain` parses, defaults to `all`, and is never part of the canonical
     /// configuration, so a pruned run keeps the configuration hash of an unpruned one.
@@ -8262,23 +7970,6 @@ mod tests {
         assert!(Config::from_json(r#"{"quant":{"fragment_selection":"library"}}"#).is_err());
     }
 
-    /// `peak_window_mode = consensus` sets the walked window's half-widths, so under a fixed
-    /// window (the default) it changes no quantity: accepted, with a warning. Under the
-    /// walked window it is read.
-    #[test]
-    fn consensus_under_a_fixed_window_is_accepted_and_flagged_as_inert() {
-        let c = Config::from_json(r#"{"quant":{"peak_window_mode":"consensus"}}"#).unwrap();
-        assert!(c.quant.consensus_is_inert());
-        let walked = Config::from_json(
-            r#"{"quant":{"peak_window_mode":"consensus","fixed_scan_halfwidth":0,
-                 "window_centre":"apex","fragment_selection":"observed_area",
-                 "baseline_subtract":false,"normalisation":"off"}}"#,
-        )
-        .unwrap();
-        assert!(!walked.quant.consensus_is_inert());
-        assert!(!QuantConfig::default().consensus_is_inert());
-    }
-
     #[test]
     fn shipped_configs_parse() {
         // `Config` is `deny_unknown_fields`, so a documentation key such as `_comment` in a
@@ -8305,7 +7996,6 @@ mod tests {
             "configs/examples/ztscan.json",
             "configs/examples/prescreen-balanced.json",
             "configs/examples/prescreen-oxidation.json",
-            "configs/examples/prescreen-components.json",
             "docker/config.dia.json",
             "docker/config.diann-lib.json",
         ] {
@@ -8321,7 +8011,7 @@ mod tests {
         }
         // In a full checkout every listed config must have been read.
         if examples_present {
-            assert_eq!(checked, 11, "a listed shipped config was not found");
+            assert_eq!(checked, 10, "a listed shipped config was not found");
         }
     }
 
@@ -8598,7 +8288,6 @@ mod tests {
             r#"{"features":{"bound_peak_fraction":-1.0}}"#,
             r#"{"quant":{"reliable_q":2.0}}"#,
             r#"{"features":{"coelution_corr_threshold":1.5}}"#,
-            r#"{"features":{"bound_confident_pct":101}}"#,
             r#"{"extract":{"frag_tol_ppm":0.0}}"#,
             r#"{"extract":{"bucket_size":1000}}"#,
             r#"{"extract":{"retain_top_peaks":1,"promote_top_peaks":3}}"#,
@@ -8626,7 +8315,6 @@ mod tests {
             r#"{"features":{"bound_peak_fraction":1.0}}"#,
             r#"{"quant":{"reliable_q":0.001}}"#,
             r#"{"features":{"coelution_corr_threshold":-1.0}}"#,
-            r#"{"features":{"bound_confident_pct":100}}"#,
             r#"{"mbr":{"consensus_corr_min":0.0}}"#,
             r#"{"compete":{"margin":0.0}}"#,
             r#"{"quant":{"fixed_window_s":0.0}}"#,
@@ -8663,17 +8351,19 @@ mod tests {
     }
 
     #[test]
-    fn mbr_defaults_to_the_second_pass_and_only_the_transfers_need_a_sidecar() {
+    fn mbr_defaults_to_the_second_pass_and_the_transfer_is_refused() {
         let d = Config::default();
         assert_eq!(d.mbr.strategy, MbrStrategy::SecondPass);
-        assert!(!d.mbr.strategy.transfers());
-        assert!(!MbrStrategy::None.transfers());
-        for s in [
-            MbrStrategy::EmpiricalLibrary,
-            MbrStrategy::RtTransfer,
-            MbrStrategy::Full,
-        ] {
-            assert!(s.transfers(), "{s:?}");
+        for old in ["empirical_library", "full", "rt_transfer"] {
+            let json = format!(r#"{{"mbr":{{"strategy":"{old}"}}}}"#);
+            // Still parsed and serialised as before, so the canonical configuration holds.
+            let c: Config = serde_json::from_str(&json).unwrap();
+            assert_eq!(c.mbr.strategy, MbrStrategy::RtTransfer, "{old}");
+            assert!(c.canonical_json().contains(r#""strategy":"rt_transfer""#));
+            // Refused at load and by validate().
+            let e = Config::from_json(&json).unwrap_err().to_string();
+            assert!(e.contains("second_pass, the default, replaces it"), "{e}");
+            assert!(c.validate().is_err(), "{old}");
         }
         let none: Config = serde_json::from_str(r#"{"mbr":{"strategy":"none"}}"#).unwrap();
         assert_eq!(none.mbr.strategy, MbrStrategy::None);
@@ -8739,79 +8429,31 @@ mod tests {
         assert!(Config::from_json(r#"{"convert":{"bruker_reader":"native"}}"#).is_err());
     }
 
-    /// `extract.ms1_calibrate` keeps `true` and `false` as they were spelled and hashed, and
-    /// adds `"surface"`; `rt_im_train.q1_calibrate` and `extract.prec_tol_auto` are omitted
-    /// from the canonical configuration at their defaults, and the runtime calibration
-    /// record never reaches it.
+    /// `extract.ms1_calibrate` keeps `true` and `false` as they were spelled and hashed;
+    /// `rt_im_train.q1_calibrate` is omitted from the canonical configuration at its default.
+    /// The MS1 shift is exactly the one-offset expression.
     #[test]
     fn the_calibration_keys_keep_the_config_hash() {
         let canon = Config::default().canonical_json();
         assert!(canon.contains(r#""ms1_calibrate":true"#), "{canon}");
-        for key in ["q1_calibrate", "prec_tol_auto", "ms1_cal\"", "ms1_surface"] {
-            assert!(!canon.contains(key), "{key}: {canon}");
-        }
+        assert!(!canon.contains("q1_calibrate"), "{canon}");
         let off = Config::from_json(r#"{"extract":{"ms1_calibrate":false}}"#).unwrap();
         assert_eq!(off.extract.ms1_calibrate, Ms1Calibrate::Off);
         assert!(off.canonical_json().contains(r#""ms1_calibrate":false"#));
-        let on = Config::from_json(
-            r#"{"extract":{"ms1_calibrate":"surface","prec_tol_auto":true},
-                "rt_im_train":{"q1_calibrate":true}}"#,
-        )
-        .unwrap();
-        assert!(on.extract.ms1_calibrate.is_surface());
-        let c = on.canonical_json();
-        for key in [
-            r#""ms1_calibrate":"surface""#,
-            r#""prec_tol_auto":true"#,
-            r#""q1_calibrate":true"#,
-        ] {
-            assert!(c.contains(key), "{key}: {c}");
-        }
-        let mut with_cal = on.clone();
-        with_cal.extract.ms1_cal = Some(Ms1Cal {
-            mode: "surface".into(),
-            ..Default::default()
-        });
-        assert_eq!(with_cal.canonical_json(), c);
+        let on = Config::from_json(r#"{"rt_im_train":{"q1_calibrate":true}}"#).unwrap();
+        assert!(on.canonical_json().contains(r#""q1_calibrate":true"#));
         for bad in [
             r#"{"extract":{"ms1_calibrate":"grid"}}"#,
-            r#"{"extract":{"ms1_calibrate":false,"prec_tol_auto":true}}"#,
+            r#"{"extract":{"ms1_calibrate":"surface"}}"#,
             r#"{"rt_im_train":{"q1_calibrate":true},"groups":{"window_groups":4}}"#,
         ] {
             assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
         }
-    }
-
-    /// The surface is additive, interpolated and held flat beyond its grids; without a
-    /// surface the shift is exactly the one-offset expression.
-    #[test]
-    fn the_ms1_surface_interpolates_and_holds_at_its_ends() {
-        let s = Ms1Surface {
-            mz_grid: vec![400.0, 600.0, 800.0],
-            mz_ppm: vec![3.0, 2.0, 2.0],
-            rt_grid: vec![1000.0, 2000.0],
-            rt_ppm: vec![0.5, -0.5],
-        };
-        assert!((s.ppm_at(500.0, 1500.0) - 2.5).abs() < 1e-12);
-        assert!((s.ppm_at(100.0, 0.0) - 3.5).abs() < 1e-12);
-        assert!((s.ppm_at(900.0, 3000.0) - 1.5).abs() < 1e-12);
-        assert_eq!(Ms1Surface::default().ppm_at(500.0, 10.0), 0.0);
-        let mut e = ExtractConfig {
+        let e = ExtractConfig {
             ms1_ppm_offset: 2.7,
             ..Default::default()
         };
-        assert_eq!(
-            e.ms1_shift(512.3, 99.0).to_bits(),
-            (1.0 + 2.7 * 1e-6f64).to_bits()
-        );
-        assert!(!e.ms1_shift_varies());
-        e.ms1_cal = Some(Ms1Cal {
-            mode: "surface".into(),
-            surface: Some(s),
-            ..Default::default()
-        });
-        assert!(e.ms1_shift_varies());
-        assert!((e.ms1_shift(500.0, 1500.0) - (1.0 + 2.5e-6)).abs() < 1e-15);
+        assert_eq!(e.ms1_shift().to_bits(), (1.0 + 2.7 * 1e-6f64).to_bits());
     }
 
     /// Refused at the parse, or, for a key whose prerequisite is left automatic, once a
@@ -8826,32 +8468,20 @@ mod tests {
         }
     }
 
-    /// The scanning-quadrupole keys change what extract and features write, so a set value
-    /// is part of the configuration's identity; at their defaults they are omitted.
+    /// The default configuration names no scanning-quadrupole key, and the removed Q1 sweep
+    /// keys are refused with the section that recorded why.
     #[test]
     fn the_q1_keys_leave_the_default_config_hash_alone() {
         let canon = Config::default().canonical_json();
         assert!(!canon.contains("q1_"), "{canon}");
-        let on = Config::from_json(
-            r#"{"extract":{"q1_cycles":true,"q1_profile":true,"q1_gate_max_offset":0.5},
-                "features":{"q1_features":true}}"#,
-        )
-        .unwrap();
-        let c = on.canonical_json();
-        for key in [
-            r#""q1_cycles":true"#,
-            r#""q1_profile":true"#,
-            r#""q1_gate_max_offset":0.5"#,
-            r#""q1_features":true"#,
-        ] {
-            assert!(c.contains(key), "{key}");
-        }
         for bad in [
+            r#"{"extract":{"q1_cycles":true}}"#,
+            r#"{"extract":{"q1_profile":true}}"#,
             r#"{"extract":{"q1_gate_max_offset":0.5}}"#,
-            r#"{"extract":{"q1_profile":true,"q1_gate_max_offset":0}}"#,
             r#"{"features":{"q1_features":true}}"#,
         ] {
-            assert!(refused_standalone(bad), "{bad} must be refused");
+            let e = Config::from_json(bad).unwrap_err().to_string();
+            assert!(e.contains("docs/09_extract.md section 10"), "{e}");
         }
     }
 
@@ -8895,7 +8525,6 @@ mod tests {
         assert_eq!(with_model.canonical_json(), c);
         for bad in [
             r#"{"extract":{"q1_fragments":true}}"#,
-            r#"{"rt_im_train":{"q1_calibrate":true},"extract":{"q1_fragments":true,"q1_cycles":true}}"#,
             r#"{"features":{"q1_fragment_features":true}}"#,
             r#"{"rescore":{"shadow_q1":true}}"#,
             r#"{"rt_im_train":{"q1_calibrate":true},"extract":{"q1_fragments":true},
@@ -8910,8 +8539,8 @@ mod tests {
         }
     }
 
-    /// The phase-5 keys of the ZT Scan plan (`features.q1_precursor`, `features.q1_multiscale`,
-    /// `search_seed.q1_deconvolved`, `extract.q1_deconvolved`) are omitted at their defaults,
+    /// The phase-5 keys of the ZT Scan plan (`features.q1_precursor`, `features.q1_multiscale`)
+    /// are omitted at their defaults,
     /// part of the identity when set, and refused without what they read or with what they
     /// cannot combine with; extract's hidden switches and the learned tolerance never reach
     /// the configuration.
@@ -8928,27 +8557,19 @@ mod tests {
         }
         let on = Config::from_json(
             r#"{"rt_im_train":{"q1_calibrate":true},
-                "extract":{"q1_fragments":true,"q1_deconvolved":true},
-                "search_seed":{"q1_deconvolved":true},
+                "extract":{"q1_fragments":true},
                 "features":{"q1_precursor":true,"q1_multiscale":true}}"#,
         )
         .unwrap();
         let c = on.canonical_json();
-        for key in [
-            r#""q1_precursor":true"#,
-            r#""q1_multiscale":true"#,
-            r#""q1_deconvolved":true"#,
-        ] {
+        for key in [r#""q1_precursor":true"#, r#""q1_multiscale":true"#] {
             assert!(c.contains(key), "{key}: {c}");
         }
-        assert_eq!(c.matches(r#""q1_deconvolved":true"#).count(), 2);
         let mut hidden = on.clone();
         hidden.extract.q1_precursor = true;
         hidden.extract.q1_multiscale = true;
         hidden.extract.q1_dec_tol_steps = Some(1.25);
         assert_eq!(hidden.canonical_json(), c);
-        // The seed key alone needs nothing else.
-        assert!(Config::from_json(r#"{"search_seed":{"q1_deconvolved":true}}"#).is_ok());
         let fd = Config::from_json(
             r#"{"rt_im_train":{"q1_calibrate":true},"extract":{"q1_fragments":true},
                 "features":{"q1_deconvolved":true}}"#,
@@ -8960,11 +8581,6 @@ mod tests {
             r#"{"features":{"q1_multiscale":true}}"#,
             r#"{"rt_im_train":{"q1_calibrate":true},"features":{"q1_deconvolved":true}}"#,
             r#"{"rt_im_train":{"q1_calibrate":true},"features":{"q1_precursor":true}}"#,
-            r#"{"extract":{"q1_deconvolved":true}}"#,
-            r#"{"rt_im_train":{"q1_calibrate":true},
-                "extract":{"q1_deconvolved":true,"q1_cycles":true}}"#,
-            r#"{"search_seed":{"q1_deconvolved":true,"count_fragments_once":true}}"#,
-            r#"{"search_seed":{"q1_deconvolved":true},"groups":{"window_groups":4}}"#,
         ] {
             assert!(refused_standalone(bad), "{bad} must be refused");
         }
@@ -8995,65 +8611,36 @@ mod tests {
         );
     }
 
-    /// The phase-3 keys of the ZT Scan plan (`quant.q1_*`, `features.ms1_envelope`) are
-    /// omitted at their defaults, part of the identity when set, and refused without what
-    /// they read or with what they cannot combine with; extract's hidden switch never reaches
-    /// the configuration.
+    /// The phase-3 keys of the ZT Scan plan (`quant.q1_*`) are omitted at their defaults,
+    /// part of the identity when set, and refused without what they read or with what they
+    /// cannot combine with.
     #[test]
-    fn the_q1_quant_and_ms1_envelope_keys_leave_the_default_config_hash_alone() {
+    fn the_q1_quant_keys_leave_the_default_config_hash_alone() {
         assert_eq!(QuantConfig::default().q1_min_belonging, Q1_MIN_BELONGING);
         let canon = Config::default().canonical_json();
-        for key in [
-            "q1_min_belonging",
-            "q1_step_weights",
-            "q1_integration",
-            "ms1_envelope",
-        ] {
-            assert!(!canon.contains(key), "{key}: {canon}");
-        }
+        assert!(!canon.contains("q1_min_belonging"), "{canon}");
         let base = r#""rt_im_train":{"q1_calibrate":true},"extract":{"q1_fragments":true}"#;
         let on = Config::from_json(&format!(
-            r#"{{{base},"quant":{{"q1_fragments":true,"q1_min_belonging":4,
-                "q1_step_weights":"uniform","q1_integration":"elution_fit"}},
-                "features":{{"ms1_envelope":true}}}}"#
+            r#"{{{base},"quant":{{"q1_fragments":true,"q1_min_belonging":4}}}}"#
         ))
         .unwrap();
         assert_eq!(on.quant.q1_min_belonging, 4);
-        assert_eq!(on.quant.q1_step_weights, Q1StepWeights::Uniform);
-        assert_eq!(on.quant.q1_integration, Q1Integration::ElutionFit);
         let c = on.canonical_json();
-        for key in [
-            r#""q1_min_belonging":4"#,
-            r#""q1_step_weights":"uniform""#,
-            r#""q1_integration":"elution_fit""#,
-            r#""ms1_envelope":true"#,
-        ] {
-            assert!(c.contains(key), "{key}: {c}");
-        }
-        // The quant key alone keeps the defaults of its three companions out.
+        assert!(c.contains(r#""q1_min_belonging":4"#), "{c}");
+        // The quant key alone keeps the default of its companion out.
         let q =
             Config::from_json(&format!(r#"{{{base},"quant":{{"q1_fragments":true}}}}"#)).unwrap();
         let qc = q.canonical_json();
-        assert!(!qc.contains("q1_min_belonging") && !qc.contains("q1_integration"));
-        let mut hidden = on.clone();
-        hidden.extract.ms1_envelope = true;
-        assert_eq!(hidden.canonical_json(), c);
-        assert!(Config::from_json(r#"{"features":{"ms1_envelope":true}}"#).is_ok());
+        assert!(!qc.contains("q1_min_belonging"));
         for bad in [
             r#"{"quant":{"q1_fragments":true}}"#.to_string(),
             format!(
                 r#"{{{base},"quant":{{"q1_fragments":true,"fragment_selection":"cross_run"}}}}"#
             ),
             format!(r#"{{{base},"quant":{{"q1_fragments":true,"q1_min_belonging":0}}}}"#),
-            format!(
-                r#"{{{base},"quant":{{"q1_fragments":true,"q1_integration":"elution_fit",
-                    "fragment_selection":"predicted","window_centre":"apex",
-                    "fixed_scan_halfwidth":0,"fixed_window_s":5.0}}}}"#
-            ),
             r#"{"quant":{"q1_min_belonging":4}}"#.to_string(),
-            r#"{"quant":{"q1_step_weights":"uniform"}}"#.to_string(),
-            r#"{"quant":{"q1_integration":"elution_fit"}}"#.to_string(),
-            r#"{"features":{"ms1_envelope":true},"groups":{"window_groups":2}}"#.to_string(),
+            format!(r#"{{{base},"quant":{{"q1_fragments":true,"q1_step_weights":"uniform"}}}}"#),
+            format!(r#"{{{base},"quant":{{"q1_fragments":true,"q1_integration":"elution_fit"}}}}"#),
         ] {
             assert!(refused_standalone(&bad), "{bad} must be refused");
         }
@@ -9202,24 +8789,22 @@ mod tests {
         );
     }
 
-    /// `extract.q1_traces` is automatic (on for ZT Scan input, off otherwise, `false` kept) and
-    /// `features.q1_separable` opt-in: both omitted from the canonical configuration unless on,
-    /// and refused without the per-fragment decision they read.
+    /// `extract.q1_traces` is automatic (on for ZT Scan input, off otherwise, `false` kept):
+    /// omitted from the canonical configuration unless on, and refused without the
+    /// per-fragment decision it reads.
     #[test]
-    fn the_cycle_trace_key_is_automatic_and_the_separable_one_opt_in() {
+    fn the_cycle_trace_key_is_automatic() {
         let d = Config::default();
-        assert!(d.extract.q1_traces.is_auto() && !d.features.q1_separable);
+        assert!(d.extract.q1_traces.is_auto());
         let canon = d.canonical_json();
-        assert!(!canon.contains("q1_traces") && !canon.contains("q1_separable"));
-        let on =
-            Config::from_json(r#"{"extract":{"q1_traces":true},"features":{"q1_separable":true}}"#)
-                .unwrap();
+        assert!(!canon.contains("q1_traces"));
+        let on = Config::from_json(r#"{"extract":{"q1_traces":true}}"#).unwrap();
         let oc = on.canonical_json();
-        assert!(oc.contains(r#""q1_traces":true"#) && oc.contains(r#""q1_separable":true"#));
+        assert!(oc.contains(r#""q1_traces":true"#));
         let mut auto = Config::default();
         auto.resolve_ztscan(ZtScanInputs::All { half_width: 1.9 })
             .unwrap();
-        assert!(auto.extract.q1_traces.on() && !auto.features.q1_separable);
+        assert!(auto.extract.q1_traces.on());
         let mut none = Config::default();
         none.resolve_ztscan(ZtScanInputs::None).unwrap();
         assert!(none.extract.q1_traces.is_off());
@@ -9228,15 +8813,10 @@ mod tests {
         off.resolve_ztscan(ZtScanInputs::All { half_width: 1.9 })
             .unwrap();
         assert!(off.extract.q1_traces.is_off() && off.extract.q1_fragments.on());
-        for json in [
-            r#"{"extract":{"q1_fragments":false,"q1_traces":true}}"#,
-            r#"{"extract":{"q1_fragments":false},"features":{"q1_separable":true}}"#,
-        ] {
-            assert!(Config::from_json(json).is_err(), "{json}");
-        }
-        let mut zt =
-            Config::from_json(r#"{"extract":{"q1_traces":true},"features":{"q1_separable":true}}"#)
-                .unwrap();
+        assert!(
+            Config::from_json(r#"{"extract":{"q1_fragments":false,"q1_traces":true}}"#).is_err()
+        );
+        let mut zt = Config::from_json(r#"{"extract":{"q1_traces":true}}"#).unwrap();
         zt.resolve_ztscan(ZtScanInputs::All { half_width: 1.9 })
             .unwrap();
         assert!(zt.extract.q1_traces.on() && zt.extract.q1_fragments.on());
@@ -9275,15 +8855,7 @@ mod tests {
                 r#"{"retrace":{"q1_repick_peaks":2}}"#,
                 "retrace.q1_repick_peaks",
             ),
-            (
-                r#"{"search_seed":{"q1_deconvolved":true}}"#,
-                "search_seed.q1_deconvolved",
-            ),
             (r#"{"extract":{"q1_traces":true}}"#, "extract.q1_traces"),
-            (
-                r#"{"features":{"q1_separable":true}}"#,
-                "features.q1_separable",
-            ),
         ] {
             let mut c = Config::from_json(json).unwrap();
             let e = c
@@ -9415,20 +8987,11 @@ mod tests {
         .unwrap();
         q.resolve_ztscan(all).unwrap();
         assert_eq!(q.quant.q1_cycle_halfwidth, Some(0));
-        // `extract.q1_cycles` keeps the decisions off.
-        let mut s = Config::from_json(r#"{"extract":{"q1_cycles":true}}"#).unwrap();
-        s.resolve_ztscan(all).unwrap();
-        assert!(s.extract.q1_fragments.is_off() && s.rt_im_train.q1_calibrate.is_off());
         // Explicit requests that conflict are refused.
         let mut x = Config::from_json(
             r#"{"retrace":{"q1_repick":true},"extract":{"apex_refine_intensity":true}}"#,
         );
         assert!(x.is_err() || x.as_mut().unwrap().resolve_ztscan(all).is_err());
-        let mut y = Config::from_json(
-            r#"{"features":{"q1_consistency":true},"extract":{"q1_cycles":true}}"#,
-        )
-        .unwrap();
-        assert!(y.resolve_ztscan(all).is_err());
     }
 
     /// Some inputs ZT Scan runs and some not: every automatic key off with a warning that
@@ -10020,12 +9583,12 @@ mod tests {
         assert_eq!(fixed.localise.fixed_temperature(), Some(1.5));
         assert_eq!(fixed.localise.fixed_experiment_temperature(), Some(2.0));
         let rules = Config::from_json(
-            r#"{"localise":{"peak_rule":"apex_tolerance","neutral_loss":true,"combine_runs":false,
+            r#"{"localise":{"peak_rule":"apex_tolerance","combine_runs":false,
                 "peak_valley_ratio":0}}"#,
         )
         .unwrap();
         assert_eq!(rules.localise.peak_rule, LocalisePeakRule::ApexTolerance);
-        assert!(rules.localise.neutral_loss && !rules.localise.combine_runs);
+        assert!(!rules.localise.combine_runs);
         let eb = Config::from_json(r#"{"localise":{"peak_rule":"elution_bounds"}}"#).unwrap();
         assert_eq!(eb.localise.peak_rule, LocalisePeakRule::ElutionBounds);
         for bad in [
@@ -10046,7 +9609,7 @@ mod tests {
     fn retrace_keys_leave_the_default_config_hash_alone() {
         let d = Config::default();
         assert!(d.retrace.is_default());
-        assert!(!d.retrace.enabled && !d.retrace.repick && !d.retrace.apex_features);
+        assert!(!d.retrace.enabled && !d.retrace.repick);
         assert!(d.retrace.ms1);
         assert_eq!(d.retrace.im_half_width, 0.015);
         let canon = d.canonical_json();
@@ -10095,7 +9658,6 @@ mod tests {
         };
         // Keys that only act inside the stage need the stage.
         assert!(err(r#"{"retrace":{"repick":true}}"#).contains("retrace.enabled"));
-        assert!(err(r#"{"retrace":{"apex_features":true}}"#).contains("retrace.enabled"));
         assert!(err(r#"{"retrace":{"im_half_width":0.0}}"#).contains("im_half_width"));
         assert!(err(r#"{"retrace":{"im_half_width":-0.01}}"#).contains("im_half_width"));
         // Grouped runs and scored alternative peaks.
@@ -10111,15 +9673,13 @@ mod tests {
         assert!(err(r#"{"retrace":{"enabled":true,"repick":true},
                 "extract":{"retain_top_peaks":5,"apex_refine_intensity":true}}"#)
         .contains("apex_refine_intensity"));
-        // `imc_ref_w` belongs to the ion-mobility family.
-        assert!(err(r#"{"retrace":{"enabled":true,"apex_features":true}}"#).contains("im_features"));
         // The measured recipe passes.
         let ok = Config::from_json(
-            r#"{"retrace":{"enabled":true,"repick":true,"apex_features":true},
+            r#"{"retrace":{"enabled":true,"repick":true},
                 "extract":{"retain_top_peaks":5},"features":{"im_features":"auto"}}"#,
         )
         .unwrap();
-        assert!(ok.retrace.enabled && ok.retrace.repick && ok.retrace.apex_features);
+        assert!(ok.retrace.enabled && ok.retrace.repick);
     }
 
     /// The extraction and feature keys of the diaPASEF work are omitted from the canonical
@@ -10533,8 +10093,6 @@ mod tests {
             Config::default().groups.rt_adaptation,
             GroupRtAdaptation::OncePerRun
         );
-        let c = Config::from_json(r#"{"groups":{"rt_adaptation":"per_band"}}"#).unwrap();
-        assert_eq!(c.groups.rt_adaptation, GroupRtAdaptation::PerBand);
         assert!(Config::from_json(r#"{"groups":{"rt_adaptation":"sometimes"}}"#).is_err());
         assert_eq!(Config::default().groups.balance, GroupBalance::Precursors);
         let c = Config::from_json(r#"{"groups":{"balance":"cost"}}"#).unwrap();
