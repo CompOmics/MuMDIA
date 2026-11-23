@@ -25,6 +25,11 @@ cd "$(dirname "$0")/.."
 # for the timsrust path is zstd >= 0.14.3, which needs timsrust >= 0.6; drop these
 # ignores when the reader moves there.
 #
+# RUSTSEC-2026-0595 (parquet 60.1.0: Bloom filters written as plaintext when writing
+# *encrypted* Parquet) is ignored deliberately: the workspace builds parquet without its
+# `encryption` feature (rust/mumdia/Cargo.toml) and never writes an encrypted file. Drop the
+# ignore when parquet moves to a fixed release.
+#
 # The zip advisories of nethost-sys need no ignore: the vendored nethost-sys
 # (rust/mumdia/vendor/nethost-sys, its `resolves` list) uses zip >= 9.0.5.
 echo "--- rust/mumdia/Cargo.lock ---"
@@ -33,7 +38,7 @@ echo "--- rust/mumdia/Cargo.lock ---"
   --ignore RUSTSEC-2026-0397 --ignore RUSTSEC-2026-0398 --ignore RUSTSEC-2026-0399 \
   --ignore RUSTSEC-2026-0400 --ignore RUSTSEC-2026-0401 --ignore RUSTSEC-2026-0402 \
   --ignore RUSTSEC-2026-0403 --ignore RUSTSEC-2026-0404 --ignore RUSTSEC-2026-0405 \
-  --ignore RUSTSEC-2026-0406)
+  --ignore RUSTSEC-2026-0406 --ignore RUSTSEC-2026-0595)
 
 # The desktop application has its own lockfile (docs/29, work package C). One
 # advisory is ignored deliberately: RUSTSEC-2024-0429, an unsound iterator in glib

@@ -1175,6 +1175,9 @@ prescreen keys below); no table of a default, diaPASEF or ZT Scan search changes
 
 ### Security
 
+- **RUSTSEC-2026-0595 (parquet 60.1.0) is audited and ignored, with its reason.** It concerns
+  Bloom filters written as plaintext when writing encrypted Parquet. MuMDIA builds parquet without
+  its `encryption` feature and never writes an encrypted file, so no MuMDIA output is affected.
 - **RUSTSEC-2026-0545, -0547 and -0548 (zip 6.0.0) are audited and ignored, with their reason
   (#329).** They reach the engine on the path of the four zip advisories the audit already
   ignores: a build dependency of `nethost-sys` under the opt-in `thermo` feature, whose build
