@@ -1,4 +1,4 @@
-"""Transfer-learn (fine-tune) multitask DeepLC 4.0 on this run's confident seed
+"""Transfer-learn (fine-tune) multitask DeepLC (4.5.0 or newer) on this run's confident seed
 PSMs, then predict RT for all target peptidoforms. Unlike predict_and_calibrate
 (a post-hoc calibration curve), finetune adapts the model weights to this run's
 chromatography.
@@ -15,7 +15,7 @@ trivial, so single-threaded BLAS costs nothing.
 Usage:
   python deeplc_finetune.py <lib_t_precursors_in> <seed_psms> <lib_t_precursors_out>
                             [--threads N] [--epochs E] [--batch B] [--patience P]
-                            [--max-ref N] [--predict-limit N] [--skip-predict]
+                            [--max-ref N]
   python deeplc_finetune.py <lib_t_precursors_in> - <lib_t_precursors_out> --no-finetune
       (engine path for rt_im_train.library_irt = deeplc: predict with the DeepLC base
       model, no seed needed; per-run LOESS calibration then maps the predictions onto
@@ -54,7 +54,6 @@ import argparse
 import contextlib
 import gc
 import hashlib
-import io
 import json
 import pickle
 import re
@@ -67,41 +66,17 @@ import time
 import deeplc                                    # import before numpy (OpenMP load order)
 import sys
 
-# The engine's floor (`mumdia_core::constants::MIN_DEEPLC_VERSION`), repeated here because
-# `mumdia doctor` cannot see a version that changes under its feet. The base-model
-# calibration is only sound from 4.1.1 on (4.0.0a2 memorised anchors: in-sample 15.9 s
-# against held-out 195 s residuals), the multi-head calibration needs 4.4.0, and the
-# projection cache, on by default, the factored prediction matrix of 4.5.0.
-_MIN_DEEPLC = (4, 5, 0)
+from _deeplc_common import (  # noqa: E402  (after deeplc, as every import here)
+    MIN_DEEPLC,
+    MOD_RE,
+    library_bases,
+    load_base_model,
+    quiet_deeplc_progress,
+    require_version,
+    unique_standard_bases,
+)
 
-
-def _check_deeplc_version():
-    raw = getattr(deeplc, "__version__", None)
-    if raw is None:
-        try:
-            import importlib.metadata as _m
-            raw = _m.version("deeplc")
-        except Exception:  # pragma: no cover
-            raw = ""
-    parts = []
-    for piece in str(raw).split(".")[:3]:
-        digits = ""
-        for ch in piece:
-            if ch.isdigit():
-                digits += ch
-            else:
-                break
-        parts.append(int(digits) if digits else 0)
-    while len(parts) < 3:
-        parts.append(0)
-    if tuple(parts) < _MIN_DEEPLC:
-        sys.exit(
-            "deeplc %s is older than the required %d.%d.%d (pip install 'deeplc>=%d.%d.%d')"
-            % (raw, *_MIN_DEEPLC, *_MIN_DEEPLC)
-        )
-
-
-_check_deeplc_version()
+require_version(deeplc, MIN_DEEPLC)
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -111,21 +86,13 @@ from psm_utils import PSM, PSMList
 from _torch_threads import capped_threads, thread_cap  # noqa: E402  (after deeplc, as every import here)
 
 STD = set("ACDEFGHIKLMNPQRSTVWY")
-# A bracketed modification, and the dash of a terminal group with it: `[Acetyl]-PEPK` strips
-# to `PEPK`. Without the dash the stripped base was `-PEPK`, which is not a standard
-# sequence, so every N-terminally modified row was left out of the prediction and kept a
-# retention time on another scale.
-MOD_RE = r"-?\[[^\]]*\]-?"
+# `MOD_RE` and the same rules over a whole Arrow column (`library_bases`,
+# `unique_standard_bases`) are in `_deeplc_common`, which the shard recipe shares.
 strip_mods = lambda s: re.sub(MOD_RE, "", s)
 # Strip the decoy marker before prediction: a "DECOY_" peptidoform must be predicted on
 # its underlying sequence, else is_std rejects it (the '_') and the decoy keeps the base
 # (un-fine-tuned) iRT, landing on a different scale than the fine-tuned targets.
 base_pf = lambda s: s[6:] if s.startswith("DECOY_") else s
-# The same two rules over a whole Arrow column. The decoy strip is anchored at the start,
-# as `base_pf` is; `replace_substring` would strip every occurrence. `*` rather than `+`
-# because `is_std("")` is true.
-DECOY_PREFIX_RE = r"^DECOY_"
-STD_FULL_RE = r"^[ACDEFGHIKLMNPQRSTVWY]*$"
 # Unique peptidoforms per prediction call. Fixed, because the call is the unit DeepLC
 # length-buckets and batches within, so the same chunks give the same numbers.
 PREDICT_CHUNK = 100_000
@@ -137,72 +104,6 @@ SHARD_AUTO_THREADS = 8
 # (`_exit_when_the_parent_exits`).
 SHARD_ORPHANED_STATUS = 3
 
-
-
-class _DropBlankProgress(io.TextIOBase):
-    """`sys.stdout` with DeepLC's empty progress writes removed.
-
-    DeepLC's prediction loop writes a carriage-return progress indicator that renders as
-    nothing when stdout is not a terminal, so every update arrives as a bare `\r\n`.
-    Measured on a real library build: 5,697 blank lines from a 2.9M-peptide prediction,
-    99% of the entire log. The engine INHERITS a worker's stdout rather than capturing it
-    (`sidecar.rs::run_worker`, deliberately, so long-running progress reaches the user
-    live), so those lines land in the terminal, in any redirected log file, and in the
-    desktop application's run log, where they push the real messages out of view.
-
-    Only segments that are empty once carriage returns and whitespace are stripped get
-    dropped. Anything DeepLC actually says still comes through, in order, and stderr --
-    where a traceback goes -- is not touched at all. Set `MUMDIA_DEEPLC_RAW_OUTPUT=1` to
-    disable the filter when debugging the worker itself.
-
-    `\r` counts as a terminator as well as `\n`: a progress writer that never emits a
-    newline would otherwise accumulate in the buffer for the whole run.
-    """
-
-    def __init__(self, inner):
-        self._inner = inner
-        self._buf = ""
-
-    def write(self, s):
-        self._buf += s
-        while True:
-            i = min(
-                (p for p in (self._buf.find("\n"), self._buf.find("\r")) if p >= 0),
-                default=-1,
-            )
-            if i < 0:
-                break
-            line, self._buf = self._buf[:i], self._buf[i + 1 :]
-            if line.strip():
-                self._inner.write(line + "\n")
-                self._inner.flush()
-        return len(s)
-
-    def flush(self):
-        self._inner.flush()
-
-    def close(self):
-        # Whatever is left had no terminator; emit it if it says anything.
-        if self._buf.strip():
-            self._inner.write(self._buf)
-        self._buf = ""
-        self._inner.flush()
-
-
-@contextlib.contextmanager
-def quiet_deeplc_progress():
-    """Install the filter for the duration of a block, unless disabled by env."""
-    if os.environ.get("MUMDIA_DEEPLC_RAW_OUTPUT", "").strip() not in ("", "0"):
-        yield
-        return
-    original = sys.stdout
-    proxy = _DropBlankProgress(original)
-    sys.stdout = proxy
-    try:
-        yield
-    finally:
-        proxy.close()
-        sys.stdout = original
 
 class PredictTimers:
     """Where the whole-library prediction spends its time, for `<lib_out>.summary.json`.
@@ -375,51 +276,6 @@ def agg(a):
     return a.mean(axis=1) if a.ndim == 2 else a
 
 
-def load_base_model():
-    """The DeepLC base model, loaded once, or None to let every call load its own.
-
-    `deeplc.predict(batch)` loads the checkpoint from disk on every call, and
-    `predict_and_calibrate` twice (once to size its head source, once to predict), so a
-    whole-library prediction in 100,000-peptidoform chunks read the model 50 to 100 times.
-    `load_model` hands a module instance back unchanged, and prediction runs in eval mode
-    under `no_grad`, so passing the one instance gives the same numbers (measured
-    bit-identical on 3,002 peptidoforms, DeepLC 4.5.0). The helpers are private DeepLC API
-    (present in 4.4.0 and 4.5.0) and the engine sets no DeepLC ceiling, so a release that
-    moves, renames or re-signatures them returns None here, with a warning, and every call
-    loads its own model as before: slower, same numbers. Identical in both DeepLC workers.
-    """
-    try:
-        from deeplc import _model_ops
-        from deeplc.core import DEFAULT_MODEL
-
-        return _model_ops.load_model(DEFAULT_MODEL)
-    except (ImportError, AttributeError, TypeError) as exc:
-        print("WARNING: could not load the DeepLC base model once (%s: %s); every "
-              "prediction call loads its own" % (type(exc).__name__, exc), flush=True)
-        return None
-
-
-def library_bases(peptidoforms):
-    """The DECOY_-stripped sequence of every library row, as `base_pf` gives it."""
-    return pc.replace_substring_regex(peptidoforms, pattern=DECOY_PREFIX_RE, replacement="")
-
-
-def unique_standard_bases(bases):
-    """Unique stripped sequences in first-occurrence order, standard residues only.
-
-    What the per-row loop `if b not in seen and is_std(pf)` produced, computed in Arrow so
-    a library of 1e7 to 1e8 rows does not become that many Python strings and a set. The
-    per-chunk uniques are widened to large_string before they are joined: at 1e8 rows they
-    can pass the 2 GiB offset limit of `string`.
-    """
-    parts = [pc.unique(chunk).cast(pa.large_string()) for chunk in bases.chunks]
-    if not parts:
-        return pa.array([], pa.large_string())
-    uniq = parts[0] if len(parts) == 1 else pc.unique(pa.concat_arrays(parts))
-    stripped = pc.replace_substring_regex(uniq, pattern=MOD_RE, replacement="")
-    return uniq.filter(pc.match_substring_regex(stripped, pattern=STD_FULL_RE))
-
-
 def holdout_cut(frac):
     """`round(frac * 1000)` of the held-out rule, rounded as rt_im_train.rs::is_holdout
     rounds it: half away from zero (`f64::round`), where Python's round() rounds half to
@@ -573,10 +429,6 @@ def main():
                          "rt-im-train sizes the RT window on exactly these held-out peptides, and "
                          "fine-tuning on them would leak adapter memorization into the residuals "
                          "(the rule is duplicated in rt_im_train.rs is_holdout; keep in sync)")
-    ap.add_argument("--predict-limit", type=int, default=0,
-                    help="cap number of unique peptidoforms predicted (0 = all)")
-    ap.add_argument("--skip-predict", action="store_true",
-                    help="fine-tune only, skip the full-library prediction (crash-path smoke test)")
     ap.add_argument("--multihead", type=int, default=0, metavar="N",
                     help="instead of fine-tuning, calibrate the base model against the run's "
                          "confident seed PSMs with MultiHeadRidgeCalibration over its N "
@@ -596,13 +448,14 @@ def main():
                          "handed to each. 1 (default) predicts in this process; 0 is "
                          "automatic, one shard per %d threads of the prediction thread "
                          "budget. The budget (--predict-threads after the thread cap) is "
-                         "divided evenly, so K shards of budget/K threads each. Whether it "
-                         "pays is unmeasured where it is meant to: docs/32 attributes the "
-                         "per-process rate to featurisation (single-threaded Python), but on "
-                         "the one desktop measured the forward pass dominated at 8 threads or "
-                         "fewer and 4 shards of 2 threads were no faster than 1 process of 8 "
-                         "(docs/08). Expected to help only where one process stops scaling "
-                         "with threads. Each child is a Python process with torch and DeepLC "
+                         "divided evenly, so K shards of budget/K threads each. The engine "
+                         "passes rt_im_train.deeplc_predict_shards, automatic (0) by default: "
+                         "on a budget of 64 threads (8 shards of 8) a six-run Astral "
+                         "experiment took 18:02 against 26:00 in one process and a five-run "
+                         "Orbitrap AIF experiment 21:04 against 29:47, while on a desktop at "
+                         "8 threads or fewer the forward pass dominated and 4 shards of 2 "
+                         "threads were no faster than 1 process of 8 (docs/08). Each child "
+                         "is a Python process with torch and DeepLC "
                          "loaded (about 0.57 GB; the model itself about 35 MB). One process "
                          "when a GPU is available." % SHARD_AUTO_THREADS)
     ap.add_argument("--bands", metavar="TSV", default=None,
@@ -695,7 +548,9 @@ def main():
     band_pairs = read_band_pairs(args) if args.bands else None
     t_phase = time.perf_counter()
     if band_pairs is None:
-        lib = pq.read_table(args.lib_in)
+        # Only the two columns the prediction reads: the whole table is read again when it
+        # is written, so it is not held through the prediction.
+        lib = pq.read_table(args.lib_in, columns=["peptidoform", "predicted_irt"])
         orig = np.asarray(lib.column("predicted_irt"), dtype=np.float32)
     else:
         # Only the sequences now; each band's whole table is read when it is written.
@@ -742,16 +597,13 @@ def main():
         ft_model = build_finetuned_model(args, ref_psms, train_threads)
         timings["fit"] = round(time.perf_counter() - t_phase, 3)
 
-    if args.skip_predict:
-        print("skip-predict set; fine-tune smoke test complete (crash path exercised)", flush=True)
-        return
-
     # Deduplicate and predict on the DECOY_-stripped underlying sequence so decoys are
     # fine-tuned onto the same iRT scale as targets (shift-decoys reuse their target's
     # prediction; reverse-decoys get their reversed-sequence prediction).
     t_phase = time.perf_counter()
     if band_pairs is None:
         bases = library_bases(lib.column("peptidoform"))
+        lib = None
         uniq = unique_standard_bases(bases)
         band_pos = None
     else:
@@ -762,8 +614,6 @@ def main():
         bases = None
         uniq, band_pos = union_positions(band_bases)
         del band_bases
-    if args.predict_limit:
-        uniq = uniq.slice(0, args.predict_limit)
     timings["unique"] = round(time.perf_counter() - t_phase, 3)
     if args.predict_chunk < 1:
         raise SystemExit(f"--predict-chunk must be >= 1, got {args.predict_chunk}")
@@ -880,6 +730,7 @@ def main():
     new, summary = rewrite_irt(bases, orig, uniq, values)
     timings["rewrite"] = round(time.perf_counter() - t_phase, 3)
     t_phase = time.perf_counter()
+    lib = pq.read_table(args.lib_in)
     idx = lib.schema.get_field_index("predicted_irt")
     lib = lib.set_column(idx, "predicted_irt", pa.array(new, pa.float32()))
     pq.write_table(lib, args.lib_out)
@@ -1176,13 +1027,13 @@ def project_sharded(uniq, shards, threads, chunk, proj_path, work):
     `proj_path` is the entry's `projections.npy`, already created at its full size; each
     child opens it for writing and fills its own row range (`shard_bounds`, whole chunks),
     so the slices never overlap and nothing is copied afterwards. The children are started,
-    watched and stopped exactly as `predict_sharded` does it, and a failing child fails the
-    stage. Their sequence and spec files go into `work`, the entry's temporary directory,
+    watched and stopped by `_run_shards`, as `predict_sharded`'s are, and a failing child
+    fails the stage. Their sequence and spec files go into `work`, the entry's temporary directory,
     and are removed before it is published. Returns the per-shard timing records.
     """
     bounds = shard_bounds(len(uniq), shards, chunk)
     token = f"tmp-{os.getpid()}"
-    procs, specs = [], []
+    specs = []
     with exit_on_termination_signals():
         try:
             for j, (a, b) in enumerate(bounds):
@@ -1202,26 +1053,9 @@ def project_sharded(uniq, shards, threads, chunk, proj_path, work):
                     "chunk": chunk,
                     "watch_parent": True,
                 }
-                with open(spec["spec"], "w", encoding="utf-8") as fh:
-                    json.dump(spec, fh)
                 specs.append(spec)
-            script = os.path.abspath(__file__)
-            for spec in specs:
-                procs.append(subprocess.Popen(
-                    [sys.executable, script, "--shard-worker", spec["spec"]],
-                    stdin=subprocess.PIPE))
-            _wait_for_shards(procs)
-            per_shard = []
-            for spec in specs:
-                with open(spec["timings"], encoding="utf-8") as fh:
-                    per_shard.append(json.load(fh))
+            per_shard = _run_shards(specs)
         finally:
-            for proc in procs:
-                if proc.poll() is None:
-                    proc.kill()
-                    proc.wait()
-                if proc.stdin is not None:
-                    proc.stdin.close()
             for spec in specs:
                 for key in ("seqs", "timings", "spec"):
                     try:
@@ -1270,7 +1104,7 @@ def evaluate_sharded(proj_path, n, shards, threads, chunk, head, calibration, de
     """
     bounds = shard_bounds(n, shards, chunk)
     token = f"tmp-{os.getpid()}"
-    procs, specs = [], []
+    specs = []
     with exit_on_termination_signals():
         work = tempfile.mkdtemp(prefix=f"projection-evaluate.{token}.", dir=scratch_base)
         try:
@@ -1300,32 +1134,17 @@ def evaluate_sharded(proj_path, n, shards, threads, chunk, head, calibration, de
                     "chunk": chunk,
                     "watch_parent": True,
                 }
-                with open(spec["spec"], "w", encoding="utf-8") as fh:
-                    json.dump(spec, fh)
                 specs.append(spec)
-            script = os.path.abspath(__file__)
-            for spec in specs:
-                procs.append(subprocess.Popen(
-                    [sys.executable, script, "--shard-worker", spec["spec"]],
-                    stdin=subprocess.PIPE))
-            _wait_for_shards(procs)
-            parts, per_shard = [], []
+            per_shard = _run_shards(specs)
+            parts = []
             for spec in specs:
                 v = np.load(spec["values"])
                 if v.shape != (spec["rows"],):
                     raise SystemExit(f"{spec['label']} returned {v.shape[0]} values for "
                                      f"{spec['rows']} sequences")
                 parts.append(v)
-                with open(spec["timings"], encoding="utf-8") as fh:
-                    per_shard.append(json.load(fh))
             values = np.concatenate(parts) if parts else np.empty(0, dtype=np.float64)
         finally:
-            for proc in procs:
-                if proc.poll() is None:
-                    proc.kill()
-                    proc.wait()
-                if proc.stdin is not None:
-                    proc.stdin.close()
             shutil.rmtree(work, ignore_errors=True)
     return values, per_shard
 
@@ -1554,7 +1373,6 @@ def predict_sharded(uniq, shards, threads, chunk, fitted, lib_out):
     bounds = shard_bounds(len(uniq), shards, chunk)
     base_dir = os.path.dirname(os.path.abspath(lib_out))
     token = f"tmp-{os.getpid()}"
-    procs = []
     with exit_on_termination_signals():
         work = tempfile.mkdtemp(prefix=f"{os.path.basename(lib_out)}.{token}.shards.",
                                 dir=base_dir)
@@ -1589,17 +1407,9 @@ def predict_sharded(uniq, shards, threads, chunk, fitted, lib_out):
                     "rows": b - a,
                     "watch_parent": True,
                 }
-                with open(spec["spec"], "w", encoding="utf-8") as fh:
-                    json.dump(spec, fh)
                 specs.append(spec)
-            script = os.path.abspath(__file__)
-            for spec in specs:
-                # stdin is the parent-liveness pipe; nothing is ever written to it.
-                procs.append(subprocess.Popen(
-                    [sys.executable, script, "--shard-worker", spec["spec"]],
-                    stdin=subprocess.PIPE))
-            _wait_for_shards(procs)
-            parts, per_shard = [], []
+            per_shard = _run_shards(specs)
+            parts = []
             for spec in specs:
                 v = np.load(spec["out"])
                 if v.shape != (spec["rows"],):
@@ -1607,16 +1417,8 @@ def predict_sharded(uniq, shards, threads, chunk, fitted, lib_out):
                         f"prediction {spec['label']} returned {v.shape[0]} values for "
                         f"{spec['rows']} sequences; refusing to rewrite the library")
                 parts.append(v)
-                with open(spec["timings"], encoding="utf-8") as fh:
-                    per_shard.append(json.load(fh))
             values = np.concatenate(parts) if parts else np.empty(0, dtype=np.float64)
         finally:
-            for proc in procs:
-                if proc.poll() is None:
-                    proc.kill()
-                    proc.wait()
-                if proc.stdin is not None:
-                    proc.stdin.close()
             shutil.rmtree(work, ignore_errors=True)
     return values, per_shard
 
@@ -1672,6 +1474,40 @@ def _exit_when_the_parent_exits():
     print("prediction shard: the parent process is gone; stopping", file=sys.stderr,
           flush=True)
     os._exit(SHARD_ORPHANED_STATUS)
+
+
+def _run_shards(specs):
+    """Run one `--shard-worker` child of this script per spec; return their timing records.
+
+    Writes each spec to its `spec` path, starts the children with the parent-liveness pipe
+    on their stdin (`_exit_when_the_parent_exits`; nothing is ever written to it) and waits
+    for all of them: a failing child stops the others and fails the stage. Every child is
+    killed and its pipe closed on any exit. The callers build the specs, read the outputs
+    and remove their own files.
+    """
+    procs = []
+    try:
+        for spec in specs:
+            with open(spec["spec"], "w", encoding="utf-8") as fh:
+                json.dump(spec, fh)
+        script = os.path.abspath(__file__)
+        for spec in specs:
+            procs.append(subprocess.Popen(
+                [sys.executable, script, "--shard-worker", spec["spec"]],
+                stdin=subprocess.PIPE))
+        _wait_for_shards(procs)
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            if proc.stdin is not None:
+                proc.stdin.close()
+    per_shard = []
+    for spec in specs:
+        with open(spec["timings"], encoding="utf-8") as fh:
+            per_shard.append(json.load(fh))
+    return per_shard
 
 
 def _wait_for_shards(procs):
@@ -1794,8 +1630,8 @@ def rewrite_irt(bases, orig, uniq, values):
     that were predicted and `values` their predictions (float64, aligned with `uniq`). A
     row whose sequence has a finite prediction takes it, rounded to float32. A row without
     one keeps its imported value: rows with non-standard residues are never sent to DeepLC
-    (`is_std`), rows past `--predict-limit` were not predicted, and a prediction that came
-    back non-finite is an unsupported input rather than a number. Both kinds are counted so
+    (`is_std`), and a prediction that came back non-finite is an unsupported input
+    rather than a number. Both kinds are counted so
     the mixture of RT sources in the written library is explicit instead of silent (docs/30
     R6). The counts and the column are what the per-row dictionary lookup gave; only the
     lookup moved into Arrow (`index_in`), so a 1e7-row library is not walked in Python.
@@ -1816,8 +1652,7 @@ def rewrite_irt(bases, orig, uniq, values):
 def rewrite_positions(orig, pos, values, n_uniq):
     """`rewrite_irt` from each row's position in the predicted set (-1 = not in it).
 
-    A position at or past `n_uniq` counts as not found, which is what a set cut short by
-    `--predict-limit` gives a sequence past the limit.
+    A position at or past `n_uniq` counts as not found.
     """
     n = len(orig)
     pos = np.where(pos < n_uniq, pos, -1)

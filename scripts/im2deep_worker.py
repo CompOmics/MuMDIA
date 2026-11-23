@@ -29,24 +29,9 @@ import im2deep  # noqa: E402
 # worker calls.
 _MIN_IM2DEEP = (2, 0, 0)
 
+from _deeplc_common import require_version  # noqa: E402
 
-def _version_tuple(raw):
-    parts = []
-    for piece in str(raw).split(".")[:3]:
-        digits = ""
-        for ch in piece:
-            if not ch.isdigit():
-                break
-            digits += ch
-        parts.append(int(digits) if digits else 0)
-    return tuple(parts + [0] * (3 - len(parts)))
-
-
-if _version_tuple(getattr(im2deep, "__version__", "0")) < _MIN_IM2DEEP:
-    sys.exit(
-        "im2deep %s is older than the required %d.%d.%d (pip install 'im2deep>=%d.%d.%d')"
-        % (getattr(im2deep, "__version__", "unknown"), *_MIN_IM2DEEP, *_MIN_IM2DEEP)
-    )
+require_version(im2deep, _MIN_IM2DEEP)
 
 import numpy as np  # noqa: E402
 import pyarrow as pa  # noqa: E402

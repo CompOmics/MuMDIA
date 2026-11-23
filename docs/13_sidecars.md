@@ -1,4 +1,4 @@
-# Python sidecars (18 scripts + three shared modules) + conda envs
+# Python sidecars (18 scripts + four shared modules) + conda envs
 > Part of the MuMDIA developer documentation (see docs/README.md).
 
 ## Purpose
@@ -33,11 +33,12 @@ empirical library with a predicted one; the **library-scale recipes**
 (`sort_fragments`, `mz_range_survivors`,
 `mh_shard_predict`) reshape very large tables (docs/32); the **post-run tool**
 (`prune_outputs`) reduces a finished output directory to a retention tier (docs/01, "Output
-retention"). The three shared modules are
+retention"). The four shared modules are
 imported, never run: `_lib_io` (the parquet writer and the peptidoform and fragment-table rules the recipe
 scripts share),
-`_torch_threads` (the torch CPU thread policy) and `_unimod` (the modification
-catalogue).
+`_torch_threads` (the torch CPU thread policy), `_deeplc_common` (the DeepLC helpers the
+two DeepLC workers, the IM2Deep worker and the shard recipe share) and `_unimod` (the
+modification catalogue).
 
 ## Failure behavior
 
@@ -91,9 +92,10 @@ For the mapping from each conda environment to the config field that points at i
 | `scripts/peptdeep_worker.py` | Predictor: AlphaPeptDeep b/y fragment intensities per peptidoform+charge, conditioned on collision energy and instrument |
 | `scripts/deeplc_worker.py` | Predictor: DeepLC iRT per peptidoform (uncalibrated) |
 | `scripts/im2deep_worker.py` | Predictor: IM2Deep 1/K0 per (peptidoform, charge), from the single-conformer CCS converted at the precursor m/z (uncalibrated); only under `predict_frag.im_predictor` |
+| `scripts/_deeplc_common.py` | Shared module: the DeepLC version floor (`require_version`, also IM2Deep's check), the one-time base-model load, the blank-progress filter and the sequence rules (`MOD_RE`, `library_bases`, `unique_standard_bases`) that the two DeepLC workers and the shard recipe share |
 | `scripts/_torch_threads.py` | Shared module: the torch CPU thread policy (physical-core count, `thread_cap`, `capped_threads`) the DeepLC and IM2Deep workers cap their pools with and the NN rescorer reads its core count from |
 | `scripts/deeplc_finetune.py` | Predictor: transfer-learn DeepLC on this run's seed and rewrite the library iRT; with `--no-finetune` (seed `-`) rewrite it with base-model predictions instead (`rt_im_train.library_irt`) |
-| `scripts/mokapot_worker.py` | Rescorer: mokapot brew over a PIN (model env-switchable: nn/logreg/xgb/percolator) |
+| `scripts/mokapot_worker.py` | Rescorer: mokapot brew over a PIN (model env-switchable: logreg/nn/xgb/percolator) |
 | `scripts/nn_rescore_worker.py` | Rescorer: PyTorch semi-supervised MLP over a PIN, in-memory or streaming memmap |
 | `scripts/entrapment_worker.py` | Rescorer: GBM/NN on real-target-vs-spike-in negatives, out-of-fold by base peptide |
 | `scripts/mbr_worker.py` | MBR (Stage D3): cross-run RT transfer + permuted-RT decoy-transfer FDR |
@@ -544,10 +546,7 @@ CLI-only knobs that `run` never sets:
 `--device cpu|cuda` (cuda aborts with `SystemExit` if `torch.cuda.is_available()`
 is false, `deeplc_finetune.py:79-81`), `--threads` (torch training pool, defaults to
 `DEEPLC_FT_THREADS`; the engine passes it only in the multi-head and re-prediction
-modes), `--max-ref N` (cap reference PSMs), `--predict-limit N`
-(cap peptidoforms predicted), and `--skip-predict` (fine-tune only, exercise the
-crash path without the full-library prediction, `deeplc_finetune.py:71-76,
-131-133`). The long
+modes) and `--max-ref N` (cap reference PSMs). The long
 docstring and the thread-cap block at the top exist to prevent an intermittent
 machine crash: numpy's OpenBLAS (GNU OpenMP) and torch's Intel OpenMP coexist
 under `KMP_DUPLICATE_LIB_OK=TRUE`, and without pinning `OMP/MKL/OPENBLAS` to 1
@@ -729,7 +728,10 @@ and `HandoffWriter`. Rust concatenates the competed feature tables, writes the
 handoff, spawns the worker, and passes the `MUMDIA_NN_*` variables of
 `NN_ENV_SET_BY_ENGINE` (folds, rounds, train FDR, the training-set knobs, seeds
 and fold keys) from `rescore.*` as env vars, overwriting any exported value, so
-the report's recorded params match what ran; mokapot ignores them. On success
+the report's recorded params match what ran. mokapot reads the folds and the training FDR
+(`brew(folds=..., test_fdr=...)` and the model's `train_fdr`); its semi-supervised
+iterations are `MUMDIA_BREW_ITERS` (20), which the report records as `num_iter` for a
+mokapot run instead of `rescore.num_iter`. On success
 the classifier label and `model_identity` are recorded; on failure the path falls
 back to `native_scores` only when `rescore.strict = false`; strict is the
 production default. The authoritative actual path is recorded in
@@ -740,10 +742,12 @@ none). `MUMDIA_NN_SEED`, `MUMDIA_NN_THREADS` (set from `--threads`) and
 `MUMDIA_NN_PARALLEL` change the scores and reach the worker only this way.
 
 - `mokapot_worker.py` reads the PIN with `mokapot.read_pin`, builds a model
-  chosen by `MUMDIA_RESCORE_MODEL` (`make_model`, `mokapot_worker.py:35-98`:
-  `nn` -> sklearn `MLPClassifier`; `logreg` -> `LogisticRegression`; `xgb` ->
-  `XGBClassifier`; `percolator`/`linear`/`svm` -> mokapot's default, `model=None`),
-  runs `mokapot.brew(..., rng=0, max_workers=MUMDIA_MOKAPOT_WORKERS)`, and uses
+  chosen by `MUMDIA_RESCORE_MODEL` (`make_model`):
+  `logreg` (the default) -> `LogisticRegression`; `nn` -> sklearn `MLPClassifier`;
+  `xgb` -> `XGBClassifier`; `percolator`/`linear`/`svm` -> mokapot's own
+  `PercolatorModel`; any other value is refused),
+  runs `mokapot.brew(..., folds=rescore.folds, test_fdr=rescore.train_fdr, rng=0,
+  max_workers=MUMDIA_MOKAPOT_WORKERS)`, and uses
   mokapot's **out-of-fold** confidence scores only (each PSM scored by the fold
   that did not train on it, `mokapot_worker.py:128-163`). There is deliberately no
   in-sample fallback: `_oof_scores` raises `RuntimeError` unless the merged
@@ -781,9 +785,9 @@ none). `MUMDIA_NN_SEED`, `MUMDIA_NN_THREADS` (set from `--threads`) and
   worker refuses it, and its `.npy` matrix is memory-mapped and copied into the
   worker's matrix (`fill_raw_matrix`) group by group, each group of `row_group_rows`
   rows cut into the same moment sub-blocks the parquet load uses, so the float64 sums,
-  the mean, the std and the scores are the parquet handoff's. The streaming backend
-  takes the matrix in the `MUMDIA_NN_CHUNK`-row chunks that `iter_batches` cuts the
-  parquet into. The constant-column drop reads the description's min/max through
+  the mean, the std and the scores are the parquet handoff's, on either backend (the
+  streaming backend fills its memmap with the same loaders). The constant-column drop
+  reads the description's min/max through
   float32, as pyarrow hands a float32 footer statistic to Python, so flush-to-zero
   treats a column of zeros and subnormals as it does there. What it saves is the
   parquet encode in the engine and the decode and strided column-to-row fill in the
@@ -822,7 +826,9 @@ single class is an error, never a gap filled with in-sample scores (docs/29 #3),
 a final model fit on all non-decoy PSMs scores the decoys only. Model is `gbm`
 (`HistGradientBoostingClassifier`, `early_stopping=False` so `random_state=0` is
 reproducible) or `nn` (StandardScaler + MLP pipeline) via
-`MUMDIA_ENTRAPMENT_MODEL` (`entrapment_worker.py:28-60`). The rationale: spike-in
+`MUMDIA_ENTRAPMENT_MODEL` (`entrapment_worker.py:28-60`); the report's `model_identity`
+names the one that ran (`entrapment-gbm-sidecar-v1` or `entrapment-nn-sidecar-v1`). The
+rationale: spike-in
 negatives experience the same chimeric DIA interference as real targets, so a
 flexible model helps (AUC ~0.97 vs ~0.62 on in-silico decoys), unlike the
 decoy-trained regime, where a native linear model is all in-silico decoys can
@@ -1048,9 +1054,9 @@ configured.
 | `mbr.requant_all` | `false` | requantify already-identified precursors, not only transfers; only meaningful for `strategy = full`. **Unwired** in the current `mbr_worker.py`. |
 
 **Worker-only env knobs** (not config fields; set in the process environment).
-`mokapot_worker.py`: `MUMDIA_RESCORE_MODEL` (default `nn`; accepts the aliases
-`logreg`/`logistic`/`lr`, `xgb`/`xgboost`, and `percolator`/`linear`/`svm`,
-`mokapot_worker.py:36-76`), `MUMDIA_BREW_ITERS` (20, the `Model.max_iter`
+`mokapot_worker.py`: `MUMDIA_RESCORE_MODEL` (default `logreg`; accepts `nn` and the aliases
+`logreg`/`logistic`/`lr`, `xgb`/`xgboost`, and `percolator`/`linear`/`svm`),
+`MUMDIA_BREW_ITERS` (20, the `Model.max_iter`
 semi-supervised count), `MUMDIA_NN_HIDDEN` (`128,64,64,32`), `MUMDIA_NN_SOLVER`
 (adam), `MUMDIA_NN_MAX_ITER` (200), `MUMDIA_NN_ALPHA` (1e-4); logreg reads
 `MUMDIA_LR_C` (1.0) and `MUMDIA_LR_MAX_ITER` (1000); xgb reads `MUMDIA_XGB_TREES`
@@ -1089,11 +1095,11 @@ locates its model archive). Every worker inherits the temporary directory the en
 chose: with `--temp-dir` or `MUMDIA_TEMP_DIR` the engine sets `TMP`, `TEMP`, `TMPDIR` and,
 unless set, `MPLCONFIGDIR` before it starts a worker (docs/14, "Where MuMDIA writes").
 `deeplc_finetune.py`: `DEEPLC_FT_THREADS`
-(8, the training pool) plus argparse flags. Note the mokapot worker's **code default
-model is `nn`** (the sklearn MLP inside mokapot). The conda env
-(`env/mumdia-rescore.yml`) does not set `MUMDIA_RESCORE_MODEL`; only the Docker
-image sets `logreg` (`Dockerfile`). The Rust caller does not set it either, so
-elsewhere you get the MLP unless you export `MUMDIA_RESCORE_MODEL=logreg`.
+(8, the training pool) plus argparse flags. The mokapot worker's default model is
+logistic regression on every install (Docker image, conda env, desktop, release archive);
+before 2026-11-20 only the Docker image set `MUMDIA_RESCORE_MODEL=logreg` and every other
+install trained the sklearn MLP. The Rust caller does not set the variable, and records the
+model as `mokapot-<MUMDIA_RESCORE_MODEL or logreg>`.
 
 ## Invariants, determinism, gotchas
 
@@ -1266,7 +1272,10 @@ elsewhere you get the MLP unless you export `MUMDIA_RESCORE_MODEL=logreg`.
     buffer (0.1 GB at 387 features) for the duration of the load, and one extra decoded
     row group is resident; with one fill thread the buffer is the main thread's and is
     released when the load ends. `MUMDIA_NN_LOAD_THREADS=0` restores the old serial loop
-    without read-ahead.
+    without read-ahead. The streaming backend fills its memmap with the same loader (and
+    the raw handoff's), reading only the per-row metadata in batches of its own; before
+    2026-11-20 it had a slower loader whose float64 moments were summed over other blocks,
+    so a streamed pool can differ from earlier runs in the last bits.
   - `MUMDIA_NN_SELECT` (default `window`): each round's positives are the targets up
     to the last position of the stable descending order whose FDR
     `(decoys+1)/max(targets,1)` is at or below the training FDR, so only a top window
@@ -1288,16 +1297,19 @@ elsewhere you get the MLP unless you export `MUMDIA_RESCORE_MODEL=logreg`.
     float32 to that subnormal where the main thread gives 0.0, and a scan thread ranks
     a float32 subnormal above 0.0 where the main thread ties them.
 
-  Three tests in `tests/python` (they need torch) hold the default path to the old
-  scores on the host that runs them. `test_default_speedups_leave_scores_byte_identical`
-  runs the worker with every switch set back and with the defaults, for the in-memory
-  and the streaming backend. `test_default_path_scores_as_the_reference_worker` runs the
+  Tests in `tests/python` (they need torch) hold the default path to the old scores on
+  the host that runs them. `test_default_speedups_leave_scores_byte_identical` runs the
+  worker with every switch set back and with the defaults, for the in-memory and the
+  streaming backend. `test_default_path_scores_as_the_reference_worker` runs the
   worker as it was before these changes (extracted with `git show` from
   `REFERENCE_COMMIT`, skipped without the history) against the current one, for the
-  in-memory, streaming and TSV paths, which also covers the refactors that have no
-  switch (the training loop moved into `_build_trainer`, the `_entry` wrapper). Both use
+  in-memory and TSV paths, which also covers the refactors (the training loop moved into
+  `_build_trainer`, the `_entry` wrapper); `test_the_serial_loop_scores_as_the_serial_reference_worker`
+  does the same for `MUMDIA_NN_PARALLEL=0`, and
+  `test_the_streaming_backend_scores_as_the_in_memory_backend` holds the streaming
+  backend to the in-memory scores, since both fill the matrix with one loader. They use
   a pool with several row groups, non-finite and subnormal cells, nulls and ties, and
-  make the default arm run the threaded init scan. `test_thread_pools_compute_under_the_main_threads_flush_to_zero`
+  the default arm runs the threaded init scan. `test_thread_pools_compute_under_the_main_threads_flush_to_zero`
   compares the threaded fill, standardisation and scan with the serial code under
   flush-to-zero, on inputs where the thread state decides the bytes. When a later
   change moves the default scores on purpose, `REFERENCE_COMMIT` is moved to the

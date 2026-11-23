@@ -30,7 +30,7 @@ with several `--mzml`, which pays the calibration once.
    sequence 2.4 times), `fit` fits the ridge once from the seeds and pickles it, `predict
    --calibration` predicts one slice with that calibration, and `merge` joins the predictions
    back. 12 shards: 36 min plus 6 min merge, measured when every shard still refitted the same
-   ridge itself (`predict` without `--calibration` still does). Pass `--q-train` and
+   ridge itself (`predict` now requires `--calibration`). Pass `--q-train` and
    `--holdout` equal to `rt_im_train.q_train` and `window_holdout_frac`; `q_train` used to be
    fixed at 0.01.
    Through the engine the same split is `rt_im_train.deeplc_predict_shards`, which fits once

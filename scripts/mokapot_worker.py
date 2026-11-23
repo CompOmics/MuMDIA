@@ -9,15 +9,19 @@ legacy `candidate_id` column plus mokapot score and q-value. SpecId is
 with an env that has mokapot + pyarrow (py312_mumdia).
 
 Model is env-switchable so the linear-vs-NN A/B needs no code edit:
-    MUMDIA_RESCORE_MODEL = nn  (default)  -> sklearn MLPClassifier in mokapot.Model
+    MUMDIA_RESCORE_MODEL = logreg (default) -> L2 logistic regression (MUMDIA_LR_C,
+                                               MUMDIA_LR_MAX_ITER)
+                         = nn             -> sklearn MLPClassifier in mokapot.Model
+                         = xgb            -> XGBClassifier (MUMDIA_XGB_TREES, _DEPTH,
+                                               _LR, _JOBS)
                          = percolator     -> mokapot's default linear model
 NN hyperparameters (only read when MODEL=nn):
-    MUMDIA_NN_HIDDEN     = "64,32"   comma-separated hidden layer sizes
+    MUMDIA_NN_HIDDEN     = "128,64,64,32"  comma-separated hidden layer sizes
     MUMDIA_NN_SOLVER     = "adam"    adam scales to large PSM sets; lbfgs is more
                                      reproducible but memory-heavy here
     MUMDIA_NN_MAX_ITER   = "200"     NN epochs per fit
     MUMDIA_NN_ALPHA      = "1e-4"    L2 penalty
-    MUMDIA_BREW_ITERS    = "5"       mokapot semi-supervised iterations (Model.max_iter)
+    MUMDIA_BREW_ITERS    = "20"      mokapot semi-supervised iterations (Model.max_iter)
 
 Determinism note (docs/14_build_test_deploy_gotchas.md): NN training is only
 approximately reproducible. random_state/rng are pinned to 0, but with solver=adam
@@ -33,12 +37,14 @@ import pyarrow.parquet as pq
 
 
 def make_model(mokapot):
-    """Build the mokapot model selected by MUMDIA_RESCORE_MODEL (default: nn)."""
-    kind = os.environ.get("MUMDIA_RESCORE_MODEL", "nn").lower()
+    """Build the mokapot model selected by MUMDIA_RESCORE_MODEL (default: logreg)."""
+    kind = os.environ.get("MUMDIA_RESCORE_MODEL", "logreg").lower()
     brew_iters = int(os.environ.get("MUMDIA_BREW_ITERS", "20"))
+    # rescore.train_fdr, which the engine passes; 0.01 is mokapot's own default.
+    train_fdr = float(os.environ.get("MUMDIA_NN_TRAIN_FDR", "0.01"))
     if kind in ("percolator", "linear", "svm"):
-        # mokapot's default (grid-searched linear SVM). model=None in brew.
-        return None
+        # mokapot's default (grid-searched linear SVM), as brew builds it for model=None.
+        return mokapot.PercolatorModel(train_fdr=train_fdr)
     if kind in ("logreg", "logistic", "lr"):
         # L2 logistic regression: fast, convex, and near-ties the NN on
         # decoy-trained data (the NN only pulls ahead on real/entrapment negatives).
@@ -50,7 +56,7 @@ def make_model(mokapot):
             random_state=0,
         )
         # scaler=None -> StandardScaler (features are on mixed scales).
-        return mokapot.Model(net, train_fdr=0.01, max_iter=brew_iters, rng=0)
+        return mokapot.Model(net, train_fdr=train_fdr, max_iter=brew_iters, rng=0)
     if kind in ("xgb", "xgboost"):
         # Gradient-boosted trees: nonlinear, captures feature interactions the
         # linear models miss. Used as the second stage after a cheap prefilter,
@@ -70,7 +76,7 @@ def make_model(mokapot):
             random_state=0,
         )
         # scaler=None -> StandardScaler; harmless for trees, keeps the API uniform.
-        return mokapot.Model(net, train_fdr=0.01, max_iter=brew_iters, rng=0)
+        return mokapot.Model(net, train_fdr=train_fdr, max_iter=brew_iters, rng=0)
     if kind != "nn":
         raise ValueError(
             f"unknown MUMDIA_RESCORE_MODEL={kind!r} (want nn|logreg|xgb|percolator)"
@@ -95,7 +101,7 @@ def make_model(mokapot):
     )
     # scaler=None -> StandardScaler (the NN needs standardized inputs). Model.max_iter
     # is mokapot's semi-supervised iteration count, not the NN's epochs.
-    return mokapot.Model(net, train_fdr=0.01, max_iter=brew_iters, rng=0)
+    return mokapot.Model(net, train_fdr=train_fdr, max_iter=brew_iters, rng=0)
 
 
 def main():
@@ -118,10 +124,13 @@ def main():
     # them serially, which dominates the runtime). Thread-based (require=sharedmem),
     # so no per-fold dataset copy; results are unchanged, only faster.
     workers = int(os.environ.get("MUMDIA_MOKAPOT_WORKERS", "3"))
-    if model is None:
-        _results, _models = mokapot.brew(psms, rng=0, max_workers=workers)
-    else:
-        _results, _models = mokapot.brew(psms, model=model, rng=0, max_workers=workers)
+    # rescore.folds and rescore.train_fdr, which the engine passes (3 and 0.01 are
+    # mokapot's defaults). The semi-supervised iterations are MUMDIA_BREW_ITERS, not
+    # rescore.num_iter; the engine's report records the count used.
+    folds = int(os.environ.get("MUMDIA_NN_FOLDS", "3"))
+    test_fdr = float(os.environ.get("MUMDIA_NN_TRAIN_FDR", "0.01"))
+    _results, _models = mokapot.brew(psms, model=model, test_fdr=test_fdr, folds=folds,
+                                     rng=0, max_workers=workers)
 
     specids = psms.data["SpecId"].astype(str).to_numpy()
 
@@ -178,7 +187,7 @@ def main():
         }
     )
     pq.write_table(out, out_path)
-    model_name = os.environ.get("MUMDIA_RESCORE_MODEL", "nn")
+    model_name = os.environ.get("MUMDIA_RESCORE_MODEL", "logreg")
     print(f"mokapot_worker[{model_name}]: {len(cids)} PSMs rescored (targets+decoys)")
 
 

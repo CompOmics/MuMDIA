@@ -9,8 +9,8 @@ Skipped without mokapot. Two contracts:
    fold models over all rows is not out-of-fold (two of three folds trained on
    each row) and makes nominal q-values anti-conservative.
 2. Model selection. `MUMDIA_RESCORE_MODEL` chooses the classifier, and the
-   worker's code default is the sklearn MLP even though the portable env sets
-   `logreg`. A silently substituted model invalidates any A/B comparison and
+   worker's default is logistic regression on every install, as the Docker image
+   used to set by itself. A silently substituted model invalidates any A/B comparison and
    contradicts the rule that an explicitly requested external classifier must
    not become something else (`CLAUDE.md`, "FDR and sidecar rules").
 """
@@ -102,11 +102,10 @@ def test_logreg_run_scores_every_pin_row_exactly_once(mokapot_module, psms, tmp_
 def test_rescore_model_env_selects_logistic_regression(worker_module, mokapot_module):
     """`MUMDIA_RESCORE_MODEL=logreg` must build a LogisticRegression.
 
-    The worker's code default is the sklearn MLP, while the recommended
-    portable environment (`env/mumdia-rescore.yml`) sets `logreg` and the Rust
-    caller sets nothing. If this mapping breaks, a run configured for the fast
-    convex path silently trains an MLP instead: different scores, different
-    identification counts, and near-bit-exact reproducibility lost.
+    It is also the default, which the Rust caller relies on: it sets nothing. If
+    this mapping breaks, a run configured for the fast convex path silently trains
+    another model: different scores, different identification counts, and
+    near-bit-exact reproducibility lost.
     """
     from sklearn.linear_model import LogisticRegression
 
@@ -128,23 +127,30 @@ def test_rescore_model_env_selects_logistic_regression(worker_module, mokapot_mo
 
 
 def test_default_and_percolator_models_are_unchanged(worker_module, mokapot_module):
-    """The unset default is the sklearn MLP, and `percolator` means `model=None`.
+    """The unset default is logistic regression on every install, `nn` the sklearn MLP,
+    and `percolator` means mokapot's own `PercolatorModel`.
 
-    `model=None` is how the worker asks mokapot for its own grid-searched
-    linear SVM. Confusing the two would make `classifier = mokapot` mean a
+    `PercolatorModel` is mokapot's own grid-searched linear SVM, built as `brew` builds
+    it for `model=None` but with the engine's training FDR. Confusing the two would make `classifier = mokapot` mean a
     different algorithm than every recorded benchmark used, while
     `psms_scored.parquet.report.json` still reports "mokapot".
     """
+    from sklearn.linear_model import LogisticRegression
     from sklearn.neural_network import MLPClassifier
 
     prior = os.environ.get("MUMDIA_RESCORE_MODEL")
     try:
         os.environ.pop("MUMDIA_RESCORE_MODEL", None)
         assert isinstance(worker_module.make_model(mokapot_module).estimator,
+                          LogisticRegression)
+        os.environ["MUMDIA_RESCORE_MODEL"] = "nn"
+        assert isinstance(worker_module.make_model(mokapot_module).estimator,
                           MLPClassifier)
         for alias in ("percolator", "linear", "svm"):
             os.environ["MUMDIA_RESCORE_MODEL"] = alias
-            assert worker_module.make_model(mokapot_module) is None
+            model = worker_module.make_model(mokapot_module)
+            assert isinstance(model, mokapot_module.PercolatorModel)
+            assert model.train_fdr == 0.01
     finally:
         if prior is None:
             os.environ.pop("MUMDIA_RESCORE_MODEL", None)

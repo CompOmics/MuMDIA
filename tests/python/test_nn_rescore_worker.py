@@ -346,6 +346,20 @@ def test_available_ram_is_optional_and_never_fatal():
     assert gb >= 4 and isinstance(why, str)
 
 
+def test_a_thread_cap_that_is_not_a_number_falls_back_to_auto(monkeypatch, capsys):
+    """`inf` used to raise OverflowError and fail the rescore, and `eight` was ignored
+    without a word; both now warn and take the automatic cap."""
+    w = _import_worker()
+    monkeypatch.setenv("MUMDIA_NN_THREAD_CAP", "auto")
+    auto = w.torch_thread_cap()
+    for raw in ("inf", "-inf", "nan", "eight"):
+        monkeypatch.setenv("MUMDIA_NN_THREAD_CAP", raw)
+        assert w.torch_thread_cap() == auto, raw
+        assert "MUMDIA_NN_THREAD_CAP" in capsys.readouterr().out, raw
+    monkeypatch.setenv("MUMDIA_NN_THREAD_CAP", "12")
+    assert w.torch_thread_cap() == (12, "MUMDIA_NN_THREAD_CAP")
+
+
 # ------------------------------------------ default-path speed-ups are score-identical
 
 # Every speed-up on the default path is meant to leave the output scores byte-identical,
@@ -541,7 +555,7 @@ def _reference_worker(tmp_path, commit=None):
     return path
 
 
-@pytest.mark.parametrize("backend", ["in-memory", "stream", "tsv"])
+@pytest.mark.parametrize("backend", ["in-memory", "tsv"])
 def test_default_path_scores_as_the_reference_worker(torch_available, tmp_path, backend):
     """The default path must give the reference worker's score bytes, on the same host.
 
@@ -554,11 +568,34 @@ def test_default_path_scores_as_the_reference_worker(torch_available, tmp_path, 
     ref = tmp_path / "reference.parquet"
     new = tmp_path / "default.parquet"
     run_worker_ok(str(reference), pin, ref, env=env)
-    run_worker_ok("nn_rescore_worker.py", pin, new, env=env)
+    stdout, _ = run_worker_ok("nn_rescore_worker.py", pin, new, env=env)
+    # The comparison is only as strong as the paths it runs.
+    assert "2 scan thread(s)" in stdout, "the default arm did not run the threaded init scan"
     _assert_same_scores(ref, new, n, "the current worker (against %s)" % REFERENCE_COMMIT[:7])
 
 
-@pytest.mark.parametrize("backend", ["in-memory", "stream", "tsv"])
+@pytest.mark.parametrize("parallel", ["auto", "0"])
+def test_the_streaming_backend_scores_as_the_in_memory_backend(torch_available, tmp_path,
+                                                               parallel):
+    """A parquet or raw handoff is streamed into a memmap by the in-memory loader, so the
+    streaming backend must give the in-memory scores byte for byte, under the default
+    parallel training and the serial loop alike.
+
+    The reference workers streamed through a loader of their own, whose float64 moments
+    were summed over other blocks, so they are not the oracle for this backend any more.
+    """
+    pin, _keys, n, env = _identity_inputs(tmp_path, "in-memory")
+    env = dict(env, MUMDIA_NN_PARALLEL=parallel)
+    ref = tmp_path / "in_memory.parquet"
+    new = tmp_path / "stream.parquet"
+    run_worker_ok("nn_rescore_worker.py", pin, ref, env=env)
+    stdout, _ = run_worker_ok("nn_rescore_worker.py", pin, new,
+                              env=dict(env, MUMDIA_NN_STREAM="1"))
+    assert "backend=stream(memmap)" in stdout
+    _assert_same_scores(ref, new, n, "the streaming backend (against in-memory)")
+
+
+@pytest.mark.parametrize("backend", ["in-memory", "tsv"])
 def test_the_serial_loop_scores_as_the_serial_reference_worker(torch_available, tmp_path,
                                                               backend):
     """`MUMDIA_NN_PARALLEL=0` keeps the serial loop, and with it the scores of the worker

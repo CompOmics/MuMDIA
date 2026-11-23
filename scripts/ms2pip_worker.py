@@ -23,7 +23,8 @@ directory cannot hold them or must not be written (docs/14, "Where MuMDIA writes
 
 The output is assembled from numpy arrays per chunk rather than from four Python
 lists appended one fragment at a time. At 9.8M peptidoforms the lists were about
-300M appends and 13 GB of Python objects before the first byte was written.
+300M appends and 13 GB of Python objects before the first byte was written. Each chunk
+is written as soon as it is predicted, so the whole fragment table is never held.
 """
 import os
 import sys
@@ -136,28 +137,28 @@ def main():
     extra = {"model_dir": where} if where else {}
     if where:
         print(f"ms2pip_worker: model files in {where} (MUMDIA_MODEL_DIR)", flush=True)
-    parts = []
     n_rows = 0
-    for start in range(0, len(ids), chunk):
-        end = min(start + chunk, len(ids))
-        # __main__ guard below makes the Windows 'spawn' start method safe for the pool.
-        # MS2PIP predictions are deterministic regardless of the process count.
-        psms = PSMList(
-            psm_list=[
-                PSM(peptidoform=f"{pforms[i]}/{charges[i]}", spectrum_id=str(ids[i]))
-                for i in range(start, end)
-            ]
-        )
-        results = predict_batch(psms, model=model, processes=procs, **extra)
-        part = fragment_rows(results)
-        n_rows += part[0].size
-        parts.append(part)
-        print(f"ms2pip_worker: {end}/{len(ids)} peptidoforms predicted", flush=True)
-
-    if not parts:
-        parts = [fragment_rows([])]
-    cols = [np.concatenate([p[k] for p in parts]) for k in range(5)]
-    pq.write_table(to_table(*cols), out_path)
+    empty = to_table(*fragment_rows([]))
+    with pq.ParquetWriter(out_path, empty.schema, compression="snappy") as writer:
+        for start in range(0, len(ids), chunk):
+            end = min(start + chunk, len(ids))
+            # __main__ guard below makes the Windows 'spawn' start method safe for the pool.
+            # MS2PIP predictions are deterministic regardless of the process count.
+            psms = PSMList(
+                psm_list=[
+                    PSM(peptidoform=f"{pforms[i]}/{charges[i]}", spectrum_id=str(ids[i]))
+                    for i in range(start, end)
+                ]
+            )
+            results = predict_batch(psms, model=model, processes=procs, **extra)
+            part = fragment_rows(results)
+            if part[0].size:
+                writer.write_table(to_table(*part))
+            n_rows += part[0].size
+            print(f"ms2pip_worker: {end}/{len(ids)} peptidoforms predicted", flush=True)
+        if n_rows == 0:
+            # Nothing predicted: the table still carries the schema the engine reads.
+            writer.write_table(empty)
     print(f"ms2pip_worker: {len(ids)} peptidoforms -> {n_rows} fragment rows")
 
 

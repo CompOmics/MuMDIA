@@ -232,6 +232,41 @@ than a number. Both are recorded in every run's `manifest.json`.
   `env/mumdia-*.yml` specifications, skips macOS on pushes to main, and the Dockerfile's
   compiler image matches `rust-toolchain.toml`.
 
+- **mokapot trains logistic regression on every install (docs/13).** The worker's default
+  model was the sklearn MLP; only the Docker image set `MUMDIA_RESCORE_MODEL=logreg`, so one
+  configuration with `rescore.classifier = mokapot` trained logistic regression in Docker and
+  an MLP in the conda environment, the desktop application and the release archive.
+  `logreg` is now the worker's default and the engine's model-identity fallback, and the
+  image no longer sets it. A mokapot run outside Docker therefore changes model: its scores
+  change, and `model_identity` reads `mokapot-logreg` instead of `mokapot-nn`.
+  `MUMDIA_RESCORE_MODEL=nn` keeps the MLP.
+- **The sidecar workers hold less memory and share one copy of their DeepLC helpers (docs/13).**
+  `ms2pip_worker.py` writes each predicted chunk as it comes instead of keeping every chunk
+  and concatenating them at the end, which held the fragment table twice.
+  `peptdeep_worker.py` no longer parses the whole request into a Python tuple per row before
+  the first prediction: a first pass, chunk by chunk, finds the supported rows and their
+  modifications (both refusals still come before any prediction), and each prediction call
+  parses its own rows, the same rows as before. `deeplc_finetune.py` holds only the
+  `peptidoform` and `predicted_irt` columns through the prediction and reads the whole
+  precursor table again to write it. The version floor, the one-time base-model load, the
+  blank-progress filter and the sequence rules that `deeplc_worker.py` and
+  `deeplc_finetune.py` copied character for character (and `mh_shard_predict.py` and
+  `im2deep_worker.py` in part) live in one stdlib-only module, `scripts/_deeplc_common.py`,
+  which the release bundle checks now require; each worker still imports `deeplc` (or
+  `im2deep`) first. The fine-tune's three shard runners share one helper. The libraries, the
+  predictions and the scores are unchanged (checked on the fleet against main's workers).
+- **The NN rescorer's streaming backend uses the in-memory loader.** For a parquet or raw
+  handoff the streaming memmap is filled by the same threaded row-group loader as the
+  in-memory matrix (the per-row metadata is still read in batches), instead of a second,
+  slower pandas loop with its own copies of the moment and standardisation code. Its float64
+  moments are now summed over the loader's blocks, so a streamed pool can differ from an
+  earlier streamed run in the last bits; it now scores as the in-memory backend does, byte
+  for byte. Only pools above `MUMDIA_NN_STREAM_GB` (twice the free memory unless set) stream.
+- **Worker docstrings and help match the code.** The NN worker's (the raw handoff is the
+  default, the in-memory backend's threshold, warm starts, the training knobs the engine
+  sets), the mokapot worker's (hidden layers `128,64,64,32`, `MUMDIA_BREW_ITERS` 20), the
+  DeepLC workers' floor (4.5.0) and the `--shards` help, which called the automatic count
+  unmeasured.
 - **Quant and report code keep one copy of each helper (#358, docs/12).** The candidate audit no
   longer looks for `<psms>.audit.parquet`, which nothing writes, so every extraction loss is
   `DID_NOT_SURVIVE_EXTRACTION` as before, and it writes the library's columns as read instead
@@ -448,6 +483,10 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Removed
 
+- **`deeplc_finetune.py --predict-limit` and `--skip-predict`, and the per-shard refit of
+  `mh_shard_predict.py predict`.** The two flags were hand-run smoke-test options nothing
+  passes. `predict` now requires `--calibration`: a refit per shard repeated the fit and
+  could select another head at rank 80.
 - **`MUMDIA_PARQUET_PLAN` (docs/03).** It turned off the float-encoding plan of capped
   writers, for a byte comparison against binaries from before 0.5.0; release checks compare
   decoded tables. A set variable is now ignored.
@@ -507,6 +546,28 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **The mokapot worker uses `rescore.folds` and `rescore.train_fdr`, and the report says how
+  many iterations it ran.** The engine passed `folds`, `num_iter` and `train_fdr` and recorded
+  them in `psms_scored.parquet.report.json`, but the worker ignored all three (3 folds, 0.01
+  and `MUMDIA_BREW_ITERS` 20 whatever the configuration said). It now reads the folds and the
+  training FDR, which changes its output only for non-default values; the iterations stay
+  `MUMDIA_BREW_ITERS`, and the report's `num_iter` for a mokapot run now records that count
+  instead of `rescore.num_iter`. The `percolator` model is built as `mokapot.brew` builds its
+  default, with the configured training FDR.
+- **An entrapment rescore with `MUMDIA_ENTRAPMENT_MODEL=nn` is reported as the MLP it ran.**
+  The engine wrote `model_identity = entrapment-gbm-sidecar-v1` whatever the worker trained;
+  it now reads the variable as the worker does and writes `entrapment-nn-sidecar-v1` for
+  the MLP. `classifier_used` stays `entrapment_gbm`, and the GBM default is unchanged.
+- **`MUMDIA_NN_THREAD_CAP=inf` no longer stops the NN rescorer.** The cap was parsed with
+  `int(float(...))` catching only `ValueError`, so `inf` raised `OverflowError` and failed
+  the rescore, and a value such as `eight` was ignored without a word; both now warn and
+  take the automatic cap, as the DeepLC and IM2Deep caps do.
+- **The fresh-interpreter import test of the DeepLC workers ran (tests/python).** It
+  imported each worker with the scripts directory off `sys.path`, so the import of
+  `_torch_threads` failed and the test skipped "for an unrelated reason" in every
+  environment; the import order it exists to check (`import deeplc` before numpy and
+  pyarrow) was never exercised. The subprocess now puts the script's directory first, as
+  `python <script>` does.
 - **`run-experiment` refuses a `quant.normalisation_rank` the run count cannot carry before
   it searches (#358).** The cross-run normalisation needs a rank of at most the number of runs less
   two and checked it only when it ran, after every run's search, rescore and quant, so two

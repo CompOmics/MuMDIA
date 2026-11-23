@@ -1302,7 +1302,7 @@ pools are capped at the physical cores available to the process
 resolved numbers are recorded under `torch_threads` in `<lib_out>.summary.json`. The
 worker also accepts standalone-only flags the engine never sets, so they take their
 defaults: `--device {cpu,cuda}` (cuda sidesteps the CPU OpenMP crash entirely),
-`--threads`, `--max-ref`, `--predict-limit`, and `--skip-predict`.
+`--threads` and `--max-ref`.
 
 The fine-tune is seeded from `rng_seed` (`--seed`), but not bit-for-bit
 reproducible because of kernel nondeterminism, so it can differ across runs. Its main use is library-input mode, where the base iRT is

@@ -106,9 +106,11 @@ The worker's default-path speed-ups must not move a score. The worker is run wit
 every switch back to the replaced code (`MUMDIA_NN_FINAL_POOL_SCORE=1`,
 `MUMDIA_NN_GATHER=numpy`, `MUMDIA_NN_SCAN_THREADS=1`, `MUMDIA_NN_LOAD_THREADS=0`,
 `MUMDIA_NN_SELECT=full`) and with the defaults, for the in-memory and the streaming
-backend; and the worker as it was before those changes, extracted with `git show`
-from `REFERENCE_COMMIT`, is run against the current one, for the in-memory,
-streaming and TSV paths (skipped when the clone lacks that commit). The score bytes
+backend; the worker as it was before those changes, extracted with `git show` from
+`REFERENCE_COMMIT` (and `SERIAL_REFERENCE_COMMIT` for the serial loop), is run against
+the current one, for the in-memory and TSV paths (skipped when the clone lacks that
+commit); and the streaming backend, which fills its memmap with the in-memory loader, is
+run against the in-memory one. The score bytes
 must be equal, on a pool with several row groups, non-finite cells, a float64
 overflow column, nulls, ties, a constant column and subnormal cells, and the default
 arm must run the threaded init scan (`MUMDIA_NN_SCAN_ROWS_PER_THREAD=500`). These are
@@ -134,7 +136,7 @@ positive selection equals the full `tda_q` selection or declines.
 The same complete-coverage contract, and that the out-of-fold branch ran (there
 is deliberately no in-sample fallback). Plus model selection:
 `MUMDIA_RESCORE_MODEL=logreg` and its aliases build a `LogisticRegression`, the
-unset default is the sklearn MLP, `percolator`/`linear`/`svm` mean `model=None`,
+unset default is also logistic regression, `nn` the sklearn MLP, `percolator`/`linear`/`svm` mean `model=None`,
 and an unknown name aborts instead of falling back.
 
 ### `test_entrapment_worker.py` (needs scikit-learn)
