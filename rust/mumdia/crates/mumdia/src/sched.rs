@@ -432,7 +432,7 @@ fn read_cgroup_limit(dir: &Path, limit_file: &str) -> Option<u64> {
 }
 
 /// The smallest headroom (limit minus working set) of the memory cgroup a process is in and
-/// of its ancestors ([`memory_cgroup_dirs`]), or `None` when none of them has a limit.
+/// of its ancestors (`memory_cgroup_dirs`), or `None` when none of them has a limit.
 ///
 /// The working set is the usage less the inactive file cache, which the kernel reclaims
 /// before it enforces the limit (the figure `docker stats` and the kubelet use); counting
@@ -459,7 +459,7 @@ pub fn cgroup_headroom_in(proc_cgroup: &str, v2_root: &Path, v1_root: &Path) -> 
 }
 
 /// The smallest memory limit of the cgroup a process is in and of its ancestors
-/// ([`memory_cgroup_dirs`]), or `None` when none of them has one.
+/// (`memory_cgroup_dirs`), or `None` when none of them has one.
 fn cgroup_memory_limit_in(proc_cgroup: &str, v2_root: &Path, v1_root: &Path) -> Option<u64> {
     memory_cgroup_dirs(proc_cgroup, v2_root, v1_root)
         .iter()
