@@ -1154,6 +1154,15 @@ prescreen keys below); no table of a default, diaPASEF or ZT Scan search changes
   in the chain reaches the fixed zip 9.0.5. RUSTSEC-2026-0543 (chrono unmaintained) has no
   patched release, 0.4.45 being the latest, and stays a warning that does not fail the audit.
   Neither lockfile changes, so no output changes.
+- **RUSTSEC-2026-0594 (cookie 0.18.2, private cookie nonces can repeat in processes that
+  fork) is fixed by cookie 0.18.3 in both lockfiles.** The audit on main failed on it.
+
+### Dependencies
+
+- clap 4.6.7 -> 4.6.9 in the engine; rusqlite 0.41.1 -> 0.43.0 (libsqlite3-sys 0.40.0),
+  ureq 3.5.0 -> 3.5.2 and zip 9.1.3 -> 9.8.1 in the desktop; docker/login-action 4.7.0 ->
+  4.8.0. `THIRD_PARTY_LICENSES.md`, `desktop/THIRD_PARTY_LICENSES.md` and `sbom.cdx.json`
+  are regenerated. Supersedes Dependabot #368, #369, #370 and #371.
 
 ## [0.14.0] - 2026-11-16
 

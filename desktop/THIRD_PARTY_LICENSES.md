@@ -10,7 +10,7 @@ installers bundle beside it has its own list, `THIRD_PARTY_LICENSES.md`.
 
 ## Obligations
 
-454 third-party crates. Every one declares an SPDX expression; none is
+456 third-party crates. Every one declares an SPDX expression; none is
 unspecified.
 
 The following copyleft identifiers appear, in each case as one arm of a
@@ -38,8 +38,8 @@ Licence identifiers by crate count:
 
 | SPDX identifier | crates |
 |---|---|
-| `MIT` | 416 |
-| `Apache-2.0` | 302 |
+| `MIT` | 417 |
+| `Apache-2.0` | 304 |
 | `Zlib` | 23 |
 | `Unicode-3.0` | 19 |
 | `Unlicense` | 11 |
@@ -47,11 +47,11 @@ Licence identifiers by crate count:
 | `ISC` | 5 |
 | `MPL-2.0` | 5 |
 | `Apache-2.0 WITH LLVM-exception` | 4 |
+| `CC0-1.0` | 2 |
 | `LGPL-2.1-or-later` | 2 |
+| `MIT-0` | 2 |
 | `0BSD` | 1 |
-| `CC0-1.0` | 1 |
 | `CDLA-Permissive-2.0` | 1 |
-| `MIT-0` | 1 |
 
 ## Crates
 
@@ -99,7 +99,8 @@ Licence identifiers by crate count:
 | `chrono` | 0.4.45 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/chronotope/chrono](https://github.com/chronotope/chrono) |
 | `combine` | 4.6.8 | MIT | - | [https://github.com/Marwes/combine](https://github.com/Marwes/combine) |
 | `const-oid` | 0.10.2 | Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/RustCrypto/formats](https://github.com/RustCrypto/formats) |
-| `cookie` | 0.18.2 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/SergioBenitez/cookie-rs](https://github.com/SergioBenitez/cookie-rs) |
+| `constant_time_eq` | 0.6.1 | CC0-1.0 OR MIT-0 OR Apache-2.0 | `Apache-2.0` | [https://codeberg.org/cesarb/constant_time_eq](https://codeberg.org/cesarb/constant_time_eq) |
+| `cookie` | 0.18.3 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/SergioBenitez/cookie-rs](https://github.com/SergioBenitez/cookie-rs) |
 | `core-foundation` | 0.10.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/servo/core-foundation-rs](https://github.com/servo/core-foundation-rs) |
 | `core-foundation-sys` | 0.8.7 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/servo/core-foundation-rs](https://github.com/servo/core-foundation-rs) |
 | `core-graphics` | 0.25.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/servo/core-foundation-rs](https://github.com/servo/core-foundation-rs) |
@@ -237,7 +238,7 @@ Licence identifiers by crate count:
 | `libdbus-sys` | 0.2.7 | Apache-2.0/MIT | `Apache-2.0` | [https://github.com/diwic/dbus-rs](https://github.com/diwic/dbus-rs) |
 | `libloading` | 0.7.4 | ISC | - | [https://github.com/nagisa/rust_libloading/](https://github.com/nagisa/rust_libloading/) |
 | `libredox` | 0.1.21 | MIT | - | [https://gitlab.redox-os.org/redox-os/libredox.git](https://gitlab.redox-os.org/redox-os/libredox.git) |
-| `libsqlite3-sys` | 0.39.1 | MIT | - | [https://github.com/rusqlite/rusqlite](https://github.com/rusqlite/rusqlite) |
+| `libsqlite3-sys` | 0.40.0 | MIT | - | [https://github.com/rusqlite/rusqlite](https://github.com/rusqlite/rusqlite) |
 | `litemap` | 0.8.3 | Unicode-3.0 | - | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
 | `lock_api` | 0.4.14 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/Amanieu/parking_lot](https://github.com/Amanieu/parking_lot) |
 | `log` | 0.4.34 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/log](https://github.com/rust-lang/log) |
@@ -319,7 +320,7 @@ Licence identifiers by crate count:
 | `rfd` | 0.17.2 | MIT | - | [https://github.com/PolyMeilex/rfd](https://github.com/PolyMeilex/rfd) |
 | `ring` | 0.17.14 | Apache-2.0 AND ISC | - | [https://github.com/briansmith/ring](https://github.com/briansmith/ring) |
 | `rsqlite-vfs` | 0.2.0 | MIT | - | [https://github.com/Spxg/sqlite-wasm-rs](https://github.com/Spxg/sqlite-wasm-rs) |
-| `rusqlite` | 0.41.1 | MIT | - | [https://github.com/rusqlite/rusqlite](https://github.com/rusqlite/rusqlite) |
+| `rusqlite` | 0.43.0 | MIT | - | [https://github.com/rusqlite/rusqlite](https://github.com/rusqlite/rusqlite) |
 | `rustc-hash` | 2.1.3 | Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/rust-lang/rustc-hash](https://github.com/rust-lang/rustc-hash) |
 | `rustc_version` | 0.4.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/djc/rustc-version-rs](https://github.com/djc/rustc-version-rs) |
 | `rustls` | 0.23.46 | Apache-2.0 OR ISC OR MIT | `Apache-2.0` | [https://github.com/rustls/rustls](https://github.com/rustls/rustls) |
@@ -359,7 +360,7 @@ Licence identifiers by crate count:
 | `softbuffer` | 0.4.8 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-windowing/softbuffer](https://github.com/rust-windowing/softbuffer) |
 | `soup3` | 0.5.0 | MIT | - | [https://gitlab.gnome.org/World/Rust/soup3-rs](https://gitlab.gnome.org/World/Rust/soup3-rs) |
 | `soup3-sys` | 0.5.0 | MIT | - | [https://gitlab.gnome.org/World/Rust/soup3-rs](https://gitlab.gnome.org/World/Rust/soup3-rs) |
-| `sqlite-wasm-rs` | 0.6.2 | MIT | - | [https://github.com/Spxg/sqlite-wasm-rs](https://github.com/Spxg/sqlite-wasm-rs) |
+| `sqlite-wasm-rs` | 0.6.3 | MIT | - | [https://github.com/Spxg/sqlite-wasm-rs](https://github.com/Spxg/sqlite-wasm-rs) |
 | `stable_deref_trait` | 1.2.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/storyyeller/stable_deref_trait](https://github.com/storyyeller/stable_deref_trait) |
 | `string_cache` | 0.9.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/servo/string-cache](https://github.com/servo/string-cache) |
 | `string_cache_codegen` | 0.6.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/servo/string-cache](https://github.com/servo/string-cache) |
@@ -422,8 +423,8 @@ Licence identifiers by crate count:
 | `unicode-ident` | 1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 | `Apache-2.0` | [https://github.com/dtolnay/unicode-ident](https://github.com/dtolnay/unicode-ident) |
 | `unicode-segmentation` | 1.13.3 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/unicode-rs/unicode-segmentation](https://github.com/unicode-rs/unicode-segmentation) |
 | `untrusted` | 0.9.0 | ISC | - | [https://github.com/briansmith/untrusted](https://github.com/briansmith/untrusted) |
-| `ureq` | 3.5.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/algesten/ureq](https://github.com/algesten/ureq) |
-| `ureq-proto` | 0.6.5 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/algesten/ureq-proto](https://github.com/algesten/ureq-proto) |
+| `ureq` | 3.5.2 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/algesten/ureq](https://github.com/algesten/ureq) |
+| `ureq-proto` | 0.7.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/algesten/ureq-proto](https://github.com/algesten/ureq-proto) |
 | `url` | 2.5.9 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/servo/rust-url](https://github.com/servo/rust-url) |
 | `urlpattern` | 0.6.0 | MIT | - | [https://github.com/denoland/rust-urlpattern](https://github.com/denoland/rust-urlpattern) |
 | `utf8-zero` | 0.8.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/algesten/utf8-zero](https://github.com/algesten/utf8-zero) |
@@ -504,10 +505,11 @@ Licence identifiers by crate count:
 | `zerofrom` | 0.1.8 | Unicode-3.0 | - | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
 | `zerofrom-derive` | 0.1.7 | Unicode-3.0 | - | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
 | `zeroize` | 1.9.0 | Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/RustCrypto/utils](https://github.com/RustCrypto/utils) |
+| `zeroize_derive` | 1.5.0 | Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/RustCrypto/utils](https://github.com/RustCrypto/utils) |
 | `zerotrie` | 0.2.5 | Unicode-3.0 | - | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
 | `zerovec` | 0.11.8 | Unicode-3.0 | - | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
 | `zerovec-derive` | 0.11.6 | Unicode-3.0 | - | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
-| `zip` | 9.1.3 | MIT | - | [https://github.com/zip-rs/zip2](https://github.com/zip-rs/zip2) |
+| `zip` | 9.8.1 | MIT | - | [https://github.com/zip-rs/zip2](https://github.com/zip-rs/zip2) |
 | `zlib-rs` | 0.6.7 | Zlib | - | [https://github.com/trifectatechfoundation/zlib-rs](https://github.com/trifectatechfoundation/zlib-rs) |
 | `zmij` | 1.0.23 | MIT | - | [https://github.com/dtolnay/zmij](https://github.com/dtolnay/zmij) |
 | `zopfli` | 0.8.3 | Apache-2.0 | - | [https://github.com/zopfli-rs/zopfli](https://github.com/zopfli-rs/zopfli) |
@@ -620,7 +622,7 @@ licence text alone does not discharge the obligation: MIT requires the copyright
 notice in all copies, BSD requires it retained, and Apache-2.0 section 4(d)
 requires the contents of a NOTICE file to be propagated.
 
-Notices recovered for 327 of 454 crates (the remainder ship no copyright line in a licence file; see their repositories, linked above).
+Notices recovered for 328 of 456 crates (the remainder ship no copyright line in a licence file; see their repositories, linked above).
 
 **adler2 2.0.1**
 
@@ -745,7 +747,7 @@ Notices recovered for 327 of 454 crates (the remainder ship no copyright line in
 
 - Copyright (c) 2020-2026 The RustCrypto Project Developers
 
-**cookie 0.18.2**
+**cookie 0.18.3**
 
 - Copyright 2017 Sergio Benitez
 - Copyright 2014 Alex Chricton
@@ -1186,7 +1188,7 @@ Notices recovered for 327 of 454 crates (the remainder ship no copyright line in
 
 - Copyright (c) 2023 4lDO2
 
-**libsqlite3-sys 0.39.1**
+**libsqlite3-sys 0.40.0**
 
 - Copyright (c) 2014 The rusqlite developers
 
@@ -1393,7 +1395,7 @@ Notices recovered for 327 of 454 crates (the remainder ship no copyright line in
 - Copyright 2015 The Chromium Authors. All rights reserved.
 - Copyright 2015-2025 Brian Smith.
 
-**rusqlite 0.41.1**
+**rusqlite 0.43.0**
 
 - Copyright (c) 2014 The rusqlite developers
 
@@ -1514,7 +1516,7 @@ Notices recovered for 327 of 454 crates (the remainder ship no copyright line in
 
 - Copyright (c) 2013-2017, The Gtk-rs Project Developers.
 
-**sqlite-wasm-rs 0.6.2**
+**sqlite-wasm-rs 0.6.3**
 
 - Copyright (c) 2024 Spxg
 
@@ -1718,11 +1720,11 @@ Notices recovered for 327 of 454 crates (the remainder ship no copyright line in
 
 - Copyright 2015-2016 Brian Smith.
 
-**ureq 3.5.0**
+**ureq 3.5.2**
 
 - Copyright (c) 2019 Martin Algesten
 
-**ureq-proto 0.6.5**
+**ureq-proto 0.7.1**
 
 - Copyright 2022 Martin Algesten
 
@@ -1986,6 +1988,10 @@ Notices recovered for 327 of 454 crates (the remainder ship no copyright line in
 
 - Copyright (c) 2018-2026 The RustCrypto Project Developers
 
+**zeroize_derive 1.5.0**
+
+- Copyright (c) 2019-2026 The RustCrypto Project Developers
+
 **zerotrie 0.2.5**
 
 - Copyright © 2020-2024 Unicode, Inc.
@@ -1998,7 +2004,7 @@ Notices recovered for 327 of 454 crates (the remainder ship no copyright line in
 
 - Copyright © 2020-2024 Unicode, Inc.
 
-**zip 9.1.3**
+**zip 9.8.1**
 
 - Copyright (c) 2014 Mathijs van de Nes
 
