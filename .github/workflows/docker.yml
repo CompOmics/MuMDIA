@@ -1,9 +1,12 @@
 name: Docker image
 
 # Builds the self-contained image (engine + mokapot/MS2PIP/DeepLC sidecars).
-# - On a version tag (v*): builds, smoke-tests, then pushes
-#   ghcr.io/compomics/mumdia:<tag> + :latest.
-# - Manual (workflow_dispatch): builds and smoke-tests only, no push.
+# - Called by release.yml on a version tag (v*), after its validate-tag gate passed:
+#   builds, smoke-tests, then pushes ghcr.io/compomics/mumdia:<tag> + :latest. It no
+#   longer runs on the tag by itself, which pushed the image and moved :latest even
+#   for a tag the gate refused.
+# - A pull request that changes the image's inputs, and a manual dispatch: builds and
+#   smoke-tests only, no push (login and push are gated on a tag ref).
 #
 # The smoke test is the point of this workflow outside a release. The image is the
 # only distribution where the Python sidecars are guaranteed present, and nothing
@@ -12,9 +15,16 @@ name: Docker image
 # catches the DeepLC-before-numpy import order, which a module-presence probe
 # cannot see.
 on:
-  push:
-    tags: ["v*"]
+  workflow_call: {}
   workflow_dispatch: {}
+  # Dependabot's base-image bumps among them, which used to merge unbuilt.
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - "env/docker-*.yml"
+      - "docker/**"
+      - .github/workflows/docker.yml
 
 permissions:
   contents: read

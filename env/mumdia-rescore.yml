@@ -13,7 +13,9 @@ channels:
 dependencies:
   - python=3.12
   - numpy
-  - pandas
+  # mokapot 0.10.0 calls pd.to_numeric(errors="ignore"), which pandas 3 removed
+  # ("invalid error value" while parsing the PIN). Found once CI installed this file.
+  - pandas<3
   - pyarrow
   - scikit-learn
   - pip

@@ -32,8 +32,8 @@ configurations in `configs/`, the container definition in `Dockerfile` +
 | `rust/mumdia/crates/mumdia/tests/pipeline.rs` | The only integration test file: extract -> features -> compete -> rescore on crafted Parquet |
 | `rust/mumdia/crates/mumdia-core/build.rs` | Stamps the git commit and build date into the crate so `manifest.json` can record them |
 | `.github/workflows/ci.yml` | Nine jobs: `lint` (fmt + clippy `-D warnings` + rustdoc), `audit` (`cargo audit` on both lockfiles, engine and desktop), `build-test` (`cargo test --workspace`) matrix on ubuntu/macos/windows, `smoke` (release build of the binary, then end-to-end `run` and `run-experiment` on a generated fixture, ubuntu + windows), `sidecar-imports` (a real conda env per sidecar, matrixed, plus `pip-audit`), `smoke-cross-platform` (asserts the two platforms produced byte-identical `peptides.tsv` and `proteins.tsv`), `desktop` (the console's own workspace: fmt, clippy, unit tests, and a frontend/backend consistency check), `desktop-windows` (the console on Windows and its MSI, installed and uninstalled), `sidecars` (compileall + JSON/YAML parse + doc-reference check + generated-document freshness); on push-to-`main`, every PR, weekly, and on demand. The Rust jobs skip their steps when `ci/ci_scope.sh` finds nothing they check in the change |
-| `.github/workflows/release.yml` | Dormant until a `v*` tag; `validate-tag` gates on tag-equals-workspace-version, ancestry from `main` and a green `ci.yml` for that exact SHA, then builds three target binaries, smoke-tests each, unpacks each archive into a clean directory and runs that archive's own `ci/smoke.sh`, and attaches archives + `.sha256` to the Release. `workflow_dispatch` rehearses everything except the upload |
-| `.github/workflows/docker.yml` | Builds the image into the local daemon, smoke-tests it, then pushes to GHCR only on a `v*` tag; build-and-smoke-only on `workflow_dispatch` |
+| `.github/workflows/release.yml` | Dormant until a `v*` tag; `validate-tag` gates on tag-equals-workspace-version, ancestry from `main` and a green `ci.yml` for that exact SHA, then builds three target binaries, smoke-tests each, unpacks each archive into a clean directory and runs that archive's own `ci/smoke.sh`, builds the desktop installers and the image, and one `publish` job attaches every file to the Release once all built (docs/14 "Release workflow"). `workflow_dispatch` rehearses everything except the gate, the release and the image push |
+| `.github/workflows/docker.yml` | Builds the image into the local daemon, smoke-tests it, then pushes to GHCR only when `release.yml` calls it on a `v*` tag after its gate; build-and-smoke-only on a pull request touching the image inputs and on `workflow_dispatch` |
 | `.github/dependabot.yml` | Monthly grouped Cargo + GitHub Actions + Docker base-image updates; `arrow*`/`parquet*` grouped apart because they carry the on-disk contract. No `pip` entry: the Python pins live in the pip sections of the `env/` conda specifications, which Dependabot cannot parse |
 | `ci/check_doc_refs.py` | Fails when a tracked file cites a Markdown document the repository does not ship |
 | `ci/check_workflows.py` | Rejects workflow YAML GitHub would refuse, notably duplicate mapping keys, which PyYAML accepts silently and which only surface when a workflow is dispatched |
@@ -768,7 +768,14 @@ requires the tag to equal the workspace version in `rust/mumdia/Cargo.toml`, the
 tagged commit to be an ancestor of `origin/main`, and `ci.yml` to have a successful
 run for that exact SHA. The last one is the substantive check: a tag push does not
 trigger `ci.yml`, so without it the only checks behind a release were `--version`,
-`--help` and `doctor`. The job is skipped for a rehearsal, which has no tag, so the
+`--help` and `doctor`. A tag pushed right after the merge arrives before
+main's `ci.yml` run has finished, or before it exists, so the gate polls the run list
+once a minute for up to an hour (no run yet, or a run not completed, means wait) and
+only then decides; the job's `timeout-minutes: 90` is the backstop. It also requires
+the desktop version (`desktop/src-tauri/Cargo.toml`; `tauri.conf.json` has none) to
+equal the tag, rebuilds both licence notices and the SBOM strictly, and runs
+`ci/cargo_audit.sh` strictly, because the audit is advisory on a pull request that
+touches no lockfile. The job is skipped for a rehearsal, which has no tag, so the
 build's condition allows exactly `success` or `skipped` -- not "anything but
 failure", because a cancelled gate is not a passed gate.
 
@@ -810,13 +817,52 @@ Every target then:
    target directory but not from a clean unpack. Because each runner executes its
    own architecture, it also gives macOS its first end-to-end coverage; the
    repository smoke job runs only on ubuntu and windows;
-5. uploads `*.tar.gz`, `*.zip` and `*.sha256` to the Release with
-   `generate_release_notes: true` (`release.yml:314`), or, on a rehearsal, uploads
-   them as a workflow artifact instead (`release.yml:332-333`).
+5. uploads `*.tar.gz`, `*.zip` and `*.sha256` as a workflow artifact, on a tag
+   and on a rehearsal alike. No build job writes to the release.
+
+The desktop installers (`desktop` job) are built with the pinned `tauri-cli`
+(`TAURI_CLI_VERSION`, the version `ci.yml`'s `desktop-windows` job tests), after a
+`cargo fetch --locked` that fails on a stale `desktop/Cargo.lock`. Besides the engine,
+uv and `scripts/`, they carry the licence notices under `binaries/`: `LICENSE`,
+`THIRD_PARTY_LICENSES.md` and `sbom.cdx.json` (the engine),
+`THIRD_PARTY_LICENSES-desktop.txt` (the application, generated by
+`ci/gen_third_party_licenses.py --desktop`, with the MPL-2.0 source notice), and
+`uv-LICENSE-MIT` / `uv-LICENSE-APACHE` fetched at the pinned `UV_VERSION` tag. Both
+bundle checks fail when one is missing.
+
+Only `publish` writes to the release, after every archive and installer built and
+verified: it downloads the artifacts, attaches them all, and writes the generated notes
+once. With no release for the tag it creates one; a draft it fills and publishes; a
+release that was already public it fills and lifts out of pre-release. That last case
+is `hold-release`: right after the gate, it marks a release published by hand as
+pre-release (with a marker comment in the body), so a failed build leaves a
+pre-release with no files rather than a half-filled "Latest". A pre-release made on
+purpose, without the marker, stays one. If a build fails, re-run the failed jobs;
+`publish` then runs with the rest.
+
+The container image is a job of the same workflow (`docker`, calling `docker.yml`
+after the gate), so a tag the gate refuses no longer pushes `:<tag>` and `:latest`.
+
+**Recommended release steps.**
+
+1. Bump `rust/mumdia/Cargo.toml` and `desktop/src-tauri/Cargo.toml` (and the
+   lockfiles), move `[Unreleased]` in `CHANGELOG.md`, and merge through a pull request.
+2. Wait for `ci.yml` on main to pass for the merge commit (the gate waits up to an
+   hour, but a red main fails it).
+3. Optional: rehearse with `gh workflow run release.yml --ref main` (no tag, nothing
+   is published; the archives and installers are workflow artifacts for 7 days).
+4. Save the GitHub release for the tag as a DRAFT with the title and any hand-written
+   text, or make none. Publishing it by hand before the tag also works (it is held as
+   pre-release until the files are attached), but a draft is never public half filled.
+   The notes `publish` writes replace the body either way.
+5. Push the tag alone: `git tag vX.Y.Z <merge commit> && git push origin vX.Y.Z`.
+6. Watch the `Release` run. `publish` attaches every file, writes the notes and
+   publishes the release; `docker` pushes the image.
 
 **Docker workflow.** `docker.yml` declares
-`permissions: contents: read, packages: write` (`docker.yml:19-21`), runs on `v*`
-tags and on manual `workflow_dispatch` (`docker.yml:14-17`), and builds
+`permissions: contents: read, packages: write`, runs when `release.yml` calls it
+after its tag gate (`workflow_call`), on a pull request that changes the image's
+inputs, and on manual `workflow_dispatch`, and builds
 `linux/amd64` only (`docker.yml:57`), so the published image is amd64. The order
 matters: it builds once with `load: true, push: false` into the local daemon
 (`docker.yml:52-63`) so the smoke test runs against exactly the image that will be

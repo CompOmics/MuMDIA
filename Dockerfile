@@ -37,8 +37,12 @@
 #
 # Dependabot's `docker` ecosystem (.github/dependabot.yml) proposes digest updates,
 # so pinning does not mean going stale silently.
-# Resolved 2026-08-28 from registry-1.docker.io.
-FROM rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b AS build
+# The tag must name the version in rust/mumdia/rust-toolchain.toml, because
+# `COPY rust/mumdia` brings that file along and rustup would otherwise download the
+# pinned toolchain at build time with no digest. Move the tag with the toolchain file;
+# Dependabot proposes digest updates only (its `rust` version updates are ignored).
+# Resolved 2026-11-21 from registry-1.docker.io.
+FROM rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS build
 # Override any (gitignored, machine-specific) .cargo/config.toml target dir.
 ENV CARGO_TARGET_DIR=/build
 WORKDIR /src

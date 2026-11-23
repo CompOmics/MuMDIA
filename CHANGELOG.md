@@ -216,6 +216,22 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **Release and CI hardening (docs/14, "Release workflow").** A release now gets its files
+  in one `publish` job after every archive and installer built, so a failed build no longer
+  leaves a half-filled release; a release published by hand before the tag is held as
+  pre-release until then, and a draft is filled and published. The container image is built
+  and pushed by `release.yml` after the tag gate, not on the tag by itself, and is built and
+  smoke-tested on pull requests that change its inputs. The tag gate waits up to an hour for
+  main's `ci.yml` run on the tagged commit, checks the desktop version, and runs the advisory
+  scan strictly (`ci/cargo_audit.sh`, which drops seven stale zip ignores); on pull requests
+  the scan is strict only when a lockfile changes. The desktop installers carry `LICENSE`,
+  both third-party notices (the new `desktop/THIRD_PARTY_LICENSES.md`, with the MPL-2.0
+  source notice), the SBOM and uv's licences, are built with `tauri-cli` `=2.12.4` from a
+  `--locked` lockfile, and take their version from `desktop/src-tauri/Cargo.toml` alone. CI
+  resolves the desktop environments with the bundled uv version, installs the three
+  `env/mumdia-*.yml` specifications, skips macOS on pushes to main, and the Dockerfile's
+  compiler image matches `rust-toolchain.toml`.
+
 - **Quant and report code keep one copy of each helper (#358, docs/12).** The candidate audit no
   longer looks for `<psms>.audit.parquet`, which nothing writes, so every extraction loss is
   `DID_NOT_SURVIVE_EXTRACTION` as before, and it writes the library's columns as read instead

@@ -21,12 +21,14 @@ seconds rather than the several hundred megabytes an install would move.
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+RELEASE = ROOT / ".github" / "workflows" / "release.yml"
 COMPONENTS = ROOT / "desktop" / "src-tauri" / "src" / "components.rs"
 # (requirements file, the Python version `Env::python_version` asks uv for)
 ENVS = [
@@ -73,6 +75,19 @@ def resolve(uv: str, rel: str, python: str) -> list[str]:
     return []
 
 
+def check_uv_version(uv: str) -> list[str]:
+    """The resolver checked here must be the one the installers bundle."""
+    m = re.search(r"UV_VERSION=([0-9.]+)", RELEASE.read_text(encoding="utf-8"))
+    if not m:
+        return [f"no UV_VERSION= line in {RELEASE.relative_to(ROOT)}"]
+    got = subprocess.run([uv, "--version"], capture_output=True, text=True,
+                         check=True).stdout.split()
+    if len(got) < 2 or got[1] != m.group(1):
+        return [f"uv on PATH is {' '.join(got)}, the installers bundle uv {m.group(1)} "
+                f"(release.yml UV_VERSION): install that version"]
+    return []
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--skip-if-no-uv", action="store_true",
@@ -92,6 +107,7 @@ def main() -> int:
                 "`pip install uv`, or pass --skip-if-no-uv to check only the flag."
             )
     else:
+        problems += check_uv_version(uv)
         for rel, python in ENVS:
             problems += resolve(uv, rel, python)
 
