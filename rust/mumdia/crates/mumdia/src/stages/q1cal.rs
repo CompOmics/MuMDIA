@@ -116,7 +116,7 @@ pub struct Q1CalParams<'a> {
     /// Also learn the per-fragment decision tolerances (`extract.q1_fragments`) and add
     /// them as `fragment_decision`.
     pub fragment_decision: bool,
-    /// Also learn the tolerance of the Q1-deconvolved evidence (`extract.q1_deconvolved`,
+    /// Also learn the tolerance of the Q1-deconvolved evidence (`features.q1_deconvolved`,
     /// `stages::q1dec`) and add it as `deconvolution`.
     pub deconvolution: bool,
 }
@@ -1185,7 +1185,7 @@ fn deconvolution_offsets(
     Ok((psms.len(), per.into_iter().flatten().collect()))
 }
 
-/// The `deconvolution` block (`extract.q1_deconvolved`): the centroid offsets of the
+/// The `deconvolution` block (`features.q1_deconvolved`): the centroid offsets of the
 /// anchors' fragment peaks and of decoy seed PSMs' ([`deconvolution_offsets`]), and the
 /// tolerance [`q1dec::learn_tolerance`] separates them at.
 #[allow(clippy::too_many_arguments)]

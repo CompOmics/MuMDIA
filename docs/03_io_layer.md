@@ -40,7 +40,6 @@ the schema-id tuples).
 | `rust/mumdia/crates/mumdia-io/src/lib.rs` | crate root: `init_logging_level`, `record_artifact`, `inspect`; re-exports the modules |
 | `rust/mumdia/crates/mumdia-io/src/table.rs` | `Col` enum (write side), `write_table`, `Table` (read side) and the typed getters |
 | `rust/mumdia/crates/mumdia-io/src/publish.rs` | `AtomicPath` (write to a sibling temp name, then rename), `publish_copy_of` / `publish_byte_copy`; re-exported from `table` |
-| `rust/mumdia/crates/mumdia-io/src/span_cache.rs` | `SpanCache`, the coalescing `ChunkReader` behind `TableFile::scan` with `ScanOptions::coalesced()` |
 | `rust/mumdia/crates/mumdia-io/src/codec.rs` | `ColumnEncoder` (parallel column encode), the codec pool (`CodecPool`, `claim`, `codec_threads`, `set_codec_threads`) shared by encode and parallel decode |
 | `rust/mumdia/crates/mumdia-io/src/report.rs` | `ArtifactReport` struct + `write_for` (the `.report.json` sidecar) |
 | `rust/mumdia/crates/mumdia-io/src/hash.rs` | `blake3_file`, `blake3_str`, `HashingWrite` (hash on write) |
@@ -63,34 +62,8 @@ schema, but no such read-side check is implemented: `schema_version` is only
 ever written into the report and the manifest, never read back and compared.
 They are `pub const` tuples in the `artifact` submodule, referenced as
 `mumdia_core::schema::artifact::PEPTIDES` and so on. The tuples are
-`(name, version)`:
-
-| logical name | version | producing stage |
-|---|---|---|
-| `spectra_ms1` | 1 | convert |
-| `spectra_ms2` | 1 | convert |
-| `isolation_windows` | 1 | convert |
-| `ms2_to_ms1` | 1 | convert |
-| `peptides` | 1 | digest |
-| `peptidoforms` | 1 | peptidoforms |
-| `fragment_library_precursors` | 1 | predict-frag / library-input |
-| `fragment_library_fragments` | 1 | predict-frag / library-input |
-| `seed_psms` | 1 | search-seed |
-| `run_windows` | 1 | rt-im-train |
-| `psms_extracted` | 1 | extract |
-| `chromatograms` | 1 | extract |
-| `chromatograms` | 2 (`CHROMATOGRAMS_V2`, only under `extract.chromatogram_schema = 2`) | extract |
-| `features` | 1 | features |
-| `psms_competed` | 2 | compete |
-| `psms_scored` | 3 | rescore |
-| `peptide_quant` | 2 | quant |
-| `peptide_quant` | 3 (`PEPTIDE_QUANT_V3`, only `run-experiment` after a second pass under `mbr.first_pass_flag`) | quant |
-| `protein_group_quant` | 2 | quant |
-| `fragment_quant` | 1 | quant |
-
-There are 18 registered artifacts. Four have been version-bumped past 1:
-`psms_competed`, `peptide_quant`, and `protein_group_quant` are at version 2, and
-`psms_scored` is at version 3; every other artifact is still version 1. The
+`(name, version)`; the current versions and the conditions that select them are
+in docs/15_data_dictionary.md, "Schema-version registry". The
 version is recorded in the report and the manifest but is not consumed anywhere:
 no stage reads a prior artifact's version back, so there is no schema-mismatch
 gate on read. A reader could compare the recorded version by hand, but the engine
@@ -381,7 +354,7 @@ The getters and their exact null behaviour:
 
 `column_names()` (`table.rs:373`) returns the schema field names in order.
 
-#### Sequential row-group reads (`span_cache.rs`)
+#### Sequential row-group reads (removed in 0.15.0)
 
 parquet-rs's synchronous reader fetches every page on its own, a header read and
 a body read through a fresh seek each time, and the arrow reader advances every
@@ -393,61 +366,17 @@ spinning array it is seek-bound: one reader of the immunopeptidomics competed
 tables measured 44 MB/s against a 133 MB/s sequential ceiling, and seven
 concurrent readers only 47-53 MB/s together.
 
-`TableFile::scan(columns, batch_size, &ScanOptions)` is `batches` with read
-options. `ScanOptions::default()` is exactly `batches`. With
-`ScanOptions::coalesced()` (or `coalesce: Some(SpanReadOptions { .. })`) the
-reader is given a `span_cache::SpanCache` instead of the `File`:
-
-- for each selected row group, in reading order, the projected column chunks'
-  byte ranges (`ColumnChunkMetaData::byte_range`) are coalesced into spans. Two
-  chunks at most `max_gap_bytes` (1 MB) apart share a span, so a narrow
-  projection never reads the columns it skipped wholesale. A `RowSpan` handle
-  (`open_rows`, `span`) plans only its own row groups;
-- a span is read with one sequential read on first use and every page request
-  inside it is sliced from memory. Requests outside a span (the footer, an
-  unplanned column) and spans over `max_span_bytes` (512 MB) are read directly,
-  exactly as the plain reader reads them;
-- a span is released as soon as every column chunk in it has been read to its
-  end, so a forward scan holds the one or two row groups a batch straddles, plus
-  one prefetched span when `prefetch` is on: a helper thread with its own file
-  handle reads span i+1 while the decoder works through span i, within
-  `max_resident_bytes` (1 GB). The decoder never waits on the budget;
-- the decoder receives the same bytes through the same metadata, projection,
-  selection and batch size, so the batches are identical to the plain reader's
-  (`coalesced_reads_yield_the_plain_readers_batches` compares them over
-  projections, span handles, straddling batch sizes and every option corner;
-  `each_span_is_read_once_and_released_when_its_chunks_are_done` counts the
-  reads). A `debug` line on drop reports spans read, bytes, prefetches and
-  direct reads.
-
-Two full scans can use it, through `stages::wide_scan_options`: rescore's feature
-stream (`for_each_feature_batch`, all ~390 feature columns of every row of every
-competed input) and compete's pass-through copy (`copy_kept_rows`, every column of
-the features table). Those are the wide scans of the run on spinning storage, where
-the memory the cache holds (two or three row groups of the projection, about 0.9 GB
-on a 131,072-row competed group) buys a forward read. It does not help a reader
-that skips pages through the page index, because a span holds whole column chunks,
-so every other reader keeps the plain `File`.
-
-`MUMDIA_WIDE_SCAN` chooses the reader of those two scans (`stages::WideScan`):
-
-| value | reader |
-|---|---|
-| unset, `plain` (default) | the plain reader with its parallel decode, at the scans' own batch sizes |
-| `rowgroup` | the plain reader, with rescore's feature stream decoding one row group a batch |
-| `coalesced` | the span cache above, one sequential read per row group |
-
-The plain reader stays the default because it is the only one measured not to lose.
-A coalesced scan decodes with one reader (see "Parallel decode" below), so from
-the page cache or an SSD it gives up the automatic column groups. Measured from
-the page cache on the HYE competed table (879,018 rows, 387 features, 131,072-row
-groups, `bench_feature_stream_a_real_artifact`, minimum of 4 rounds on a loaded
-host): the feature stream took 1.54 s plain, 1.58 s plain at one row group a batch,
-and 2.50 s coalesced. One reader decodes about 1.1 GB/s of f64, far above the
-44-133 MB/s of the spinning array the change is for, so the single reader would not
-limit a seek-bound read, but neither `rowgroup` nor `coalesced` has been measured on
-that array yet (the iostat check of the 2026-09-25 survey). Promote one once it has.
-The output is the same under all three, because the batches are.
+`MUMDIA_WIDE_SCAN` chose a different reader for rescore's feature stream and
+compete's pass-through copy until 0.15.0: `rowgroup` decoded one row group a
+batch, and `coalesced` read each row group's projected column chunks with one
+sequential read through a span cache (`span_cache.rs`). Measured from the page
+cache on the HYE competed table (879,018 rows, 387 features, 131,072-row groups,
+minimum of 4 rounds on a loaded host): the feature stream took 1.54 s plain,
+1.58 s plain at one row group a batch, and 2.50 s coalesced. Neither was measured
+on the spinning array it was meant for, and the variable, the span cache and
+`ScanOptions::coalesced` were removed in 0.15.0. `TableFile::scan(columns,
+batch_size, &ScanOptions)` is `batches` with read options; `ScanOptions` now
+carries only the decode threads below.
 
 #### Parallel decode
 
@@ -459,29 +388,23 @@ the codec pool (`codec.rs`) and joins each batch column-wise. Every group
 reader has the same row groups, row selection and batch size, so each yields
 the same rows per batch; the joined batches are the single reader's batches
 exactly, schema included (`parallel_decode_yields_the_single_readers_batches`
-covers projections, row spans trimmed at both ends, straddling batch sizes, more
-groups than columns and coalesced reads). A group that ends early or returns a
+covers projections, row spans trimmed at both ends, straddling batch sizes and more
+groups than columns). A group that ends early or returns a
 different row count is an error, not a short batch.
 
 Because the batches are identical, this is on by default: `decode_threads: None`
 uses `codec_threads()` groups (at most 8, fewer when the projection has fewer
 root columns or less than 4 MB of compressed data per group,
 `MIN_DECODE_GROUP_BYTES`; `automatic_decode_groups`). It uses the single reader
-from inside a rayon pool, for the reason the encoder avoids the pool there, and
-for a coalesced scan. A coalesced scan exists to give seek-bound storage one
-forward read per row group. Column groups would each hold their own spans, read
-their own slices of every row group and run their own prefetcher, so the disk
-would again see up to eight interleaved streams. `Some(1)` is the single reader;
-`Some(k)` asks for k groups whatever the size, coalesced or not, and
+from inside a rayon pool, for the reason the encoder avoids the pool there.
+`Some(1)` is the single reader; `Some(k)` asks for k groups whatever the size, and
 `MUMDIA_PARQUET_DECODE_THREADS=k` does the same for every automatic scan of a
 process, which is how a whole run, small artifacts included, is checked end to
 end (the smoke with `MUMDIA_PARQUET_DECODE_THREADS=3` writes every artifact
-byte for byte as without it). Under `coalesce` with explicit groups each group
-holds its own spans, and the resident budget is divided between them.
-`BatchReader::decode_groups` reports what a scan uses. A getter that reads one
+byte for byte as without it). `BatchReader::decode_groups` reports what a scan uses. A getter that reads one
 column is unchanged.
 
-Automatic groups stay on for uncoalesced scans, including on spinning storage.
+Automatic groups stay on for every scan, including on spinning storage.
 The plain reader already fetches each page on its own with a seek, from every
 projected column chunk in turn (previous section). Column groups issue the same
 page reads, of the same sizes, from several threads at once, so they change the
@@ -499,24 +422,13 @@ features 1.18 s with one reader, 0.80 s with 2 groups, 0.65 s with 4, 0.60 s
 with 8, 0.51 s automatic; psms_competed 1.22 / 0.86 / 0.55 / 0.47, 0.45 s
 automatic; chromatograms 5.14 s against 2.99 s with 2 groups and 3.29 s
 automatic (7 groups: the two list columns carry the work); spectra_ms2 0.85
-against 0.44 s. Coalesced reads split into the same automatic group counts,
-which a coalesced scan now uses only when `decode_threads` asks for them: 0.43,
-0.47, 2.97 and 0.46 s.
+against 0.44 s.
 
 #### Row selections and page skipping
 
-`TableFile::open` parses the footer only. `TableFile::open_with_offset_index`
-also loads the offset index, the location and first row of every data page of
-every column chunk, where the file carries one (the engine's writer writes it;
-pyarrow does not by default, and such a file opens as with `open`). A reader
-built on that footer and given a row selection skips a page that holds no
-selected row without reading or decompressing it. `TableFile::batches_runs`
-takes a selection as `(rows, keep)` runs over the handle's own rows, on a whole
-file or a span, and reuses the handle's footer, so a caller that selects row
-group by row group parses the footer once. It always materialises the selection
-as a queue of selectors (`RowSelectionPolicy::Selectors`): parquet-rs's
-automatic choice may pick a bitmask, which decodes every row of a chunk and
-filters afterwards, and so reads every page.
+`TableFile::open` parses the footer only. `TableFile::batches_selected` takes a
+selection as `(rows, keep)` runs over a whole file and loads the offset index
+for it, so a page that holds no selected row is skipped without being read.
 
 Skipping rows inside a page is not free. parquet-rs steps over the rows of a
 list column one repetition level at a time, which on long lists costs more than
@@ -524,13 +436,14 @@ decoding them: on the AIF chromatograms rewritten in the current layout (90
 points per trace on average, 65,536-row groups) selecting 11% of one group's
 `rt` rows took 101 ms against 78 ms for the whole group, while on a run of the
 six-file Astral LFQ experiment (21 points per trace) selecting 7% took 4.2 ms
-against 12.3 ms. A caller that wants a
-selection to cost no more than a full read therefore cuts it at page boundaries
-(`TableFile::page_starts` gives the rows at which a column's pages begin) and
-reads each column on its own selection, which is what quant does
-(`docs/12_quant_lfq_align_mbr_report_audit.md`). What a skipped page holds is
-never checked, so a corrupt page there goes unnoticed where a full read would
-have refused it.
+against 12.3 ms. What a skipped page holds is never checked, so a corrupt page
+there goes unnoticed where a full read would have refused it.
+
+Quant used to read its chromatogram row groups through a page-aligned selection
+(`MUMDIA_QUANT_SELECTIVE_READ`). On the AIF and Astral HYE tables every list
+page held an accepted row, so nothing was skipped and the read cost what a full
+read did. It was removed in 0.15.0, with `TableFile::open_with_offset_index`,
+`offset_indexed`, `batches_runs` and `page_starts`.
 
 ### Parquet written outside this crate
 
@@ -675,7 +588,7 @@ stage-local helper `write_reports` (`stages/convert.rs:269-290`) that writes one
 report per artifact with a shared `params` and empty `stats`; note this
 `write_reports` lives in `convert.rs`, it is not part of the `mumdia-io` public
 API. Stages with report coverage build their `ArtifactReport` directly (see the
-`write_for` call sites in `align`, `compete`, `extract`, `search_seed`,
+`write_for` call sites in `compete`, `extract`, `search_seed`,
 `predict_frag`, `peptidoforms`, `rt_im_train`, `rescore`, `features`, `quant`).
 
 ### `record_artifact` and the manifest
@@ -705,7 +618,7 @@ The orchestrators therefore take the hash from the stage instead:
 
 - each stage an orchestrator calls has a `run_hashed` sibling of `run`
   (`digest`, `peptidoforms`, `predict_frag`, `search_seed`, `rt_im_train` (as
-  `run_in_memory`), `extract`, `features` and `features::run_with_bounds_hashed`,
+  `run_in_memory`), `extract`, `features`,
   `compete`, `rescore`, `quant`) that returns a `report::Written { rows, content_hash }`
   per output, taken from the report it just wrote. `convert::run` returns the
   four hashes in `ConvertOutputs::hashes`. `run` itself is unchanged and
@@ -782,9 +695,7 @@ is a no-op rather than a panic.
 | `TableFile::row_parts` | `table.rs:1868` | cut a handle into at most `max_parts` row-contiguous parts, in order: whole row groups, merged, and page-aligned ranges inside a group that has an offset index (a group without one is never split) |
 | `TableFile::batches` / `batches_dict` | `table.rs:2038` / `:2050` | streaming batch reader over the named columns; `batches_dict` reads the named `Utf8` columns as `Dictionary(Int32, Utf8)`, with the same row values |
 | `TableFile::batches_selected` | `table.rs:2100` | stream only the rows of `(rows, keep)` runs, skipping pages with no kept row where the file has an offset index (whole-file handles only) |
-| `TableFile::open_with_offset_index` / `offset_indexed` | `table.rs` | `open` with the page locations of every column chunk loaded as well (opt-in); whether a handle holds them for every row group it covers |
-| `TableFile::batches_runs` | `table.rs` | stream only the rows of `(rows, keep)` runs of this handle, a whole file or a span, through the footer it already holds, always as a queue of selectors; a page with no kept row is skipped unread on an offset-indexed handle |
-| `TableFile::row_group_parts` / `page_starts` | `table.rs` | a handle cut at the file's row-group boundaries; the handle rows at which a column's data pages begin in every one of its leaves, from the offset index |
+| `TableFile::row_group_parts` | `table.rs` | a handle cut at the file's row-group boundaries |
 | `WriteOptions::metadata` / `TableWriter::with_metadata` / `TableFile::metadata_value` | `table.rs` | record a small fact about the whole table under a key in the footer's key-value metadata, next to the arrow schema; read it back from the footer alone (the overlap loser table names its band tables this way) |
 | `TableFile::str_flat_rows` | `table.rs` | `str_flat` at given rows only: one text arena plus offsets for the picked rows, the same null policy |
 | `TableFile::str_interned` / `str_flat` | `table.rs:2309` / `:2358` | a string column as one id per row plus its distinct values (first appearance), or as one text arena plus offsets; both refuse a NULL with the row |

@@ -569,14 +569,11 @@ pub fn write_band_slice(precursors: &str, first_row: usize, n: usize, out: &str)
 
 /// Write the run-level `cal.json` of a grouped run from the bands' own (`groups/gNN/cal.json`).
 ///
-/// Under global calibration every band fitted the same anchors, so the fit is one and the
-/// first band's record is the run's, with a `groups` list documenting each band's copy.
-/// Under per-group calibration the bands fitted different anchors; the run-level record then
-/// sums `n_train`, takes the median `w_rt`, weights the residual summaries by anchors, and
-/// reports a `calibration_status` of `mixed` when the bands disagree. Either way the record
-/// keeps the keys an ungrouped `cal.json` has, so tooling reads it unchanged, and adds
+/// Every band fitted the same pooled anchors, so the fit is one and the first band's record
+/// is the run's, with a `groups` list documenting each band's copy. The record keeps the
+/// keys an ungrouped `cal.json` has, so tooling reads it unchanged, and adds
 /// `window_groups`, `groups_calibration` and `groups`.
-pub fn summarise_cal(cals: &[(usize, String)], global: bool, out: &str) -> Result<()> {
+pub fn summarise_cal(cals: &[(usize, String)], out: &str) -> Result<()> {
     if cals.is_empty() {
         bail!("groups: no band calibration to summarise");
     }
@@ -586,7 +583,6 @@ pub fn summarise_cal(cals: &[(usize, String)], global: bool, out: &str) -> Resul
             .with_context(|| format!("reading the band calibration {path}"))?;
         records.push((*index, v));
     }
-    let num = |v: &Value, key: &str| v.get(key).and_then(Value::as_f64);
     let groups: Vec<Value> = records
         .iter()
         .map(|(i, v)| {
@@ -599,59 +595,9 @@ pub fn summarise_cal(cals: &[(usize, String)], global: bool, out: &str) -> Resul
             })
         })
         .collect();
-    let mut top = if global {
-        records[0].1.clone()
-    } else {
-        let mut t = records[0].1.clone();
-        let n: Vec<f64> = records
-            .iter()
-            .map(|(_, v)| num(v, "n_train").unwrap_or(0.0))
-            .collect();
-        let n_sum: f64 = n.iter().sum();
-        t["n_train"] = json!(n_sum as u64);
-        let mut w: Vec<f64> = records
-            .iter()
-            .filter_map(|(_, v)| num(v, "w_rt"))
-            .filter(|w| w.is_finite())
-            .collect();
-        w.sort_by(|a, b| a.total_cmp(b));
-        t["w_rt"] = if w.is_empty() {
-            Value::Null
-        } else {
-            json!(w[w.len() / 2])
-        };
-        for key in [
-            "rt_residual_median_s",
-            "rt_residual_abs_median_s",
-            "rt_residual_mad_s",
-        ] {
-            let mut acc = 0.0;
-            let mut wsum = 0.0;
-            for ((_, v), ni) in records.iter().zip(&n) {
-                if let Some(x) = num(v, key) {
-                    if x.is_finite() && *ni > 0.0 {
-                        acc += x * ni;
-                        wsum += ni;
-                    }
-                }
-            }
-            t[key] = if wsum > 0.0 {
-                json!(acc / wsum)
-            } else {
-                Value::Null
-            };
-        }
-        let statuses: Vec<&Value> = records
-            .iter()
-            .filter_map(|(_, v)| v.get("calibration_status"))
-            .collect();
-        if statuses.windows(2).any(|p| p[0] != p[1]) {
-            t["calibration_status"] = json!("mixed");
-        }
-        t
-    };
+    let mut top = records[0].1.clone();
     top["window_groups"] = json!(records.len());
-    top["groups_calibration"] = json!(if global { "global" } else { "per_group" });
+    top["groups_calibration"] = json!("global");
     top["groups"] = Value::Array(groups);
     mumdia_io::json::write_json(out, &top)
 }
@@ -836,20 +782,8 @@ mod tests {
             .unwrap();
             cals.push((i, p));
         }
-        let out = dir.join("cal_pg.json").to_str().unwrap().to_string();
-        summarise_cal(&cals, false, &out).unwrap();
-        let v: Value = mumdia_io::json::read_json(&out).unwrap();
-        assert_eq!(v["n_train"], json!(400));
-        assert_eq!(v["w_rt"], json!(40.0), "median of the finite w_rt");
-        assert_eq!(v["calibration_status"], json!("mixed"));
-        assert!((v["rt_residual_abs_median_s"].as_f64().unwrap() - 3.5).abs() < 1e-9);
-        assert_eq!(v["groups_calibration"], json!("per_group"));
-        assert_eq!(v["window_groups"], json!(3));
-        assert_eq!(v["groups"].as_array().unwrap().len(), 3);
-        assert_eq!(v["w_rt_sizing"], json!("in_sample"));
-
         let out_g = dir.join("cal_g.json").to_str().unwrap().to_string();
-        summarise_cal(&cals[..2], true, &out_g).unwrap();
+        summarise_cal(&cals[..2], &out_g).unwrap();
         let v: Value = mumdia_io::json::read_json(&out_g).unwrap();
         assert_eq!(
             v["n_train"],
@@ -858,6 +792,8 @@ mod tests {
         );
         assert_eq!(v["groups_calibration"], json!("global"));
         assert_eq!(v["groups"].as_array().unwrap().len(), 2);
+        assert_eq!(v["window_groups"], json!(2));
+        assert_eq!(v["w_rt_sizing"], json!("in_sample"));
     }
 
     #[test]

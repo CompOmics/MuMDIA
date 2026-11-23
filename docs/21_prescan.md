@@ -181,6 +181,7 @@ sound, because `rescore --competed` stamps `source` and computes a per-source `r
 (docs/11_compete_rescore_fdr.md), but cross-run quantification will have structural gaps wherever
 a precursor is present in one run's library and absent from another's.
 
-For a modification search, pair this stage with `compete.group_by = peptidoform_charge`. Under the
-default competition key every modform of a peptide collapses to one winner before rescore, which
-discards exactly the candidates this stage was run to retain (docs/11_compete_rescore_fdr.md).
+The default `compete.group_by = peptidoform_charge` keeps every modform as its own precursor.
+Do not combine this stage with `compete.group_by = base_peptide`: under that key every modform of a
+peptide collapses to one winner before rescore, which discards exactly the candidates this stage was
+run to retain (docs/11_compete_rescore_fdr.md).

@@ -18,10 +18,10 @@ stages that operate across multiple runs.
   `quant.normalisation = "stable_set"`, the default since 2026-11-07): cross-run normalisation of the per-run
   precursor quantities by retention-time-binned medians of a stable set of ions, written
   to separate tables.
-- **align** (Stage D2, `mumdia align`): put >=2 runs on a common RT coordinate by
-  fitting a reference LOESS RT map per run and recording the residual spread.
-- **mbr** (Stage D3, `mumdia mbr`): partially wired match-between-runs identification
-  transfer. A Rust CLI + config gate that shells out to `scripts/mbr_worker.py`.
+- **align** (Stage D2, `mumdia align`): removed in 0.15.0. It wrote a cross-run RT map
+  (`alignment.parquet`) that no stage read; the second pass builds its own map.
+- **mbr** (Stage D3, `mumdia mbr`): removed in 0.15.0. It ran the rescuable-tier
+  transfer worker; the second pass of `run-experiment` replaces it (see "Second pass").
 - **report** (`mumdia report`): emit human-readable `peptides.tsv`, `precursors.tsv`
   and `proteins.tsv` from the scored PSM table, joined to quant. Invoked by the
   single-run `run` chain, by `run-experiment` (one experiment-wide set at the
@@ -36,14 +36,11 @@ stages that operate across multiple runs.
 | `rust/mumdia/crates/mumdia/src/stages/quant.rs` | `quant` stage, its chromatogram reader and the cross-run fit (`fit_cross_run`) |
 | `rust/mumdia/crates/mumdia/src/stages/quant_norm.rs` | cross-run normalisation (`quant-normalise`, `quant.normalisation`, default `stable_set`) |
 | `rust/mumdia/crates/mumdia/src/quant_lfq.rs` | MaxLFQ/directLFQ ratio-alignment core (`lfq_profile`) and the `quant-lfq` combine with its size factors (`run_lfq_combine_grouped`) |
-| `rust/mumdia/crates/mumdia/src/stages/align.rs` | Stage D2 cross-run RT alignment |
 | `rust/mumdia/crates/mumdia/src/stages/report.rs` | `peptides.tsv` + `precursors.tsv` + `proteins.tsv` writer |
 | `rust/mumdia/crates/mumdia/src/stages/audit.rs` | candidate identification-loss ladder |
 | `rust/mumdia/crates/mumdia-core/src/rejection.rs` | `RejectionReason` enum + ladder ordering |
 | `rust/mumdia/crates/mumdia-core/src/config.rs` | `QuantConfig`, `MbrConfig`, `RtImTrainConfig`, and the strategy enums |
-| `scripts/mbr_worker.py` | MBR transfer sidecar (rescuable + re-extraction tiers) |
 | `rust/mumdia/crates/mumdia/src/main.rs` | CLI definitions + handlers for all six subcommands |
-| `rust/mumdia/crates/mumdia/src/sidecar.rs` | `run_mbr` (builds argv for `mbr_worker.py`) |
 
 ## Inputs and outputs
 
@@ -129,8 +126,8 @@ also written next to `<out>`: `<out>.peptide.parquet` (rolled up by stripped bas
 sequence) and `<out>.precursor.parquet` (by peptidoform + charge), each with columns
 `group` (str), `charge` (i32; -1 for peptide level), `run`, `quantity`, `n_features`,
 from the same normalized feature matrix and LFQ engine. The protein output is
-unchanged. Unlike `quant` and
-`align`, `run_lfq_combine_grouped` writes no `<out>.report.json`: it calls `write_table` and
+unchanged. Unlike `quant`,
+`run_lfq_combine_grouped` writes no `<out>.report.json`: it calls `write_table` and
 logs, with no `ArtifactReport` (`quant.rs:720`). `--quantity-column` names the input
 intensity column (`quantity` by default; `quantity_normalised` for the tables below).
 `--condition`, once per input in input order, estimates the size factors within each
@@ -151,12 +148,6 @@ smoothing; the global shift on the global row), `log2_shift`.
 Every table has a `<artifact>.report.json`. In `run-experiment` the tables are
 `<run>/peptide_quant_normalised.parquet` and `quant_normalisation.parquet` at the
 experiment root, and the manifest records both and a `cross_run_normalisation` block.
-
-### align
-Consumes one `seed_psms.parquet` per run (`--seed-psms`, first is the reference).
-Produces `alignment.parquet` (`align.rs:130`): `run_id` (u32), `source_rt` (f64),
-`reference_rt` (f64), `residual_spread` (f64). The mapping is emitted on a grid of
-`grid_n` points per run (`grid_n = 100`, hardcoded in `main.rs:667`).
 
 ### Run names (`run-experiment`)
 `<run>` in this document is the run's name: its subdirectory of the experiment, the label of
@@ -206,29 +197,6 @@ empirical library. `experiment_manifest.json` records `experiment.second_pass` (
 pass's scored table, the library summary, the per-run directories) and the first-pass
 table and the library as artifacts.
 
-### mbr
-Consumes an experiment-wide `scored_combined.parquet` (must carry a `source` column)
-and one `psms.parquet` per run in `source` order. Produces `<out>.parquet`, one row
-per accepted transfer (`mbr_worker.py:254`): `candidate_id`, `source`, `peptidoform`,
-`charge`, `protein_group`, `label`, `expected_rt`, `observed_rt`, `rt_delta`,
-`transfer_q` (10 columns). When there are no transfer candidates at all the worker
-short-circuits and writes the same ten columns with zero rows (`write_empty_transfers`),
-and, when `--out-scored` was asked for, the scored table unchanged with `is_transferred`
-false and `transfer_q` NaN on every row (`write_unflagged_scored`), so a downstream stage
-never meets a missing file or a one-column placeholder (docs/30).
-Optionally writes an augmented scored table (`--out-scored`) that lowers each accepted
-transfer's PSM q columns to `min(q, transfer_q)` on the matching `(candidate_id,
-source)` row and adds an `is_transferred` bool plus a `transfer_q` column (the accepted
-q on transferred rows, NaN elsewhere; `mbr_worker.py`); this requires the scored table
-to carry a `source` column. All MBR outputs are written by Python and
-have no `report.json`.
-
-The unreachable re-extraction tier (`--emit-transfer-targets <dir>`) instead writes
-per-run `transfer_targets_<i>.parquet` and `transfer_decoys_<i>.parquet` in
-`run_windows` format (`mbr_worker.py:142`): `candidate_id` (u32), `rt_pred_cal`,
-`rt_lo`, `rt_hi` (f64), plus null `im_pred_cal`/`im_lo`/`im_hi` (f64) columns for the
-3D data model. `run_mbr` never passes this flag, so `mumdia mbr` never produces these.
-
 ### report
 Consumes `psms_scored.parquet` and optionally the two quant tables. The CLI takes
 `--out-dir` and derives `<out-dir>/peptides.tsv` + `<out-dir>/proteins.tsv`
@@ -237,11 +205,10 @@ Consumes `psms_scored.parquet` and optionally the two quant tables. The CLI take
 (`report.rs:95`): `precursor`, `stripped_sequence`, `charge`, `protein`,
 `q_value`, `score`, `quantity`, `is_transferred`, `transfer_q`. `proteins.tsv` header
 (`report.rs:134`): `protein_group`, `q_value`, `quantity`, `is_transferred`,
-`transfer_q`. The last two export the acceptance basis: a row is written when it is a
-target and either its grouped q passes the threshold or it is an accepted
-match-between-runs transfer, and a transferred row keeps its grouped q (usually 1.0)
-next to the transfer q it was accepted at. A tighter threshold does not revoke a
-transfer; a transfer is not protein-group confidence (docs/29 #19). No Parquet or
+`transfer_q`. The last two exported the acceptance basis of the rescuable-tier transfer,
+removed in 0.15.0. They stay in the header, `false` and empty, and the report still reads
+a scored table that an older engine wrote with transfers: such a row is written next to the
+transfer q it was accepted at, and a tighter threshold does not revoke it (docs/29 #19). No Parquet or
 `report.json` is written;
 `report::run` returns `(n_precursors, n_protein_groups)`, and the `mumdia report`
 handler prints a one-line summary (`main.rs:806`).
@@ -369,8 +336,7 @@ table, so every extraction loss carries one reason (see the gotchas). Writes
    `charge`, `protein_group`, `base_peptide_id`) are read at the accepted rows only,
    once those rows are known, and the identification apex (the first finite
    `apex_rt` of a candidate in row order) is kept only for the candidates whose
-   chromatograms are loaded. The consensus mode's best target q per candidate is kept
-   for the same candidates. The values at every row that is used are the ones a whole
+   chromatograms are loaded. The values at every row that is used are the ones a whole
    read gives, and so is the null and type policy; the report's
    `candidates_with_scored_apex` still counts every candidate of the table with a
    finite apex. On a per-run split of a large experiment most scored rows are not
@@ -380,32 +346,19 @@ table, so every extraction loss carries one reason (see the gotchas). Writes
    whose `frag_name` starts with `ms1_` are MS1 isotope XIC pseudo-traces, not
    fragment ions; they are excluded from both peak detection and the top-N sum.
 
-   Only the accepted candidates' rows are kept (and, in consensus mode, the reliable
-   anchors'), except under `--out-peak-bounds`, which keeps every candidate and reads
+   Only the accepted candidates' rows are kept, except under `--out-peak-bounds`, which keeps every candidate and reads
    the table as it always has. The table is read row group by row group
    (`load_chromatograms`). A row group whose `candidate_id` statistics hold no
    accepted id is not opened: its `[min, max]` is tested against the sorted accepted
-   ids, which is sharper than the accepted range as a whole. In an opened group the
-   `candidate_id` column is read first, and then each other column on its own
-   selection, which skips unread every data page of that column that holds no kept
-   row (the offset index gives the page boundaries; `docs/03_io_layer.md`, "Row
-   selections and page skipping"). Rows are never skipped inside a page, which in
-   parquet-rs costs more than decoding them on long traces, and a group with no whole
-   page to skip is read in one pass. The store is the one pass's, field for field, so
-   every output is byte-identical to a full read. How much is skipped depends on how
-   the accepted rows fall against the pages: on the AIF and Astral HYE tables every
-   list page holds an accepted row, so nothing is skipped and the read costs what it
-   did. `MUMDIA_QUANT_SELECTIVE_READ=0` turns the selection off, to time the two reads
-   against each other; the outputs do not change. The ignored test
-   `selective_read_on_a_real_artifact` prints, for a real table and scored table,
-   how many pages hold an accepted row and both load times.
+   ids, which is sharper than the accepted range as a whole. An opened group is read
+   in one pass. A page-selective read of the opened groups
+   (`MUMDIA_QUANT_SELECTIVE_READ`) was removed in 0.15.0: on the AIF and Astral HYE
+   tables every list page held an accepted row, so nothing was skipped and the read
+   cost what it did (`docs/03_io_layer.md`, "Row selections and page skipping").
 
    Both chromatogram layouts are read (docs/15_data_dictionary.md, "Layout v2"). Every
    span quant reads is a whole file or whole row groups, and a v2 span is decoded from
-   its first row by a `chromatograms::Decoder` of its own, in the single pass and in the
-   page-selective read, which reads the four v2 columns (`rt_axis`,
-   `intensity_trimmed`, `trace_offset`, `trace_len`) under the same selection as the
-   other columns. Only kept rows are decoded. That is enough because a
+   its first row by a `chromatograms::Decoder` of its own. Only kept rows are decoded. That is enough because a
    candidate is kept or dropped whole, so a kept candidate's rows in a row group include
    the row that carries its axis. MS1 rows are checked and followed but not rebuilt,
    since quant drops them. The store is the v1 table's, axis ids included, so every
@@ -444,14 +397,10 @@ table, so every extraction loss carries one reason (see the gotchas). Writes
    `peak_fraction` and `peak_grace`. A collapsed `lo==hi` window is widened to the
    adjacent grid scans so `trapezoid_window` never returns a raw height (units bug,
    `quant.rs:164`).
-4. **Consensus mode** (`quant.rs:342`, `peak_window_mode == Consensus`): peak width is
-   treated as a near-constant instrument/gradient property. Over confident target
-   peptides (`pep_q <= reliable_q`) it takes the median left half-width `apex - lo` and
-   right half-width `hi - apex`, and applies `(apex - ml, apex + mr)` around each
-   candidate's apex. Requires `>= 20` anchors (`quant.rs:364`), else falls back to the
-   per-candidate windows. The consensus is local to one quant invocation; separate
-   runs estimate separate widths unless an external workflow supplies a shared
-   policy.
+4. **Consensus mode** (`peak_window_mode = consensus`) was removed in 0.15.0. It
+   replaced each walked window by the median half-widths of confident targets. Under
+   the default fixed window it changed no quantity, and the walked window it refined
+   measured worse than the fixed one (phase 2 below).
 5. **Phase 2:** integrate each fragment trace. Three integration modes, in the order
    the code decides between them:
 
@@ -500,7 +449,7 @@ table, so every extraction loss carries one reason (see the gotchas). Writes
      the per-run E. coli compression was 0.22-0.24 log2 both in runs clipped 2% and in runs
      clipped 94%.
    - **bounded**, when `bound_peak` is on and no fixed window is configured:
-     `trapezoid_window` restricts to the walked or consensus window.
+     `trapezoid_window` restricts to the walked window.
    - **whole trace**, otherwise: `trapezoid` over every sample.
 
    Two optional transforms apply inside the fixed window: `interference_envelope`
@@ -530,11 +479,9 @@ table, so every extraction loss carries one reason (see the gotchas). Writes
    interference; see
    [Fragment selection under interference](#fragment-selection-under-interference).
 
-   `passes_quant_filter` also admits a row flagged `is_transferred` by
-   `mbr_worker.py`, whatever `q_filter` selects: MBR lowers only the PSM-level q
-   columns, so a transfer would otherwise fail the default `peptide_q` filter and
-   match-between-runs would appear to have done nothing. A decoy is never quantified,
-   transferred or not.
+   `passes_quant_filter` also admits a row flagged `is_transferred` (written by the
+   transfer worker removed in 0.15.0, so only in an older scored table), whatever
+   `q_filter` selects. A decoy is never quantified, transferred or not.
 
    The applied apex and bounds are written with the row, and they describe the window
    actually integrated -- under a fixed window that is the fixed window, not the
@@ -556,7 +503,9 @@ so the single-sample rule is identical; an empty window integrates to 0.
 
 #### Fragment selection under interference
 
-The default quant block (`top_n_fragments = 3`, `fragment_selection = observed_area`,
+This subsection records the measurements behind the change of default on 2026-11-07
+(see "Default quantification recipe"). The default quant block before that date
+(`top_n_fragments = 3`, `fragment_selection = observed_area`,
 `baseline_subtract = false`) sums, in each run separately, the 3 fragments with the largest
 observed area. A fragment that also carries co-eluting signal from another precursor has a
 larger area, so the rule selects it preferentially. Its ratio is then pulled toward the
@@ -581,18 +530,18 @@ identical ion sets in every arm: Astral 132,079 ions, 127,830 finite ratios; AIF
 
 | data | rule | species-weighted | global | CV median | median log2 A/B yeast (+1) / E. coli (-2) |
 |---|---|---|---|---|---|
-| Astral | `observed_area` top 3 (default) | 0.355 | 0.238 | 0.151 | 0.87 / -1.43 |
+| Astral | `observed_area` top 3 (default before 2026-11-07) | 0.355 | 0.238 | 0.151 | 0.87 / -1.43 |
 | Astral | `predicted` top 3 | 0.301 | 0.249 | 0.172 | 0.95 / -1.68 |
 | Astral | `cross_run` | 0.291 | 0.246 | 0.161 | 0.98 / -1.71 |
-| AIF | `observed_area` top 3 (default) | 0.329 | 0.199 | 0.321 | 0.86 / -1.50 |
+| AIF | `observed_area` top 3 (default before 2026-11-07) | 0.329 | 0.199 | 0.321 | 0.86 / -1.50 |
 | AIF | `predicted` top 3 | 0.251 | 0.185 | 0.321 | 0.94 / -1.75 |
 | AIF | `cross_run` | 0.259 | 0.187 | 0.331 | 0.96 / -1.79 |
 
 On ProteoBench Low Input (human and yeast only) the species-weighted |eps| is 0.605 under
-the default, 0.469 under `predicted` and 0.496 under `cross_run` (41,670 ions), and the
+that default, 0.469 under `predicted` and 0.496 under `cross_run` (41,670 ions), and the
 human-yeast gap goes from 0.54 to 0.66 and 0.64 of its expected value. On ProteoBench
 diaPASEF, re-quantified offline from `fragment_quant`, `observed_area` top 3 gives 0.329
-(E. coli -1.43); the `configs/examples/diapasef.json` recipe, which uses `cross_run`, gives
+(E. coli -1.43); the `configs/examples/diapasef.json` recipe as it was until 2026-11-07, with `cross_run`, gave
 0.206.
 
 The interference-aware rules remove bias in the minor species, not noise. On Astral they
@@ -601,8 +550,8 @@ make the global |eps| and the CV worse, and the per-ion SD of the human log2 A/B
 E. coli is traded for variance in the weak ions of every species. On AIF the global |eps|
 improves as well and the CV is unchanged. `predicted` is better on AIF and Low Input,
 `cross_run` on Astral; the differences between them (0.008-0.03) rest on one seed and are not
-interpretable. `observed_area` stays the default until a rule is chosen with seeds on
-several acquisitions; report the global |eps|, the CV and the per-species medians next to
+interpretable. `observed_area` stayed the default until 2026-11-07, when the pattern fit
+replaced it (see "Default quantification recipe"); report the global |eps|, the CV and the per-species medians next to
 the species-weighted score when comparing rules. `baseline_source = experiment` on top of
 `cross_run` is not a remedy on Orbitrap data: it measured 0.296 against 0.291 on Astral and
 0.317 against 0.259 on AIF (E. coli over-corrected to -2.14).
@@ -706,10 +655,11 @@ instrument-agnostic in its code, but it was measured only on diaPASEF. A recomme
 diaPASEF or any other acquisition, needs a second known-ratio set. Quantification is
 deterministic on fixed identifications, so these keys need no entrapment arm.
 
-The diaPASEF recipe (`configs/examples/diapasef.json`) sets the measured base
+Until 2026-11-07 the diaPASEF recipe (`configs/examples/diapasef.json`) set the measured base
 (`fixed_scan_halfwidth 4`, `interference_envelope`, `baseline_subtract`) with
 `fragment_selection = cross_run` and `baseline_source = experiment`. The width
-(`fixed_scan_halfwidth_scale`) is left out of it as the next lever to confirm. The IM
+(`fixed_scan_halfwidth_scale`) was left out of it as the next lever to confirm. The
+recipe now has no quant block and uses the default quantification. The IM
 branch's quantification and match-between-runs record on the same data is condensed in
 docs/35_diapasef.md section 8.
 
@@ -1049,7 +999,7 @@ which `run-experiment` does once.
 Two further readings of a ZT Scan run were measured for quantification on the K562 three-run
 experiment (docs/37_ztscan.md, section 15): the traces collapsed to one value a cycle measure the
 replicate CV of the 4-cycle window on the interleaved traces (0.104 both), and quantities from the
-amplitudes of the separable RT x step model (`features.q1_separable`) times its elution profile
+amplitudes of the separable RT x step model (`features.q1_separable`, removed in 0.15.0) times its elution profile
 measured 0.165, so that option was not kept. The cycle traces of `extract.q1_traces` are written
 for drawing; quant does not read them.
 
@@ -1077,7 +1027,8 @@ which it needs:
   at the step's target: the calibrated trapezoid transmission summed over the precursor's
   isotopes with the fragment-conditional weights (`q1frag::CandQ1`), at the precursor's
   calibrated expected centre (the run's Q1 offset at its m/z and its isotope envelope).
-  `quant.q1_step_weights = uniform` uses `w = 1` (the mean of the steps). The weights do not
+  Uniform weights (`w = 1`, the mean of the steps) measured the same and were removed in
+  0.15.0 with `quant.q1_step_weights`. The weights do not
   use the row's own fitted centre (`q1f_centre`): that carries its fit noise into each run's
   value (measured below). The value is the fragment's intensity at full transmission,
   the same quantity in every run whatever the precursor's position against the steps, and the
@@ -1092,26 +1043,20 @@ which it needs:
   `pattern_area`, and the dispersion leaves such a cell out of its candidate in every run. A
   candidate with fewer fragments that belong keeps every one of them, on the same cycle
   traces, so one precursor is in the same units in every run.
-- **Integration** (`quant.q1_integration`). `trapezoid` (default): the trapezoid rule over the
-  window's cycles. `elution_fit`: one Gaussian elution profile per candidate and run, the
-  weighted (`y^2`) parabola of `ln y` fitted to the summed window samples of the fragments it
-  quantifies, and each fragment's area its least-squares amplitude under the profile times the
-  profile's area (`sum(k x)`, `k = G sigma sqrt(2 pi) / sum(G^2)`); the trapezoid where the fit
-  fails (fewer than three positive cycles, a parabola that does not open downward, a width
-  outside a fifth of the spacing to three window spans, a centre beyond the window). Under the
-  pattern rules the same weights replace the trapezoid weights of both levels and of the
-  export's `pattern_area`. It needs the scan form of the fixed window.
+- **Integration.** The trapezoid rule over the window's cycles. A Gaussian elution fit per
+  candidate and run (`quant.q1_integration = elution_fit`) measured a worse CV (below) and was
+  removed in 0.15.0.
 
 `peptide_quant` is then v4, with `q1_quant` per row: `belonging`, `fallback` (fewer than
 `q1_min_belonging` belong), `uncollapsed` (the candidate has no decision, its decision does not
 list its chromatogram rows, or a point is not a scan of the sweep; the traces are read as
 extracted) or `no_traces`. The quant reports record `params.q1_fragments` (the inputs, the
-settings, the model, the candidates by outcome, the masked fragments, the elution fits). `run`
+settings, the model, the candidates by outcome, the masked fragments). `run`
 and `run-experiment` pass the run's `psms_extracted` (the second pass's when it ran, whose
 chromatograms are the ones quantified) and its spectra to every quant pass; `mumdia quant`
 takes `--psms-extracted` and `--spectra-ms2`. Refused without `extract.q1_fragments`, with
-`fragment_selection = cross_run` (its weights would read a masked fragment as an area of 0),
-and, for `elution_fit`, without the scan form of the fixed window. Off, quant reads nothing
+`fragment_selection = cross_run` (its weights would read a masked fragment as an area of 0).
+Off, quant reads nothing
 more and every artifact keeps its bytes.
 
 **Measured (2026-11-11), replicate precision only.** No ZT Scan data with known ratios could be
@@ -1133,9 +1078,9 @@ without the phase-2 keys (its own identifications).
 | base, default recipe | 0.319 | 25.3% | 0.133 |
 | phase-2 keys, default recipe | 0.273 | 34.6% | 0.111 |
 | + `quant.q1_fragments` | **0.120** | 73.4% | **0.054** |
-| + `q1_fragments`, `q1_step_weights = uniform` | 0.120 | 73.3% | 0.054 |
+| + `q1_fragments`, `q1_step_weights = uniform` (removed in 0.15.0) | 0.120 | 73.3% | 0.054 |
 | + `q1_fragments`, weights at the row's fitted centre (first implementation) | 0.125 | 71.3% | 0.057 |
-| + `q1_fragments`, `q1_integration = elution_fit` | 0.133 | 68.5% | 0.061 |
+| + `q1_fragments`, `q1_integration = elution_fit` (removed in 0.15.0) | 0.133 | 68.5% | 0.061 |
 | + `q1_fragments`, `q1_min_belonging` 5 | 0.115 | 77.0% | 0.051 |
 | + `q1_fragments`, no restriction (`q1_min_belonging` 1000: collapse only) | 0.106 | 82.4% | 0.047 |
 | + `q1_fragments`, `fixed_scan_halfwidth` 2 / 4 (cycles) | 0.125 / 0.117 | | 0.056 / 0.053 |
@@ -1427,27 +1372,6 @@ With it, MaxLFQ reads `quantity_normalised` with `NormalizeMethod::None` in plac
 `quantity` with `MedianRatio`. Status: benchmark-gated. It changes reported normalised
 quantities only, never an identification.
 
-### align (`align.rs:53`, `run`)
-
-`confident_rts` (`align.rs:32`) reads a seed table's `base_peptide_id`, `spectrum_q`,
-`observed_rt`, `score`, `label`, validates labels, and returns the best-scoring
-observed RT per base peptide among confident targets (`q <= q_train`, target only).
-The reference is `seeds[0]`. For each run, shared base peptides with the reference give
-paired `(this_rt, ref_rt)`. A LOESS map is fit only when there are `>= 4` shared
-peptides (`align.rs:93`, `Loess::fit(xs, ys, span=0.4, grid_n)`); the span is hardcoded
-at 0.4 and is independent of `rt_im_train.loess_span`. The residual spread is the p95 of
-`|ref - loess(this)|` on the shared set (`align.rs:105`); it is what sets how tight an
-MBR window can be. The mapping is emitted on `grid_n.max(2)` evenly-spaced grid points;
-the reference-run grid spans `[min(ref_rt, 0.0), max(ref_rt, 1.0)]` (`align.rs:58`) and
-each other run's grid extends that span to cover its own shared RTs (`align.rs:88`). The
-reference run and any run with too few shared peptides emit the identity map with
-residual 0 (the insufficient-anchor guard, `align.rs:93`/`align.rs:113`). `align::run`
-asserts at least one seed (`align.rs:55`) and writes an `alignment.report.json`
-(schema `alignment` v1, `align.rs:141`, the only literal-string schema here since there
-is no `schema.rs` constant for it). This is an experiment-level stage: with one run it
-degenerates to identity, and it is not part of the `run` chain. Real multi-run
-validation needs a multi-file experiment; only crafted two-run unit input exercises it.
-
 ### Second pass (`mbr.strategy = second_pass`, the default since 2026-10-13)
 
 `run-experiment` matches between runs by searching every run a second time on an
@@ -1627,90 +1551,20 @@ abundance reproduces 46-102% of its gain. It is a reporting operating point with
 quantified ions, to be compared with other results at a matched number of finite ratios,
 not a better quantification. Not yet measured through the engine column.
 
-### mbr (rescuable-tier transfer, opt-in)
+### mbr (rescuable-tier transfer, removed in 0.15.0)
 
-`mbr.strategy = rt_transfer` (`empirical_library` and `full` behave the same) runs the
-transfer worker below after the pooled rescore instead of the second pass. It accepts an
+`mbr.strategy = rt_transfer` (`empirical_library` and `full` were read as it) ran a
+transfer worker after the pooled rescore instead of the second pass. It accepted an
 already extracted, sub-threshold candidate on retention-time agreement alone, against a
 permuted-RT null. Measured on the same pools on 2026-10-13: ProteoBench +3.6% per run, with
 the transfers themselves at 2.3-2.7% combined entrapment FDP and the per-run FDP rising
 from 0.97% to 1.03%; on the single-cell plate +50% per cell with the CAM-modified share of
 the transfers 4.4x that of the direct identifications. Transfers with low support (the
 precursor confident in 2-5 of 240 runs) carry most of the excess, and on ProteoBench those
-with an own `run_psm_q` above 0.5 (33% FDP). It stays available, warns when selected, and
-is the only strategy that needs `mbr.python`.
-
-### mbr (partially wired Stage D3)
-
-The Rust side is a gate, not the algorithm. `Cmd::Mbr` (`main.rs:671`): loads config;
-bails unless `cfg.mbr.strategy` is one of the transfer variants (`MbrStrategy::transfers`); bails if fewer than 2 psms paths
-(`main.rs:685`); requires `cfg.mbr.python` (`main.rs:688`); resolves `mbr_worker.py`
-relative to the binary; calls `sidecar::run_mbr`. `run_mbr` (`sidecar.rs:162`) joins
-the psms paths into a comma-separated `psms_csv` and forwards a fixed set of flags.
-
-**Which `MbrConfig` knobs are forwarded, and which are NOT.** Forwarded to the worker:
-`q_anchor` (`--q-anchor`), `min_anchor_runs` (`--min-anchor-runs`), `q_transfer`
-(`--q-transfer`), `consensus_corr_min` (`--consensus-corr-min`, only together with
-`--frag-csv` and only when `frag` is non-empty and `consensus_corr_min > 0`,
-`sidecar.rs:209`), plus `cfg.rng_seed` as `--seed` and the optional `--out-scored`.
-NOT forwarded (present in `MbrConfig`, `config.rs:873`, but dead in the wired path):
-- `strategy` beyond the None/not-None gate: `EmpiricalLibrary`, `RtTransfer`, `Full`
-  are indistinguishable to the worker, which always runs the rescuable transfer tier.
-- `rt_window_s` (`config.rs:884`): the worker's `--rt-window` (default 20 s) is only
-  read by the `--emit-transfer-targets` re-extraction tier, which `run_mbr` never
-  invokes, so this knob has no effect on the wired path.
-- `decoy_transfer` (`config.rs:886`): the worker hardcodes the permuted-RT null;
-  `ReverseSequence`/`Both` are not implemented in the worker.
-- `requant_all` (`config.rs:892`): `Full`-only requantification, unused.
-
-The worker reads the scored table columns `candidate_id`, `source`, `label`, `q_value`,
-`peptidoform`, `charge`, `protein_group` (`mbr_worker.py:81`) and per-run `apex_rt` from
-each psms path. Run index 0 is the RT reference `REF` (`mbr_worker.py:101`); the
-cross-run RT calibration (`to_ref`/`from_ref`, `mbr_worker.py:102`) uses `binned_map`
-only when a run shares `>= 200` confident anchors with the reference, else the identity
-map. The confident-anchor set uses targets only (a decoy anchor would inject a random
-cross-run RT pair); decoys ride the same transfer test to measure the empirical
-decoy-transfer fraction (`mbr_worker.py:87`).
-
-The worker (`scripts/mbr_worker.py`) implements two tiers:
-- **Rescuable transfer** (default path, `mbr_worker.py:156`): for each precursor
-  confident (`q <= q_anchor`, target) in `>= min_anchor_runs` OTHER runs, sub-threshold
-  in a target run where it WAS extracted (`c in rt_all[i]`), predict its RT in that run
-  from the median of the other runs' binned-median-aligned apex RTs (`expected_rt`,
-  `mbr_worker.py:116`; calibration via `binned_map`, `mbr_worker.py:31`, default 80
-  bins). The false-transfer FDR is a permuted-RT decoy-transfer null: each candidate is
-  given a shuffled candidate's predicted RT (`mbr_worker.py:177`). The transfer q-value
-  is standard target/decoy competition on `rt_delta = |observed - predicted|` (smaller
-  is better), computed as a running min from the tail (`mbr_worker.py:198`). Accept when
-  `q <= q_transfer`. When no transfer candidates exist at all it writes the empty
-  placeholder and returns (`mbr_worker.py:187`).
-- **Fragment-consensus guard** (`mbr_worker.py:209`, M4 enhancement, active only with
-  `--frag-csv` and `--consensus-corr-min > 0`): reject an accepted transfer whose
-  observed fragment pattern in the target run has cosine `< corr_min` with the
-  empirical consensus (per-run L1-normalized, averaged over the confident runs) over its
-  confident runs. A transfer is also rejected if the candidate has no fragment data in
-  the target run or fewer than `min_anchor_runs` confident runs with fragments
-  (`mbr_worker.py:229`). Removes RT-concordant interference.
-- **Re-extraction tier** (`--emit-transfer-targets`, `mbr_worker.py:126`): for the
-  ABSENT set (confident elsewhere, not confident here, and NOT extracted here) emit
-  per-run `run_windows`-format tables (`transfer_targets_<i>.parquet`) at the tight
-  predicted-RT window plus a permuted-RT decoy target file (`transfer_decoys_<i>.parquet`),
-  to feed `extract --restrict-candidates --run-windows`. This tier is fully implemented
-  in the worker but has no Rust CLI plumbing, so it is unreachable from `mumdia mbr`.
-
-The M5 augmented scored output (`--out-scored`, `mbr_worker.py:272`) requires the
-scored table to have a `source` column and matches transfers on `(candidate_id,
-source)`, taking `min(q, transfer_q)` on the PSM q columns and setting `is_transferred`
-and `transfer_q`. The worker
-prints a validation summary: accepted counts per run, how many permuted-RT null draws
-fall inside the accepted RT window, and the window `delta_star` at `q_transfer`. It
-no longer prints a "decoy fraction" among accepted transfers: every transfer candidate
-is a confident target of another run, so that fraction was structurally zero and said
-nothing about calibration (docs/29 #6). The transfer q uses the engine's `+1`
-pseudocount, `(null <= delta + 1) / (targets <= delta)`, so a pool no permuted residual
-undercuts no longer gets q = 0 (docs/29 #7), and the RT residual is measured on the
-peak rescore selected (`selected_peak_rank`) when a competed table carries several
-peaks per candidate (docs/29 #8).
+with an own `run_psm_q` above 0.5 (33% FDP). It was removed in 0.15.0, together with the
+`mumdia mbr` command, `scripts/mbr_worker.py` and `MUMDIA_PYTHON_MBR`. A configuration
+that names the strategy is refused; `mbr.min_anchor_runs`, `mbr.q_transfer`,
+`mbr.consensus_corr_min` and `mbr.python` still parse and do nothing.
 
 ### report (`report.rs:49`, `run`)
 
@@ -1814,19 +1668,12 @@ FDR/reporting); `audit.rs` tests the stages in that order and keeps the first lo
 | `lfq_profile` | quant_lfq.rs:84 | MaxLFQ least-squares per-sample profile |
 | `stats::median_or` | stats.rs | the shared in-place median (a given value for an empty slice) the profile and the size factors call |
 | `solve_fixed` | quant_lfq.rs:28 | dense Laplacian solve, first var fixed at 0 |
-| `AlignParams` | align.rs:22 | seeds + q_train + grid_n |
-| `confident_rts` | align.rs:32 | best observed RT per confident target base peptide |
-| `align::run` | align.rs:53 | reference LOESS RT map per run |
-| `run_mbr` | sidecar.rs:162 | build argv and spawn `mbr_worker.py` |
-| `binned_map` | mbr_worker.py:31 | monotone binned-median RT calibration |
-| `expected_rt` | mbr_worker.py:116 | cross-run predicted RT for a candidate in a run |
-| `write_empty_transfers` / `write_unflagged_scored` | mbr_worker.py | full-schema outputs when there are no transfer candidates |
 | `ReportParams` / `report::run` | report.rs:13 / 49 | TSV writer |
 | `base_sequence` | quant_lfq.rs | stripped sequence of a peptidoform, for the peptide-level LFQ groups and the report |
 | `qcell` | report.rs:39 | quantity cell formatting (1 decimal; empty on NaN) |
 | `AuditParams` / `audit::run` | audit.rs:28 / 64 | candidate loss ladder |
 | `RejectionReason` | rejection.rs:22 | earliest-loss category enum (`code`) |
-| `resolve_script` | sidecar.rs:20 | locate a worker script relative to CWD or the binary |
+| `resolve_script` | sidecar.rs:20 | locate a worker script: an absolute dir as given, else next to the binary, and the CWD last |
 | `run_worker` | sidecar.rs:217 | spawn `python <script> <args>`; error on non-zero exit |
 
 ## Configuration
@@ -1839,8 +1686,9 @@ FDR/reporting); `audit.rs` tests the stages in that order and keeps the first lo
 - `bound_peak` (true): integrate over the detected window vs the whole trace.
 - `peak_fraction` (1/6): descent threshold, fraction of apex height.
 - `peak_grace` (1): consecutive sub-threshold scans bridged during the walk.
-- `peak_window_mode` (`PerCandidate`): `PerCandidate` or `Consensus` (`config.rs:717`).
-- `reliable_q` (0.001): confident-set cutoff calibrating the consensus half-widths.
+- `peak_window_mode` (`PerCandidate`) and `reliable_q` (0.001): parsed and part of the
+  configuration hash, but `per_candidate` is the only value since `consensus` was removed
+  in 0.15.0, and nothing reads `reliable_q`.
 - `q_filter` (`PeptideQ`): which q column to filter on:
   `PeptideQ`/`PrecursorQ`/`PsmQ`/`RunPsmQ`. Use `PeptideQ`/`PrecursorQ` only
   after a single-run rescore, because the grouped columns are populated on group
@@ -1862,11 +1710,10 @@ FDR/reporting); `audit.rs` tests the stages in that order and keeps the first lo
   The last two are omitted from the canonical configuration at their defaults, and all
   three cross-run values are described in
   [Cross-run fragment selection and background](#cross-run-fragment-selection-and-background).
-- `q1_fragments` (false), `q1_min_belonging` (3), `q1_step_weights` (`transmission` or
-  `uniform`) and `q1_integration` (`trapezoid` or `elution_fit`): quantification of ZT Scan
+- `q1_fragments` (false) and `q1_min_belonging` (3): quantification of ZT Scan
   DIA traces collapsed to Q1 cycles from the fragments that belong
   ([Quantification from the fragments that belong](#quantification-from-the-fragments-that-belong-quantq1_fragments-zt-scan-dia));
-  each omitted from the canonical configuration at its default, and the last three refused
+  each omitted from the canonical configuration at its default, and the second refused
   without the first.
 - `q1_cycle_halfwidth` (`"auto"`: 4 for a ZT Scan search, 0 otherwise): the fixed window's
   half-width in Q1 cycles on spectra that record the sweep (docs/37_ztscan.md, section 6);
@@ -1883,31 +1730,22 @@ or `off`) and its settings `normalisation_rank` (unset, automatic) and `normalis
 the canonical configuration at `off`, the other two at their defaults. See
 [Cross-run normalisation](#cross-run-normalisation-quant_normrs-quantnormalisation).
 
-**align** reads `rt_im_train.q_train` (0.01, `config.rs:326`) as the anchor cutoff;
-`grid_n` is hardcoded to 100 in `main.rs:667` and the LOESS span to 0.4 in `align.rs:93`.
-
 **`MbrConfig`** (`config.rs:873`, defaults at `config.rs:898`): `strategy` (`None`;
-`MbrStrategy` at `config.rs:845`), `q_anchor` (0.01), `min_anchor_runs` (2),
-`q_transfer` (0.01), `rt_window_s` (20.0, unwired), `decoy_transfer` (`PermutedRt`,
-`DecoyTransfer` at `config.rs:864`, unwired), `consensus_corr_min` (0.0), `requant_all`
-(false, unwired), `python` (None, required when `strategy != None`). See the mbr
-section for exactly which of these reach the worker.
+`MbrStrategy`), `q_anchor` (0.01), and `min_anchor_runs` (2), `q_transfer` (0.01),
+`consensus_corr_min` (0.0) and `python` (None). The last four configured the rescuable-tier
+transfer, removed in 0.15.0; they still parse, so the configuration hash does not move, and
+`validate()` warns that they do nothing.
 
 **report** takes `q_threshold` (`--q`, default 0.01) and optional quant table paths as
 CLI args; no config struct.
 
 **audit** takes `q` (0.01), `run_id` ("run"), `entrapment_substr` ("") as CLI args.
 
-The config was recently pruned of dead fields. The `MbrConfig` knobs noted as
-"unwired" above are intentionally documented as such: they still exist in the struct
-but do not affect the wired `mumdia mbr` path.
-
 ## Invariants, determinism, gotchas
 
 - **Determinism.** quant uses `BTreeMap` for candidate iteration, the RT union axis,
   and f64 summation order; quant-lfq iterates `BTreeMap` keys and sorts medians in
-  place; align iterates via `HashMap` but writes a fixed grid. The `mbr_worker.py`
-  permutation is seeded from `cfg.rng_seed` (`--seed`). The DeepLC fine-tune elsewhere
+  place; align iterates via `HashMap` but writes a fixed grid. The DeepLC fine-tune elsewhere
   is nondeterministic, but none of these stages depend on it.
 - **quant units bug guard.** A collapsed `lo==hi` window would make `trapezoid_window`
   return a raw height (intensity, not intensity*seconds), mixing units against
@@ -1987,12 +1825,10 @@ but do not affect the wired `mumdia mbr` path.
   `RT_PRUNED`, `WRONG_ISOLATION_WINDOW`) have no producer.
 - **report.json coverage is partial.** `quant` writes reports for
   `peptide_quant`, `protein_quant`, and emitted `fragment_quant`; the peak-bounds
-  diagnostic gets none. `quant-lfq` and `mbr` write no `report.json`; `align` and `audit` do
-  (the latter as `<out>.metrics.json`). Do not assume every artifact here has a sidecar
+  diagnostic gets none. `quant-lfq` writes no `report.json`; `audit` does
+  (as `<out>.metrics.json`). Do not assume every artifact here has a sidecar
   report.
-- **align / mbr need >=2 runs.** align degenerates to identity on one run; `mumdia mbr`
-  hard-bails on `<2` psms paths (`main.rs:685`). Neither is in the single-run `run`
-  chain; from `run`, only `quant` (with fragment export, no peak-bounds,
+- **From the single-run `run` chain**, only `quant` (with fragment export, no peak-bounds,
   `run.rs:445`), `report` (`run.rs:484`), and the optional `audit` stage
   (`run.rs:430`) fire.
 - **quant-lfq single input** reduces to the per-run sum; MaxLFQ/directLFQ have only
@@ -2007,15 +1843,6 @@ but do not affect the wired `mumdia mbr` path.
 - **Quantifiability gate:** filter `summarize_fragment_areas` (`quant.rs:185`) on
   `n_fragments_used` or a minimum window width; emit the reason so `report` can surface
   low-evidence quantities.
-- **Wire the MBR strategy tiers:** thread `cfg.mbr.strategy` past the None gate in
-  `main.rs:680` and forward `rt_window_s`/`decoy_transfer`/`requant_all` in
-  `run_mbr` (`sidecar.rs:193`). The re-extraction tier already exists in the worker
-  (`--emit-transfer-targets`); it needs a Rust subcommand that then calls
-  `extract --restrict-candidates --run-windows` and re-scores. Implement the
-  `ReverseSequence`/`Both` nulls in the worker before honoring `decoy_transfer`.
-- **Consume `alignment.parquet` in MBR** instead of the worker's internal
-  `binned_map`, so the RT map is computed once and shared; align already records the
-  p95 residual that should set `rt_window_s`.
 - **Add an audit reason:** extend `RejectionReason` (`rejection.rs:22`) at its pipeline
   position, with a `code()` arm and a branch in the ladder; an extraction reason needs
   extract to record it per candidate first.

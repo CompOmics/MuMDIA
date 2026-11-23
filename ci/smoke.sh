@@ -579,22 +579,16 @@ echo "    ok: run completed, drop reported, identifications unchanged"
 #     fitted on confident seed anchors, all of which this fixture already has and that one
 #     would have to fake.
 #
-#     `calibration: per_group` on purpose. It is the mode in which each band applies its
-#     OWN mass calibration to the run's spectra, which since the bands share one decoded
-#     buffer is the configuration most exposed to a stage writing a corrected m/z back
-#     into the scans.
-#
-#     `allow_unbounded_rt: true` because no band of this fixture reaches a confident seed
-#     anchor on its own q scale (the `1/T` floor, docs/33 section 4), so every band extracts
-#     with unbounded RT windows, which a grouped run refuses by default (docs/33 section
-#     4c). The refusal itself is checked right after this arm.
+#     `calibration: global` (the only value since 0.15.0): the bands calibrate on the pooled
+#     seed, which at the default `q_train` has anchors on this fixture. The refusal of a
+#     pooled seed without anchors is checked right after this arm.
 echo "=== smoke: the grouped orchestrator"
 cat > "$work/grouped.json" <<'JSONEOF'
 {
   "predict_frag": { "allow_native_predictors": true },
   "features": { "set": "extended" },
   "extract": { "apex_count_window": 5, "apex_rt_prior_s": 120.0, "gate_min_score": 0.2 },
-  "groups": { "window_groups": 3, "parallel": 2, "allow_unbounded_rt": true, "calibration": "per_group" }
+  "groups": { "window_groups": 3, "parallel": 2, "calibration": "global" }
 }
 JSONEOF
 "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
@@ -629,14 +623,12 @@ n_ms1=$(grep -c 'stage=load-ms1' "$work/grouped.log" || true)
 # The grouped path identifies peptides, and does so reproducibly. Not compared against the
 # ungrouped run: banding changes the competition population and the pooled q denominator,
 # so the two are not expected to agree row for row (measured on this fixture: 150 rows
-# ungrouped, 146 grouped under per_group).
+# ungrouped).
 n_grouped=$(($(wc -l < "$work/out_grouped/peptides.tsv") - 1))
 [ "$n_grouped" -ge 100 ] \
     || { echo "the grouped run found only $n_grouped peptides; expected at least 100"; exit 1; }
 diff "$work/out_grouped/peptides.tsv" "$work/out_grouped2/peptides.tsv" > /dev/null \
     || { echo "two grouped runs of the same input disagree"; exit 1; }
-grep -q 'because groups.allow_unbounded_rt = true' "$work/grouped.log" \
-    || { echo "the grouped run extracted with unbounded windows without the warning"; exit 1; }
 # No DeepLC step ran on the bands, so the manifest names the FASTA library's own RT model.
 grep -q '"rt_predictor": "Native"' "$work/out_grouped/manifest.json" \
     || { grep rt_predictor "$work/out_grouped/manifest.json"; echo "the grouped run's manifest names the wrong RT model"; exit 1; }
@@ -644,17 +636,12 @@ echo "    ok: 3 bands, $n_ms2 MS2 + $n_ms1 MS1 decodes, $n_grouped peptides, rep
 
 #     Without `groups.allow_unbounded_rt` a grouped run stops before a band extracts with
 #     unbounded RT windows (docs/33 section 4c). The seeds are counted right after
-#     `seed-pool`, so both refusals come before any band slice, DeepLC sidecar or retention-
+#     `seed-pool`, so the refusal comes before any band slice, DeepLC sidecar or retention-
 #     time fit, and before the spectra are decoded for extraction: the MS2 is decoded once
-#     (the seeding phase) instead of twice. Under per_group every band of the fixture has no
-#     anchor, so the one error names all three. Under global a `q_train` below the pooled
-#     seed's `1/T` floor leaves the pooled seed without anchors; the same search with the key
-#     set must extract, with the warning, which is the global call site's allowed branch.
+#     (the seeding phase) instead of twice. A `q_train` below the pooled seed's `1/T` floor
+#     leaves the pooled seed without anchors; the same search with the key set must
+#     extract, with the warning, which is the allowed branch.
 echo "=== smoke: a grouped run refuses unbounded RT windows"
-sed 's/"allow_unbounded_rt": true, //' "$work/grouped.json" > "$work/grouped_refused.json"
-if grep -q 'allow_unbounded_rt' "$work/grouped_refused.json"; then
-    echo "could not derive the refused per_group config"; exit 1
-fi
 cat > "$work/grouped_refused_global.json" <<'JSONEOF'
 {
   "predict_frag": { "allow_native_predictors": true },
@@ -664,7 +651,7 @@ cat > "$work/grouped_refused_global.json" <<'JSONEOF'
   "groups": { "window_groups": 2, "calibration": "global" }
 }
 JSONEOF
-for arm in grouped_refused grouped_refused_global; do
+for arm in grouped_refused_global; do
     if "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
         --out-dir "$work/out_$arm" --config "$work/$arm.json" --threads 4 \
         > "$work/$arm.log" 2>&1; then
@@ -686,13 +673,6 @@ for arm in grouped_refused grouped_refused_global; do
         echo "$arm: the refusal came after a retention-time stage started"; exit 1
     fi
 done
-grep -q 'groups: the retention-time windows of 3 of the 3 bands would be unbounded' \
-    "$work/grouped_refused.log" \
-    || { echo "the per_group refusal does not name the three bands at once"; exit 1; }
-grep -q 'g00 0, g01 0, g02 0' "$work/grouped_refused.log" \
-    || { echo "the per_group refusal does not list each band's anchors"; exit 1; }
-grep -q 'to learn a tolerance extract would search at the configured' "$work/grouped_refused.log" \
-    || { echo "the per_group refusal does not give the configured fragment tolerance"; exit 1; }
 grep -q 'groups: the retention-time windows would be unbounded' \
     "$work/grouped_refused_global.log" \
     || { echo "the global refusal is not the pooled one"; exit 1; }
@@ -713,7 +693,7 @@ grep -q 'because groups.allow_unbounded_rt = true' "$work/grouped_allowed_global
 n_ms2=$(grep -c 'stage=load-ms2' "$work/grouped_allowed_global.log" || true)
 [ "$n_ms2" = "2" ] \
     || { echo "the allowed global run did not reach the extraction decode ($n_ms2 MS2 decodes)"; exit 1; }
-echo "    ok: per_group and global runs without anchors stop after the seed; allowed, global extracts"
+echo "    ok: a run without anchors stops after the seed; allowed, it extracts"
 
 # The default grouped run above left the competed rows and the chromatograms per band
 # (`groups.pool_competed` and `groups.pool_chromatograms` are `false` by default since
@@ -733,7 +713,7 @@ test ! -e "$work/out_grouped/chromatograms.parquet" \
     || { echo "the default grouped run wrote a pooled chromatograms.parquet"; exit 1; }
 test -s "$work/out_grouped/groups/overlap_losers.parquet" \
     || { echo "the default grouped run did not persist the overlap losers"; exit 1; }
-sed 's/"calibration": "per_group" }/"calibration": "per_group", "pool_competed": true, "pool_chromatograms": true }/' \
+sed 's/"calibration": "global" }/"calibration": "global", "pool_competed": true, "pool_chromatograms": true }/' \
     "$work/grouped.json" > "$work/grouped_pool.json"
 grep -q '"pool_competed": true' "$work/grouped_pool.json" \
     || { echo "could not derive the pool_competed = true config"; exit 1; }
@@ -969,6 +949,51 @@ lib = json.load(open(sys.argv[1] + "/second_pass/library/empirical_library.json"
 assert lib["entries"] > 100 and lib["targets"] == lib["entries"] and lib["decoys"] == lib["targets"], lib
 print(f"    ok: empirical library {lib['entries']} entries + {lib['decoys']} paired decoys, "
       f"{lib['runs_aligned']} runs aligned; no decoy extracted, so the first pass stands")
+PYEOF
+
+# 5b. The applied second pass, the default multi-run path on real data. A second run with
+#     more noise drawn from the library's fragment m/z (60 peaks per spectrum; 40 is not
+#     enough) and the extraction gate open (gate_min_score 0) give the second pass chance
+#     decoys, so it applies: the experiment's scored table is then the second pass's rescore,
+#     and quant must read the second pass's chromatograms, whose candidate ids are the
+#     empirical library's.
+echo "=== smoke: second pass applied"
+"$PY" ci/make_fixture_mzml.py \
+    --precursors "$work/lib_prec.parquet" --fragments "$work/lib_frag.parquet" \
+    --out "$work/fixture_noisy.mzML" --n-planted 160 --windows 8 --library-noise-peaks 60 --quiet
+"$PY" - "$cfg" "$work/exp_sp.json" <<'PYEOF'
+import json, sys
+c = json.load(open(sys.argv[1]))
+c.setdefault("experiment", {}).update(parallel_runs=1, overlap_front_threads=0)
+c.setdefault("extract", {})["gate_min_score"] = 0.0
+json.dump(c, open(sys.argv[2], "w"), indent=2)
+PYEOF
+"$BIN" run-experiment --fasta test_data/fixture.fasta \
+    --mzml "$work/fixture.mzML" --mzml "$work/fixture_noisy.mzML" \
+    --run-names a --run-names b \
+    --out-dir "$work/exp_sp" --config "$work/exp_sp.json" > "$work/exp_sp.log" 2>&1 \
+    || { tail -30 "$work/exp_sp.log"; echo "run-experiment with an applied second pass failed"; exit 1; }
+"$PY" - "$work/exp_sp" <<'PYEOF'
+import json, sys
+import pyarrow.parquet as pq
+d = sys.argv[1]
+m = json.load(open(d + "/experiment_manifest.json"))
+assert m["model_identities"]["mbr"] == "SecondPass", m["model_identities"]["mbr"]
+assert m["experiment"]["second_pass"] is not None, "experiment.second_pass is null"
+lib = set(pq.read_table(d + "/second_pass/library/lib_precursors.parquet",
+                        columns=["candidate_id"]).column(0).to_pylist())
+n = 0
+for run in ("a", "b"):
+    ids = set(pq.read_table(f"{d}/{run}/peptide_quant.parquet",
+                            columns=["candidate_id"]).column(0).to_pylist())
+    chrom = set(pq.read_table(f"{d}/second_pass/{run}/chromatograms.parquet",
+                              columns=["candidate_id"]).column(0).to_pylist())
+    assert ids, f"run {run} quantified nothing"
+    assert ids <= lib, f"run {run}: quantified ids outside the empirical library"
+    assert ids <= chrom, f"run {run}: quantified ids without a second-pass chromatogram"
+    n += len(ids)
+print(f"    ok: second pass applied; {n} quantified precursors, all empirical-library ids "
+      f"with second-pass chromatograms")
 PYEOF
 
 # 5r. `output.retain` (docs/01, "Output retention"): the same experiment at `viewer` and at
@@ -1412,7 +1437,8 @@ PYEOF
 #     DeepLC call to make, and where its output goes, ran only on a developer machine:
 #     `groups.rt_adaptation = once_per_run` writing each band under the name a later run's
 #     `shared_bands` looks for, the bands keeping an experiment-level re-prediction without
-#     calling the worker, a later run taking the first grouped run's band slices, the refusal
+#     calling the worker, a later run taking the first grouped run's band slices
+#     (`experiment.rt_library_scope = per_run`, where every run adapts its own bands), the refusal
 #     of a deferred library the calibration did not fully re-predict, and
 #     `experiment.overlap_front_threads`. A regression there (a later run failing with
 #     "shared bands do not match", or a calibration silently skipped) passed CI.
@@ -1507,8 +1533,8 @@ arm("union", groups=dict(banded, rt_adaptation="once_per_run"),
     rt_im_train={"multihead_calibration": 2})
 arm("keep", groups=dict(banded, rt_adaptation="once_per_run"),
     rt_im_train={"multihead_calibration": 0})
-arm("perband", groups=dict(banded, rt_adaptation="per_band"),
-    rt_im_train={"multihead_calibration": 0})
+arm("perrun", groups=dict(banded, rt_adaptation="once_per_run"),
+    rt_im_train={"multihead_calibration": 2}, experiment={"rt_library_scope": "per_run"})
 arm("defer", groups=dict(banded, rt_adaptation="once_per_run"),
     rt_im_train={"multihead_calibration": 2},
     predict_frag={"rt_predictor": "deeplc", "defer_deeplc_to_multihead": True})
@@ -1532,6 +1558,12 @@ arm("auto_seed", rt_im_train={"multihead_calibration": 2, "multihead_search_belo
 # The automatic multi-head calibration on a seed short of anchors at every anchor_q_ladder
 # rung: skipped, and the imported library searched on base-model retention times instead.
 arm("skip", rt_im_train={"min_seed_for_calibration": 1000000})
+# A first run short of seed anchors (a near-blank input): the first run that has them adapts
+# the library for every run, sequentially and overlapped.
+arm("short", rt_im_train={"multihead_calibration": 2, "multihead_anchors": "seed"},
+    experiment={"parallel_runs": 1, "overlap_front_threads": 0})
+arm("short_overlap", rt_im_train={"multihead_calibration": 2, "multihead_anchors": "seed"},
+    experiment={"overlap_front_threads": 1})
 # No trailing newline: on Windows it would arrive as CR LF, and $( ) strips the LF only.
 sys.stdout.write(os.path.join(root, "site"))
 PYEOF
@@ -1551,7 +1583,7 @@ stub_experiment() {
         --run-names a --run-names b --out-dir "$stub/$name" \
         --config "$stub/$cfgname.json" --threads 2 "$@"
 }
-for a in union keep perband; do
+for a in union keep perrun; do
     stub_experiment "$a" "$a" \
         || { tail -30 "$stub/$a.log"; echo "stub arm $a failed"; exit 1; }
 done
@@ -1604,6 +1636,18 @@ grep -q "converting and seeding the other runs while the first adapts" "$stub/au
     || { echo "the auto_overlap arm did not keep the overlap"; exit 1; }
 grep -q "multihead_anchors = auto kept the seed anchors" "$stub/auto_seed.log" \
     || { tail -20 "$stub/auto_seed.log"; echo "the auto_seed arm did not keep the seed anchors"; exit 1; }
+# A near-blank first run (one planted precursor, far below min_seed_for_calibration).
+"$PY" ci/make_fixture_mzml.py \
+    --precursors "$work/lib_prec.parquet" --fragments "$work/lib_frag.parquet" \
+    --out "$work/blank.mzML" --n-planted 1 --windows 8 --quiet
+for a in short short_overlap; do
+    stub_run "$a" "$BIN" run-experiment \
+        --lib-precursors "$work/lib_prec.parquet" --lib-fragments "$work/lib_frag.parquet" \
+        --mzml "$work/blank.mzML" --mzml "$work/fixture.mzML" \
+        --run-names a --run-names b --out-dir "$stub/$a" \
+        --config "$stub/$a.json" --threads 2 \
+        || { tail -30 "$stub/$a.log"; echo "stub arm $a failed"; exit 1; }
+done
 # The skipped multi-head calibration, in `run-experiment` and in `run`.
 stub_experiment skip skip \
     || { tail -30 "$stub/skip.log"; echo "stub arm skip failed"; exit 1; }
@@ -1674,19 +1718,24 @@ for run in ("a", "b"):
         if list((stub / "keep" / run / "groups" / g).glob("lib_precursors*.parquet")):
             fail("keep: %s/%s wrote a band table" % (run, g))
 
-# per_band, multi-head off: the experiment re-prediction, then one per band per run, and run
-# b takes run a's band slices instead of writing its own.
-c = calls("perband")
-if [x["mode"] for x in c] != ["repredict"] * 5 or any(x["bands"] for x in c):
-    fail("perband: expected five single-table re-predictions, got %r" % c)
-for k, (run, g) in enumerate([(r, g) for r in ("a", "b") for g in bands], start=1):
-    lib_in, lib_out = c[k]["pairs"][0]
-    if not same(lib_in, stub / "perband/a/groups" / g / "lib_precursors.parquet"):
-        fail("perband: run %s band %s read %r, not run a's slice" % (run, g, lib_in))
-    if not same(lib_out, stub / "perband" / run / "groups" / g / "lib_precursors_deeplc.parquet"):
-        fail("perband: run %s band %s wrote %r" % (run, g, lib_out))
-    if (stub / "perband/b/groups" / g / "lib_precursors.parquet").exists():
-        fail("perband: run b wrote its own slice of " + g)
+# once_per_run + multi-head under rt_library_scope = per_run: one --bands multi-head call
+# per run, each over both bands, and run b takes run a's band slices instead of writing its
+# own.
+c = calls("perrun")
+if [(x["mode"], x["bands"]) for x in c] != [("multihead", True)] * 2:
+    fail("perrun: expected one --bands multi-head call per run, got %r" % c)
+for k, run in enumerate(("a", "b")):
+    if len(c[k]["pairs"]) != len(bands):
+        fail("perrun: run %s adapted %d bands" % (run, len(c[k]["pairs"])))
+    for (lib_in, lib_out), g in zip(c[k]["pairs"], bands):
+        if not same(lib_in, stub / "perrun/a/groups" / g / "lib_precursors.parquet"):
+            fail("perrun: run %s band %s read %r, not run a's slice" % (run, g, lib_in))
+        if not same(lib_out,
+                    stub / "perrun" / run / "groups" / g / "lib_precursors_multihead.parquet"):
+            fail("perrun: run %s band %s wrote %r" % (run, g, lib_out))
+for g in bands:
+    if (stub / "perrun/b/groups" / g / "lib_precursors.parquet").exists():
+        fail("perrun: run b wrote its own slice of " + g)
 
 # The overlap: the same single multi-head call on run a, and the same scored table as the
 # runs one after the other (the stub makes the adaptation a copy, so the fronts are the
@@ -1705,7 +1754,7 @@ if not c["projection_cache"] or not same(c["projection_cache"],
     fail("seq: the multi-head call got projection cache %r" % c["projection_cache"])
 if not c["projection_default"]:
     fail("seq: the default projection cache was not flagged as the default")
-for name in ("union", "keep", "perband", "overlap"):
+for name in ("union", "keep", "perrun", "overlap"):
     for x in calls(name):
         if x["projection_cache"] is not None:
             fail("%s: a projection cache %r under MUMDIA_CACHE_DIR=off"
@@ -1828,17 +1877,35 @@ if not same(m["artifacts"]["fragment_library_precursors"]["path"],
     fail("skip_run: the manifest records %r as the library"
          % m["artifacts"]["fragment_library_precursors"]["path"])
 
+# A short first run: one multi-head call, on run b's seed, and run a reads that library.
+for name in ("short", "short_overlap"):
+    c = calls(name)
+    if len(c) != 1 or c[0]["mode"] != "multihead" or c[0]["bands"]:
+        fail("%s: expected one multi-head call, got %r" % (name, c))
+    if not same(c[0]["seed"], stub / name / "b/seed_psms.parquet"):
+        fail("%s: calibrated against %r, not run b's seed" % (name, c[0]["seed"]))
+    if list((stub / name / "a").glob("fragment_library*")):
+        fail("%s: run a adapted a library of its own" % name)
+    if not (stub / name / "scored_combined.parquet").exists():
+        fail("%s: the experiment did not finish" % name)
+a = pq.read_table(stub / "short/scored_combined.parquet")
+b = pq.read_table(stub / "short_overlap/scored_combined.parquet")
+if not a.equals(b):
+    fail("short: the overlapped experiment scored differently from the sequential one")
+
 # The deferred build: one --bands multi-head call per run, over the two bands.
 for name in ("defer_fast", "defer_kept"):
     c = calls(name)
     if len(c) != 1 or c[0]["mode"] != "multihead" or len(c[0]["pairs"]) != 2:
         fail("%s: expected one two-band multi-head call, got %r" % (name, c))
-print("    ok: once_per_run union, kept re-prediction, per-band slices reused, deferred "
+print("    ok: once_per_run union, kept re-prediction, band slices reused per run, deferred "
       "library refused and accepted, overlap equal to sequential, search anchors refit and "
-      "fall back, a skipped calibration re-predicted (%d stub calls)"
-      % sum(len(calls(n)) for n in ("union", "keep", "perband", "seq", "overlap",
+      "fall back, a skipped calibration re-predicted, a short first run adapted on the "
+      "next (%d stub calls)"
+      % sum(len(calls(n)) for n in ("union", "keep", "perrun", "seq", "overlap",
                                      "overlap_fail", "defer_fast", "defer_kept", "boot",
-                                     "boot_run", "boot_fallback", "skip", "skip_run")))
+                                     "boot_run", "boot_fallback", "skip", "skip_run",
+                                     "short", "short_overlap")))
 PYEOF
 
 # 5p. Protein annotations: the report of the run's scored table without the annotation table

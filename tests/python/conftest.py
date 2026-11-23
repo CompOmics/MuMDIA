@@ -14,6 +14,7 @@ useful in a minimal environment and skips honestly rather than failing.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
 import subprocess
@@ -97,7 +98,7 @@ def run_worker(script, *args, env=None, cwd=None, timeout=900):
 def run_worker_ok(script, *args, env=None, cwd=None, timeout=900):
     """`run_worker` plus the exit-code assertion, with stderr in the message.
 
-    A nonzero exit from a predictor or MBR worker aborts the whole engine run
+    A nonzero exit from a predictor worker aborts the whole engine run
     (`docs/13_sidecars.md`, "Failure behavior"), so a failing assertion here
     stands for an aborted production run; the captured stderr is the only
     diagnostic the engine itself would surface.
@@ -132,25 +133,30 @@ def importorskip_any(name, reason=None):
         )
 
 
-def import_module_in_fresh_interpreter(script, timeout=300):
+def import_module_in_fresh_interpreter(script, timeout=300, then=""):
     """Import a worker at module scope in a brand-new interpreter.
 
     The import-order contract can only be tested this way. Inside pytest, numpy
     and pyarrow are already loaded by the time any test runs, so an in-process
     import of a DeepLC worker exercises the wrong order and, on Windows,
     reproduces the very `WinError 1114` the ordering exists to prevent. A fresh
-    subprocess is also exactly how the engine runs the worker.
+    subprocess is also exactly how the engine runs the worker, and like the engine's
+    `python <script>` it puts the script's directory first on `sys.path`, where the
+    shared modules (`_deeplc_common`, `_torch_threads`) are found. `then` is code run
+    after the import, with the worker bound to `m`.
     """
     path = Path(script)
     if not path.is_absolute():
         path = SCRIPTS / script
     code = (
-        "import importlib.util, sys\n"
+        "import importlib.util, os, sys\n"
+        "sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[1])))\n"
         "spec = importlib.util.spec_from_file_location('w', sys.argv[1])\n"
         "m = importlib.util.module_from_spec(spec)\n"
         "spec.loader.exec_module(m)\n"
         "assert callable(m.main)\n"
-        "print('MODULE_IMPORT_OK')\n"
+        + then
+        + "print('MODULE_IMPORT_OK')\n"
     )
     proc = subprocess.run(
         [sys.executable, "-c", code, str(path)],
@@ -161,6 +167,25 @@ def import_module_in_fresh_interpreter(script, timeout=300):
         timeout=timeout,
     )
     return proc.returncode, proc.stdout, proc.stderr
+
+
+def run_in_imported_worker(script, then, packages=("deeplc",)):
+    """Run `then` in a fresh interpreter that imported `script` as `m`; return stdout.
+
+    Skips when a package is not installed or the worker does not import here (a DeepLC
+    below the floor, say); a failure of `then` itself fails the test. Gated on presence,
+    because importing DeepLC inside pytest is the broken import order.
+    """
+    for package in packages:
+        if importlib.util.find_spec(package) is None:
+            pytest.skip("{} is not installed".format(package))
+    rc, out, err = import_module_in_fresh_interpreter(
+        script, then="print('WORKER_IMPORTED', flush=True)\n" + then)
+    if "WORKER_IMPORTED" not in out:
+        tail = [ln for ln in err.strip().splitlines() if ln.strip()]
+        pytest.skip("{} does not import here: {}".format(script, tail[-1] if tail else "?"))
+    assert rc == 0 and "MODULE_IMPORT_OK" in out, err
+    return out
 
 
 @pytest.fixture(scope="session")
@@ -424,59 +449,6 @@ def write_features_parquet(path, psms):
         ["-.{}.-".format(p) for p in psms["peptidoform"]], pa.string()
     )
     cols["Proteins"] = pa.array(psms["protein"], pa.string())
-    pq.write_table(pa.table(cols), str(path), compression="snappy")
-    return path
-
-
-# ---------------------------------------------------------------------------
-# synthetic scored / psms tables: the MBR contract
-# ---------------------------------------------------------------------------
-
-
-def write_scored_table(path, rows, extra_q=None, extra_int=None):
-    """Write an experiment-wide scored_combined table for `mbr_worker.py`.
-
-    `rows` holds equal-length sequences for the columns MBR reads
-    (`mbr_worker.py:81-82`): candidate_id, source, label, q_value, peptidoform,
-    charge, protein_group. `extra_q` adds further PSM-level q columns
-    (`run_psm_q`, `experiment_psm_q`) that the M5 augmentation must also lower;
-    `extra_int` adds int32 columns such as `selected_peak_rank`.
-    """
-    cols = {
-        "candidate_id": pa.array(
-            np.asarray(rows["candidate_id"], dtype=np.uint32), pa.uint32()
-        ),
-        "source": pa.array(np.asarray(rows["source"], dtype=np.uint32), pa.uint32()),
-        "label": pa.array(list(rows["label"]), pa.string()),
-        "q_value": pa.array(np.asarray(rows["q_value"], dtype=np.float64), pa.float64()),
-        "peptidoform": pa.array(list(rows["peptidoform"]), pa.string()),
-        "charge": pa.array(np.asarray(rows["charge"], dtype=np.int32), pa.int32()),
-        "protein_group": pa.array(list(rows["protein_group"]), pa.string()),
-    }
-    for name, values in (extra_q or {}).items():
-        cols[name] = pa.array(np.asarray(values, dtype=np.float64), pa.float64())
-    for name, values in (extra_int or {}).items():
-        cols[name] = pa.array(np.asarray(values, dtype=np.int32), pa.int32())
-    pq.write_table(pa.table(cols), str(path), compression="snappy")
-    return path
-
-
-def write_psms_table(path, candidate_ids, apex_rts, extra_cols=None):
-    """Write a per-run psms.parquet: the columns MBR reads (`mbr_worker.py`).
-
-    `extra_cols` adds the optional top-K columns (`peak_rank` int32, `prelim_score`
-    float64) a competed table carries when `extract.retain_top_peaks` is above 1.
-    """
-    cols = {
-        "candidate_id": pa.array(np.asarray(candidate_ids, dtype=np.uint32), pa.uint32()),
-        "apex_rt": pa.array(np.asarray(apex_rts, dtype=np.float64), pa.float64()),
-    }
-    for name, values in (extra_cols or {}).items():
-        arr = np.asarray(values)
-        if np.issubdtype(arr.dtype, np.integer):
-            cols[name] = pa.array(arr.astype(np.int32), pa.int32())
-        else:
-            cols[name] = pa.array(arr.astype(np.float64), pa.float64())
     pq.write_table(pa.table(cols), str(path), compression="snappy")
     return path
 

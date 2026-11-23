@@ -12,7 +12,7 @@
 //!    peaks, per charge (`peaks`); the isomers on one peak share one localisation;
 //! 3. enumerates every placement of the modification's count on its candidate slots, and on
 //!    the decoy residue, whether or not the library carries that placement;
-//! 4. reads every fragment m/z of those placements (and their neutral losses) from the MS2
+//! 4. reads every fragment m/z of those placements from the MS2
 //!    scans at the apex (`xic`), and scores the placements by the presence of their
 //!    site-determining ions (`model`);
 //! 5. turns the log-likelihoods into a posterior at a temperature, fixed or fitted to the
@@ -471,12 +471,6 @@ fn analyse(p: &LocaliseParams, proteins: &mut Proteins) -> Result<RunAnalysis> {
             Some(d)
         })
         .collect();
-    // Neutral losses: phosphoric acid from Phospho, nothing for any other modification.
-    let loss_of = |r: &Row| -> Option<ions::Loss> {
-        (cfg.neutral_loss && cfg.mods[r.modi] == "Phospho")
-            .then(|| ions::phosphate_loss(&r.split, decoy_residue[r.modi]))
-    };
-
     // --- isomer groups and their picked target-decoy q ---
     let mut group_ids: BTreeMap<(u32, u32, Vec<i64>, bool), u32> = BTreeMap::new();
     let mut q_keys: BTreeMap<(u32, u32, Vec<i64>), u32> = BTreeMap::new();
@@ -663,7 +657,6 @@ fn analyse(p: &LocaliseParams, proteins: &mut Proteins) -> Result<RunAnalysis> {
     }
 
     // --- evidence from the spectra ---
-    let losses = cfg.neutral_loss;
     let need: Vec<usize> = (0..peaks.len())
         .filter(|&pi| results[pi].status.is_empty())
         .collect();
@@ -682,8 +675,7 @@ fn analyse(p: &LocaliseParams, proteins: &mut Proteins) -> Result<RunAnalysis> {
                 let r = &rows[peaks[pi].rep];
                 let res = &results[pi];
                 let zmax = if r.charge >= 3 { 2 } else { 1 };
-                let loss = loss_of(r);
-                let set = ions::build(&r.split, &res.hyps, zmax, loss.as_ref());
+                let set = ions::build(&r.split, &res.hyps, zmax);
                 let (sel, band) = sp.apex_selection(r, &set, cfg)?;
                 let mut ev = Evidence {
                     common: Counts::default(),
@@ -717,9 +709,6 @@ fn analyse(p: &LocaliseParams, proteins: &mut Proteins) -> Result<RunAnalysis> {
         }
         global_d = cd.laplace();
         global_f = cf.laplace();
-        if losses {
-            ions::loss_false_presence_from_plain(&mut global_f);
-        }
         let scored: Vec<(usize, PeakResult)> = need
             .par_iter()
             .zip(evidence.par_iter())
@@ -730,10 +719,7 @@ fn analyse(p: &LocaliseParams, proteins: &mut Proteins) -> Result<RunAnalysis> {
                     return (pi, res);
                 };
                 let d = ev.common.shrunk(&global_d, cfg.prior_strength);
-                let mut f = ev.impossible.shrunk(&global_f, cfg.prior_strength);
-                if losses {
-                    ions::loss_false_presence_from_plain(&mut f);
-                }
+                let f = ev.impossible.shrunk(&global_f, cfg.prior_strength);
                 let obs: Vec<model::Observed> = ev
                     .sdi
                     .iter()
@@ -904,7 +890,7 @@ impl Spectra {
         if hyps[0].len() != hyps[1].len() {
             return false;
         }
-        let set = ions::build(&a.split, &hyps, zmax, None);
+        let set = ions::build(&a.split, &hyps, zmax);
         let shared: Vec<f64> = (0..set.ions.len())
             .filter(|&j| set.is_common(j))
             .map(|j| set.ions[j].mz)
@@ -1275,17 +1261,11 @@ fn write(
             "im_half_width": cfg.im_half_width,
             "prior_strength": cfg.prior_strength,
             "temperature": cfg.fixed_temperature().map_or(json!("auto"), |t| json!(t)),
-            "neutral_loss": cfg.neutral_loss,
+            // Removed in 0.15.0; kept so the report of a localise run stays as it was.
+            "neutral_loss": false,
         }),
         stats,
-        model_identity: Some(
-            if cfg.neutral_loss {
-                "localise-sdi-presence-v2-neutral-loss"
-            } else {
-                "localise-sdi-presence-v2"
-            }
-            .to_string(),
-        ),
+        model_identity: Some("localise-sdi-presence-v2".to_string()),
         elapsed_ms,
     }
     .write_for(p.out)?;

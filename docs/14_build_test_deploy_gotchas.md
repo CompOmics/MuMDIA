@@ -28,12 +28,12 @@ configurations in `configs/`, the container definition in `Dockerfile` +
 | `rust/mumdia/.cargo/config.toml.example` | Committed template of the above; a fresh clone with no local copy builds into `./target` |
 | `rust/mumdia/crates/mumdia/Cargo.toml` | The bin+lib crate `mumdia`; `[[bin]]` name `mumdia` -> `src/main.rs`; all deps come from `workspace.dependencies` |
 | `rust/mumdia/crates/mumdia-core/Cargo.toml` | Core crate; depends only on `serde`/`serde_json`/`thiserror` (no arrow/parquet, so no I/O layer) |
-| `rust/mumdia/crates/mumdia-io/Cargo.toml` | I/O crate; adds `arrow`/`parquet`/`blake3` over `mumdia-core`, plus `rayon` for the dedicated parquet codec pool (`codec.rs`) and `bytes` for the `SpanCache` `ChunkReader` (`span_cache.rs`) |
+| `rust/mumdia/crates/mumdia-io/Cargo.toml` | I/O crate; adds `arrow`/`parquet`/`blake3` over `mumdia-core`, plus `rayon` for the dedicated parquet codec pool (`codec.rs`) |
 | `rust/mumdia/crates/mumdia/tests/pipeline.rs` | The only integration test file: extract -> features -> compete -> rescore on crafted Parquet |
 | `rust/mumdia/crates/mumdia-core/build.rs` | Stamps the git commit and build date into the crate so `manifest.json` can record them |
 | `.github/workflows/ci.yml` | Nine jobs: `lint` (fmt + clippy `-D warnings` + rustdoc), `audit` (`cargo audit` on both lockfiles, engine and desktop), `build-test` (`cargo test --workspace`) matrix on ubuntu/macos/windows, `smoke` (release build of the binary, then end-to-end `run` and `run-experiment` on a generated fixture, ubuntu + windows), `sidecar-imports` (a real conda env per sidecar, matrixed, plus `pip-audit`), `smoke-cross-platform` (asserts the two platforms produced byte-identical `peptides.tsv` and `proteins.tsv`), `desktop` (the console's own workspace: fmt, clippy, unit tests, and a frontend/backend consistency check), `desktop-windows` (the console on Windows and its MSI, installed and uninstalled), `sidecars` (compileall + JSON/YAML parse + doc-reference check + generated-document freshness); on push-to-`main`, every PR, weekly, and on demand. The Rust jobs skip their steps when `ci/ci_scope.sh` finds nothing they check in the change |
-| `.github/workflows/release.yml` | Dormant until a `v*` tag; `validate-tag` gates on tag-equals-workspace-version, ancestry from `main` and a green `ci.yml` for that exact SHA, then builds three target binaries, smoke-tests each, unpacks each archive into a clean directory and runs that archive's own `ci/smoke.sh`, and attaches archives + `.sha256` to the Release. `workflow_dispatch` rehearses everything except the upload |
-| `.github/workflows/docker.yml` | Builds the image into the local daemon, smoke-tests it, then pushes to GHCR only on a `v*` tag; build-and-smoke-only on `workflow_dispatch` |
+| `.github/workflows/release.yml` | Dormant until a `v*` tag; `validate-tag` gates on tag-equals-workspace-version, ancestry from `main` and a green `ci.yml` for that exact SHA, then builds three target binaries, smoke-tests each, unpacks each archive into a clean directory and runs that archive's own `ci/smoke.sh`, builds the desktop installers and the image, and one `publish` job attaches every file to the Release once all built (docs/14 "Release workflow"). `workflow_dispatch` rehearses everything except the gate, the release and the image push |
+| `.github/workflows/docker.yml` | Builds the image into the local daemon, smoke-tests it, then pushes to GHCR only when `release.yml` calls it on a `v*` tag after its gate; build-and-smoke-only on a pull request touching the image inputs and on `workflow_dispatch` |
 | `.github/dependabot.yml` | Monthly grouped Cargo + GitHub Actions + Docker base-image updates; `arrow*`/`parquet*` grouped apart because they carry the on-disk contract. No `pip` entry: the Python pins live in the pip sections of the `env/` conda specifications, which Dependabot cannot parse |
 | `ci/check_doc_refs.py` | Fails when a tracked file cites a Markdown document the repository does not ship |
 | `ci/check_workflows.py` | Rejects workflow YAML GitHub would refuse, notably duplicate mapping keys, which PyYAML accepts silently and which only surface when a workflow is dispatched |
@@ -51,9 +51,9 @@ configurations in `configs/`, the container definition in `Dockerfile` +
 | `Dockerfile` | Two-stage image: Rust build stage + micromamba runtime with two sidecar envs |
 | `docker/config.dia.json` | Baked FASTA-digest config (MS2PIP + DeepLC + strict mokapot wired to in-image envs) |
 | `docker/config.diann-lib.json` | Baked library-input config (per-run RT calibration of the library iRT, no fine-tune; strict NnTorch through the torch-capable DeepLC env) |
-| `env/docker-rescore.yml` | Conda spec for the in-image `rescore` env (`python=3.11`, `mokapot==0.10.0` + `ms2pip==4.0.0.dev9`) |
+| `env/docker-rescore.yml` | Conda spec for the in-image `rescore` env (`python=3.11`, `mokapot==0.10.0` + `ms2pip==4.2.0`) |
 | `env/docker-deeplc.yml` | Conda spec for the in-image `deeplc` env (`python=3.11`, `torch==2.14.0+cpu` + `deeplc==4.5.0` from PyPI) |
-| `env/mumdia-rescore.yml` | Minimal host env for the default mokapot rescorer only (`python=3.12`, no torch/DeepLC/MS2PIP) |
+| `env/mumdia-rescore.yml` | Minimal host env for the mokapot rescorer only (`python=3.12`, no torch/DeepLC/MS2PIP) |
 | `env/mumdia-deeplc.yml` | Host env for the DeepLC, MS2PIP and nn_torch sidecars (`python=3.11`, `torch==2.14.0+cpu`, `deeplc==4.5.0`, `ms2pip==4.2.0`, `psm-utils`, `pyarrow`) |
 | `configs/examples/*.json` | Portable example configs (`native`, `fasta-sidecars`, `diann-library`), all using `"auto"` interpreters |
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | Sidecar subprocess clients + `resolve_script` path resolution |
@@ -125,8 +125,7 @@ resolver (`resolver = "2"`, `Cargo.toml:2`) and lists three members
 depends on `serde`/`serde_json`/`thiserror` only (no arrow/parquet, so the core
 types stay I/O-free); `mumdia-io` adds `arrow`/`parquet`/`blake3` over
 `mumdia-core`, plus `rayon` for its own parquet codec pool (parallel column
-encode and decode, `codec.rs`) and `bytes` for the coalescing `ChunkReader`
-(`span_cache.rs`); the `mumdia` bin+lib crate pulls the full set including
+encode and decode, `codec.rs`); the `mumdia` bin+lib crate pulls the full set including
 `clap`, `rayon`, `mzdata`, and `tracing`. The engine needs **no cmake and no system C libraries**, which is what the feature
 selection buys: `parquet` uses `default-features = false, features =
 ["arrow","snap","zstd"]` to drop the C zlib-ng backend that needs cmake, keeping the
@@ -381,13 +380,10 @@ _`mumdia`:_
 **Sidecar invocation contract.** `sidecar.rs` is a set of thin subprocess
 clients over a positional-CLI file contract: write an input Parquet, run
 `python <script> <args...>`, read an output Parquet keyed by id
-(`sidecar.rs:1-4`). `resolve_script` (`sidecar.rs:20`) finds a worker by trying
-the configured dir relative to CWD, then relative to the binary's own directory,
-then `<exe_dir>/scripts`, so a deployed binary locates its workers regardless of
-CWD. `python::resolve_script_dir` (`python.rs:372`) makes the same decision one
-level up, before any worker runs: it accepts the configured directory only if it
-actually holds a worker file, and otherwise tries the config file's own directory
-and the executable's directory, which is the layout of the release archive.
+(`sidecar.rs:1-4`). An absolute `sidecar_script_dir` is used as given; a relative
+one is tried against the config file's directory, then next to the executable, and
+the working directory last (`python::resolve_script_dir`, `sidecar::resolve_script`;
+configs/README.md, "Where the worker scripts have to be").
 `run_worker` (`sidecar.rs:233`) sets `PYTHONUTF8=1` and
 `PYTHONIOENCODING=utf-8` only when its `utf8` argument is set (the DeepLC calls)
 because Keras crashes on the Windows cp1252 console otherwise
@@ -404,13 +400,14 @@ things in order.
 
 1. The worker scripts. `predict_frag.sidecar_script_dir` is resolved through
    `python::resolve_script_dir` (`python.rs:372`), and every worker file each
-   needed role runs must exist. This check is skipped entirely when no role is
-   required, so a native configuration is not failed over a directory it never
-   opens. The previous version failed exactly that case, and a missing script
-   directory was the most common misconfiguration.
-2. One line per interpreter role, for all four roles (`Role::Rescore`,
-   `DeepLc`, `Ms2pip`, `Mbr`; `python.rs:35`). `mbr.python` was previously never
-   probed. A role that is neither required by the config nor explicitly named
+   role the run will use runs must exist: a required role, and a wanted one whose
+   interpreter resolved, such as DeepLC under the default `library_irt = auto`,
+   whose `deeplc_finetune.py` the default library search runs. This check is
+   skipped entirely when no role is in use, so a native configuration is not failed
+   over a directory it never opens. The previous version failed exactly that case,
+   and a missing script directory was the most common misconfiguration.
+2. One line per interpreter role (`Role::Rescore`, `DeepLc`, `Ms2pip`, `Peptdeep`,
+   `Im2deep`; `python.rs:35`). A role that is neither required by the config nor explicitly named
    prints `[skip]` and is not probed at all. An `"auto"` field is resolved by
    `python::discover` (`python.rs:245`) exactly as a run would resolve it, and the
    line states the provenance (configured, which environment variable, the
@@ -674,7 +671,7 @@ A pull request is diffed as its merge commit against the first parent (hence
 `fetch-depth: 2` on those checkouts), a push against `github.event.before`; a
 scheduled or dispatched run, or any run whose base cannot be established, does
 everything.
-`CI_SCOPE_FILES=$'docs/04_convert.md\nscripts/mbr_worker.py' bash ci/ci_scope.sh smoke`
+`CI_SCOPE_FILES=$'docs/04_convert.md\nscripts/nn_rescore_worker.py' bash ci/ci_scope.sh smoke`
 prints the decision for a list of paths. A path that belongs to no class is treated as
 the engine, so a new directory costs a full run until it is classified, never a skipped
 check.
@@ -768,7 +765,14 @@ requires the tag to equal the workspace version in `rust/mumdia/Cargo.toml`, the
 tagged commit to be an ancestor of `origin/main`, and `ci.yml` to have a successful
 run for that exact SHA. The last one is the substantive check: a tag push does not
 trigger `ci.yml`, so without it the only checks behind a release were `--version`,
-`--help` and `doctor`. The job is skipped for a rehearsal, which has no tag, so the
+`--help` and `doctor`. A tag pushed right after the merge arrives before
+main's `ci.yml` run has finished, or before it exists, so the gate polls the run list
+once a minute for up to an hour (no run yet, or a run not completed, means wait) and
+only then decides; the job's `timeout-minutes: 90` is the backstop. It also requires
+the desktop version (`desktop/src-tauri/Cargo.toml`; `tauri.conf.json` has none) to
+equal the tag, rebuilds both licence notices and the SBOM strictly, and runs
+`ci/cargo_audit.sh` strictly, because the audit is advisory on a pull request that
+touches no lockfile. The job is skipped for a rehearsal, which has no tag, so the
 build's condition allows exactly `success` or `skipped` -- not "anything but
 failure", because a cancelled gate is not a passed gate.
 
@@ -810,13 +814,52 @@ Every target then:
    target directory but not from a clean unpack. Because each runner executes its
    own architecture, it also gives macOS its first end-to-end coverage; the
    repository smoke job runs only on ubuntu and windows;
-5. uploads `*.tar.gz`, `*.zip` and `*.sha256` to the Release with
-   `generate_release_notes: true` (`release.yml:314`), or, on a rehearsal, uploads
-   them as a workflow artifact instead (`release.yml:332-333`).
+5. uploads `*.tar.gz`, `*.zip` and `*.sha256` as a workflow artifact, on a tag
+   and on a rehearsal alike. No build job writes to the release.
+
+The desktop installers (`desktop` job) are built with the pinned `tauri-cli`
+(`TAURI_CLI_VERSION`, the version `ci.yml`'s `desktop-windows` job tests), after a
+`cargo fetch --locked` that fails on a stale `desktop/Cargo.lock`. Besides the engine,
+uv and `scripts/`, they carry the licence notices under `binaries/`: `LICENSE`,
+`THIRD_PARTY_LICENSES.md` and `sbom.cdx.json` (the engine),
+`THIRD_PARTY_LICENSES-desktop.txt` (the application, generated by
+`ci/gen_third_party_licenses.py --desktop`, with the MPL-2.0 source notice), and
+`uv-LICENSE-MIT` / `uv-LICENSE-APACHE` fetched at the pinned `UV_VERSION` tag. Both
+bundle checks fail when one is missing.
+
+Only `publish` writes to the release, after every archive and installer built and
+verified: it downloads the artifacts, attaches them all, and writes the generated notes
+once. With no release for the tag it creates one; a draft it fills and publishes; a
+release that was already public it fills and lifts out of pre-release. That last case
+is `hold-release`: right after the gate, it marks a release published by hand as
+pre-release (with a marker comment in the body), so a failed build leaves a
+pre-release with no files rather than a half-filled "Latest". A pre-release made on
+purpose, without the marker, stays one. If a build fails, re-run the failed jobs;
+`publish` then runs with the rest.
+
+The container image is a job of the same workflow (`docker`, calling `docker.yml`
+after the gate), so a tag the gate refuses no longer pushes `:<tag>` and `:latest`.
+
+**Recommended release steps.**
+
+1. Bump `rust/mumdia/Cargo.toml` and `desktop/src-tauri/Cargo.toml` (and the
+   lockfiles), move `[Unreleased]` in `CHANGELOG.md`, and merge through a pull request.
+2. Wait for `ci.yml` on main to pass for the merge commit (the gate waits up to an
+   hour, but a red main fails it).
+3. Optional: rehearse with `gh workflow run release.yml --ref main` (no tag, nothing
+   is published; the archives and installers are workflow artifacts for 7 days).
+4. Save the GitHub release for the tag as a DRAFT with the title and any hand-written
+   text, or make none. Publishing it by hand before the tag also works (it is held as
+   pre-release until the files are attached), but a draft is never public half filled.
+   The notes `publish` writes replace the body either way.
+5. Push the tag alone: `git tag vX.Y.Z <merge commit> && git push origin vX.Y.Z`.
+6. Watch the `Release` run. `publish` attaches every file, writes the notes and
+   publishes the release; `docker` pushes the image.
 
 **Docker workflow.** `docker.yml` declares
-`permissions: contents: read, packages: write` (`docker.yml:19-21`), runs on `v*`
-tags and on manual `workflow_dispatch` (`docker.yml:14-17`), and builds
+`permissions: contents: read, packages: write`, runs when `release.yml` calls it
+after its tag gate (`workflow_call`), on a pull request that changes the image's
+inputs, and on manual `workflow_dispatch`, and builds
 `linux/amd64` only (`docker.yml:57`), so the published image is amd64. The order
 matters: it builds once with `load: true, push: false` into the local daemon
 (`docker.yml:52-63`) so the smoke test runs against exactly the image that will be
@@ -907,9 +950,9 @@ and defeat the staleness check.
 | `python::discover` | `python.rs:245` | `"auto"` interpreter discovery: role env var, `MUMDIA_PYTHON`, `CONDA_PREFIX`/`VIRTUAL_ENV`, `PATH`; accepts only if the modules import |
 | `python::resolve` | `python.rs:280` | Resolves every needed role before the config hash is taken, so the manifest records the interpreter that ran |
 | `python::resolve_script_dir` | `python.rs:372` | Picks the worker directory: configured, then the config file's directory, then the exe's directory |
-| `sidecar::resolve_script` | `sidecar.rs:20` | CWD/exe-dir/`scripts` path resolution for a single worker |
+| `sidecar::resolve_script` | `sidecar.rs:20` | exe-dir, `<exe_dir>/scripts`, then CWD path resolution for a single worker; an absolute dir is used as given |
 | `sidecar::run_worker` | `sidecar.rs:222` | Spawns `python <script> <args>`; forces UTF-8 I/O only when its `utf8` arg is set (DeepLC calls) |
-| `sidecar::run_deeplc_finetune` | `sidecar.rs:111` | Positional-CLI DeepLC multitask fine-tune; a known nondeterministic path (no torch/numpy seed) |
+| `sidecar::run_deeplc_finetune` | `sidecar.rs:111` | Positional-CLI DeepLC multitask fine-tune; seeded from `rng_seed` (`--seed`), but not bit-for-bit reproducible because of kernel nondeterminism |
 | `make_decoy` | `digest.rs:119` | Reverse or seeded-scramble decoy generation |
 | `collision_safe_decoy` | `digest.rs:155` | Retries scrambles until the decoy collides with no target/other decoy; drops the pair if none exists |
 | `splitmix64` | `digest.rs:177` | Deterministic PRNG for the scramble Fisher-Yates shuffle |
@@ -922,35 +965,16 @@ This area reads very little config directly; it mostly enforces config validity
 and wires interpreters. The config surface was recently pruned of dead fields, so
 do not reintroduce removed knobs. The fields relevant here:
 
-- `Config::validate` (`config.rs:1434`) rejects twelve combinations, all of which
-  the committed defaults pass. Six are strategy, gate or quantification footguns:
-  `digest.decoy.strategy = diann_shift` (threaded but realized nowhere; would
-  yield zero decoys and an invalid FDR, `config.rs:1436`);
-  `rt_im_train.calibration_method = none` (silently falls through to the linear
-  fit, `config.rs:1445`); `extract.retain_top_peaks = 0` (must be >= 1, where 1 is
-  the legacy single-apex behaviour, `config.rs:1452`); `extract.gate_min_score`
-  outside `[0,1]` or non-finite (0 disables the gate, `config.rs:1459`);
-  `quant.fixed_window_s` non-finite or negative (`config.rs:1468`); and
-  `quant.baseline_quantile` non-finite or outside its range
-  (`config.rs:1475`). Six guard the rescore contract: `rescore.folds < 2` (every
-  PSM needs an out-of-fold score, `config.rs:1482`); `rescore.num_iter = 0`
-  (`config.rs:1489`); `rescore.train_fdr` non-finite or outside `(0,1]`
-  (`config.rs:1494`); `mokapot`/`nn_torch` without `rescore.python`
-  (`config.rs:1502`); `percolator` (declared but not wired, `config.rs:1512`); and
-  `entrapment` without `rescore.entrapment_marker` (`config.rs:1519`).
-- `validate` also warns without failing in four cases (`config.rs:1528-1578`),
-  which is how the inert and mutually-exclusive fields announce themselves rather
-  than silently doing nothing: a non-default `mbr.rt_window_s`,
-  `mbr.decoy_transfer` or `mbr.requant_all` (all three marked NOT YET WIRED at
-  `config.rs:1207,1210,1217`); a non-`none` `mbr.strategy`, whose tiers are not
-  distinguished; `quant.fixed_window_s` and `quant.fixed_scan_halfwidth` both set,
-  where the seconds form wins; and `quant.baseline_subtract` without a fixed
-  window to subtract inside.
+- `Config::validate` rejects the parameter combinations that would run but
+  produce a wrong or meaningless result (for example `rescore.folds < 2`, or an
+  external classifier without `rescore.python`), and warns without failing for
+  inert or mutually exclusive fields. The committed defaults pass it. The list
+  grows with the config; read `Config::validate` itself, or docs/24 for each
+  key's constraints, rather than a count here.
 - `apply_profile("dia")` sets `features.set = Extended`,
   `extract.apex_count_window = "auto"` (0), `extract.apex_rt_prior_s = 120.0`. Any
   other name is an error.
-- Deserialization uses `#[serde(deny_unknown_fields)]` throughout `config.rs` (20
-  occurrences), so an unknown or misspelled key is a hard load error rather than a
+- Deserialization uses `#[serde(deny_unknown_fields)]` throughout `config.rs`, so an unknown or misspelled key is a hard load error rather than a
   silently-ignored no-op (tested at `config.rs:1722`). This is also what makes
   `shipped_configs_parse` (`config.rs:1651`) a real check on every config the
   repository ships, and why the CI JSON-parse step is only a syntax floor beneath
@@ -961,9 +985,11 @@ do not reintroduce removed knobs. The fields relevant here:
   actually ran rather than the word `auto`. That makes the config hash
   machine-specific for an `"auto"` config, which is correct: two runs whose
   rescorer came from different environments are not the same configuration.
-- The Docker default rescorer model is selected by the env var
-  `MUMDIA_RESCORE_MODEL=logreg` baked at `Dockerfile:57`; the NN worker also reads
-  `MUMDIA_NN_SEEDS` (`scripts/nn_rescore_worker.py:42`).
+- The Docker image selects the mokapot model through the env var
+  `MUMDIA_RESCORE_MODEL=logreg` in the `Dockerfile`. The NN worker's seed count,
+  folds and rounds come from `rescore.seeds`, `rescore.folds` and
+  `rescore.num_iter`: the engine sets `MUMDIA_NN_SEEDS`, `MUMDIA_NN_FOLDS` and
+  `MUMDIA_NN_ITERS` from them and overwrites any exported value.
 - Both `docker/*.json` configs open with the same DIA preset written out
   explicitly (`features.set = extended`, `extract.apex_rt_prior_s = 120.0`), matching
   `apply_profile("dia")`. They leave `extract.apex_count_window` at its `"auto"`
@@ -980,8 +1006,8 @@ do not reintroduce removed knobs. The fields relevant here:
 - `docker/config.diann-lib.json` (library-input path) does NOT set
   `predictor`/`rt_predictor` (fragment intensities + iRT come from the imported
   library), configures only `deeplc_python` + `sidecar_script_dir` for the
-  optional iRT fine-tune, and additionally sets `rt_im_train.finetune_deeplc =
-  true` and `rt_im_train.rt_window_multiplier = 1.5`. It selects `nn_torch` using
+  library iRT re-prediction and the multi-head calibration, and additionally sets
+  `rt_im_train.finetune_deeplc = false` and `rt_im_train.rt_window_multiplier = 1.5`. It selects `nn_torch` using
   the torch-capable `/opt/conda/envs/deeplc/bin/python` and sets
   `rescore.strict = true`.
 - `configs/examples/{native,fasta-sidecars,diann-library}.json` are the portable
@@ -1017,9 +1043,9 @@ floats are summed (for example the digest stats use a `BTreeMap`,
 **Known nondeterministic paths (opt-in only).** Two paths are explicitly
 nondeterministic and are never on the default path. The DeepLC multitask
 fine-tune (`scripts/deeplc_finetune.py`, invoked by `sidecar::run_deeplc_finetune`
-at `sidecar.rs:111`) sets no torch/numpy seed. The PyTorch NN rescorer
+at `sidecar.rs:111`) is seeded from `rng_seed` (`--seed`), but not bit-for-bit reproducible because of kernel nondeterminism. The PyTorch NN rescorer
 (`scripts/nn_rescore_worker.py`) is only approximately reproducible; its own
-header says so (`nn_rescore_worker.py:29-30`) and offers `MUMDIA_NN_SEEDS>1` to
+header says so. `rescore.seeds > 1` (passed as `MUMDIA_NN_SEEDS`) is offered to
 ensemble seeds and average out-of-fold scores as mitigation. Enabling either
 breaks byte-reproducibility of the run; that is a known and accepted trade for the
 identification gain.

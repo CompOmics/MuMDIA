@@ -398,7 +398,7 @@ worker is `deeplc_finetune.py --no-finetune` (docs/13), so every row is predicte
 decoy gets its own) and rows with non-standard residues keep the imported value, exactly as
 under a fine-tune. Both label populations must move to the new scale together: a table whose
 targets carry DeepLC values and whose decoys keep the imported iRT is not exchangeable and
-its decoy-based q is invalid. This is the reason DeepLC 4.1.1 is the engine's floor: the default path calibrates
+its decoy-based q is invalid. This is the reason the engine has a DeepLC floor (4.5.0 today): the default path calibrates
 base-model predictions and 4.0.0a2's base model memorised anchors.
 
 HYE B01 (`LFQ_Orbitrap_AIF_Condition_B_Sample_Alpha_01`, 10.9M-row imported library, fast
@@ -612,7 +612,9 @@ experiment: 1.4x wall clock on AIF and 1.7x on Astral when every run pays it.
 Since 2026-09-14 it does not have to. `experiment.rt_library_scope` (default
 `first_run_only`, formerly `finetune_scope`) governs multi-head exactly as it already
 governed the fine-tune: the first run adapts the library, the rest reuse it and fit their
-own LOESS on top. What a shared library fixes is elution ORDER, which replicate injections
+own LOESS on top. When the first run's seed is short of the anchors the multi-head
+calibration needs (a blank, a failed injection), the first run whose seed has them adapts
+for every run instead, the first included. What a shared library fixes is elution ORDER, which replicate injections
 on one method share; a batch that genuinely reorders -- different gradients or columns, a
 method change part-way -- wants `per_run`, and so does a long batch where drift
 accumulates. The fine-tune's measured cost of sharing is the guide until the multi-head
@@ -984,8 +986,8 @@ a 2D-correlation floor of 0.556 (first pass 1.31, 0.82 and 0.519), under which 7
 anchors' fragments belong, 20.8% are interfered and 0.1% are absent. The entrapment-library
 run learns 1.10, 0.68 and 0.578.
 
-**The deconvolution tolerance** (`deconvolution`, only under `extract.q1_deconvolved` or
-`features.q1_deconvolved`, which read it; docs/09_extract.md, section 14). For at most 3,000
+**The deconvolution tolerance** (`deconvolution`, only under `features.q1_deconvolved`, which
+reads it; docs/09_extract.md, section 14). For at most 3,000
 anchors and 3,000 decoy seed PSMs (each one per candidate at its best scan, every k-th), the
 full peak lists of the seed scan's cycle in the steps within the window's reach plus six
 either side of the expected centre are read, every peak is given its trace's Q1 centroid
@@ -1302,10 +1304,10 @@ pools are capped at the physical cores available to the process
 resolved numbers are recorded under `torch_threads` in `<lib_out>.summary.json`. The
 worker also accepts standalone-only flags the engine never sets, so they take their
 defaults: `--device {cpu,cuda}` (cuda sidesteps the CPU OpenMP crash entirely),
-`--threads`, `--max-ref`, `--predict-limit`, and `--skip-predict`.
+`--threads` and `--max-ref`.
 
-The fine-tune sets no torch/numpy seed, so it is nondeterministic across runs
-(CLAUDE.md notes this). Its main use is library-input mode, where the base iRT is
+The fine-tune is seeded from `rng_seed` (`--seed`), but not bit-for-bit
+reproducible because of kernel nondeterminism, so it can differ across runs. Its main use is library-input mode, where the base iRT is
 the imported library value rather than a native or DeepLC prediction and is often
 too coarse for a tight RT window.
 
@@ -1518,9 +1520,10 @@ though the enum variant still exists.
   CLAUDE.md's determinism rule (ordered iteration where floats are summed); do not
   reintroduce a `.values()`-order reduction. The test
   `anchor_vectors_are_sorted_by_base_peptide_id` (rt_im_train.rs:360-375) guards it.
-- **The fine-tune is explicitly nondeterministic.** `deeplc_finetune.py` sets no
-  torch/numpy seed (CLAUDE.md), so `finetune_deeplc = true` makes `predicted_irt`,
-  and therefore the whole run, non-reproducible. Treat it as an accuracy lever, not
+- **The fine-tune is not reproducible.** `deeplc_finetune.py` is seeded from
+  `rng_seed` (`--seed`), but not bit-for-bit reproducible because of kernel
+  nondeterminism, so `finetune_deeplc = true` makes `predicted_irt`, and therefore
+  the whole run, non-reproducible. Treat it as an accuracy lever, not
   a deterministic default.
 - **`slope`/`intercept` are emitted in `cal.json` whenever calibration is available,
   including under LOESS** (rt_im_train.rs:128, 286-287, 313-314). Under LOESS they

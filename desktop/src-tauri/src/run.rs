@@ -588,8 +588,7 @@ pub fn kill_tree(pid: u32) {
 
 /// The process-group id of `pid`, via `ps`, or `None` if it cannot be determined.
 ///
-/// Shelling out rather than calling `getpgid`, which would need `unsafe` in a crate
-/// that has none. This runs twice per cancellation, not in a loop.
+/// Shelling out rather than calling `getpgid`, which would need `unsafe`. This runs twice per cancellation, not in a loop.
 #[cfg(unix)]
 fn pgid_of(pid: u32) -> Option<u32> {
     let out = std::process::Command::new("ps")
@@ -671,7 +670,7 @@ fn argv(req: &Request) -> Result<Vec<String>, String> {
     // this refuses the invalid state rather than letting clap report it.
     if !req.experiment && req.mzml.len() > 1 {
         return Err(format!(
-            "{} files were given for a single search. Either search them separately,              which runs one search per file, or choose a pooled experiment.",
+            "{} files were given for a single search. Either search them separately, \n             which runs one search per file, or choose a pooled experiment.",
             req.mzml.len()
         ));
     }
@@ -842,6 +841,11 @@ pub fn needs_no_sidecar(engine: &Path, config: Option<&str>) -> Result<bool, Str
 
 /// Start a search. Returns immediately with a handle; progress arrives by polling.
 pub fn start(id: String, req: Request) -> Result<Arc<Run>, String> {
+    // A relative folder resolves against the working directory, which for a batch without
+    // a results folder was the drive root (`/01_<stem>`).
+    if !Path::new(&req.out_dir).is_absolute() {
+        return Err("choose a folder for the results".into());
+    }
     let args = argv(&req)?;
     let (exe, _source) = engine::resolve()?;
 
@@ -898,26 +902,19 @@ pub fn start(id: String, req: Request) -> Result<Arc<Run>, String> {
     run.set(|s| s.status = "running".into());
 
     // stderr carries the log; stdout carries result summaries. Both are shown.
-    for (stream, tag) in [
-        (
-            child
-                .stderr
-                .take()
-                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
-            "",
-        ),
-        (
-            child
-                .stdout
-                .take()
-                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
-            "",
-        ),
+    for stream in [
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
     ] {
         let Some(stream) = stream else { continue };
         let run = Arc::clone(&run);
         let run_log = run_log.clone();
-        let _ = tag;
         std::thread::spawn(move || {
             // Lossy and to the end of the stream: the engine's Python workers inherit
             // these pipes, and a line that is not UTF-8 (a cp1252 path) used to end the
@@ -1540,6 +1537,19 @@ mod tests {
             threads: None,
             build_library: false,
             ion_mobility: None,
+        }
+    }
+
+    #[test]
+    fn a_search_without_an_absolute_results_folder_is_refused() {
+        for out in ["out", "01_sample"] {
+            let r = Request {
+                out_dir: out.into(),
+                ..req()
+            };
+            let err = start("t".into(), r).err().expect("refused");
+            assert_eq!(err, "choose a folder for the results");
+            assert!(!Path::new(out).exists());
         }
     }
 

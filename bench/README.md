@@ -141,6 +141,8 @@ taken on the raw imported library before the augmented tables,
 
 #### A/B: `extract.apex_evidence_rank`, the promoted default
 
+`false` was removed in 0.15.0 on this measurement and the HYE one below; it is refused.
+
 Both arms reuse ONE set of upstream artifacts from the run above -- same spectra,
 same seed PSMs and mass calibration, same DeepLC-fine-tuned library, same RT windows
 -- so the apex change is isolated from DeepLC draw variance, which alone has moved

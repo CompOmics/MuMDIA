@@ -1,18 +1,18 @@
-//! Experiment-wide orchestrator `mumdia run-experiment`: run the per-file search
-//! chain over N runs, then a single experiment-wide rescore, optional rescuable
-//! match-between-runs transfer, a by-run split, per-run quantification, and
-//! cross-run LFQ. This reifies the multi-run flow that was previously a manual
-//! script sequence, keeping the rescuable-tier MBR first-class.
+//! Experiment-wide orchestrator `mumdia run-experiment`: every run's search chain, one
+//! experiment-wide rescore, by default a second pass that searches every run again on the
+//! empirical library of that pooled first pass (`mbr.strategy = second_pass`), then a by-run
+//! split, per-run quantification and cross-run LFQ.
 //!
 //! The library is built or imported once and shared. Each run gets its own retention-time
 //! calibration, its own extraction (chromatograms kept for quantification), and its own
 //! competed table. The competed tables of all runs feed one rescore so the classifier and
 //! FDR are experiment-wide.
 //!
-//! The DeepLC fine-tune defaults to running ONCE, on the first run, with every other run
-//! reusing that library and fitting its own calibration against it
-//! (`experiment.finetune_scope`). It is the most expensive step of a large experiment, and
-//! per-run weight adaptation buys little once each run is calibrated separately.
+//! The library's retention-time adaptation (the multi-head calibration, or the fine-tune)
+//! runs ONCE by default, on the first run whose seed has the anchors for it, and every other
+//! run reuses that library and fits its own calibration on it (`experiment.rt_library_scope`).
+//! It is the most expensive step of a large experiment, and adapting per run buys little once
+//! each run is calibrated separately.
 
 use std::time::Instant;
 
@@ -114,7 +114,6 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
             cfg.predict_frag.deeplc_python.as_deref(),
         ),
         ("rescore.python", cfg.rescore.python.as_deref()),
-        ("mbr.python", cfg.mbr.python.as_deref()),
     ] {
         if let Some(exe) = path {
             if crate::python::interpreter_missing(exe) {
@@ -185,6 +184,80 @@ struct SecondPassOut {
     has_im: bool,
 }
 
+/// The experiment's scored table and its hash: under a second pass that applied, the rescore
+/// of its competed tables, with the second pass's chromatograms that its candidate ids (the
+/// empirical library's) index; otherwise the first pass, copied up from `first_pass/` under
+/// a second pass that did not apply, whose chromatograms stay the first pass's (`None`).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn second_pass_result(
+    cfg: &Config,
+    ch: &str,
+    out_dir: &str,
+    second: &mut Option<SecondPassOut>,
+    second_pass_on: bool,
+    first_scored: &str,
+    first_written: Written,
+    shadow_windows: &[String],
+    n_runs: usize,
+) -> Result<(String, Written, Option<Vec<Vec<ChromTable>>>)> {
+    let d = |name: &str| format!("{out_dir}/{name}");
+    match second {
+        Some(sp) => {
+            let scored = d("scored_combined.parquet");
+            // `mbr.second_pass_prefilter_keep_decoys`, when set, is this rescore's prefilter.
+            let second_rescore = cfg.second_pass_rescore();
+            if cfg.mbr.second_pass_prefilter_keep_decoys.is_some() {
+                info!(
+                    keep_decoys = second_rescore.prefilter_keep_decoys,
+                    first_pass = cfg.rescore.prefilter_keep_decoys,
+                    "run-experiment: second-pass rescore prefilter from \
+                     mbr.second_pass_prefilter_keep_decoys"
+                );
+            }
+            let written = rescore::run_hashed(rescore::RescoreParams {
+                competed: &sp.competed,
+                sources: None,
+                out: &scored,
+                work_dir: &rescore::sidecar_work_dir(&d("sidecar_work")),
+                script_dir: &cfg.predict_frag.sidecar_script_dir,
+                cfg: &second_rescore,
+                config_hash: ch,
+                // The second pass's own extracted rows: its candidate ids are the empirical
+                // library's, not the first pass's.
+                shadow: Some(
+                    crate::stages::shadow::ShadowInputs::new(&sp.library.fragments, shadow_windows)
+                        .with_psms_extracted(&sp.psms_extracted),
+                ),
+            })?;
+            // The second pass against the first: logged always, and written to
+            // `empirical_library.json` on an experiment with ion mobility.
+            let diag = second_pass::diagnose(&sp.library, &scored, n_runs)?;
+            if sp.has_im {
+                second_pass::record_diagnostics(&mut sp.library, diag)?;
+            }
+            let chroms = sp.chroms.iter().map(|c| vec![c.clone()]).collect();
+            Ok((scored, written, Some(chroms)))
+        }
+        // The experiment's `scored_combined.parquet` is the result either way: the first pass,
+        // copied up from `first_pass/` with its report when the second pass did not apply.
+        None if second_pass_on => {
+            let scored = d("scored_combined.parquet");
+            for (src, dst) in [
+                (first_scored.to_string(), scored.clone()),
+                (
+                    format!("{first_scored}.report.json"),
+                    format!("{scored}.report.json"),
+                ),
+            ] {
+                std::fs::copy(&src, &dst)
+                    .with_context(|| format!("copying the first pass {src} to {dst}"))?;
+            }
+            Ok((scored, first_written, None))
+        }
+        None => Ok((first_scored.to_string(), first_written, None)),
+    }
+}
+
 /// The first pass's `w_im` of a run, from its `cal.json`: `None` for a run without one (every
 /// 3D run) or with a non-finite one.
 fn first_pass_w_im(cal: &str) -> Option<f64> {
@@ -236,6 +309,12 @@ fn second_pass_trace_pad(cfg: &Config, run: &str) -> Option<extract::TracePad> {
 ///   flanks of an apex near its edge.
 ///
 /// Retrace runs here as in the first pass (`finish_run` with `retrace` on).
+///
+/// `plan` is the first pass's run plan. `uncut` is that plan from before the first pass cut
+/// it to one chain at a time for the chains' own DeepLC workers
+/// (`sched::one_at_a_time_for_sidecars`): the second pass starts none, so it then runs its
+/// first run alone, bounds the rest by its peak (`sched::run_first_alone`), and leaves that
+/// plan in `plan` for quant.
 #[allow(clippy::too_many_arguments)]
 fn search_second_pass(
     cfg: &Config,
@@ -246,7 +325,8 @@ fn search_second_pass(
     names: &[String],
     run_dirs: &[String],
     out: &str,
-    plan: &crate::sched::RunConcurrency,
+    plan: &mut crate::sched::RunConcurrency,
+    uncut: Option<crate::sched::RunConcurrency>,
     par: usize,
 ) -> Result<Option<SecondPassOut>> {
     // The first pass's extracted rows, by source, for the consensus 1/K0.
@@ -331,7 +411,20 @@ fn search_second_pass(
         )
     };
     let all: Vec<usize> = (0..n).collect();
-    let done: Vec<(String, String)> = if plan.is_auto() {
+    let done: Vec<(String, String)> = if let Some(uncut) = uncut {
+        crate::sched::run_first_alone(
+            uncut,
+            rayon::current_num_threads(),
+            "run-experiment",
+            "the first run's second pass",
+            &all,
+            one,
+            |p, rest| {
+                *plan = p;
+                p.map_pooled(rest, one)
+            },
+        )?
+    } else if plan.is_auto() {
         plan.map_pooled(&all, one)?
     } else {
         let mut done = Vec::with_capacity(n);
@@ -394,17 +487,19 @@ fn count_decoys(tables: &[String]) -> Result<u64> {
     Ok(n)
 }
 
-/// The per-run search chain: convert -> seed -> optional fine-tune -> rt-cal ->
-/// extract -> features -> compete. The chromatograms are kept for the later per-run
-/// quantification.
-/// `shared_ft` is a precursor library that has ALREADY been
-/// DeepLC-fine-tuned (by an earlier run of this same experiment); when present this run
-/// uses it as-is instead of fine-tuning again, and still fits its own retention-time
-/// calibration on top. Returns `(competed, chromatograms, fine_tuned_library_if_produced)`,
-/// where `competed` is the run's competed tables in row order: one, or a grouped run's band
-/// tables when its pooled table was not written (`groups.pool_competed = false`).
+/// One grouped run's whole chain (`groups.window_groups > 1`): convert, then seed,
+/// calibration, extract, features and compete one isolation-window group at a time, with the
+/// pooled competed table and chromatograms under the names the pooled stages below read,
+/// exactly as in the single-run orchestrator. An ungrouped run is converted and seeded with
+/// the others and continues in [`chain_after_seed`].
+///
+/// `shared_rt_lib` is an earlier grouped run's `groups/` directory whose adapted bands this
+/// run reuses (`experiment.rt_library_scope = first_run_only`). Returns `(competed,
+/// chromatograms, this run's groups/ directory)`, where `competed` is the run's competed
+/// tables in row order: one, or the band tables when its pooled table was not written
+/// (`groups.pool_competed = false`).
 #[allow(clippy::too_many_arguments)]
-fn process_run(
+fn process_grouped_run(
     cfg: &Config,
     ch: &str,
     lib_p_base: &str,
@@ -412,6 +507,8 @@ fn process_run(
     // Whether the experiment was given a library rather than a FASTA. Only the caller
     // knows, and the multi-head default is scoped on it.
     library_input: bool,
+    // `RtImTrainConfig::multihead_heads`, resolved once by the caller.
+    mh_heads: usize,
     mzml: &str,
     out: &str,
     top_peaks_ms2: usize,
@@ -424,56 +521,47 @@ fn process_run(
     // `lib_p_base` carries placeholder iRT the multi-head calibration must replace in full
     // (`predict_frag.defer_deeplc_to_multihead`).
     irt_placeholder: bool,
-    // The experiment's base-model re-prediction of an imported library (`chain::BaseIrt`).
-    base_irt: Option<&chain::BaseIrt>,
 ) -> Result<(Vec<String>, Vec<ChromTable>, Option<String>)> {
+    debug_assert!(cfg.groups.window_groups > 1);
     let co = convert_run(cfg, mzml, out, top_peaks_ms2, max_spectra, library_input)?;
-    let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
-    let mh_heads = cfg
-        .rt_im_train
-        .multihead_heads(has_deeplc, cfg.deeplc_rt_source(library_input, has_deeplc));
-    // Grouped: seed, calibration, extract, features and compete happen one isolation-window
-    // group at a time, and the pooled competed table and chromatograms come back under the
-    // names the pooled stages below read, exactly as in the single-run orchestrator. The
-    // third return value is then this run's `groups/` directory rather than an adapted
-    // library, which is what `experiment.rt_library_scope = first_run_only` hands to the
-    // runs that follow (`shared_rt_lib` here).
-    if cfg.groups.window_groups > 1 {
-        let pooled = crate::stages::run_groups::run(crate::stages::run_groups::GroupRun {
-            cfg,
-            config_hash: ch,
-            converted: &co,
-            lib_precursors: lib_p_base,
-            lib_fragments: lib_f,
-            out_dir: out,
-            man: None,
-            shared_bands: shared_rt_lib,
-            mh_heads,
-            library_input,
-            library_irt_repredicted,
-            slices_from,
-            irt_placeholder,
-        })?;
-        return Ok((
-            pooled.competed,
-            pooled.chromatograms,
-            Some(format!("{out}/groups")),
-        ));
-    }
-    let seed = seed_run(cfg, lib_p_base, lib_f, &co, out, None)?;
-    chain_after_seed(
+    let pooled = crate::stages::run_groups::run(crate::stages::run_groups::GroupRun {
         cfg,
-        ch,
-        lib_p_base,
-        lib_f,
+        config_hash: ch,
+        converted: &co,
+        lib_precursors: lib_p_base,
+        lib_fragments: lib_f,
+        out_dir: out,
+        man: None,
+        shared_bands: shared_rt_lib,
+        mh_heads,
         library_input,
-        &co,
-        out,
-        &seed,
-        shared_rt_lib,
+        library_irt_repredicted,
+        slices_from,
         irt_placeholder,
-        base_irt,
-    )
+    })?;
+    Ok((
+        pooled.competed,
+        pooled.chromatograms,
+        Some(format!("{out}/groups")),
+    ))
+}
+
+/// The run that adapts the library's retention times for the others under
+/// `rt_library_scope = first_run_only`, from the runs' seeds in run order: the first one on
+/// which the multi-head calibration would not be skipped for want of anchors
+/// (`rt_im_train::plan_anchors`), so that a short first run (a blank, a failed injection)
+/// does not leave every run to adapt its own. `None` when no seed has the anchors.
+fn adapting_run<'s>(
+    cfg: &Config,
+    mh_heads: usize,
+    seeds: impl IntoIterator<Item = &'s str>,
+) -> Result<Option<usize>> {
+    for (i, seed) in seeds.into_iter().enumerate() {
+        if mh_heads == 0 || rt_im_train::plan_anchors(seed, &cfg.rt_im_train)?.sufficient {
+            return Ok(Some(i));
+        }
+    }
+    Ok(None)
 }
 
 /// Convert one run's mzML (or vendor file) into `<out>/spectra`.
@@ -550,7 +638,8 @@ fn chain_after_seed(
     ch: &str,
     lib_p_base: &str,
     lib_f: &str,
-    library_input: bool,
+    // `RtImTrainConfig::multihead_heads`, resolved once by the caller.
+    mh_heads: usize,
     co: &convert::ConvertOutputs,
     out: &str,
     seed: &str,
@@ -558,10 +647,6 @@ fn chain_after_seed(
     irt_placeholder: bool,
     base_irt: Option<&chain::BaseIrt>,
 ) -> Result<(Vec<String>, Vec<ChromTable>, Option<String>)> {
-    let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
-    let mh_heads = cfg
-        .rt_im_train
-        .multihead_heads(has_deeplc, cfg.deeplc_rt_source(library_input, has_deeplc));
     let adapted = chain::adapt_rt_library(chain::AdaptParams {
         cfg,
         config_hash: ch,
@@ -1171,7 +1256,7 @@ fn resolve_conditions(
 
 /// Each run's condition as an index, in order of first appearance, for the grouped size
 /// factors of `quant.normalisation_scope = condition`.
-fn condition_groups(conditions: &[Option<String>]) -> Vec<usize> {
+pub fn condition_groups(conditions: &[Option<String>]) -> Vec<usize> {
     let mut seen: Vec<&str> = Vec::new();
     conditions
         .iter()
@@ -1221,7 +1306,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     //
     // The old `_ =>` arm swallowed any count mismatch with no warning, and accepted
     // duplicates outright. Duplicates are the dangerous half: two runs then share
-    // `d(&names[i])`, so above one parallel run two `process_run` calls concurrently
+    // `d(&names[i])`, so above one parallel run two run chains concurrently
     // write the same spectra_ms2 / seed_psms / psms_extracted / chromatograms into one
     // directory, and the split and quant paths collide too. The output is an interleaving
     // of two runs with no error anywhere. Reachable by naming runs after their basenames
@@ -1468,7 +1553,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     };
 
     // --- per-run search chains ---
-    // Runs are independent: `process_run` derives every path from its own per-run output
+    // Runs are independent: a run's chain derives every path from its own per-run output
     // directory, so nothing is shared between them. Concurrency is OPT-IN and bounded
     // because each run's extract can hold tens of GB -- running all 83 files of an
     // experiment at once would exhaust memory long before it saturated the CPU.
@@ -1499,7 +1584,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
              16 threads at most, each in a pool of its own)"
         );
     }
-    // Each run's competed tables, in row order (see `process_run`).
+    // Each run's competed tables, in row order (see `process_grouped_run`).
     let mut competed: Vec<Vec<String>> = Vec::with_capacity(n_runs);
     // Each run's chromatogram tables, in row order: one, or a grouped run's band tables
     // (`groups.pool_chromatograms = false`).
@@ -1519,16 +1604,14 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // fine-tune, which has been shareable all along: what a shared library fixes is elution
     // ORDER, which replicate injections on one method share. A batch that genuinely
     // reorders wants `per_run`.
-    // Resolved exactly as `process_run` resolves it, so the decision to process the first
+    // Resolved once and handed to every run's chain, so the decision to process the first
     // run alone matches what that run will actually do.
-    let has_deeplc_for_scope = cfg.predict_frag.deeplc_python.is_some();
-    let deeplc_rt_source_for_scope =
-        cfg.deeplc_rt_source(p.lib_precursors.is_some(), has_deeplc_for_scope);
-    let adapts_rt_library = cfg.rt_im_train.finetune_deeplc
-        || cfg
-            .rt_im_train
-            .multihead_heads(has_deeplc_for_scope, deeplc_rt_source_for_scope)
-            > 0;
+    let library_input = p.lib_precursors.is_some();
+    let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
+    let mh_heads = cfg
+        .rt_im_train
+        .multihead_heads(has_deeplc, cfg.deeplc_rt_source(library_input, has_deeplc));
+    let adapts_rt_library = cfg.rt_im_train.finetune_deeplc || mh_heads > 0;
     // A grouped run adapts its bands rather than one library table, and shares them the
     // same way: the first run's `groups/` directory is what the rest reuse.
     let share_ft = adapts_rt_library
@@ -1561,11 +1644,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // `auto` decides only after run 1's seed, so it keeps the overlap: when it chooses the
     // bootstrap, that pass runs on the adaptation's thread share beside the fronts. It
     // chooses it on runs short of seed anchors, which are the small ones.
-    let mh_heads_for_scope = cfg
-        .rt_im_train
-        .multihead_heads(has_deeplc_for_scope, deeplc_rt_source_for_scope);
-    let search_anchors = rt_bootstrap::always(cfg, mh_heads_for_scope);
-    rt_bootstrap::warn_if_inert(cfg, mh_heads_for_scope, "run-experiment");
+    let search_anchors = rt_bootstrap::always(cfg, mh_heads);
+    rt_bootstrap::warn_if_inert(cfg, mh_heads, "run-experiment");
     if cfg.extract.emit_candidate_audit {
         warn!(
             "run-experiment: extract.emit_candidate_audit has no effect here: the candidate \
@@ -1601,7 +1681,6 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // stages of different runs execute changes. A grouped run seeds band by band against
     // band libraries and keeps its own chain. The overlapped experiment orders its own
     // phases (below), so it skips these.
-    let library_input = p.lib_precursors.is_some();
     let prepared: Vec<Option<(convert::ConvertOutputs, String)>> = if grouped_runs || overlapped {
         (0..n_runs).map(|_| None).collect()
     } else {
@@ -1702,7 +1781,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 &ch,
                 &lib_p_base,
                 &lib_f,
-                library_input,
+                mh_heads,
                 co,
                 &d(&names[i]),
                 seed,
@@ -1710,12 +1789,13 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 irt_placeholder,
                 base_irt.as_ref(),
             ),
-            None => process_run(
+            None => process_grouped_run(
                 cfg,
                 &ch,
                 &lib_p_base,
                 &lib_f,
                 library_input,
+                mh_heads,
                 &p.mzmls[i],
                 &d(&names[i]),
                 p.top_peaks_ms2,
@@ -1724,7 +1804,6 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 library_irt_repredicted,
                 slices_from,
                 irt_placeholder,
-                base_irt.as_ref(),
             ),
         }
     };
@@ -1736,27 +1815,19 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     let mut first_window: Option<crate::sched::PeakWindow> = None;
     // What that window measured, for the log.
     let mut first_step = "the first run's chain";
-    // The first run's adapted library when only its adaptation ran alone and its finish
-    // joins the other runs' chains (below).
-    let mut first_lib: Option<String> = None;
+    // The run whose adaptation the others reuse under `first_run_only` (`adapting_run`).
+    let mut adapting = 0;
+    // The automatic plan from before the chains were cut to one at a time for their DeepLC
+    // workers, for the second pass, which starts none (`search_second_pass`).
+    let mut uncut: Option<crate::sched::RunConcurrency> = None;
+    // The adapting run's chain when it ran alone above: (run, competed, chromatograms).
+    let mut alone: Option<(usize, Vec<String>, Vec<ChromTable>)> = None;
     if overlapped {
         // Run 1's front, then its RT adaptation beside the fronts of runs 2..N on disjoint
         // thread budgets, then every run's rest on the whole pool.
         let total = rayon::current_num_threads();
         let front_threads = overlap.min(total.saturating_sub(1)).max(1);
         let adapt_threads = total.saturating_sub(front_threads).max(1);
-        let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
-        let mh_heads = cfg
-            .rt_im_train
-            .multihead_heads(has_deeplc, cfg.deeplc_rt_source(library_input, has_deeplc));
-        info!(
-            run = %names[0],
-            n = n_runs,
-            front_threads,
-            adapt_threads,
-            "run-experiment: converting and seeding the other runs while the first adapts \
-             the library's retention times (experiment.overlap_front_threads)"
-        );
         let out0 = d(&names[0]);
         let co0 = convert_run(
             cfg,
@@ -1767,8 +1838,28 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             library_input,
         )?;
         let seed0 = seed_run(cfg, &lib_p_base, &lib_f, &co0, &out0, None)?;
+        // A first run short of seed anchors does not adapt beside the fronts: they take every
+        // thread, and the first of them whose seed has anchors adapts after them.
+        let adapt0 = adapting_run(cfg, mh_heads, [seed0.as_str()])?.is_some();
+        if adapt0 {
+            info!(
+                run = %names[0],
+                n = n_runs,
+                front_threads,
+                adapt_threads,
+                "run-experiment: converting and seeding the other runs while the first adapts \
+                 the library's retention times (experiment.overlap_front_threads)"
+            );
+        } else {
+            warn!(
+                run = %names[0],
+                "run-experiment: the first run's seed has too few anchors to adapt the \
+                 library's retention times; converting and seeding the other runs first, to \
+                 adapt it on the first of them that has enough"
+            );
+        }
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(front_threads)
+            .num_threads(if adapt0 { front_threads } else { total })
             .build()
             .context("building the thread pool for the overlapped runs")?;
         // Set when run 1's RT adaptation fails: the fronts of runs 2..N then stop before
@@ -1846,21 +1937,23 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 }
                 r
             });
-            let adapted = chain::adapt_rt_library(chain::AdaptParams {
-                cfg,
-                config_hash: &ch,
-                lib_p_base: &lib_p_base,
-                lib_f: &lib_f,
-                converted: &co0,
-                seed: &seed0,
-                out_dir: &out0,
-                mh_heads,
-                shared_rt_lib: None,
-                irt_placeholder,
-                threads: adapt_threads,
-                base_irt: base_irt.as_ref(),
+            let adapted = adapt0.then(|| {
+                chain::adapt_rt_library(chain::AdaptParams {
+                    cfg,
+                    config_hash: &ch,
+                    lib_p_base: &lib_p_base,
+                    lib_f: &lib_f,
+                    converted: &co0,
+                    seed: &seed0,
+                    out_dir: &out0,
+                    mh_heads,
+                    shared_rt_lib: None,
+                    irt_placeholder,
+                    threads: adapt_threads,
+                    base_irt: base_irt.as_ref(),
+                })
             });
-            if adapted.is_err() {
+            if matches!(adapted, Some(Err(_))) {
                 cancel.store(true, std::sync::atomic::Ordering::SeqCst);
             }
             let fronts = fronts
@@ -1868,28 +1961,58 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("the overlapped runs' thread panicked")));
             (adapted, fronts)
         });
-        let chain::Adapted {
-            lib: lib0,
-            produced,
-            ..
-        } = adapted?;
+        let adapted = adapted.transpose()?;
         let fronts = fronts?;
-        // Under `parallel_runs = auto`, the first run's finish is what every later run
-        // repeats after its reused adaptation, so its peak alone sizes them.
+        let adapted = match adapted {
+            Some(a) => a,
+            None => {
+                // The first front whose seed has anchors, else run 1, whose calibration is
+                // then skipped and every run adapts its own.
+                let k = adapting_run(cfg, mh_heads, fronts.iter().map(|(_, s)| s.as_str()))?;
+                let (co, seed) = match k {
+                    Some(k) => (&fronts[k].0, fronts[k].1.as_str()),
+                    None => (&co0, seed0.as_str()),
+                };
+                adapting = k.map_or(0, |k| k + 1);
+                info!(run = %names[adapting], "run-experiment: adapting the library's retention times on this run for every run");
+                chain::adapt_rt_library(chain::AdaptParams {
+                    cfg,
+                    config_hash: &ch,
+                    lib_p_base: &lib_p_base,
+                    lib_f: &lib_f,
+                    converted: co,
+                    seed,
+                    out_dir: &d(&names[adapting]),
+                    mh_heads,
+                    shared_rt_lib: None,
+                    irt_placeholder,
+                    threads: total,
+                    base_irt: base_irt.as_ref(),
+                })?
+            }
+        };
+        let chain::Adapted { lib, produced, .. } = adapted;
+        let front0 = (co0, seed0);
+        let runs: Vec<(usize, &(convert::ConvertOutputs, String))> = std::iter::once((0, &front0))
+            .chain((1..n_runs).zip(fronts.iter()))
+            .collect();
+        // Under `parallel_runs = auto`, the adapting run's finish is what every other run
+        // repeats after its reused adaptation, so its peak alone sizes them. Its tables take
+        // their place in run order after the other chains (`alone`).
         let window = plan.is_auto().then(crate::sched::PeakWindow::open);
-        let (comp0, chrom0) = finish_run(
+        let (co, seed) = runs[adapting].1;
+        let (comp, chrom) = finish_run(
             cfg,
             &ch,
-            &lib0,
+            &lib,
             &lib_f,
-            &co0,
-            &seed0,
-            &out0,
+            co,
+            seed,
+            &d(&names[adapting]),
             true,
             Default::default(),
         )?;
-        competed.push(vec![comp0]);
-        chroms.push(vec![ChromTable::whole(&chrom0)]);
+        alone = Some((adapting, vec![comp], vec![ChromTable::whole(&chrom)]));
         if produced.is_none() {
             warn!(
                 "run-experiment: the first run produced no adapted library; the remaining \
@@ -1927,20 +2050,21 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             )
         };
         let items: Vec<(usize, &(convert::ConvertOutputs, String))> =
-            (1..n_runs).zip(fronts.iter()).collect();
+            runs.into_iter().filter(|&(i, _)| i != adapting).collect();
         if plan.is_auto() {
-            // Run 1 finished alone above, so its peak is the measurement the rest is sized
+            // The adapting run finished alone above, so its peak is the measurement the rest is sized
             // on (`sched::bound_by_measured_peak`), unless each of them adapts the library
             // itself in a DeepLC worker the measurement cannot see.
             plan = match (produced.is_none(), window) {
                 (true, _) => {
+                    uncut = Some(plan);
                     crate::sched::one_at_a_time_for_sidecars(plan, threads_budget, "run-experiment")
                 }
                 (false, Some(w)) => crate::sched::bound_by_measured_peak(
                     plan,
                     threads_budget,
                     "run-experiment",
-                    "the first run's chain",
+                    "the adapting run's chain",
                     w,
                 ),
                 (false, None) => plan,
@@ -1971,34 +2095,50 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         }
         first = n_runs;
     } else if share_ft {
+        // The first run adapts, unless its seed is short of anchors and a later run's is not
+        // (`adapting_run`): that run then adapts for every run, the first included. A grouped
+        // run seeds inside its own chain, so the first one adapts.
+        adapting = adapting_run(
+            cfg,
+            mh_heads,
+            prepared.iter().flatten().map(|(_, s)| s.as_str()),
+        )?
+        .unwrap_or(0);
+        if adapting > 0 {
+            warn!(
+                run = %names[adapting],
+                "run-experiment: the first run's seed has too few anchors to adapt the \
+                 library's retention times; adapting it on this run for every run"
+            );
+        }
         info!(
-            run = %names[0],
+            run = %names[adapting],
             n = n_runs,
-            "run-experiment: adapting the library's retention times on the first run only; \
-             the remaining runs reuse that library and fit their own RT calibration on it \
+            "run-experiment: adapting the library's retention times on one run only; the \
+             other runs reuse that library and fit their own RT calibration on it \
              (experiment.rt_library_scope = per_run to adapt for every run instead)"
         );
         // Under `parallel_runs = auto` the first run's peak sizes the rest (below).
-        let ft = match (&prepared[0], plan.is_auto()) {
+        let ft = match (&prepared[adapting], plan.is_auto() || adapting > 0) {
             // A converted and seeded run adapts first. When that adaptation searched the
             // run (`rt_bootstrap`: extract, features and compete on the seed-anchored
             // library, all of the finish but retrace), the window around it measured a
             // search of this run, which sizes the chains as the whole first chain did, and
-            // the first run's finish joins the other runs' chains below instead of running
+            // the run's finish joins the other runs' chains below instead of running
             // alone. On the six HYE diaPASEF runs that alone time was about 5 of 48 min,
             // with one of the six per-run pools idle in the parallel phase after it.
-            (Some((co0, seed0)), true) => {
-                let out0 = d(&names[0]);
+            (Some((co, seed)), true) => {
+                let out = d(&names[adapting]);
                 let window = crate::sched::PeakWindow::open();
                 let adapted = chain::adapt_rt_library(chain::AdaptParams {
                     cfg,
                     config_hash: &ch,
                     lib_p_base: &lib_p_base,
                     lib_f: &lib_f,
-                    converted: co0,
-                    seed: seed0,
-                    out_dir: &out0,
-                    mh_heads: mh_heads_for_scope,
+                    converted: co,
+                    seed,
+                    out_dir: &out,
+                    mh_heads,
                     shared_rt_lib: None,
                     irt_placeholder,
                     threads: rayon::current_num_threads(),
@@ -2006,25 +2146,24 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 })?;
                 first_window = Some(window);
                 if adapted.searched {
-                    first_step = "the first run's retention-time adaptation (a search of it)";
-                    first_lib = Some(adapted.lib);
+                    first_step = "the adapting run's retention-time adaptation (a search of it)";
                 } else {
                     // Nothing of a search ran in this process yet, so the finish runs
-                    // alone and is measured, as before.
+                    // alone and is measured, as before; its tables take their place in run
+                    // order after the other chains (`alone`).
+                    first_step = "the adapting run's chain";
                     let (comp, chrom) = finish_run(
                         cfg,
                         &ch,
                         &adapted.lib,
                         &lib_f,
-                        co0,
-                        seed0,
-                        &out0,
+                        co,
+                        seed,
+                        &out,
                         true,
                         Default::default(),
                     )?;
-                    competed.push(vec![comp]);
-                    chroms.push(vec![ChromTable::whole(&chrom)]);
-                    first = 1;
+                    alone = Some((adapting, vec![comp], vec![ChromTable::whole(&chrom)]));
                 }
                 adapted.produced
             }
@@ -2042,8 +2181,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 info!(library = %path, "run-experiment: reusing this adapted library for the remaining runs");
                 shared_ft = Some(path);
             }
-            // The first run's multi-head calibration was skipped for want of anchors
-            // (`chain::adapt_rt_library`): the rest adapt their own, slower but never
+            // No run's seed had the anchors, so the first run's multi-head calibration was
+            // skipped (`chain::adapt_rt_library`): the rest adapt their own, slower but never
             // silently wrong.
             None => warn!(
                 "run-experiment: the first run produced no adapted library; the remaining \
@@ -2057,8 +2196,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // first takes the first grouped run's slices where the plans agree (`run_groups`).
     let grouped = cfg.groups.window_groups > 1;
     let mut slice_source: Option<String> = if grouped { shared_ft.clone() } else { None };
-    let rest: Vec<usize> = (first..n_runs).collect();
-    if plan.is_auto() && first < n_runs {
+    let rest: Vec<usize> = (first..n_runs)
+        .filter(|&i| alone.as_ref().is_none_or(|(a, ..)| *a != i))
+        .collect();
+    if plan.is_auto() && !rest.is_empty() {
         // Under `parallel_runs = auto` the chains are pulled from a queue, each in its own
         // pool. A chain that adapts the library itself (no adapted library to share) runs
         // a DeepLC worker no memory reading of this process includes, so those chains run
@@ -2068,6 +2209,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         // measured peak. Without a reading that would only cost concurrency.
         let mut queue: &[usize] = &rest;
         if adapts_rt_library && shared_ft.is_none() {
+            uncut = Some(plan);
             plan = crate::sched::one_at_a_time_for_sidecars(plan, threads_budget, "run-experiment");
         } else if let Some(w) = first_window {
             plan = crate::sched::bound_by_measured_peak(
@@ -2131,22 +2273,6 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         // and a reused slice is the same bytes a run would have written (`run_groups`).
         let slices = std::sync::Mutex::new(slice_source.clone());
         let done = plan.map_pooled(queue, |&i| {
-            // The first run's finish, on the library its adaptation produced above.
-            if let (0, Some(lib0), Some((co0, seed0))) = (i, first_lib.as_deref(), &prepared[0]) {
-                info!(run = %names[0], i = 1, n = n_runs, "run-experiment: per-run chain, the first run's finish on its adapted library");
-                let (comp, chrom) = finish_run(
-                    cfg,
-                    &ch,
-                    lib0,
-                    &lib_f,
-                    co0,
-                    seed0,
-                    &d(&names[0]),
-                    true,
-                    Default::default(),
-                )?;
-                return Ok((vec![comp], vec![ChromTable::whole(&chrom)], None));
-            }
             info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain");
             let from = slices.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let r = run_one(i, shared_ft.as_deref(), from.as_deref())?;
@@ -2196,6 +2322,11 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 }
             }
         }
+    }
+
+    if let Some((a, comp, chrom)) = alone {
+        competed.insert(a, comp);
+        chroms.insert(a, chrom);
     }
 
     // `output.retain` below `all`: every chain is done, so the runs' library copies with
@@ -2300,7 +2431,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             &names,
             &run_dirs,
             &d("second_pass"),
-            &plan,
+            &mut plan,
+            uncut,
             par,
         )?
     } else {
@@ -2325,64 +2457,23 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
              result"
         );
     }
-    let (scored_combined, scored_written) = match &mut second {
-        Some(sp) => {
-            let scored = d("scored_combined.parquet");
-            // `mbr.second_pass_prefilter_keep_decoys`, when set, is this rescore's prefilter.
-            let second_rescore = cfg.second_pass_rescore();
-            if cfg.mbr.second_pass_prefilter_keep_decoys.is_some() {
-                info!(
-                    keep_decoys = second_rescore.prefilter_keep_decoys,
-                    first_pass = cfg.rescore.prefilter_keep_decoys,
-                    "run-experiment: second-pass rescore prefilter from \
-                     mbr.second_pass_prefilter_keep_decoys"
-                );
-            }
-            let written = rescore::run_hashed(rescore::RescoreParams {
-                competed: &sp.competed,
-                sources: None,
-                out: &scored,
-                work_dir: &rescore::sidecar_work_dir(&d("sidecar_work")),
-                script_dir: &cfg.predict_frag.sidecar_script_dir,
-                cfg: &second_rescore,
-                config_hash: &ch,
-                // The second pass's own extracted rows: its candidate ids are the empirical
-                // library's, not the first pass's.
-                shadow: Some(
-                    crate::stages::shadow::ShadowInputs::new(
-                        &sp.library.fragments,
-                        &shadow_windows,
-                    )
-                    .with_psms_extracted(&sp.psms_extracted),
-                ),
-            })?;
-            // The second pass against the first: logged always, and written to
-            // `empirical_library.json` on an experiment with ion mobility.
-            let diag = second_pass::diagnose(&sp.library, &scored, names.len())?;
-            if sp.has_im {
-                second_pass::record_diagnostics(&mut sp.library, diag)?;
-            }
-            chroms = sp.chroms.iter().map(|c| vec![c.clone()]).collect();
-            (scored, written)
-        }
-        // The experiment's `scored_combined.parquet` is the result either way: the first pass,
-        // copied up from `first_pass/` with its report when the second pass did not apply.
-        None if second_pass_on => {
-            let scored = d("scored_combined.parquet");
-            for (src, dst) in [
-                (first_scored.clone(), scored.clone()),
-                (
-                    format!("{first_scored}.report.json"),
-                    format!("{scored}.report.json"),
-                ),
-            ] {
-                std::fs::copy(&src, &dst)
-                    .with_context(|| format!("copying the first pass {src} to {dst}"))?;
-            }
-            (scored, first_written)
-        }
-        None => (first_scored.clone(), first_written),
-    };
+    // Recorded for `scored_first_pass` below, without hashing the table again.
+    let first_pass_hash = first_written.content_hash.clone();
+    let (scored_combined, scored_written, second_chroms) = second_pass_result(
+        cfg,
+        &ch,
+        p.out_dir,
+        &mut second,
+        second_pass_on,
+        &first_scored,
+        first_written,
+        &shadow_windows,
+        n_runs,
+    )?;
+    // Quant, localise and the report read the scored table's candidate ids against these.
+    if let Some(c) = second_chroms {
+        chroms = c;
+    }
     // The classifier that actually ran, from the rescore artifact report: the source of
     // truth, since the configured enum can differ from it under a compatibility path.
     let rescore_report: mumdia_io::report::ArtifactReport =
@@ -2398,71 +2489,9 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         .clone()
         .unwrap_or_else(|| actual_rescorer.clone());
 
-    // --- optional rescuable-tier MBR transfer ---
-    let scored_for_quant = if cfg.mbr.strategy.transfers() {
-        let python = cfg.mbr.python.as_deref().expect("preflight");
-        let script =
-            crate::sidecar::resolve_script(&cfg.predict_frag.sidecar_script_dir, "mbr_worker.py");
-        let transferred = d("mbr_transferred.parquet");
-        let scored_mbr = d("scored_mbr.parquet");
-        // Remove any stale copy BEFORE the worker runs, so that the `exists()` check
-        // afterwards is a statement about THIS run. The worker writes this file only when
-        // it accepts at least one transfer, so without the removal a rerun into the same
-        // --out-dir that accepted transfers last time and none this time would silently
-        // feed the previous experiment's scored table to the split and to every per-run
-        // quant. It joins cleanly, because candidate_id and source are stable across
-        // reruns of the same library, so the failure is plausible numbers from the wrong
-        // data, logged as "MBR transfers applied".
-        if std::path::Path::new(&scored_mbr).exists() {
-            std::fs::remove_file(&scored_mbr).with_context(|| {
-                format!("removing a previous run's {scored_mbr} before running MBR")
-            })?;
-        }
-        // The competed tables carry candidate_id + apex_rt in `source` order, one per run:
-        // match-between-runs keeps a grouped run's competed table pooled (`run_groups`).
-        if !one_table_per_run {
-            anyhow::bail!(
-                "match-between-runs reads one competed table per run, and a grouped run left \
-                 its competed rows per band"
-            );
-        }
-        let mbr_competed: Vec<String> = competed.iter().map(|t| t[0].clone()).collect();
-        crate::sidecar::run_mbr(
-            python,
-            &script,
-            &scored_combined,
-            &mbr_competed,
-            &transferred,
-            Some(&scored_mbr),
-            &[],
-            cfg.mbr.q_anchor,
-            cfg.mbr.min_anchor_runs,
-            cfg.mbr.q_transfer,
-            cfg.mbr.consensus_corr_min,
-            cfg.rng_seed,
-        )?;
-        // The worker writes the augmented scored table only when it accepts at
-        // least one transfer; with none, fall back to the un-augmented combined
-        // table so quantification still runs.
-        //
-        // `exists()` is only a signal because the stale file was removed before the
-        // worker ran (see above). Without that, it could not tell "this run wrote it"
-        // from "a previous run left it": rerunning the same --out-dir with different
-        // mzMLs or a tighter mbr.q_transfer, and finding no transfers this time, made
-        // the split and every per-run quant consume the OLD scored table. It joins
-        // successfully, because candidate_id and source are stable across reruns of the
-        // same library, so the result was plausible quantities from the wrong data while
-        // the log said "MBR transfers applied".
-        if std::path::Path::new(&scored_mbr).exists() {
-            info!("run-experiment: MBR transfers applied");
-            scored_mbr
-        } else {
-            info!("run-experiment: MBR accepted no transfers; using combined scored");
-            scored_combined.clone()
-        }
-    } else {
-        scored_combined.clone()
-    };
+    // The rescuable-tier transfer that could replace this table was removed in 0.15.0;
+    // the manifest keeps `scored_for_quant`, which `mumdia report --experiment-dir` reads.
+    let scored_for_quant = scored_combined.clone();
 
     // --- split by source, per-run quant (psm_q filter), cross-run LFQ ---
     let split_paths: Vec<String> = (0..n_runs)
@@ -2541,8 +2570,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         );
     }
     qcfg.q_filter = QuantQColumn::PsmQ;
-    // Both quant loops run under the experiment's memory-bounded plan, each run in its own
-    // pool share, with the results in run order. An explicit `parallel_runs` keeps quant
+    // Both quant loops run under the experiment's memory-bounded plan (the second pass's
+    // own, when it sized itself after the chains ran one at a time for their DeepLC
+    // workers), each run in its own pool share, with the results in run order. An explicit
+    // `parallel_runs` keeps quant
     // serial, as it was. Each loop reads `chroms`, which after a second pass are the second
     // pass's chromatograms: the ones the reported quantities come from.
     let run_idx: Vec<usize> = (0..n_runs).collect();
@@ -3028,16 +3059,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // Model identities reflect the path that produced the downstream artifacts, as
     // in the single-run manifest (docs/29 #15): which RT source the library carried,
     // which fragment predictor, and the classifier that actually ran.
-    let library_input = p.lib_precursors.is_some();
     let deeplc_py = cfg.predict_frag.deeplc_python.as_deref();
-    // Resolved the same way the stage itself resolved it, so the manifest records what
-    // ran rather than what was configured.
-    let mh_heads = cfg.rt_im_train.multihead_heads(
-        deeplc_py.is_some(),
-        cfg.deeplc_rt_source(library_input, deeplc_py.is_some()),
-    );
-    // `auto` decides per adapting run. Under `first_run_only` that is run 1, whose library
-    // records the choice; under `per_run` the runs may differ, and each library says which.
+    // `auto` decides per adapting run. Under `first_run_only` that is one run (`adapting`),
+    // whose library records the choice; under `per_run` the runs may differ, and each library
+    // says which.
     let auto_search = mh_heads > 0
         && cfg.rt_im_train.multihead_anchors == MultiheadAnchors::Auto
         && cfg.groups.window_groups <= 1
@@ -3045,7 +3070,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             RtLibraryScope::FirstRunOnly => {
                 rt_bootstrap::anchor_source(&format!(
                     "{}/{}",
-                    d(&names[0]),
+                    d(&names[adapting]),
                     rt_bootstrap::MULTIHEAD_LIBRARY
                 ))
                 .as_deref()
@@ -3130,7 +3155,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             artifact::PSMS_SCORED,
             first_scored.clone(),
             "rescore",
-            None,
+            Some(first_pass_hash),
         ));
         artifacts.push((
             "empirical_library_precursors".to_string(),
@@ -3153,18 +3178,6 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             artifact::PROTEIN_ANNOTATIONS,
             a.clone(),
             *producer,
-            None,
-        ));
-    }
-    // Only when MBR actually produced a different table; otherwise
-    // `scored_for_quant` IS `scored_combined` and recording it twice would claim two
-    // artifacts where one file exists.
-    if scored_for_quant != scored_combined {
-        artifacts.push((
-            "scored_for_quant".to_string(),
-            artifact::PSMS_SCORED,
-            scored_for_quant.clone(),
-            "mbr",
             None,
         ));
     }
@@ -3389,6 +3402,42 @@ mod tests {
             let cfg = Config::from_json(&json).unwrap();
             assert_eq!(refuse_unchecked_cross_run_step(&cfg).is_ok(), ok, "{json}");
         }
+    }
+
+    /// A seed table with `n` confident target anchors (distinct base peptides at q 0.001).
+    fn seed_with_anchors(n: u32) -> String {
+        let path = tmp("seed_psms.parquet");
+        let k = n as usize;
+        write_table(
+            &path,
+            vec![
+                Col::U32("base_peptide_id".into(), (0..n).collect()),
+                Col::F64("spectrum_q".into(), vec![0.001; k]),
+                Col::F64("score".into(), vec![1.0; k]),
+                Col::F64("observed_rt".into(), vec![100.0; k]),
+                Col::Str("label".into(), vec!["target".to_string(); k]),
+            ],
+        )
+        .unwrap();
+        path
+    }
+
+    /// The first run whose seed has the anchors adapts the library for every run, so a short
+    /// first run does not make each run adapt its own.
+    #[test]
+    fn the_first_run_with_seed_anchors_adapts_the_library() {
+        let cfg = Config::default();
+        let need = cfg.rt_im_train.min_seed_for_calibration as u32;
+        let (short, enough) = (seed_with_anchors(need - 1), seed_with_anchors(need));
+        let pick = |heads: usize, seeds: &[&str]| {
+            adapting_run(&cfg, heads, seeds.iter().copied()).unwrap()
+        };
+        assert_eq!(pick(80, &[&enough, &short]), Some(0));
+        assert_eq!(pick(80, &[&short, &short, &enough]), Some(2));
+        assert_eq!(pick(80, &[&short, &short]), None);
+        // Without the multi-head calibration nothing is skipped: the first run adapts.
+        assert_eq!(pick(0, &[&short, &enough]), Some(0));
+        assert_eq!(pick(80, &[]), None);
     }
 
     fn names(xs: &[&str]) -> Vec<String> {

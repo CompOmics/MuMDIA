@@ -86,28 +86,8 @@ reads them back to validate a downstream read (`Table::read`, `table.rs:317-319`
 does no version check, and `write_table`, `table.rs:166-211`, does not stamp the
 id into the Parquet file itself).
 
-| Constant | Logical name | Version |
-|---|---|---|
-| `SPECTRA_MS1` | `spectra_ms1` | 1 |
-| `SPECTRA_MS2` | `spectra_ms2` | 1 |
-| `ISOLATION_WINDOWS` | `isolation_windows` | 1 |
-| `MS2_TO_MS1` | `ms2_to_ms1` | 1 |
-| `PEPTIDES` | `peptides` | 1 |
-| `PEPTIDES_V2` | `peptides` | 2 (adds `protein_n_term`; written only with a protein-N-terminal modification rule, through `artifact::peptides(flag)`) |
-| `PEPTIDOFORMS` | `peptidoforms` | 1 |
-| `FRAGMENT_LIBRARY_PRECURSORS` | `fragment_library_precursors` | 1 |
-| `FRAGMENT_LIBRARY_FRAGMENTS` | `fragment_library_fragments` | 1 |
-| `SEED_PSMS` | `seed_psms` | 1 |
-| `RUN_WINDOWS` | `run_windows` | 1 |
-| `PSMS_EXTRACTED` | `psms_extracted` | **2** |
-| `CHROMATOGRAMS` | `chromatograms` | 1 |
-| `CHROMATOGRAMS_V2` | `chromatograms` | **2** (only under `extract.chromatogram_schema = 2`) |
-| `FEATURES` | `features` | 1 |
-| `PSMS_COMPETED` | `psms_competed` | **3** |
-| `PSMS_SCORED` | `psms_scored` | **4** |
-| `PEPTIDE_QUANT` | `peptide_quant` | **2** |
-| `PROTEIN_GROUP_QUANT` | `protein_group_quant` | **2** |
-| `FRAGMENT_QUANT` | `fragment_quant` | 1 |
+The current versions, and the conditions under which a stage writes a variant, are
+listed once in docs/15_data_dictionary.md, "Schema-version registry".
 
 `PSMS_SCORED` v3 added the identification apex/bounds so quant can integrate the
 selected peak; v4 added `selected_peak_rank` for top-K peak promotion. The
@@ -122,7 +102,7 @@ chain. The scored column layout is written by the rescore stage
 | `charge` | I32 | precursor charge |
 | `label` | Str | `target` / `decoy` |
 | `protein` | Str | protein accession |
-| `base_peptide_id` | U32 | interned stripped-peptide id; the peptide-level q grouping and also the default `compete.group_by = base_peptide` key |
+| `base_peptide_id` | U32 | interned stripped-peptide id; the peptide-level q grouping and also the `compete.group_by = base_peptide` key (the default is `peptidoform_charge`) |
 | `apex_rt` | F64 | identification apex used by downstream quant |
 | `elution_lo` / `elution_hi` | F64 | identified elution bounds carried through |
 | `score` | F64 | rescorer score |
@@ -217,11 +197,10 @@ poor setting is detectable. Defaults always pass.
 10. Entrapment without `rescore.entrapment_marker` -> `Invalid`
     (`config.rs:1396-1404`).
 
-`validate()` also emits two non-fatal warnings (`config.rs:1405-1437`), because
-erroring would break configs that already parse: one when `mbr.rt_window_s`,
-`mbr.decoy_transfer`, or `mbr.requant_all` is moved off its default (no stage
-reads those fields), and one when `mbr.strategy` is any non-`none` variant (only
-`none` vs not-`none` is distinguished in code).
+`validate()` also warns, without failing, when `mbr.strategy` selects the
+rescuable-tier transfer. `mbr.rt_window_s`, `mbr.decoy_transfer`, `mbr.requant_all`
+and `rescore.percolator_bin` were removed in 0.15.0 because no stage read them; a file that sets
+one at its old default still loads.
 
 `canonical_json` (`config.rs:1464-1466`) serializes the fully-resolved config;
 `run` hashes it with `blake3_str` into `config_hash` (`run.rs:89`) and stores the
@@ -308,8 +287,9 @@ oxidation products, acylations, methylations, `GlyGly`, `HexNAc`, `Hex`, `Sulfo`
 `Palmitoyl`, `Biotin` and homocysteinylation (`HCysThiolactone` 117.024835 on K,
 `HCysteinyl` 133.019749 on C). An entry may carry an optional plain-language `label`,
 which the desktop Search tab shows and matches in its filter; the engine ignores it. A unit test recomputes every delta from its elemental
-composition. The desktop Search tab lists the same file. Terminal modifications are not
-implemented. An unknown name is `MassError::UnknownModification`, never a silent zero.
+composition. The desktop Search tab lists the same file. N-terminal modifications are offered
+where the catalogue lists them (docs/05, "Terminal modifications"); C-terminal ones are
+not supported. An unknown name is `MassError::UnknownModification`, never a silent zero.
 
 **ProForma-lite parse** (`parse_peptidoform`, `mass.rs:187-249`): optional
 N-terminal `[Mod]-`, residues each optionally followed by `[Mod]`, optional
@@ -412,7 +392,7 @@ listed with its default and effect. Fields marked **default-off**, **inert**, or
 | `MatcherKind` | config.rs:38-42 | `bucketed`, **`fragindex`** | fragment-matcher backend for search-seed + extract |
 | `Enzyme` | config.rs | **`trypsin_p`**, `trypsin`, `lys_c`, `lys_n`, `arg_c`, `asp_n`, `glu_c`, `chymotrypsin`, `non_specific`, `custom` | cleavage preset or a custom rule (docs/05, "Cleavage rules") |
 | `CalibrationMethod` | config.rs:56-61 | **`loess`**, `linear`, `none` | `none` rejected by validate (falls through to linear) |
-| `FeatureSet` | config.rs:65-75 | **`minimal`** (14), `rich` (44), `extended` (387) | superset battery in `stages/features/`; the `feature_sets_sized` test (`features.rs:1724-1738`) asserts 14, 14+30, and `14 + 30 + extended_names().len() + 6`, which currently resolves to 387 (337 deduplicated family names) |
+| `FeatureSet` | config.rs | **`minimal`** (14), `rich` (44), `extended` (426 with the default window families) | superset battery in `stages/features/`; the `feature_sets_sized` test asserts 14, 14+30, and `14 + 30 + extended_names().len() + 6`; docs/10 has the derivation |
 | `RtPredictorKind` | config.rs:79-86 | **`native`**, `deeplc` | DeepLC is a Python sidecar |
 | `FragPredictorKind` | config.rs:90-96 | **`native`**, `ms2pip` | MS2PIP is a Python sidecar |
 | `RescorerKind` | config.rs:100-123 | **`native_tda`**, `mokapot`, `nn_torch`, `entrapment` | see RescoreConfig |
@@ -423,11 +403,10 @@ listed with its default and effect. Fields marked **default-off**, **inert**, or
 | `CompetitionMode` | config.rs:873-890 | **`winner_take_all`**, `none`, `unique_evidence`, `margin_gated` | within-group resolution |
 | `CompeteGroupBy` | config.rs:894-901 | `base_peptide`, `apex`, **`peptidoform_charge`** | competition grouping key; `peptidoform_charge` (precursor-level) is the default since 2026-09-06, `base_peptide` was renamed from `precursor`, which named stripped-peptide grouping inaccurately (see below) |
 | `RollupMethod` | config.rs:905-911 | **`top_n_sum`**, `sum` | protein rollup |
-| `PeakWindowMode` | config.rs:916-928 | **`per_candidate`**, `consensus` | quant integration window |
+| `PeakWindowMode` | config.rs:916-928 | **`per_candidate`** (`consensus` removed in 0.15.0) | quant integration window |
 | `NormalizeMethod` | config.rs:936-949 | `none`, **`median_ratio`**, `median` | cross-run LFQ normalization; `from_token` at 953-960 |
 | `QuantQColumn` | config.rs:971-988 | **`peptide_q`**, `precursor_q`, `psm_q`, `run_psm_q` | which q column quant filters on |
-| `MbrStrategy` | config.rs:1058-1068 | **`none`**, `empirical_library`, `rt_transfer`, `full` | only `none` vs not-`none` is distinguished in code; the three non-`none` variants behave identically and `validate()` warns |
-| `DecoyTransfer` | config.rs:1077-1082 | **`permuted_rt`**, `reverse_sequence`, `both` | MBR false-transfer null; **not read by any stage** (`validate()` warns if changed) |
+| `MbrStrategy` | config.rs:1058-1068 | `none`, **`second_pass`** | `rt_transfer` (and `empirical_library`, `full`, read as it) was removed in 0.15.0 and is refused; the variant stays so the type serialises as before |
 | `RtLibraryScope` | config.rs | **`first_run_only`**, `per_run` | `run-experiment` only: how many DeepLC fine-tunes an experiment pays for |
 | `Handoff` | config.rs | `tsv`, `parquet`, **`raw`** | how the feature matrix crosses into a sidecar rescorer; `parquet` and `raw` are nn_torch only (mokapot falls back to `tsv` with a warning) |
 
@@ -516,43 +495,34 @@ else keep it (conservative removal for the low-FDR region). Target/decoy labels
 stay in the competition key in every mode, so a target never competes against its
 own decoy.
 
-**`MbrStrategy`** (1043-1068) and **`DecoyTransfer`** (1070-1082) are the recorded
-MBR design ladder, not four (respectively three) distinct behaviors. Only
-`strategy == None` vs `!= None` is ever tested in the tree, so `RtTransfer` and
-`Full` behave exactly like `EmpiricalLibrary` today, and `validate()` warns when
-any non-`None` variant is selected. `DecoyTransfer` is read by no stage at all
-and `validate()` warns when it is moved off its default. The intended staging is:
-`None` (default) reproduces the chain byte-for-byte; `EmpiricalLibrary` builds
-the cross-run consensus anchor library only (M1); `RtTransfer` adds cross-run
-expected-RT transfer extraction (M2/M3); `Full` adds requantification (M5). The
-intended null (M4) is `PermutedRt` (default), transferring real precursors to a
-decoupled wrong expected RT, `ReverseSequence`, transferring reverse/scramble
-decoys at the same expected RT, or `Both`. All require >= 2 runs.
+**`MbrStrategy`** (1043-1068). `SecondPass` is the default and `None` turns
+match-between-runs off. `RtTransfer`, the rescuable-tier transfer, was removed in 0.15.0:
+`rt_transfer` and its old spellings `empirical_library` and `full` are refused at load and
+by `validate()`. The variant still parses, so the canonical configuration does not move.
 
-**`CompeteGroupBy`** (894-901). `Precursor` (default) does **not** group by
-precursor. Its full key is `(base_peptide_id, label_code, 0, peak_rank)`
-(compete.rs:88), where `base_peptide_id` is the stripped-sequence id
+**`CompeteGroupBy`**. The default is `PeptidoformCharge` (since 2026-09-06).
+`BasePeptide` (renamed from `precursor`, which is no longer accepted) is the
+explicit peptide-level option and does **not** group by precursor. Its full key is
+`(base_peptide_id, label_code, 0, peak_rank)`, where `base_peptide_id` is the stripped-sequence id
 (`pd.factorize(Stripped.Sequence)` on the imported path,
 import_diann_lib.py:137; the target peptide row id on the native path,
 peptidoforms.rs:216-220), so every charge state and every modification variant of
 one stripped peptide shares a group and `winner_take_all` deletes all but the
 best-scoring member before rescore. `Apex` replaces the constant `0` with a
-rounded apex-RT bucket (`apex_rt_tolerance_s`, compete.rs:89-92).
-`PeptidoformCharge` keys `(pform_id, label_code, charge, peak_rank)`
-(compete.rs:93-98), so each distinct peptidoform+charge is its own group
-(precursor-level, as DIA-NN/Spectronaut report), recovering the sibling forms the
+rounded apex-RT bucket (`apex_rt_tolerance_s`).
+`PeptidoformCharge` keys `(pform_id, label_code, charge, peak_rank)`, so each
+distinct peptidoform+charge is its own group (precursor-level), recovering the sibling forms the
 stripped-peptide grouping collapses. `peak_rank` is in the key in every mode, so a
 promoted alternate peak competes only against other candidates at the same rank.
 
 The difference is large in a modification-rich search. Measured on a
-modification-expanded imported library, the default grouping removed 880,464 of
+modification-expanded imported library, `base_peptide` removed 880,464 of
 1,890,239 extracted candidates (46.6%), while `peptidoform_charge` removed 0 rows,
 left the peptide count unchanged, and raised precursors per peptide from 1.000 to
-1.174 (DIA-NN reports about 1.126 on comparable data). Under the default grouping
+1.174. Under `base_peptide`
 a modified form is deleted whenever an unmodified or otherwise-modified sibling
-scores higher, so `peptidoform_charge` is required for a PTM-oriented search; it
-stays benchmark-gated as a global default because it changes the rescorer training
-and FDR population.
+scores higher, so `peptidoform_charge` is required for a PTM-oriented search. It
+became the default once the entrapment, HYE and AIF benchmarks had run under it.
 
 The label stays in the key in every mode: a
 target never directly competes against its paired decoy in the `compete` stage.
@@ -571,7 +541,7 @@ not shared across runs.
 uses `peptide_q_value`. `PrecursorQ` uses `precursor_q` and is valid only for a
 single-run rescore; after pooled rescoring that grouped q is experiment-wide. It
 is also a precursor-level filter only when compete ran with
-`group_by = peptidoform_charge`; under the default grouping the sibling forms were
+`group_by = peptidoform_charge` (the default); under `base_peptide` the sibling forms were
 already removed, so it selects base peptides.
 `PsmQ` uses pooled `q_value`. `RunPsmQ` uses per-source `run_psm_q` and is the
 run-local choice after an experiment-wide rescore. Quant has no source selector:
@@ -777,7 +747,7 @@ selection dominate.
 | `alt_peak_min_area_frac` | 0.10 | min integrated area of a promoted alternate as a fraction of the rank-0 peak; only used when `promote_top_peaks > 1` |
 | `alt_peak_min_separation_s` | 5.0 | min apex-RT separation of a promoted alternate from the rank-0 apex; only used when `promote_top_peaks > 1` |
 | `emit_candidate_audit` | `false` | **default-off**; in a single-file `run` gates the separate `audit` stage that writes `candidate_audit.parquet`; extract writes no per-candidate table; no-op for standalone `mumdia extract` and for `run-experiment`, which warns (P0.3) |
-| `apex_evidence_rank` | `true` | evidence-count apex. On by default: the legacy signature-intensity score is 0.0 at every qualifying scan when none of the top-K predicted fragments is observed, which silently selects the lowest-RT qualifying scan |
+| `apex_evidence_rank` | `true` | evidence-count apex; `false` was removed in 0.15.0 and is refused: the legacy signature-intensity score is 0.0 at every qualifying scan when none of the top-K predicted fragments is observed, which silently selects the lowest-RT qualifying scan |
 | `emit_gate_diagnostics` | `false` | **default-off** four gate-score columns |
 | `gate_mode` | `window_mean` | which spectral score `gate_min_score` thresholds |
 | `gate_coelution_min` | 0.5 | second threshold for `gate_mode = combined` |
@@ -794,12 +764,9 @@ requiring entrapment/target-decoy FDR validation before use.
 | `set` | `minimal` | feature set (minimal / rich / extended) |
 | `emit_pin` | `false` | write the Percolator-style `.pin` text file requested by `--out-pin`. Off by default: no MuMDIA stage consumes it (`rescore` builds its own PIN) and at 1.5M rows by 387 features it is a ~5.4 GB text write, so set it true only when an external tool needs the file |
 | `coelution_corr_threshold` | 0.9 | co-elution correlation cutoff |
-| `prec_tol_ppm` | 20.0 | precursor tolerance for MS1 features |
 | `bound_features` | `true` | restrict trace features to the elution peak |
 | `bound_peak_fraction` | 1/3 | peak-boundary descent fraction of apex height |
 | `bound_peak_grace` | 0 | consecutive sub-threshold scans to bridge |
-| `bound_from_confident` | `false` | `true` learns one global peak width from confident seed PSMs; per-candidate bounds are the default since 2026-10-04 (docs/10) |
-| `bound_confident_pct` | 50.0 | percentile of confident half-widths as the shared width |
 | `ms1_precursor_features` | `false` | **default-off** MS1 apex-isotope feature `ms1_isotope_height_corr`; it overlaps the existing `ms1_isotope_cosine_apex`, so it is opt-in. The name stays in the battery either way and returns 0.0 when off, so the vector length does not change |
 | `chrom_loaders` | 3 | chromatogram decode threads in the main feature pass, capped by `--threads` and by the chunk count. Changes time and memory only, never a value or a byte of the features table. The pass holds up to `chrom_loaders + 1` decoded chunks (about 0.92 GiB of traces each at the HYE shape, docs/27 section 3.4); `1` restores the previous single loader and its two resident chunks |
 
@@ -825,8 +792,8 @@ requiring entrapment/target-decoy FDR validation before use.
 | `bound_peak` | `true` | integrate only over the detected peak window |
 | `peak_fraction` | 1/6 | descent threshold for the peak-window walk |
 | `peak_grace` | 1 | zig-zag grace (bridge N sub-threshold scans) |
-| `peak_window_mode` | `per_candidate` | per-candidate vs consensus window |
-| `reliable_q` | 0.001 | confident-set q for the consensus width |
+| `peak_window_mode` | `per_candidate` | the only value since `consensus` was removed in 0.15.0 |
+| `reliable_q` | 0.001 | read by nothing since `consensus` was removed in 0.15.0 |
 | `q_filter` | `peptide_q` | `peptide_q`, `precursor_q` (single-run only), `psm_q`, or `run_psm_q` |
 | `interference_envelope` | `false` | apex-outward interference envelope on fragment traces before integration (opt-in, benchmark-gated) |
 
@@ -839,7 +806,6 @@ requiring entrapment/target-decoy FDR validation before use.
 | `train_fdr` | 0.01 | positive-selection FDR |
 | `num_iter` | 10 | semi-supervised iterations (native) |
 | `python` | `None` | interpreter for a Python rescorer (mokapot/nn_torch/entrapment) |
-| `percolator_bin` | `None` | percolator.exe path |
 | `entrapment_marker` | `None` | protein substring marking spike-in negatives (required for `entrapment`) |
 | `entrapment_exclude` | `None` | substring that de-marks (own-species) |
 | `entrapment_contaminant_markers` | `[]` | substrings that keep a spike-in hit as a real target |
@@ -857,13 +823,13 @@ requiring entrapment/target-decoy FDR validation before use.
 
 ### `MbrConfig` (config.rs:1084-1129), partly inert
 
-The MBR stage (D3) is not wired into the run chain. Fields: `strategy` (`none`
-default), `q_anchor` 0.01, `min_anchor_runs` 2, `q_transfer` 0.01, `rt_window_s`
-20.0, `decoy_transfer` `permuted_rt`, `consensus_corr_min` 0.0, `requant_all`
-`false`, `python` `None`. Of these, `rt_window_s`, `decoy_transfer`, and
-`requant_all` are read by no stage at all and `validate()` warns when any is
-moved off its default, because a config that sets them looks configured but
-changes nothing. With `strategy = none` the chain is byte-identical to no MBR.
+Read by `run-experiment` only. Fields: `strategy` (`second_pass` default), `q_anchor` 0.01,
+`min_anchor_runs` 2, `q_transfer` 0.01, `consensus_corr_min` 0.0, `python` `None`,
+`second_pass_prefilter_keep_decoys`, `first_pass_flag`. `min_anchor_runs`, `q_transfer`,
+`consensus_corr_min` and `python` configured the rescuable-tier transfer, removed in 0.15.0:
+they still parse, so the configuration hash does not move, and `validate()` warns that they
+do nothing. `rt_window_s`, `decoy_transfer` and `requant_all` were removed in 0.15.0
+because no stage read them.
 
 ### `ExperimentConfig` (config.rs:1247-1272)
 
@@ -947,8 +913,8 @@ stale.
   struct declaration order), so the same config hashes to the same `config_hash`
   across runs. `manifest.artifacts` and `model_identities` are `BTreeMap`s
   (`manifest.rs:28-30`), so manifest key order is deterministic. Sidecars are the
-  exception: `deeplc_finetune.py` sets no numpy or torch seed, so
-  `finetune_deeplc` is not reproducible byte-for-byte, and the `nn_torch` worker
+  exception: `deeplc_finetune.py` is seeded from `rng_seed` (`--seed`), but
+  kernel nondeterminism means `finetune_deeplc` is not reproducible byte-for-byte, and the `nn_torch` worker
   seeds numpy and torch but its training kernels are not guaranteed
   bit-deterministic either.
 - **Fragment generation drops b1/y1/y2** unconditionally (`mass.rs:111`,

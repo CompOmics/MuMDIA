@@ -341,6 +341,10 @@ existed. An imported library reads no `predict_frag` setting and is never refuse
 
 Sidecars follow a positional-CLI Parquet contract (no JSON request file): write an
 input Parquet, invoke `python script arg...`, read an output Parquet keyed by id.
+The two tables of a predictor call (`<tag>_in_<PID>.parquet`, `<tag>_out_<PID>.parquet`
+in the work directory) are removed once the output has been read back, unless
+`MUMDIA_KEEP_HANDOFF=1`; a failed worker leaves them in place. Every worker runs with
+UTF-8 I/O (`PYTHONUTF8=1`, `PYTHONIOENCODING=utf-8`).
 
 - `run_ms2pip` (`sidecar.rs:42-78`): input columns `id` (u32), `peptidoform`
   (str), `charge` (i32); output columns `id`, `ion_type` (str), `ordinal` (i32),
@@ -364,17 +368,10 @@ input Parquet, invoke `python script arg...`, read an output Parquet keyed by id
   peptidoforms). Both residual figures are the in-sample `cal.json` fit
   diagnostic, so read them as "equal or marginally better", not as an RT error
   estimate. See `docs/08_rt_im_train.md`.
-- `run_mbr` (`sidecar.rs:162-213`): match-between-runs transfer (Stage D3, needs
-  >= 2 runs). Positional contract `mbr_worker.py <scored_combined> <psms_csv>
-  <out_transferred> [flags]`, where `psms_csv` is the per-run psms paths joined by
-  `,` in `source` order; the launcher always passes `--q-anchor`,
-  `--min-anchor-runs`, `--q-transfer`, and `--seed`, adds `--out-scored` when an
-  output-scored path is supplied, and adds `--frag-csv` / `--consensus-corr-min`
-  only when fragments are supplied and the threshold is > 0.
 - `run_worker` (`sidecar.rs:217-233`) is the shared launcher; it bails if the
   process exits non-zero. `utf8 = true` sets `PYTHONUTF8=1` and
   `PYTHONIOENCODING=utf-8` (DeepLC/Keras/torch crash on the Windows cp1252 console);
-  it is on for the DeepLC and fine-tune calls, off for MS2PIP and MBR.
+  it is on for the DeepLC and fine-tune calls, off for MS2PIP.
 
 ### Library load and the bucketed inverted index (`index.rs`)
 
@@ -712,7 +709,6 @@ m/z (`Library::local_frag_index`, `index.rs:325`).
 | `run_ms2pip` | `sidecar.rs:42` | MS2PIP client; in `id`/`peptidoform`/`charge`, out `id`/`ion_type`/`ordinal`/`intensity`; returns `cid -> (ion_byte, ordinal) -> intensity` |
 | `run_deeplc` | `sidecar.rs:81` | DeepLC client; in `id`/`peptidoform`, out `id`/`predicted_rt`; returns `id -> predicted_rt` |
 | `run_deeplc_finetune` | `sidecar.rs:111` | DeepLC multitask fine-tune; `deeplc_finetune.py <lib_in> <seed> <lib_out>` + epoch/patience/q-train/batch flags (called by `run`, not predict-frag) |
-| `run_mbr` | `sidecar.rs:162` | MBR transfer (Stage D3); `mbr_worker.py <scored> <psms_csv> <out>` + flags |
 | `run_worker` | `sidecar.rs:217` | shared launcher; bails on non-zero exit; `utf8` sets `PYTHONUTF8`/`PYTHONIOENCODING` |
 | `Candidate` | `index.rs:43` | one candidate as an owned record; only the input of `Library::from_candidates` (tests, benchmarks). A loaded library holds the same fields as columns |
 | `CandInfo` / `Library::cand` | `index.rs:59` / `index.rs:1506` | one candidate's precursor fields, borrowed from the library's columns |
@@ -935,8 +931,9 @@ Matcher selection (both stages default to `Fragindex`):
   sums `obs_sum` in the caller's fixed peak order and `touched()` is in
   first-touch order, so callers sort before any float reduction
   (`fragindex.rs:346-350`).
-- **DeepLC nondeterminism and unpredicted peptidoforms.** The DeepLC sidecar and
-  fine-tune are not seeded, so iRT values vary run to run. Any peptidoform DeepLC
+- **DeepLC nondeterminism and unpredicted peptidoforms.** The DeepLC fine-tune is
+  seeded from `rng_seed` (`--seed`), but not bit-for-bit reproducible because of
+  kernel nondeterminism, so fine-tuned iRT values can vary run to run. Any peptidoform DeepLC
   does not return is dropped from the library together with its pair (it used to be
   anchored at iRT 0.0); the library report's `candidates_dropped_unpredicted` counts
   them so a large miss is visible rather than silent.

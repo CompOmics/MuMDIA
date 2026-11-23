@@ -2,8 +2,15 @@ name: Release
 
 # Dormant until a version tag is pushed, e.g.:
 #   git tag v0.1.0 && git push origin v0.1.0
-# Then builds a release binary per platform and attaches archives to the
-# GitHub Release for that tag.
+# Then builds a release binary per platform and the desktop installers, keeps every file
+# as a workflow artifact, and only when ALL of them built attaches them to the GitHub
+# Release for that tag in one job (`publish`), together with the notes. It also builds,
+# smoke-tests and pushes the container image (docker.yml), behind the same gate.
+#
+# The release itself: push the tag alone and `publish` creates it, or save a DRAFT
+# release for the tag first and `publish` fills and publishes it. A release already
+# published by hand is marked pre-release by `hold-release` until every file is attached,
+# so it never shows as "Latest" half filled (docs/14, "Release workflow").
 #
 # The archive is a working installation, not just an executable: MuMDIA's ML
 # predictors and rescorers are Python sidecars that the engine launches by path,
@@ -19,9 +26,9 @@ on:
   # and prunes two working documents, and the checksum step. A release path that has
   # never run is not a release path.
   #
-  # A dispatch run builds, packages, verifies and uploads the archives as a workflow
-  # ARTIFACT, and skips creating a GitHub Release: the upload step below is gated on
-  # a tag ref. So the whole path is exercised without publishing anything.
+  # A dispatch run builds, packages and verifies the archives, the installers and the
+  # image, keeps the files as workflow ARTIFACTS, and publishes nothing: the gate, the
+  # hold, `publish` and the image push run on a tag ref only.
   workflow_dispatch:
     inputs:
       version_name:
@@ -53,6 +60,11 @@ jobs:
       # returns 403 and the gate cannot tell a green commit from an untested one.
       actions: read
     if: startsWith(github.ref, 'refs/tags/v')
+    # The CI wait below is bounded at an hour; this is the backstop.
+    timeout-minutes: 90
+    env:
+      # Move with ci.yml's CARGO_AUDIT_VERSION, whose cache this job restores.
+      CARGO_AUDIT_VERSION: 0.22.2
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -71,6 +83,15 @@ jobs:
             echo "::error::tag v$tag does not match the workspace version $crate."
             echo "Bump rust/mumdia/Cargo.toml or retag; a release whose archive reports a"
             echo "different version than its tag is not traceable."
+            exit 1
+          fi
+          # The installers take their version from the desktop crate (tauri.conf.json
+          # has none, so Tauri reads src-tauri/Cargo.toml).
+          desktop=$(grep -m1 '^version' desktop/src-tauri/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "desktop=$desktop"
+          if [ "$tag" != "$desktop" ]; then
+            echo "::error::tag v$tag does not match the desktop version $desktop."
+            echo "Bump desktop/src-tauri/Cargo.toml with rust/mumdia/Cargo.toml."
             exit 1
           fi
 
@@ -95,15 +116,31 @@ jobs:
           # The CI workflow's conclusion for this SHA, not for the branch tip. A tag
           # push does not run ci.yml, so without this the only evidence a release
           # rests on is that someone believed it was fine.
-          runs=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=$sha&per_page=20" \
-                 --jq '[.workflow_runs[] | select(.conclusion != null) | .conclusion] | join(",")')
-          echo "ci.yml conclusions for $sha: ${runs:-<none>}"
-          case ",$runs," in
-            *",success,"*) echo "CI passed for this commit" ;;
-            *) echo "::error::no successful ci.yml run for $sha."
-               echo "Push the commit to a PR, let CI pass, merge to main, then tag."
-               exit 1 ;;
-          esac
+          #
+          # A tag pushed right after the merge arrives before main's run has finished,
+          # or before it exists at all, so wait for it (up to an hour) instead of
+          # failing: while there is no run yet, or one is not completed, poll every
+          # minute. Any successful run passes; all runs completed without one fails.
+          deadline=$((SECONDS + 3600))
+          while :; do
+            runs=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=$sha&per_page=20" \
+                   --jq '[.workflow_runs[] | "\(.status):\(.conclusion)"] | join(",")')
+            echo "ci.yml runs for $sha: ${runs:-<none>}"
+            case ",$runs," in
+              *",completed:success,"*) echo "CI passed for this commit"; break ;;
+            esac
+            if [ -n "$runs" ] && ! printf '%s\n' "$runs" | tr ',' '\n' | grep -qv '^completed:'; then
+              echo "::error::no successful ci.yml run for $sha."
+              echo "Push the commit to a PR, let CI pass, merge to main, then tag; or re-run"
+              echo "the failed CI jobs and then re-run this workflow."
+              exit 1
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::ci.yml for $sha did not finish within an hour."
+              exit 1
+            fi
+            sleep 60
+          done
 
       # CI tolerates a THIRD_PARTY_LICENSES.md or sbom.cdx.json that differs from the
       # lockfile in crate versions only, because Dependabot does not run the generators
@@ -114,14 +151,68 @@ jobs:
         run: |
           set -euo pipefail
           cargo fetch --locked --manifest-path rust/mumdia/Cargo.toml
+          cargo fetch --locked --manifest-path desktop/Cargo.toml
           python3 ci/gen_third_party_licenses.py --check --strict
+          python3 ci/gen_third_party_licenses.py --desktop --check --strict
           python3 ci/gen_sbom.py --check --strict
+
+      # The advisory scan is advisory on most pull requests (ci.yml, `cargo audit`), so
+      # an advisory can sit unhandled on main. Here it is strict: a release cannot ship
+      # one nobody handled.
+      - name: Restore cargo-audit
+        id: audit-bin
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ runner.os }}-${{ env.CARGO_AUDIT_VERSION }}
+
+      - name: Install cargo-audit
+        if: steps.audit-bin.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked --force
+
+      - name: No unhandled advisory
+        run: bash ci/cargo_audit.sh
+
+  # A release the maintainer published by hand before pushing the tag is public while
+  # the builds run, and stays public if one of them fails. Mark it pre-release, so it is
+  # not shown as "Latest" until `publish` has attached every file; `publish` clears the
+  # mark. The marker in the body makes a re-run see its own hold rather than a
+  # deliberate pre-release, which is left alone, as is a draft (not public).
+  hold-release:
+    name: hold a published release
+    needs: [validate-tag]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Mark a published release as pre-release until its files are attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          MARKER: "<!-- release.yml: held until every file is attached -->"
+        run: |
+          set -euo pipefail
+          if ! state=$(gh release view "$TAG" --repo "$REPO" --json isDraft,isPrerelease \
+                       --jq '"\(.isDraft) \(.isPrerelease)"' 2>/dev/null); then
+            echo "no release for $TAG yet; publish will create it"
+            exit 0
+          fi
+          echo "release $TAG: draft prerelease = $state"
+          if [ "$state" = "false false" ]; then
+            body=$(gh release view "$TAG" --repo "$REPO" --json body --jq .body)
+            printf '%s\n\n%s\n' "$MARKER" "$body" > held-body.txt
+            gh release edit "$TAG" --repo "$REPO" --prerelease --notes-file held-body.txt
+            echo "::notice::release $TAG was public; marked pre-release until publish finishes"
+          fi
+
   release:
     name: ${{ matrix.target }}
     needs: [validate-tag]
     permissions:
-      # Creating the release and attaching the archives.
-      contents: write
+      # Builds only; `publish` attaches the files.
+      contents: read
     # `always()` because `validate-tag` is SKIPPED on a rehearsal (it has no tag to
     # validate) and a skipped dependency would otherwise skip this job too.
     #
@@ -325,32 +416,13 @@ jobs:
           # script, which is a needless difference between the two invocations.
           MUMDIA_BIN="$PWD/mumdia${{ matrix.exe }}" bash ci/smoke.sh
 
-      - name: Upload to release
-        if: startsWith(github.ref, 'refs/tags/v')
-        # Pinned to a commit, not the mutable `v2` tag. This is the only
-        # third-party action in the tree (the other nine are actions/* and
-        # docker/*), it receives the release token and the built archives, and a
-        # moved tag would run new code with repository write access on every tag
-        # push. Dependabot covers `github-actions`, so the SHA keeps moving on a
-        # reviewed PR instead of silently.
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          files: |
-            rust/mumdia/dist/*.tar.gz
-            rust/mumdia/dist/*.zip
-            rust/mumdia/dist/*.sha256
-          # The notes are written once, by `release-notes` below. Every upload step that
-          # also asked for generated notes appended another copy: v0.10.0 was published
-          # with the same "What's Changed" list six times, one per upload job.
-          generate_release_notes: false
-
-      # The rehearsal's output, so the archives can actually be inspected rather than
-      # merely reported as built.
-      - name: Upload archives as a workflow artifact (rehearsal only)
-        if: github.event_name == 'workflow_dispatch'
+      # Every run, not only a rehearsal: `publish` attaches these to the release once
+      # every build has passed, so one failed leg can no longer leave a release with
+      # some files and not others.
+      - name: Upload archives as a workflow artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: release-dryrun-${{ matrix.target }}
+          name: release-${{ matrix.target }}
           path: |
             rust/mumdia/dist/*.tar.gz
             rust/mumdia/dist/*.zip
@@ -370,7 +442,11 @@ jobs:
     needs: [validate-tag]
     if: always() && contains(fromJSON('["success", "skipped"]'), needs.validate-tag.result)
     permissions:
-      contents: write
+      contents: read
+    env:
+      # The bundler. ci.yml's desktop-windows job installs, caches and tests the same
+      # version under the same name; move the two together.
+      TAURI_CLI_VERSION: 2.12.4
     strategy:
       fail-fast: false
       matrix:
@@ -440,6 +516,11 @@ jobs:
           # `binaries/scripts/` (its README alone) and every sidecar failed at the point
           # of use. The verification step below fails the build if this ever regresses.
           cp scripts/*.py desktop/src-tauri/binaries/scripts/
+          # The notices. The engine is statically linked (THIRD_PARTY_LICENSES.md, the
+          # SBOM), so is the application (desktop/THIRD_PARTY_LICENSES.md), and uv's
+          # archive carries no licence file, so its two texts come from the same tag.
+          cp LICENSE THIRD_PARTY_LICENSES.md sbom.cdx.json desktop/src-tauri/binaries/
+          cp desktop/THIRD_PARTY_LICENSES.md desktop/src-tauri/binaries/THIRD_PARTY_LICENSES-desktop.txt
           # uv publishes static binaries per platform; take the pinned release rather
           # than whatever `latest` happens to be on the day of a build.
           UV_VERSION=0.10.6
@@ -453,12 +534,17 @@ jobs:
             *.tar.gz) tar xzf uv-asset --strip-components=1 -C desktop/src-tauri/binaries ;;
             *.zip)    python -c "import sys,zipfile;zipfile.ZipFile('uv-asset').extractall('desktop/src-tauri/binaries')" ;;
           esac
+          for lic in LICENSE-MIT LICENSE-APACHE; do
+            curl -fsSL -o "desktop/src-tauri/binaries/uv-$lic" \
+              "https://raw.githubusercontent.com/astral-sh/uv/${UV_VERSION}/$lic"
+          done
           ls -la desktop/src-tauri/binaries
 
       # The bundler that produces the .msi and .AppImage. Installed rather than
-      # vendored, and pinned, so a bundler change arrives as a reviewed version bump.
+      # vendored, and pinned to the exact version ci.yml tests the MSI with, so a
+      # bundler change arrives as a reviewed version bump.
       - name: Install the Tauri bundler
-        run: cargo install tauri-cli --version "^2" --locked
+        run: cargo install tauri-cli --version "=$TAURI_CLI_VERSION" --locked
 
       # The Microsoft Visual C++ x64 runtime that PyTorch needs on Windows. A machine
       # without a current one cannot load `torch\lib\c10.dll` (`WinError 1114`), so the
@@ -486,6 +572,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # `cargo tauri build` resolves without --locked; this fails on a stale lockfile,
+          # so the installer ships the crates desktop/Cargo.lock names and CI audited.
+          cargo fetch --locked
           if [ "${{ runner.os }}" = "Windows" ]; then
             cargo tauri build --config src-tauri/tauri.vcruntime.conf.json
           else
@@ -537,11 +626,12 @@ jobs:
             Where-Object { Test-Path (Join-Path $_.FullName "mumdia-console.exe") } |
             Select-Object -First 1
           if (-not $app) { Write-Error "the bundle lacks mumdia-console.exe"; exit 1 }
-          $workers = @("deeplc_worker.py", "deeplc_finetune.py", "nn_rescore_worker.py",
-                       "mokapot_worker.py", "ms2pip_worker.py", "mbr_worker.py",
-                       "import_diann_lib.py", "remap_library.py", "merge_libraries.py", "make_reverse_decoys.py", "predict_decoys.py", "_lib_io.py", "_unimod.py",
-                       "_torch_threads.py", "im2deep_worker.py")
+          # Every script the staging step copied, not a hand-kept list.
+          $workers = Get-ChildItem scripts/*.py | ForEach-Object { $_.Name }
+          $notices = @("LICENSE", "THIRD_PARTY_LICENSES.md", "THIRD_PARTY_LICENSES-desktop.txt",
+                       "sbom.cdx.json", "uv-LICENSE-MIT", "uv-LICENSE-APACHE")
           $required = @("binaries\mumdia.exe", "binaries\uv.exe") +
+                      ($notices | ForEach-Object { "binaries\$_" }) +
                       ($workers | ForEach-Object { "binaries\scripts\$_" })
           foreach ($r in $required) {
             if (-not (Test-Path (Join-Path $app.FullName $r))) { Write-Error "the bundle lacks $r"; exit 1 }
@@ -571,53 +661,85 @@ jobs:
           lib=$(dirname "$(find "$root/usr/lib" -type f -name mumdia -path "*/binaries/*" | head -1)")
           [ -n "$lib" ] || { echo "::error::the bundle lacks the engine"; exit 1; }
           [ -f "$lib/uv" ] || { echo "::error::the bundle lacks uv"; exit 1; }
-          for f in deeplc_worker.py deeplc_finetune.py nn_rescore_worker.py mokapot_worker.py \
-                   ms2pip_worker.py mbr_worker.py import_diann_lib.py remap_library.py merge_libraries.py make_reverse_decoys.py predict_decoys.py _lib_io.py _unimod.py \
-                   _torch_threads.py im2deep_worker.py; do
+          # Every script the staging step copied, not a hand-kept list.
+          for f in scripts/*.py; do
+            f=$(basename "$f")
             [ -f "$lib/scripts/$f" ] || { echo "::error::the bundle lacks binaries/scripts/$f"; exit 1; }
+          done
+          for f in LICENSE THIRD_PARTY_LICENSES.md THIRD_PARTY_LICENSES-desktop.txt sbom.cdx.json \
+                   uv-LICENSE-MIT uv-LICENSE-APACHE; do
+            [ -f "$lib/$f" ] || { echo "::error::the bundle lacks binaries/$f"; exit 1; }
           done
           "$lib/mumdia" --version
 
-      - name: Upload to release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          files: |
-            desktop/dist/*
-          # The notes are written once, by `release-notes` below. Every upload step that
-          # also asked for generated notes appended another copy: v0.10.0 was published
-          # with the same "What's Changed" list six times, one per upload job.
-          generate_release_notes: false
-
-      - name: Upload installers as a workflow artifact (rehearsal only)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Upload installers as a workflow artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: desktop-dryrun-${{ matrix.target }}
+          name: desktop-${{ matrix.target }}
           path: desktop/dist/*
           if-no-files-found: error
           retention-days: 7
 
-  # One set of release notes, written after every upload has finished. The upload
-  # steps above run in six parallel jobs and each one used to append generated notes to
-  # the release body; this job replaces the body with a single copy, so re-running a
-  # failed upload job cannot duplicate them either.
-  release-notes:
-    name: release notes
-    needs: [release, desktop]
+  # The container image, behind the same gate as everything else. It used to run on the
+  # tag by itself, so a tag the gate refused still pushed :<tag> and moved :latest.
+  # docker.yml pushes on a tag ref only; on a rehearsal it builds and smoke-tests.
+  docker:
+    name: docker image
+    needs: [validate-tag]
+    if: always() && contains(fromJSON('["success", "skipped"]'), needs.validate-tag.result)
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker.yml
+
+  # The one job that writes to the release, after every archive and installer built
+  # and verified. It attaches all files and writes the notes once (each upload job used
+  # to append its own copy: v0.10.0 had the "What's Changed" list six times):
+  #
+  # - no release for the tag: creates it with the files and notes (gh uploads to a
+  #   draft and publishes it once the files are there);
+  # - a draft: attaches the files, writes the notes and publishes it;
+  # - published by hand: attaches the files, writes the notes, and lifts the
+  #   pre-release mark `hold-release` set.
+  #
+  # The notes replace the body, as they did before. If a build fails this job does not
+  # run, so nothing is attached; re-running the failed jobs re-runs this one.
+  publish:
+    name: publish the release
+    needs: [hold-release, release, desktop]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Write the generated notes once
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Attach every file and write the notes
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
           REPO: ${{ github.repository }}
+          MARKER: "<!-- release.yml: held until every file is attached -->"
         run: |
           set -euo pipefail
+          ls -la assets
+          test -n "$(ls assets)"
           gh api -X POST "repos/$REPO/releases/generate-notes" -f tag_name="$TAG" --jq .body > release-notes.txt
           test -s release-notes.txt
-          gh release edit "$TAG" --repo "$REPO" --notes-file release-notes.txt
-          echo "release notes for $TAG: $(grep -c "^\* " release-notes.txt) entries"
+          if ! state=$(gh release view "$TAG" --repo "$REPO" --json isDraft,body \
+                       --jq '"\(.isDraft) \((.body // "") | contains(env.MARKER))"' 2>/dev/null); then
+            gh release create "$TAG" assets/* --repo "$REPO" --verify-tag \
+              --title "$TAG" --notes-file release-notes.txt
+          else
+            echo "release $TAG: draft held = $state"
+            gh release upload "$TAG" assets/* --repo "$REPO" --clobber
+            case "$state" in
+              "true "*)    gh release edit "$TAG" --repo "$REPO" --notes-file release-notes.txt --draft=false ;;
+              "false true") gh release edit "$TAG" --repo "$REPO" --notes-file release-notes.txt --prerelease=false --latest ;;
+              *)           gh release edit "$TAG" --repo "$REPO" --notes-file release-notes.txt ;;
+            esac
+          fi
+          echo "release $TAG: $(ls assets | wc -l) files, $(grep -c "^\* " release-notes.txt || true) notes entries"

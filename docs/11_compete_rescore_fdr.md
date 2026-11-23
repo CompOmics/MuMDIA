@@ -131,7 +131,7 @@ rescorer kept; `0` = the up-front apex). Plus
 `nn_torch` ran, `nn_env`: the `MUMDIA_NN_*` variables the worker inherited beyond the
 ones the engine sets (`inherited_nn_env`, `docs/13_sidecars.md`),
 `model_identity` (e.g. `native-percolator-lite-v1`, `mokapot-<estimator>`
-(default `mokapot-nn`), `nn-torch-semisup-sidecar-v1`,
+(default `mokapot-logreg`), `nn-torch-semisup-sidecar-v1`,
 `entrapment-gbm-sidecar-v1`, `native-percolator-lite-entrapment-v1`,
 set in `rescore::run_hashed`), and `stats` records `psms`, `classifier`,
 `target_psms_at_1pct`, `target_peptides_at_1pct`, `target_protein_groups_at_1pct`,
@@ -185,10 +185,11 @@ contracts exist:
   `row_id` through the same `align_sidecar_scores` coverage contract, so an
   incomplete or duplicated response hard-errors.
   Both sidecars are run with `PYTHONUTF8=1` and a non-zero exit is a hard error
-  (`run_entrapment_gbm`, `run_pin_sidecar`). The PIN sidecar is spawned behind a
-  `ChildGuard` that kills the worker if the parent unwinds;
-  without it a killed `mumdia` leaves the Python process holding its feature
-  memmap and every later rescore fails on a file it cannot delete.
+  (`run_entrapment_gbm`, `run_pin_sidecar`). A killed `mumdia` runs no destructor,
+  so nothing in the engine can stop its worker: Ctrl-C reaches the worker through the
+  terminal's process group, and the desktop stops a run's whole process tree. An
+  orphaned worker no longer breaks a later rescore, because every invocation names
+  its files apart (`sidecar_paths`).
 
 The work directory is `sidecar_work` under the run's output directory inside `run`
 and `run-experiment`, and `sidecar_work` in the current directory (or `--work-dir`)
@@ -427,19 +428,12 @@ however many folds are configured. The stage logs the figure before allocating, 
 
 **Reading the feature columns.** The feature pass (`for_each_feature_batch`) is the
 widest read of the stage: every selected feature column of every row of every
-input, once. It reads through `stages::wide_scan_options`, which is the plain
-reader with its parallel decode and 16,384-row batches unless `MUMDIA_WIDE_SCAN`
-asks otherwise (docs/03 "Sequential row-group reads"). The plain reader seeks once
-per page, which is what limits it on a spinning array (44 MB/s measured on the
-immunopeptidomics competed tables against a 133 MB/s ceiling). Two opt-ins address
-that: `MUMDIA_WIDE_SCAN=rowgroup` decodes one row group a batch
-(`feature_batch_rows`, at most 131,072 rows), so the reader sweeps each column chunk
-before the next one, and `MUMDIA_WIDE_SCAN=coalesced` reads each row group's
-projected column chunks in one sequential read at 16,384-row batches. Neither is
-the default: from the page cache the stream over the 879,018-row HYE competed table
-took 1.54 s plain, 1.58 s `rowgroup` and 2.50 s `coalesced`, and neither has been
-measured on the spinning array yet. The rows reach the handoff and the matrix in
-file order whatever the reader and batch size
+input, once. It reads with the plain reader, its parallel decode and 16,384-row
+batches. `MUMDIA_WIDE_SCAN`, which chose a row-group or a coalesced reader instead, was
+removed in 0.15.0: from the page cache the stream over the 879,018-row HYE competed
+table took 1.54 s plain, 1.58 s `rowgroup` and 2.50 s `coalesced` (docs/03
+"Sequential row-group reads"). The rows reach the handoff and the matrix in
+file order whatever the batch size
 (`every_read_mode_streams_the_same_feature_rows`).
 
 The stream hands out whole decoded batches (`FeatureBatch`), and each consumer
@@ -577,8 +571,8 @@ values actually used. Same strict/fallback logic as Mokapot.
 > fold only. Both facts are properties of the sidecar, not the Rust dispatch.
 
 **No `percolator` classifier.** `RescorerKind` has no such variant, so a config
-naming it fails to parse; `rescore.percolator_bin` is a dead field until an adapter
-exists.
+naming it fails to parse. `rescore.percolator_bin` was removed in 0.15.0 because no
+stage read it.
 
 **`RescorerKind::Entrapment`** (config.rs:116-122): a decoy-independent path for
 spike-in entrapment experiments. It requires `entrapment_marker` and at least one
@@ -661,7 +655,7 @@ and the pools are sorted.
 
 The classifier reads every column of the competed table's feature list (its `.schema.json`
 companion), so a family the features stage appends (`features.q1_fragment_features`,
-`features.ms1_envelope`, `features.q1_consistency`, ...) reaches it without a rescore change.
+`features.q1_precursor`, `features.q1_consistency`, ...) reaches it without a rescore change.
 The rescore prefilter (`rescore.prefilter_keep_decoys`, on for pools of at least
 `rescore.prefilter_min_psms` PSMs, docs/35_diapasef.md section 16) does not: its logistic
 regression reads `rescore.prefilter_features`, a fixed default list of 32 columns when unset,
@@ -864,8 +858,7 @@ counts feed a hyperscore-style term; `n` is small so the naive loop is fine.
 
 ## Configuration
 
-The fields below are the live ones this subsystem reads. `percolator_bin` is the
-one dead field kept in the struct (there is no `percolator` classifier).
+The fields below are the live ones this subsystem reads.
 
 ### `compete` (`CompeteConfig`, config.rs:825-851)
 
@@ -891,14 +884,13 @@ unless a knob is set.
 | `train_fdr` | `0.01` | q threshold for the confident-positive set in the semi-supervised loop |
 | `num_iter` | `10` | semi-supervised iterations for the native rescorer |
 | `python` | `None` | interpreter for the Mokapot/NnTorch/entrapment sidecars; required for those paths |
-| `percolator_bin` | `None` | dead field until the `percolator` path is wired (config.rs:1140) |
 | `entrapment_marker` | `None` | protein substring marking spike-in negatives; required for `entrapment` |
 | `entrapment_exclude` | `None` | substring that, if also present, keeps a PSM as a real target (shared peptides) |
 | `entrapment_contaminant_markers` | `[]` | substrings marking genuine contaminants inside the spike-in proteome; matching PSMs stay real targets |
 | `entrapment_ratio` | `1.0` | `N_real_lib / N_entrap_lib`, scales the entrapment FDR estimate |
 | `strict` | `true` | production default: any sidecar failure / misconfiguration is a hard error; false explicitly enables compatibility fallback |
 | `shadow_min_shared` | `3` | shadow demotion: demote a row with at least this many library fragments shared with a better first-pass-accepted target of its run and isolation window co-eluting within `shadow_rt_s` (see "shadow demotion and its Q1 term"); 0 is off |
-| `shadow_q1` | `false` | the Q1 term of shadow demotion on scanning-quadrupole runs: co-isolation by precursor m/z and each shared fragment counted by where its Q1 signal sits; needs `extract.q1_fragments`. Omitted from the canonical configuration at its default |
+| `shadow_q1` | `"auto"` | on for a ZT Scan search, off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"); the Q1 term of shadow demotion on scanning-quadrupole runs: co-isolation by precursor m/z and each shared fragment counted by where its Q1 signal sits; needs `extract.q1_fragments`. Omitted from the canonical configuration at its default |
 | `handoff` | `raw` | how the feature matrix reaches a sidecar (`Handoff`): `tsv` writes the Percolator PIN, `parquet` writes an f32 Parquet feature table, `raw` (the default since 2026-09-28) a row-major f32 `.npy` matrix with a metadata parquet and a `.raw.json` description. `parquet` and `raw` apply to `nn_torch` only; a mokapot run warns and falls back to `tsv` (`sidecar_paths`) |
 
 ## Invariants, determinism, gotchas
@@ -932,8 +924,7 @@ unless a knob is set.
   (standardization fit over the full matrix, not per fold, on all three backends;
   `nn_rescore_worker.py:387-391,406-409,455-460`). Do not treat its scores as
   reproducible; do not use it where byte-identity is required.
-- **There is no `percolator` classifier.** A config naming it fails to parse;
-  `percolator_bin` remains a dead field.
+- **There is no `percolator` classifier.** A config naming it fails to parse.
 - **Only the best peak per `(source, candidate_id)` reaches the q kernels**
   (in `rescore::run_hashed`). The collapse is a no-op at `extract.promote_top_peaks = 1`;
   with promotion on it is what stops K peaks per candidate from K-inflating the
@@ -983,7 +974,7 @@ unless a knob is set.
 - **Add a `percolator` classifier**: a `RescorerKind` variant and a dispatch arm in
   `rescore::run_hashed` that runs a PIN round-trip. The PIN writer already exists
   (`run_pin_sidecar`); percolator consumes the same PIN, so the work is invoking
-  `percolator_bin` (config.rs:1140) and parsing its output back into a per-row score
+  a percolator executable and parsing its output back into a per-row score
   vector aligned to input order. Honor `strict`.
 - **Add a rescorer sidecar** that follows the PIN contract: reuse `run_pin_sidecar`
   (through `HandoffWriter`), which writes SpecId `psm_i` / ScanNr `i`, ExpMass=CalcMass=mz,

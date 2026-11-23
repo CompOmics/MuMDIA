@@ -371,33 +371,36 @@ fn stat_field(text: &str, name: &str) -> Option<u64> {
     })
 }
 
-/// The smallest headroom (limit minus working set) of the memory cgroup a process is in and
-/// of its ancestors, or `None` when none of them has a limit.
+/// The memory cgroup a process is in and its ancestors, each with the files of its hierarchy:
+/// `(dir, [limit file, usage file, inactive-cache key of memory.stat])`.
 ///
 /// `proc_cgroup` is the text of `/proc/self/cgroup`; `v2_root` and `v1_root` are where the
-/// unified hierarchy and the v1 memory controller are mounted. The working set is the usage
-/// less the inactive file cache, which the kernel reclaims before it enforces the limit
-/// (the figure `docker stats` and the kubelet use); counting that cache as used would call
-/// a container that has read a large file full. Ancestors count because a batch system sets
-/// the limit on the job and runs the process in a step below it. When the process's own
-/// path is not visible (a cgroup namespace shows it as `/`), the mount root is read, which
-/// in a container is the container's own cgroup.
-pub fn cgroup_headroom_in(proc_cgroup: &str, v2_root: &Path, v1_root: &Path) -> Option<u64> {
-    let mut best: Option<u64> = None;
+/// unified hierarchy and the v1 memory controller are mounted. Ancestors count because a
+/// batch system sets the limit on the job and runs the process in a step below it. When the
+/// process's own path is not visible (a cgroup namespace shows it as `/`), the mount root is
+/// read, which in a container is the container's own cgroup.
+fn memory_cgroup_dirs(
+    proc_cgroup: &str,
+    v2_root: &Path,
+    v1_root: &Path,
+) -> Vec<(std::path::PathBuf, [&'static str; 3])> {
+    let mut out = Vec::new();
     for line in proc_cgroup.lines() {
         let mut parts = line.splitn(3, ':');
         let (Some(_id), Some(controllers), Some(rel)) = (parts.next(), parts.next(), parts.next())
         else {
             continue;
         };
-        let (root, limit_file, usage_file, inactive_key) = if controllers.is_empty() {
-            (v2_root, "memory.max", "memory.current", "inactive_file")
+        let (root, files) = if controllers.is_empty() {
+            (v2_root, ["memory.max", "memory.current", "inactive_file"])
         } else if controllers.split(',').any(|c| c == "memory") {
             (
                 v1_root,
-                "memory.limit_in_bytes",
-                "memory.usage_in_bytes",
-                "total_inactive_file",
+                [
+                    "memory.limit_in_bytes",
+                    "memory.usage_in_bytes",
+                    "total_inactive_file",
+                ],
             )
         } else {
             continue;
@@ -407,21 +410,7 @@ pub fn cgroup_headroom_in(proc_cgroup: &str, v2_root: &Path, v1_root: &Path) -> 
             dir = root.to_path_buf();
         }
         loop {
-            let limit = std::fs::read_to_string(dir.join(limit_file))
-                .ok()
-                .and_then(|t| cgroup_limit(&t))
-                .flatten();
-            let usage = std::fs::read_to_string(dir.join(usage_file))
-                .ok()
-                .and_then(|t| t.trim().parse::<u64>().ok());
-            if let (Some(limit), Some(usage)) = (limit, usage) {
-                let inactive = std::fs::read_to_string(dir.join("memory.stat"))
-                    .ok()
-                    .and_then(|t| stat_field(&t, inactive_key))
-                    .unwrap_or(0);
-                let headroom = limit.saturating_sub(usage.saturating_sub(inactive));
-                best = Some(best.map_or(headroom, |b| b.min(headroom)));
-            }
+            out.push((dir.clone(), files));
             if dir.as_path() == root {
                 break;
             }
@@ -431,7 +420,62 @@ pub fn cgroup_headroom_in(proc_cgroup: &str, v2_root: &Path, v1_root: &Path) -> 
             }
         }
     }
+    out
+}
+
+/// A cgroup directory's memory limit, `None` for no limit or none readable.
+fn read_cgroup_limit(dir: &Path, limit_file: &str) -> Option<u64> {
+    std::fs::read_to_string(dir.join(limit_file))
+        .ok()
+        .and_then(|t| cgroup_limit(&t))
+        .flatten()
+}
+
+/// The smallest headroom (limit minus working set) of the memory cgroup a process is in and
+/// of its ancestors (`memory_cgroup_dirs`), or `None` when none of them has a limit.
+///
+/// The working set is the usage less the inactive file cache, which the kernel reclaims
+/// before it enforces the limit (the figure `docker stats` and the kubelet use); counting
+/// that cache as used would call a container that has read a large file full.
+pub fn cgroup_headroom_in(proc_cgroup: &str, v2_root: &Path, v1_root: &Path) -> Option<u64> {
+    let mut best: Option<u64> = None;
+    for (dir, [limit_file, usage_file, inactive_key]) in
+        memory_cgroup_dirs(proc_cgroup, v2_root, v1_root)
+    {
+        let limit = read_cgroup_limit(&dir, limit_file);
+        let usage = std::fs::read_to_string(dir.join(usage_file))
+            .ok()
+            .and_then(|t| t.trim().parse::<u64>().ok());
+        if let (Some(limit), Some(usage)) = (limit, usage) {
+            let inactive = std::fs::read_to_string(dir.join("memory.stat"))
+                .ok()
+                .and_then(|t| stat_field(&t, inactive_key))
+                .unwrap_or(0);
+            let headroom = limit.saturating_sub(usage.saturating_sub(inactive));
+            best = Some(best.map_or(headroom, |b| b.min(headroom)));
+        }
+    }
     best
+}
+
+/// The smallest memory limit of the cgroup a process is in and of its ancestors
+/// (`memory_cgroup_dirs`), or `None` when none of them has one.
+fn cgroup_memory_limit_in(proc_cgroup: &str, v2_root: &Path, v1_root: &Path) -> Option<u64> {
+    memory_cgroup_dirs(proc_cgroup, v2_root, v1_root)
+        .iter()
+        .filter_map(|(dir, [limit_file, ..])| read_cgroup_limit(dir, limit_file))
+        .min()
+}
+
+/// This process's [`cgroup_memory_limit_in`]: a container's, or a SLURM or systemd job's
+/// (Linux only).
+pub(crate) fn cgroup_memory_limit() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    cgroup_memory_limit_in(
+        &text,
+        Path::new("/sys/fs/cgroup"),
+        Path::new("/sys/fs/cgroup/memory"),
+    )
 }
 
 /// How many chains of `peak` bytes fit at once in [`AUTO_MEMORY_FRACTION`] of what the
@@ -633,11 +677,6 @@ impl DecoderLease {
                 Err(seen) => cur = seen,
             }
         }
-    }
-
-    /// Threads to run on: the lease, or one when the budget was empty.
-    pub(crate) fn decoders(&self) -> usize {
-        self.n.max(1)
     }
 
     /// What the budget actually granted, which may be zero.
@@ -966,6 +1005,18 @@ mod tests {
         std::fs::create_dir_all(&empty).unwrap();
         assert_eq!(cgroup_headroom_in("0::/\n", &empty, &empty), None);
         assert_eq!(cgroup_headroom_in("", &v2, &v1), None);
+        // The limit alone, the machine-memory ceiling's: the tightest on the path.
+        assert_eq!(
+            cgroup_memory_limit_in("0::/job/step\n", &v2, &v1),
+            Some(500)
+        );
+        assert_eq!(cgroup_memory_limit_in("0::/job\n", &v2, &v1), Some(1000));
+        assert_eq!(cgroup_memory_limit_in("0::/\n", &v2, &v1), Some(2000));
+        assert_eq!(
+            cgroup_memory_limit_in("4:memory:/slurm/job_1\n", &v2, &v1),
+            Some(4096)
+        );
+        assert_eq!(cgroup_memory_limit_in("0::/\n", &empty, &empty), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 

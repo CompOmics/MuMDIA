@@ -49,8 +49,6 @@ const state = {
     diann_lib: "", diann_lib_out: "",
     // An optional FASTA the converted library's peptides are re-mapped to (#319).
     diann_remap_fasta: "",
-    // An empirical and a predicted library to merge, and the folder the merged pair goes in.
-    merge_emp_p: "", merge_emp_f: "", merge_pred_p: "", merge_pred_f: "", merge_out: "",
     // The condition of each spectra file of an experiment, by path
     // (`quant.normalisation_scope = condition`, `run-experiment --condition`).
     conditions: {},
@@ -59,7 +57,6 @@ const state = {
   // file names.
   conditionTyped: {},
   diannTimer: null,
-  diannGetTimer: null,
   thermoTimer: null,
   thermoReady: false,
   msconvert: null,
@@ -79,7 +76,6 @@ const state = {
   runMode: "experiment",
   // Batch progress: which file of how many, and what each one produced.
   batch: null,
-  diannOffer: null,
   runId: null,
   timer: null,
   lastStatus: null,
@@ -347,7 +343,6 @@ async function init() {
   }
   $("diann-import").addEventListener("click", importDiannLibrary);
   $("diann-remap-clear").addEventListener("click", clearRemapFasta);
-  $("merge-libraries").addEventListener("click", mergeLibraries);
   // The built-in path's predictors depend on the preset as well as on the files.
   $("preset").addEventListener("change", scheduleBuiltinPlan);
   for (const b of document.querySelectorAll("[data-pick]")) {
@@ -381,7 +376,6 @@ async function init() {
     )
   );
   $("diann-locate").addEventListener("click", locateDiann);
-  $("diann-download").addEventListener("click", downloadDiann);
   $("diann-ack").addEventListener("change", async (e) => {
     try {
       await invoke("diann_acknowledge", { accepted: e.target.checked });
@@ -526,18 +520,21 @@ async function seededOverrides(path) {
   return out;
 }
 
-/// Whether `value` is the engine default for `f`. List-valued settings carry their
-/// default as JSON text in the schema, so both sides are compared as parsed JSON.
-function sameAsDefault(f, value) {
-  let dflt = f.default;
-  if (typeof dflt === "string" && f.kind === "other") {
-    try {
-      dflt = JSON.parse(dflt);
-    } catch {
-      /* a plain text default stays text */
-    }
+/// The engine default of `f` as a value. The schema carries text defaults as JSON text
+/// (`"\"Lumos\""`, `"null"`, `"true"`, lists), so a string default is parsed when it
+/// parses; a plain text default stays text.
+function defaultOf(f) {
+  if (typeof f.default !== "string") return f.default;
+  try {
+    return JSON.parse(f.default);
+  } catch {
+    return f.default;
   }
-  return JSON.stringify(value) === JSON.stringify(dflt);
+}
+
+/// Whether `value` is the engine default for `f`, compared as parsed JSON.
+function sameAsDefault(f, value) {
+  return JSON.stringify(value) === JSON.stringify(defaultOf(f));
 }
 
 /// A value as the text input shows it: lists and objects as JSON, scalars as they are.
@@ -549,7 +546,7 @@ function displayValue(v) {
 /// The value currently shown for a setting: an override if one was typed, else the
 /// engine's default.
 function currentValue(f) {
-  return f.path in state.overrides ? state.overrides[f.path] : f.default;
+  return f.path in state.overrides ? state.overrides[f.path] : defaultOf(f);
 }
 
 const escHtml = (t) =>
@@ -563,21 +560,22 @@ function settingRow(f, label) {
   const esc = escHtml;
   const changed = f.path in state.overrides;
   const v = currentValue(f);
+  const named = `data-path="${esc(f.path)}" aria-label="${esc(label || f.path)}"`;
   let control;
   if (f.kind === "bool") {
     control =
-      `<select data-path="${esc(f.path)}">` +
+      `<select ${named}>` +
       `<option value="true"${v === true ? " selected" : ""}>true</option>` +
       `<option value="false"${v === false ? " selected" : ""}>false</option></select>`;
   } else if (f.kind === "enum" && f.choices) {
     control =
-      `<select data-path="${esc(f.path)}">` +
+      `<select ${named}>` +
       f.choices
         .map((c) => `<option value="${esc(c)}"${String(c) === String(v) ? " selected" : ""}>${esc(c)}</option>`)
         .join("") +
       `</select>`;
   } else {
-    control = `<input type="text" data-path="${esc(f.path)}" value="${esc(displayValue(v))}">`;
+    control = `<input type="text" ${named} value="${esc(displayValue(v))}">`;
   }
   // A field the engine accepts but does not act on yet is shown as exactly that,
   // and cannot be edited: a value typed there would be saved, validated and then
@@ -600,7 +598,9 @@ function settingRow(f, label) {
     `<div class="setting${changed ? " changed" : ""}">` +
     `<div class="sname">${name} ${gate} ${badge}</div>` +
     `<div class="shelp">${esc(f.help || "No description in the engine source.")}` +
-    (f.default !== null && f.default !== undefined ? ` <em>Default: ${esc(f.default)}</em>` : "") +
+    (defaultOf(f) != null
+      ? ` <em>Default: ${esc(displayValue(defaultOf(f)))}</em>`
+      : "") +
     `</div><div class="sctl">${control}</div></div>`
   );
 }
@@ -675,7 +675,9 @@ function onSettingChanged(el) {
   if (!f) return;
   let raw = el.value;
   let value = raw;
-  if (f.kind === "bool") value = raw === "true";
+  // An optional setting left blank is unset, whatever its kind, not the text "".
+  if (raw.trim() === "" && f.optional) value = null;
+  else if (f.kind === "bool") value = raw === "true";
   // A choice spelled `true` or `false` is a JSON boolean to the engine (the ZT Scan switches,
   // `quant.baseline_subtract`, `extract.ms1_calibrate`), not the string.
   else if (f.kind === "enum" && (raw === "true" || raw === "false")) value = raw === "true";
@@ -683,16 +685,12 @@ function onSettingChanged(el) {
     // An OPTIONAL number left blank means "unset", which is a real value for these
     // (`rt_im_train.multihead_calibration` unset is what turns the automatic default
     // on). A required one left blank is still an error.
-    if (raw.trim() === "" && f.optional) {
-      value = null;
-    } else {
-      const n = Number(raw);
-      if (raw.trim() === "" || Number.isNaN(n)) {
-        banner($("settings-error"), `${path} must be a number.`);
-        return;
-      }
-      value = n;
+    const n = Number(raw);
+    if (raw.trim() === "" || Number.isNaN(n)) {
+      banner($("settings-error"), `${path} must be a number.`);
+      return;
     }
+    value = n;
   } else if (f.kind === "other" && /^\s*[\[{]/.test(raw)) {
     // A list or object typed as JSON (the modification lists, for instance).
     try {
@@ -793,7 +791,6 @@ const LOCAL_SETTINGS = new Set([
   "predict_frag.sidecar_script_dir",
   "predict_frag.library_cache",
   "rt_im_train.deeplc_projection_cache",
-  "rescore.percolator_bin",
   "rescore.features_file",
   "convert.parallel_conversions",
   "extract.windows_in_flight",
@@ -837,10 +834,9 @@ function isComputersOwn(path) {
 const SETUP_SPEC = [
   { path: "search_space.source", kind: "choice", values: ["fasta", "library"], label: "Search space",
     tabs: true, names: { fasta: "From a FASTA", library: "From a spectral library" } },
-  { path: "search_space.library_input", kind: "choice", values: ["tables", "diann", "merge"],
+  { path: "search_space.library_input", kind: "choice", values: ["tables", "diann"],
     label: "Spectral library input", radio: "libin",
-    names: { tables: "MuMDIA library tables", diann: "a DIA-NN library",
-             merge: "a spectral library + a predicted library" } },
+    names: { tables: "MuMDIA library tables", diann: "a DIA-NN library" } },
   { path: "search_space.library_build", kind: "choice", values: ["diann", "builtin"],
     label: "Library from a FASTA built with", radio: "libsrc",
     names: { diann: "DIA-NN", builtin: "the built-in predictors" } },
@@ -1392,7 +1388,8 @@ function setupValueText(e, v) {
 
 function engineValueText(path, v) {
   if (v === undefined) {
-    const d = fieldOf(path)?.default;
+    const f = fieldOf(path);
+    const d = f ? defaultOf(f) : undefined;
     return d === null || d === undefined ? "the engine default" : `the engine default (${displayValue(d)})`;
   }
   return typeof v === "string" ? v : JSON.stringify(v);
@@ -2508,7 +2505,7 @@ async function refreshDiannNow() {
     where.textContent = `${d.version || "DIA-NN"} — ${d.path} (${via[d.source] || d.source})`;
   } else {
     where.textContent =
-      "No DIA-NN found. Install it yourself from github.com/vdemichev/DiaNN, then " +
+      "No DIA-NN found. Install DIA-NN 2.x yourself from github.com/vdemichev/DiaNN, then " +
       "use Locate. MuMDIA does not download it.";
   }
 
@@ -2516,92 +2513,7 @@ async function refreshDiannNow() {
   // DIA-NN is available and licensed. What it decides changes what the Search screen
   // can offer, so that is refreshed too.
 
-  refreshDiannOffer(d);
   refreshLibSrcNote();
-}
-
-async function refreshDiannOffer(d) {
-  if (!state.diannOffer) {
-    try {
-      state.diannOffer = await invoke("diann_offer");
-    } catch {
-      return;
-    }
-  }
-  const o = state.diannOffer;
-  // Only worth showing when there is nothing working already.
-  show($("diann-get"), !!o.available && !d.runs);
-  if (!o.available || d.runs) return;
-
-  const gb = (b) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : `${Math.round(b / 1e6)} MB`);
-  $("diann-get-sub").textContent =
-    `DIA-NN ${o.version} from the vendor's release page. ${gb(o.download_bytes)} download, ` +
-    `about ${gb(o.disk_bytes)} on disk. MuMDIA does not host or modify these files, and ` +
-    `verifies their checksum before use.` +
-    (o.hands_off ? "" : " The DIA-NN installer opens at the end and you complete it there.");
-  $("diann-download").disabled = !$("diann-ack").checked;
-  if (!$("diann-ack").checked) {
-    $("diann-get-step").textContent = "Acknowledge the licence above first.";
-  }
-  refreshDiannInstall();
-}
-
-async function refreshDiannInstall() {
-  let s;
-  try {
-    s = await invoke("diann_install_state");
-  } catch {
-    return;
-  }
-  const running = s.status === "running";
-  const bar = $("diann-get-bar");
-  show(bar, running);
-  bar.classList.toggle("pct", s.percent > 0);
-  bar.firstElementChild.style.width = s.percent > 0 ? `${s.percent}%` : "";
-
-  show($("diann-get-log-card"), s.log.length > 0);
-  const logEl = $("diann-get-log");
-  const text = (s.log || []).join("\n");
-  if (logEl.textContent !== text) {
-    logEl.textContent = text;
-    logEl.scrollTop = logEl.scrollHeight;
-  }
-
-  $("diann-download").disabled = running || !$("diann-ack").checked;
-  if (running) {
-    $("diann-get-step").textContent = s.percent > 0 ? `${s.step} — ${s.percent}%` : s.step;
-  } else if (s.status === "handoff") {
-    // Windows: the vendor's installer is now the thing the user is talking to.
-    $("diann-get-step").textContent =
-      "The DIA-NN installer is open. Finish it, then press Locate.";
-  } else if (s.status === "done") {
-    $("diann-get-step").textContent = "Installed.";
-  } else if (!$("diann-ack").checked) {
-    $("diann-get-step").textContent = "Acknowledge the licence above first.";
-  } else {
-    $("diann-get-step").textContent = "";
-  }
-  banner($("diann-get-error"), s.status === "failed" ? s.error || "The download failed." : "");
-
-  if (running && !state.diannGetTimer) {
-    state.diannGetTimer = setInterval(refreshDiannInstall, 700);
-  } else if (!running && state.diannGetTimer) {
-    clearInterval(state.diannGetTimer);
-    state.diannGetTimer = null;
-    // A finished install changes what detection sees.
-    if (s.status === "done" || s.status === "handoff") refreshDiann();
-  }
-}
-
-async function downloadDiann() {
-  banner($("diann-get-error"), "");
-  try {
-    await invoke("diann_install");
-  } catch (e) {
-    banner($("diann-get-error"), String(e));
-    return;
-  }
-  refreshDiannInstall();
 }
 
 async function locateDiann() {
@@ -2807,10 +2719,6 @@ const FILTERS = {
   // Parquet (DIA-NN 1.9 and 2.x) or DIA-NN's binary .speclib; a .tsv is not accepted.
   diann_lib: [{ name: "DIA-NN library", extensions: ["parquet", "speclib"] }],
   diann_remap_fasta: [{ name: "FASTA", extensions: ["fasta", "fa", "fas"] }],
-  merge_emp_p: [{ name: "Parquet", extensions: ["parquet"] }],
-  merge_emp_f: [{ name: "Parquet", extensions: ["parquet"] }],
-  merge_pred_p: [{ name: "Parquet", extensions: ["parquet"] }],
-  merge_pred_f: [{ name: "Parquet", extensions: ["parquet"] }],
 };
 const LABEL = {
   mzml: "p-mzml",
@@ -2824,16 +2732,11 @@ const LABEL = {
   diann_lib: "p-diann-lib",
   diann_lib_out: "p-diann-lib-out",
   diann_remap_fasta: "p-diann-remap",
-  merge_emp_p: "p-merge-ep",
-  merge_emp_f: "p-merge-ef",
-  merge_pred_p: "p-merge-pp",
-  merge_pred_f: "p-merge-pf",
-  merge_out: "p-merge-out",
 };
 // Pickers that choose a folder rather than a file.
 // `mzml_dir` is here because Bruker/Agilent `.d` and Waters `.raw` are
 // directories, and a file dialog cannot select one.
-const DIR_PICKS = new Set(["out_dir", "lib_out", "mzml_dir", "diann_lib_out", "merge_out"]);
+const DIR_PICKS = new Set(["out_dir", "lib_out", "mzml_dir", "diann_lib_out"]);
 
 // Render the selected spectra, with the vendor note each one needs.
 //
@@ -3454,7 +3357,6 @@ async function pick(what) {
     banner($("diann-import-error"), "");
   if (what === "diann_remap_fasta") show($("diann-remap-clear"), true);
   if (what === "diann_lib" || what === "diann_lib_out") banner($("diann-import-error"), "");
-  if (what.startsWith("merge_")) banner($("merge-error"), "");
   const el = $(LABEL[what]);
   // Shown right-to-left so the filename stays visible on a long path; the full
   // path is the tooltip.
@@ -4365,7 +4267,10 @@ function searchProblems() {
 // DIA-NN is the default source. While it cannot be used (not installed, or its licence
 // not acknowledged) the built-in predictors are selected instead, and DIA-NN comes back
 // by itself once it can be used, unless the user picked one of the two explicitly.
-async function refreshLibSrcNote() {
+// One plan call at a time: the command runs off the window thread, so an older, slower
+// answer could otherwise overwrite the note for the current modifications.
+const refreshLibSrcNote = () => oneAtATime("lib-src-note", refreshLibSrcNoteNow);
+async function refreshLibSrcNoteNow() {
   const note = $("libsrc-diann-note");
   const radio = $("libsrc-diann");
   if (!note || !radio) return;
@@ -4612,13 +4517,11 @@ async function followLibraryBuild(errorEl) {
 // selected under "MuMDIA library tables", ready for the search.
 function selectLibIn(which) {
   state.libIn = which;
-  const r = $(which === "diann" ? "libin-diann" : which === "merge" ? "libin-merge" : "libin-tables");
+  const r = $(which === "diann" ? "libin-diann" : "libin-tables");
   if (r) r.checked = true;
   show($("libin-tables-pane"), which === "tables");
   show($("libin-diann-pane"), which === "diann");
-  show($("libin-merge-pane"), which === "merge");
   if (which === "diann") refreshImportNote();
-  if (which === "merge") refreshMergeNote();
 }
 
 // Say, before Convert is pressed, whether the DIA-NN the conversion needs is there.
@@ -4651,78 +4554,6 @@ function clearRemapFasta() {
   el.title = "";
   el.classList.remove("set");
   show($("diann-remap-clear"), false);
-}
-
-// -- a spectral library + a predicted library ----------------------------------
-// Two MuMDIA libraries, an empirical one and one predicted from a FASTA, merged into one
-// pair of tables by `merge_libraries.py` (`diann::merge`), whose decoys DIA-NN predicts. On
-// success the merged tables are selected under "MuMDIA library tables", as after a
-// conversion.
-async function refreshMergeNote() {
-  const note = $("merge-note");
-  let d;
-  try {
-    d = (await invoke("diann_status")).status;
-  } catch (e) {
-    note.textContent = String(e);
-    return;
-  }
-  note.textContent = !d.runs
-    ? "No working DIA-NN was found: install DIA-NN 2.x and locate it on the Setup screen."
-    : !d.licence_acknowledged
-      ? "Acknowledge the DIA-NN licence on the Setup screen first."
-      : !d.writes_parquet
-        ? `${d.version || "This DIA-NN"} cannot write Parquet; DIA-NN 2.x is needed.`
-        : `Decoys predicted with ${d.version || "DIA-NN"}.`;
-}
-
-async function mergeLibraries() {
-  const err = $("merge-error");
-  banner(err, "");
-  if (state.buildingLibrary) return banner(err, "A library build is already running.");
-  const p = state.picks;
-  for (const [key, what] of [
-    ["merge_emp_p", "the empirical precursor table"],
-    ["merge_emp_f", "the empirical fragment table"],
-    ["merge_pred_p", "the predicted precursor table"],
-    ["merge_pred_f", "the predicted fragment table"],
-    ["merge_out", "an empty folder for the merged library"],
-  ]) {
-    if (!p[key]) return banner(err, `Choose ${what}.`);
-  }
-  const req = {
-    empirical_precursors: p.merge_emp_p,
-    empirical_fragments: p.merge_emp_f,
-    predicted_precursors: p.merge_pred_p,
-    predicted_fragments: p.merge_pred_f,
-    out_dir: p.merge_out,
-    precedence: $("merge-precedence").value || "empirical",
-  };
-  const threads = parseInt($("d-threads").value, 10);
-  if (Number.isFinite(threads) && threads > 0) req.threads = threads;
-  try {
-    await invoke("diann_merge", { req });
-  } catch (e) {
-    banner(err, String(e));
-    return;
-  }
-  enterLibraryPhase("Merging the libraries", "Merging the libraries");
-  const built = await followLibraryBuild(err);
-  screen("input");
-  if (!built) return;
-  for (const [what, path] of [
-    ["lib_precursors", built[0]],
-    ["lib_fragments", built[1]],
-  ]) {
-    state.picks[what] = path;
-    const el = $(LABEL[what]);
-    el.textContent = path;
-    el.title = path;
-    el.classList.add("set");
-  }
-  selectLibIn("tables");
-  scheduleSpace();
-  banner($("start-error"), "");
 }
 
 async function importDiannLibrary() {
@@ -4782,7 +4613,7 @@ async function importDiannLibrary() {
 // other files of the batch take different bands (`separateRestBands`).
 async function runBatch(p, built, threads, config, configOf = () => config) {
   const files = p.mzml.slice();
-  state.batch = { total: files.length, done: 0, failed: 0, results: [] };
+  state.batch = { files, total: files.length, done: 0, failed: 0, results: [] };
 
   for (const [i, file] of files.entries()) {
     if (state.batch.stopped) break;
@@ -4828,8 +4659,10 @@ async function runBatch(p, built, threads, config, configOf = () => config) {
     state.outDir = req.out_dir;
     rememberFolder(req.out_dir);
     screen("progress");
-    $("prog-title").textContent = `Searching ${i + 1} of ${files.length}`;
-    $("prog-sub").textContent = baseName(file);
+    // A finished earlier search leaves Stop disabled; render() shows the file position.
+    $("stop").disabled = false;
+    $("stop").textContent = "Stop";
+    banner($("run-error"), "");
     for (const b of document.querySelectorAll(".nav")) {
       if (b.dataset.screen === "progress") b.disabled = false;
     }
@@ -4841,6 +4674,7 @@ async function runBatch(p, built, threads, config, configOf = () => config) {
   }
 
   state.batch.done = files.length;
+  $("nav-results").disabled = false;
   renderBatchSummary();
 }
 
@@ -5249,16 +5083,17 @@ async function startSearch() {
     banner($("start-error"), "Add at least one spectra file.");
     return;
   }
+  // Without one, a batch would write each file's folder to the drive root ("/01_<stem>").
+  if (!p.out_dir) {
+    banner($("start-error"), "Choose a results folder.");
+    return;
+  }
   // A DIA-NN library is searched through the two tables its conversion writes.
   if (state.mode === "library" && state.libIn === "diann" && !p.lib_precursors) {
     banner(
       $("start-error"),
       "Convert the DIA-NN library first: the search reads the two tables it writes."
     );
-    return;
-  }
-  if (state.mode === "library" && state.libIn === "merge" && !p.lib_precursors) {
-    banner($("start-error"), "Merge the libraries first: the search reads the two tables it writes.");
     return;
   }
 
@@ -5759,8 +5594,12 @@ function render(s) {
   const done = expected.filter(([k]) => seen.has(k)).length;
   const parts = [];
   // `s.runs` only has entries once a file has written something, so during the very
-  // first file it reads "file 1 of n" rather than "0".
-  if (active && (s.runs || []).length && s.status === "running") {
+  // first file it reads "file 1 of n" rather than "0". Not in a batch: there each search
+  // is one file, and its `s.runs` can hold the RT bootstrap's folder.
+  const batch = state.batch && state.batch.done < state.batch.total ? state.batch : null;
+  if (batch) {
+    parts.push(`file ${batch.done + 1} of ${batch.total}: ${baseName(batch.files[batch.done])}`);
+  } else if (active && (s.runs || []).length && s.status === "running") {
     const total = state.picks.mzml.length || s.runs.length;
     parts.push(`file ${Math.min(s.runs.length, total)} of ${total}`);
   }

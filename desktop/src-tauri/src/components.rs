@@ -285,6 +285,26 @@ pub fn interpreter_home(venv: &Path) -> Option<PathBuf> {
     })
 }
 
+/// Why the environment `venv` cannot start although its `python.exe` exists, or `None`.
+///
+/// On Windows a uv environment's `python.exe` is a launcher for the interpreter named by
+/// the `home` line of `pyvenv.cfg`. When that interpreter is deleted (uv's own folder
+/// cleaned, a roaming profile reset), every call fails with "uv trampoline failed to spawn
+/// Python", while the environment still looks installed. `uv venv --allow-existing`
+/// repoints it at a fresh interpreter, so Install repairs it without the packages.
+pub fn base_interpreter_gone(venv: &Path) -> Option<String> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let home = interpreter_home(venv)?;
+    (!home.join("python.exe").is_file()).then(|| {
+        format!(
+            "The Python this environment was made from ({}) is gone, so the environment              cannot start. Press Install to repair it.",
+            home.display()
+        )
+    })
+}
+
 /// What [`compile_bytecode`] compiles for the environment `venv`: its packages, and the
 /// standard library of the interpreter it was created from. Windows layout, the only one
 /// with a machine scope.
@@ -434,19 +454,18 @@ pub fn stamp_env(cmd: &mut std::process::Command) {
     // Per-role rather than the blanket `MUMDIA_PYTHON`, because the two
     // environments are not interchangeable: MS2PIP cannot share the primary one.
     let primary = managed_python(Env::Primary);
-    if primary.is_file() {
+    if primary.is_file() && base_interpreter_gone(&venv_dir(Env::Primary)).is_none() {
         // IM2Deep is installed into the primary environment (`console-requirements.txt`).
         for var in [
             "MUMDIA_PYTHON_RESCORE",
             "MUMDIA_PYTHON_DEEPLC",
-            "MUMDIA_PYTHON_MBR",
             "MUMDIA_PYTHON_IM2DEEP",
         ] {
             cmd.env(var, &primary);
         }
     }
     let ms2pip = managed_python(Env::Ms2pip);
-    if ms2pip.is_file() {
+    if ms2pip.is_file() && base_interpreter_gone(&venv_dir(Env::Ms2pip)).is_none() {
         cmd.env("MUMDIA_PYTHON_MS2PIP", &ms2pip);
     }
     // The Thermo .raw converter -- but only if it RUNS.
@@ -498,9 +517,23 @@ pub const THERMO_DIR_NAME: &str = "ThermoRawFileParser";
 /// `thermo_parser` answers "is it on disk", which is the right question for showing
 /// install state. This answers "will it convert", which is the only question worth
 /// putting in an environment variable the engine treats as an explicit choice.
+///
+/// Every engine call asks, so a success is remembered for the same file and modified
+/// time; a failure is not, so a one-off timeout is probed again.
 pub fn runnable_thermo_parser() -> Option<PathBuf> {
+    static OK: std::sync::Mutex<Option<(PathBuf, std::time::SystemTime)>> =
+        std::sync::Mutex::new(None);
     let p = thermo_parser()?;
-    crate::thermo::runs(&p).then_some(p)
+    let modified = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
+    let mut ok = OK.lock().unwrap_or_else(|e| e.into_inner());
+    if modified.is_some() && ok.as_ref().map(|(q, t)| (q, Some(*t))) == Some((&p, modified)) {
+        return Some(p);
+    }
+    if !crate::thermo::runs(&p) {
+        return None;
+    }
+    *ok = modified.map(|t| (p.clone(), t));
+    Some(p)
 }
 
 /// The managed ThermoRawFileParser executable, if it is installed.
@@ -712,8 +745,10 @@ pub fn status_of(env: Env) -> Status {
         ..Default::default()
     };
     let py = managed_python(env);
-    if !py.is_file() {
+    let gone = base_interpreter_gone(&venv_dir(env));
+    if !py.is_file() || gone.is_some() {
         s.missing = env.modules().iter().map(|m| m.to_string()).collect();
+        s.error = gone;
         return s;
     }
     s.python = Some(py.display().to_string());
@@ -738,11 +773,6 @@ pub fn status_of(env: Env) -> Status {
     s
 }
 
-/// The primary environment, which is what "are the components installed" means.
-pub fn status() -> Status {
-    status_of(Env::Primary)
-}
-
 /// Why a search cannot start on `s`, an environment that is not `complete`: the sentence
 /// the pre-flight check shows.
 pub fn blocker(s: &Status) -> String {
@@ -756,6 +786,7 @@ pub fn blocker(s: &Status) -> String {
                 .as_deref()
                 .unwrap_or("their packages do not load")
         ),
+        _ if s.error.is_some() => s.error.clone().unwrap_or_default(),
         _ => format!(
             "The analysis components are not installed{}.",
             if s.missing.is_empty() {
@@ -969,12 +1000,15 @@ impl Installer {
     /// Refresh one environment from disk. Cheap enough to call whenever the screen
     /// is shown.
     pub fn refresh(&self, env: Env) -> Status {
-        let mut fresh = status_of(env);
-        // An installation tests the packages itself when it ends; starting a second
-        // import underneath it would test a half-written environment.
-        if !self.busy(env) {
-            self.with_probe(env, &mut fresh);
+        // An installation tests the packages itself when it ends (`record_outcome`);
+        // starting the environment's Python underneath it would test a half-written one.
+        if self.busy(env) {
+            if let Ok(s) = self.slot(env).lock() {
+                return s.clone();
+            }
         }
+        let mut fresh = status_of(env);
+        self.with_probe(env, &mut fresh);
         if let Ok(mut s) = self.slot(env).lock() {
             *s = carry_outcome(&s, fresh);
             return s.clone();
@@ -1133,8 +1167,11 @@ pub fn install(installer: Arc<Installer>, env: Env) -> Result<(), String> {
             // uv's package cache (and, with the environments moved, its interpreters) in
             // the storage folder, when one was chosen.
             crate::storage::apply(&mut cmd);
-            if machine {
-                for (k, v) in machine_uv_env(&tools) {
+            // In the user scope too, the interpreter goes into the application's own
+            // folder and never comes from elsewhere: an environment based on a Python
+            // that is later removed stops starting ([`base_interpreter_gone`]).
+            for (k, v) in machine_uv_env(&tools) {
+                if machine || k != "UV_LINK_MODE" {
                     cmd.env(k, v);
                 }
             }
@@ -1465,8 +1502,9 @@ fn inventory(tools: &Path, data: &Path, user_tools: &Path) -> Vec<Removable> {
         (
             "diann",
             "DIA-NN 1.8.1",
-            "The copy of DIA-NN downloaded through this application. A DIA-NN you \
-             installed yourself lives elsewhere and is not touched.",
+            "The copy of DIA-NN 1.8.1 that earlier versions of this application \
+             downloaded. No feature uses it. A DIA-NN you installed yourself lives \
+             elsewhere and is not touched.",
             false,
             vec![root.join(crate::diann::MANAGED_DIR_NAME)],
         ),
@@ -2036,6 +2074,30 @@ mod tests {
     }
 
     #[test]
+    fn an_environment_whose_base_python_was_deleted_is_reported_gone() {
+        let d = scratch("pyvenv-gone");
+        let venv = d.join("python");
+        std::fs::create_dir_all(&venv).unwrap();
+        // No pyvenv.cfg: nothing to judge, so not gone.
+        assert_eq!(base_interpreter_gone(&venv), None);
+        let home = d.join("uv-python").join("cpython-3.11");
+        std::fs::write(
+            venv.join("pyvenv.cfg"),
+            format!("home = {}\n", home.display()),
+        )
+        .unwrap();
+        let gone = base_interpreter_gone(&venv);
+        if cfg!(windows) {
+            assert!(gone.unwrap().contains("Press Install to repair it"));
+        } else {
+            assert_eq!(gone, None);
+        }
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("python.exe"), b"").unwrap();
+        assert_eq!(base_interpreter_gone(&venv), None);
+    }
+
+    #[test]
     fn the_interpreter_of_an_environment_is_read_from_its_pyvenv_cfg() {
         let d = scratch("pyvenv-home");
         let venv = d.join("python");
@@ -2565,11 +2627,11 @@ mod tests {
         // without touching a real installation.
         let s = if managed_python(Env::Primary).is_file() {
             eprintln!("a managed environment exists on this machine; checking the warm path");
-            let s = status();
+            let s = status_of(Env::Primary);
             assert!(s.python.is_some());
             return;
         } else {
-            status()
+            status_of(Env::Primary)
         };
         assert!(s.python.is_none());
         assert!(!s.complete);
@@ -2633,7 +2695,6 @@ mod tests {
             for var in [
                 "MUMDIA_PYTHON_RESCORE",
                 "MUMDIA_PYTHON_DEEPLC",
-                "MUMDIA_PYTHON_MBR",
                 "MUMDIA_PYTHON_IM2DEEP",
             ] {
                 assert!(

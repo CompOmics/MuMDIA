@@ -7,8 +7,6 @@
     "prescan",
     "prescreen",
     "prescreen.tags",
-    "prescreen.mass_hypotheses",
-    "prescreen.trace",
     "digest",
     "digest.decoy",
     "peptidoforms",
@@ -467,19 +465,6 @@
       ]
     },
     {
-      "path": "prescreen.top_peaks",
-      "name": "top_peaks",
-      "section": "prescreen",
-      "rust_type": "usize",
-      "kind": "integer",
-      "optional": false,
-      "default": 0,
-      "default_text": "0",
-      "help": "Most intense peaks per MS2 used for both the rarity histogram and the matching; 0 (the default) uses every positive peak. 300 is the capped comparison setting.",
-      "gates": [],
-      "source_struct": "PrescreenConfig"
-    },
-    {
       "path": "prescreen.frag_tol_da",
       "name": "frag_tol_da",
       "section": "prescreen",
@@ -597,119 +582,6 @@
       "source_struct": "PrescreenConfig"
     },
     {
-      "path": "prescreen.retrieval",
-      "name": "retrieval",
-      "section": "prescreen",
-      "rust_type": "PrescreenRetrieval",
-      "kind": "enum",
-      "optional": false,
-      "default": "all",
-      "default_text": "`all`",
-      "help": "Candidate retrieval before scoring. `all` (default) scores every candidate.",
-      "gates": [],
-      "source_struct": "PrescreenConfig",
-      "choices": [
-        "all",
-        "tags"
-      ]
-    },
-    {
-      "path": "prescreen.rescue",
-      "name": "rescue",
-      "section": "prescreen",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": true,
-      "default_text": "true",
-      "help": "With `retrieval = \"tags\"`, score candidates without tag evidence anyway (the permissive rescue route) instead of dropping them. Default true.",
-      "gates": [],
-      "source_struct": "PrescreenConfig"
-    },
-    {
-      "path": "prescreen.delayed_modforms",
-      "name": "delayed_modforms",
-      "section": "prescreen",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "With `retrieval = \"tags\"`, retrieve backbone families first and examine forms only in retrieved families (delayed modification enumeration). Same retrieved set.",
-      "gates": [],
-      "source_struct": "PrescreenConfig"
-    },
-    {
-      "path": "prescreen.complement_bonus",
-      "name": "complement_bonus",
-      "section": "prescreen",
-      "rust_type": "f64",
-      "kind": "float",
-      "optional": false,
-      "default": 0.0,
-      "default_text": "0.0",
-      "help": "Weight of the complementary-ion component (prototype 0.25 measured); 0 = off.",
-      "gates": [],
-      "source_struct": "PrescreenConfig"
-    },
-    {
-      "path": "prescreen.tag_bonus",
-      "name": "tag_bonus",
-      "section": "prescreen",
-      "rust_type": "f64",
-      "kind": "float",
-      "optional": false,
-      "default": 0.0,
-      "default_text": "0.0",
-      "help": "Weight of the tag-evidence component (spectrum rarity x path fit, each distinct trimer once); 0 = off.",
-      "gates": [],
-      "source_struct": "PrescreenConfig"
-    },
-    {
-      "path": "prescreen.fasta_bonus",
-      "name": "fasta_bonus",
-      "section": "prescreen",
-      "rust_type": "f64",
-      "kind": "float",
-      "optional": false,
-      "default": 0.0,
-      "default_text": "0.0",
-      "help": "Weight of the FASTA/library-side tag information, kept separate from the spectrum side; 0 = off.",
-      "gates": [],
-      "source_struct": "PrescreenConfig"
-    },
-    {
-      "path": "prescreen.flank_bonus",
-      "name": "flank_bonus",
-      "section": "prescreen",
-      "rust_type": "f64",
-      "kind": "float",
-      "optional": false,
-      "default": 0.0,
-      "default_text": "0.0",
-      "help": "Weight of positioned flank support (an observed tag whose ladder endpoints sit at the candidate's b/y masses); 0 = off.",
-      "gates": [],
-      "source_struct": "PrescreenConfig"
-    },
-    {
-      "path": "prescreen.localization",
-      "name": "localization",
-      "section": "prescreen",
-      "rust_type": "PrescreenLocalization",
-      "kind": "enum",
-      "optional": false,
-      "default": "own",
-      "default_text": "`own`",
-      "help": "",
-      "gates": [],
-      "source_struct": "PrescreenConfig",
-      "choices": [
-        "own",
-        "family_support",
-        "best_site"
-      ]
-    },
-    {
       "path": "prescreen.tag_prefilter",
       "name": "tag_prefilter",
       "section": "prescreen",
@@ -762,32 +634,6 @@
       "source_struct": "PrescreenTagsConfig"
     },
     {
-      "path": "prescreen.tags.gap_edges",
-      "name": "gap_edges",
-      "section": "prescreen.tags",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "Also allow two-residue gap steps; every compatible residue pair is kept as an alternative and gapped three-peak ladders are keyed separately from four-peak ones.",
-      "gates": [],
-      "source_struct": "PrescreenTagsConfig"
-    },
-    {
-      "path": "prescreen.tags.rms_sigma_da",
-      "name": "rms_sigma_da",
-      "section": "prescreen.tags",
-      "rust_type": "f64",
-      "kind": "float",
-      "optional": false,
-      "default": 0.003,
-      "default_text": "0.003",
-      "help": "Sigma of the whole-path soft weight `exp(-0.5 (rms / sigma)^2)` (Da).",
-      "gates": [],
-      "source_struct": "PrescreenTagsConfig"
-    },
-    {
       "path": "prescreen.tags.extra_mods",
       "name": "extra_mods",
       "section": "prescreen.tags",
@@ -799,235 +645,6 @@
       "help": "Variable states added to the chemistry configuration's alphabet, `RESIDUE:Name`.",
       "gates": [],
       "source_struct": "PrescreenTagsConfig"
-    },
-    {
-      "path": "prescreen.tags.positioned",
-      "name": "positioned",
-      "section": "prescreen.tags",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "Positioned retrieval: a candidate is retrieved only by a tag whose ladder starts at one of its own b or y fragment masses (+/- 0.01 Da), not by the same trimer anywhere in the spectrum. Much more specific in dense spectra.",
-      "gates": [],
-      "source_struct": "PrescreenTagsConfig"
-    },
-    {
-      "path": "prescreen.tags.positioned_residues",
-      "name": "positioned_residues",
-      "section": "prescreen.tags",
-      "rust_type": "usize",
-      "kind": "integer",
-      "optional": false,
-      "default": 3,
-      "default_text": "3",
-      "help": "Residue steps of a positioned ladder: 3 (four consecutive fragments, the default) or 2 (three consecutive fragments, more permissive).",
-      "gates": [],
-      "source_struct": "PrescreenTagsConfig"
-    },
-    {
-      "path": "prescreen.mass_hypotheses.enabled",
-      "name": "enabled",
-      "section": "prescreen.mass_hypotheses",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "Infer hypotheses and write `<out>.mass_hypotheses.parquet`.",
-      "gates": [],
-      "source_struct": "PrescreenMassConfig"
-    },
-    {
-      "path": "prescreen.mass_hypotheses.sample_spectra",
-      "name": "sample_spectra",
-      "section": "prescreen.mass_hypotheses",
-      "rust_type": "usize",
-      "kind": "integer",
-      "optional": false,
-      "default": 512,
-      "default_text": "512",
-      "help": "Spectra sampled for inference (seeded); 0 = every spectrum (expensive).",
-      "gates": [],
-      "source_struct": "PrescreenMassConfig"
-    },
-    {
-      "path": "prescreen.mass_hypotheses.ms1",
-      "name": "ms1",
-      "section": "prescreen.mass_hypotheses",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "Look for the monoisotopic and +1 isotope peaks in MS1 scans within `ms1_rt_s`.",
-      "gates": [],
-      "source_struct": "PrescreenMassConfig"
-    },
-    {
-      "path": "prescreen.mass_hypotheses.ms1_rt_s",
-      "name": "ms1_rt_s",
-      "section": "prescreen.mass_hypotheses",
-      "rust_type": "f64",
-      "kind": "float",
-      "optional": false,
-      "default": 2.0,
-      "default_text": "2.0",
-      "help": "",
-      "gates": [],
-      "source_struct": "PrescreenMassConfig"
-    },
-    {
-      "path": "prescreen.mass_hypotheses.ms1_ppm",
-      "name": "ms1_ppm",
-      "section": "prescreen.mass_hypotheses",
-      "rust_type": "f64",
-      "kind": "float",
-      "optional": false,
-      "default": 10.0,
-      "default_text": "10.0",
-      "help": "MS1 tolerance: max(0.005 Da, this many ppm).",
-      "gates": [],
-      "source_struct": "PrescreenMassConfig"
-    },
-    {
-      "path": "prescreen.mass_hypotheses.require_ms1",
-      "name": "require_ms1",
-      "section": "prescreen.mass_hypotheses",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "Drop hypotheses without an MS1 link. A hard gate; off by default.",
-      "gates": [],
-      "source_struct": "PrescreenMassConfig"
-    },
-    {
-      "path": "prescreen.mass_hypotheses.bonus",
-      "name": "bonus",
-      "section": "prescreen.mass_hypotheses",
-      "rust_type": "f64",
-      "kind": "float",
-      "optional": false,
-      "default": 0.0,
-      "default_text": "0.0",
-      "help": "Weight of the candidate mass-support component in the combined score; 0 = report only.",
-      "gates": [],
-      "source_struct": "PrescreenMassConfig"
-    },
-    {
-      "path": "prescreen.trace.enabled",
-      "name": "enabled",
-      "section": "prescreen.trace",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "Compute the trace component (reported in the scores table).",
-      "gates": [],
-      "source_struct": "PrescreenTraceConfig"
-    },
-    {
-      "path": "prescreen.trace.scans",
-      "name": "scans",
-      "section": "prescreen.trace",
-      "rust_type": "usize",
-      "kind": "integer",
-      "optional": false,
-      "default": 7,
-      "default_text": "7",
-      "help": "Consecutive same-window scans per pool.",
-      "gates": [],
-      "source_struct": "PrescreenTraceConfig"
-    },
-    {
-      "path": "prescreen.trace.cluster_da",
-      "name": "cluster_da",
-      "section": "prescreen.trace",
-      "rust_type": "f64",
-      "kind": "float",
-      "optional": false,
-      "default": 0.01,
-      "default_text": "0.01",
-      "help": "Maximum m/z range (max - min) of one merged cluster.",
-      "gates": [],
-      "source_struct": "PrescreenTraceConfig"
-    },
-    {
-      "path": "prescreen.trace.min_detections",
-      "name": "min_detections",
-      "section": "prescreen.trace",
-      "rust_type": "usize",
-      "kind": "integer",
-      "optional": false,
-      "default": 2,
-      "default_text": "2",
-      "help": "Scans a merged cluster must be detected in.",
-      "gates": [],
-      "source_struct": "PrescreenTraceConfig"
-    },
-    {
-      "path": "prescreen.trace.pooling",
-      "name": "pooling",
-      "section": "prescreen.trace",
-      "rust_type": "PrescreenPooling",
-      "kind": "enum",
-      "optional": false,
-      "default": "merged",
-      "default_text": "`merged`",
-      "help": "",
-      "gates": [],
-      "source_struct": "PrescreenTraceConfig",
-      "choices": [
-        "merged",
-        "unmerged"
-      ]
-    },
-    {
-      "path": "prescreen.trace.score",
-      "name": "score",
-      "section": "prescreen.trace",
-      "rust_type": "PrescreenTraceScore",
-      "kind": "enum",
-      "optional": false,
-      "default": "tag_coherence",
-      "default_text": "`tag_coherence`",
-      "help": "",
-      "gates": [],
-      "source_struct": "PrescreenTraceConfig",
-      "choices": [
-        "tag_coherence",
-        "coherent_fragments"
-      ]
-    },
-    {
-      "path": "prescreen.trace.min_quality",
-      "name": "min_quality",
-      "section": "prescreen.trace",
-      "rust_type": "f64",
-      "kind": "float",
-      "optional": false,
-      "default": 0.6,
-      "default_text": "0.6",
-      "help": "Trace cosine counted as compatible by `coherent_fragments`.",
-      "gates": [],
-      "source_struct": "PrescreenTraceConfig"
-    },
-    {
-      "path": "prescreen.trace.bonus",
-      "name": "bonus",
-      "section": "prescreen.trace",
-      "rust_type": "f64",
-      "kind": "float",
-      "optional": false,
-      "default": 0.0,
-      "default_text": "0.0",
-      "help": "Weight of the trace component in the combined score; 0 = report only.",
-      "gates": [],
-      "source_struct": "PrescreenTraceConfig"
     },
     {
       "path": "digest.enzyme",
@@ -1678,21 +1295,6 @@
       "source_struct": "SearchSeedConfig"
     },
     {
-      "path": "search_seed.q1_deconvolved",
-      "name": "q1_deconvolved",
-      "section": "search_seed",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "Scanning-quadrupole spectra (SCIEX ZT Scan DIA read with `convert.isolation_half_width`, spectra_ms2 v3): count a peak for a candidate only when its Q1 centroid lies within 2 steps of the candidate's nominal expected Q1 centre (`stages::q1dec`). Every MS2 peak is given the centroid of its trace along the Q1 axis (mutual-nearest peaks of adjacent steps of one cycle, split at valleys), so a fragment m/z another precursor shares, transmitted around that precursor's position, no longer counts for this one. The seed runs before the Q1 calibration, so the centre is the precursor's isotope envelope with no window offset. Refused on spectra that carry 1/K0 and with window groups. Default false. Benchmark-gated (docs/37_ztscan.md). Omitted from the canonical configuration at its default.",
-      "gates": [
-        "benchmark-gated"
-      ],
-      "source_struct": "SearchSeedConfig"
-    },
-    {
       "path": "search_seed.frag_tol_mad_k",
       "name": "frag_tol_mad_k",
       "section": "search_seed",
@@ -2206,7 +1808,7 @@
       "optional": false,
       "default": "auto",
       "default_text": "`auto`",
-      "help": "Scanning-quadrupole spectra (SCIEX ZT Scan DIA read with `convert.isolation_half_width`): calibrate the Q1 dimension on the confident seed PSMs (`stages::q1cal`). For each anchor's strongest library fragments, the matched intensity in every Q1 step near its precursor over the cycles around its seed scan gives the fragment's observed Q1 centre; the expected centre is that of the transmission, summed over the precursor's isotopes weighted by their abundance. The window-centre offset is fitted as a smooth function of precursor m/z (and of fragment m/z and retention time when they reduce the residuals), with the effective half-width and edge width, and written to `cal.json` (`q1_calibration`), with the residual distribution in steps before and after and which reading of the target (centre or edge) fits; `extract.q1_fragments` and the Q1-deconvolved keys decide with it. Refused on any other layout, on spectra with 1/K0 and with `groups.window_groups > 1`. `\"auto\"` (the default since 0.12.0): on for a ZT Scan search unless `groups.window_groups > 1` or `extract.q1_fragments = false` (and `extract.q1_deconvolved` off) leave nothing to read it, off for every other search (`ZtSwitch`, docs/37_ztscan.md, \"Automatic for ZT Scan files\"; docs/08_rt_im_train.md, section 4h). Omitted from the canonical configuration unless on.",
+      "help": "Scanning-quadrupole spectra (SCIEX ZT Scan DIA read with `convert.isolation_half_width`): calibrate the Q1 dimension on the confident seed PSMs (`stages::q1cal`). For each anchor's strongest library fragments, the matched intensity in every Q1 step near its precursor over the cycles around its seed scan gives the fragment's observed Q1 centre; the expected centre is that of the transmission, summed over the precursor's isotopes weighted by their abundance. The window-centre offset is fitted as a smooth function of precursor m/z (and of fragment m/z and retention time when they reduce the residuals), with the effective half-width and edge width, and written to `cal.json` (`q1_calibration`), with the residual distribution in steps before and after and which reading of the target (centre or edge) fits; `extract.q1_fragments` and `features.q1_deconvolved` decide with it. Refused on any other layout, on spectra with 1/K0 and with `groups.window_groups > 1`. `\"auto\"` (the default since 0.12.0): on for a ZT Scan search unless `groups.window_groups > 1` or `extract.q1_fragments = false` leave nothing to read it, off for every other search (`ZtSwitch`, docs/37_ztscan.md, \"Automatic for ZT Scan files\"; docs/08_rt_im_train.md, section 4h). Omitted from the canonical configuration unless on.",
       "gates": [],
       "source_struct": "RtImTrainConfig",
       "choices": [
@@ -2237,53 +1839,8 @@
       "optional": true,
       "default": "null",
       "default_text": "null",
-      "help": "Refuse an extraction whose hit store is estimated, before anything is probed, to hold more than this many GiB at once. Unset (the default) is `auto`: the machine's physical memory (the cgroup limit when a container sets a smaller one), checked only once the estimate passes 4 GiB, and no check when the memory cannot be read. `0` turns the check off; a number is a ceiling of your own. Under `groups.parallel` each band in flight gets its share of the ceiling. The estimate is the stage's largest structure, the fragment-peak matches each window collects, for the windows held at once: a batch of `windows_in_flight` on the streamed path, the whole run under a two-pass peak claim, the contested features or the bucketed matcher. Per window it sums, over (a sample of) the candidates the window reaches, their fragments times the peaks of the window's scans inside their RT (and 1/K0) windows times the chance that a peak falls within the fragment tolerance, with the peaks spread evenly over the log m/z span of the scans, at 20 bytes a match. It is an order-of-magnitude estimate, logged on every run (`extract: estimated hit store`), not a prediction of the peak RSS. The case it exists for is an all-ion layout: spectra whose isolation window is the whole m/z range, so that every spectrum reaches every candidate and nothing can be written before the end of the run. A SCIEX ZT Scan DIA run converted without isolation offsets was such a layout (one window, 2.15 million spectra) and grew past 521 GB in extract before it was killed. Not part of the canonical configuration: it changes whether the stage runs, not what it computes.",
+      "help": "Refuse an extraction whose hit store is estimated, before anything is probed, to hold more than this many GiB at once. Unset (the default) is `auto`: the machine's physical memory (the tightest cgroup limit on the process's path when smaller: a container's, or a SLURM or systemd job's), checked only once the estimate passes 4 GiB, and no check when the memory cannot be read. `0` turns the check off; a number is a ceiling of your own. Under `groups.parallel` each band in flight gets its share of the ceiling. The estimate is the stage's largest structure, the fragment-peak matches each window collects, for the windows held at once: a batch of `windows_in_flight` on the streamed path, the whole run under a two-pass peak claim, the contested features or the bucketed matcher. Per window it sums, over (a sample of) the candidates the window reaches, their fragments times the peaks of the window's scans inside their RT (and 1/K0) windows times the chance that a peak falls within the fragment tolerance, with the peaks spread evenly over the log m/z span of the scans, at 20 bytes a match. It is an order-of-magnitude estimate, logged on every run (`extract: estimated hit store`), not a prediction of the peak RSS. The case it exists for is an all-ion layout: spectra whose isolation window is the whole m/z range, so that every spectrum reaches every candidate and nothing can be written before the end of the run. A SCIEX ZT Scan DIA run converted without isolation offsets was such a layout (one window, 2.15 million spectra) and grew past 521 GB in extract before it was killed. Not part of the canonical configuration: it changes whether the stage runs, not what it computes.",
       "gates": [],
-      "source_struct": "ExtractConfig"
-    },
-    {
-      "path": "extract.q1_cycles",
-      "name": "q1_cycles",
-      "section": "extract",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "Scanning-quadrupole spectra (SCIEX ZT Scan DIA read with `convert.isolation_half_width`): sum a candidate's matches in the Q1 bins of one cycle into one chromatogram point, placed at the bin whose target is nearest its precursor m/z, instead of keeping every bin a point of its own. The about five bins that transmit a precursor are 1.3 ms apart, so without it the traces interleave them, each at its own transmission. Refused on any other isolation layout and on spectra that carry 1/K0. Default false. Benchmark-gated (docs/09_extract.md, \"Scanning-quadrupole data\"). Omitted from the canonical configuration at its default.",
-      "gates": [
-        "benchmark-gated"
-      ],
-      "source_struct": "ExtractConfig"
-    },
-    {
-      "path": "extract.q1_profile",
-      "name": "q1_profile",
-      "section": "extract",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "Scanning-quadrupole spectra: write each accepted candidate's Q1-profile evidence (psms_extracted v5): how the matched fragment intensity of its apex cycles is spread over the Q1 bins that cover its precursor, against the trapezoid the quadrupole's window, swept across a bin, transmits a precursor at that m/z with. `q1_corr` is their Pearson correlation, `q1_offset` the shift of the observed centroid from the expected one in half-widths, `q1_frag_sd` the spread of the fragments' own centroids in half-widths, `q1_bin_frac` the share of covering bins with signal. A fragment shared with a precursor at another m/z pulls its centroid that way. `features.q1_features` gives them to the classifier. Refused as `q1_cycles` is. Default false. Benchmark-gated. Omitted from the canonical configuration at its default.",
-      "gates": [
-        "benchmark-gated"
-      ],
-      "source_struct": "ExtractConfig"
-    },
-    {
-      "path": "extract.q1_gate_max_offset",
-      "name": "q1_gate_max_offset",
-      "section": "extract",
-      "rust_type": "Option<f64>",
-      "kind": "float",
-      "optional": true,
-      "default": "null",
-      "default_text": "null",
-      "help": "Reject a candidate whose Q1-profile centroid is further than this many half-widths from the expected one (`|q1_offset|`). Needs `q1_profile`. Unset: no gate. Must be finite and > 0. Benchmark-gated. Omitted from the canonical configuration while unset.",
-      "gates": [
-        "benchmark-gated"
-      ],
       "source_struct": "ExtractConfig"
     },
     {
@@ -2295,7 +1852,7 @@
       "optional": false,
       "default": "auto",
       "default_text": "`auto`",
-      "help": "Scanning-quadrupole spectra: decide for every library fragment of an accepted candidate whether its signal belongs to the candidate's precursor (`stages::q1frag`, psms_extracted v6). For each fragment the matched intensity is read in every Q1 step whose calibrated window reaches the precursor (plus two steps either side) over the seven cycles around the apex: an RT x step patch, with every step kept apart. One Q1 centre and width shared by the candidate's fragments are fitted to the patch with a height per fragment, each fragment's own centre and residual are read against it, and its 2D correlation with the other fragments' elution times the expected transmission; a fragment is then `belongs`, `interfered` or `absent` by tolerances `rt_im_train.q1_calibrate` learns from the confident seed PSMs, and the fit is repeated once on the fragments that belong. Writes per row the decision of every library fragment (`q1f_frag_*` lists) and its summary (`q1f_*`), which `features.q1_fragment_features`, `retrace.q1_repick` and `rescore.shadow_q1` read. Needs `rt_im_train.q1_calibrate` and spectra_ms2 v3 (a run converted with `convert.isolation_half_width`); refused with `q1_cycles`, on any other layout and on spectra that carry 1/K0. `\"auto\"` (the default since 0.12.0): on for a ZT Scan search with the Q1 calibration on and `q1_cycles` off, off for every other search (`ZtSwitch`; docs/09_extract.md, \"Per-fragment Q1 decisions\"). Omitted from the canonical configuration unless on.",
+      "help": "Scanning-quadrupole spectra: decide for every library fragment of an accepted candidate whether its signal belongs to the candidate's precursor (`stages::q1frag`, psms_extracted v6). For each fragment the matched intensity is read in every Q1 step whose calibrated window reaches the precursor (plus two steps either side) over the seven cycles around the apex: an RT x step patch, with every step kept apart. One Q1 centre and width shared by the candidate's fragments are fitted to the patch with a height per fragment, each fragment's own centre and residual are read against it, and its 2D correlation with the other fragments' elution times the expected transmission; a fragment is then `belongs`, `interfered` or `absent` by tolerances `rt_im_train.q1_calibrate` learns from the confident seed PSMs, and the fit is repeated once on the fragments that belong. Writes per row the decision of every library fragment (`q1f_frag_*` lists) and its summary (`q1f_*`), which `features.q1_fragment_features`, `retrace.q1_repick` and `rescore.shadow_q1` read. Needs `rt_im_train.q1_calibrate` and spectra_ms2 v3 (a run converted with `convert.isolation_half_width`); refused on any other layout and on spectra that carry 1/K0. `\"auto\"` (the default since 0.12.0): on for a ZT Scan search with the Q1 calibration on, off for every other search (`ZtSwitch`; docs/09_extract.md, \"Per-fragment Q1 decisions\"). Omitted from the canonical configuration unless on.",
       "gates": [],
       "source_struct": "ExtractConfig",
       "choices": [
@@ -2321,21 +1878,6 @@
         "true",
         "false"
       ]
-    },
-    {
-      "path": "extract.q1_deconvolved",
-      "name": "q1_deconvolved",
-      "section": "extract",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "Scanning-quadrupole spectra: count a peak for a candidate only when its Q1 centroid (the intensity-weighted mean step target of its trace along the Q1 axis within one cycle, `stages::q1dec`) lies within the tolerance the Q1 calibration learns from the confident seed PSMs (`q1_calibration.deconvolution`) of the candidate's calibrated expected Q1 centre. Applies to every hit extract collects (the traces, the apex, the presence rules, the gate and the features read them), not to the per-fragment decision's patches, which read the spectra directly. Needs `rt_im_train.q1_calibrate` (which then learns the tolerance) and spectra_ms2 v3; refused with `q1_cycles`, on spectra that carry 1/K0 and with window groups. Default false. Benchmark-gated (docs/37_ztscan.md). Omitted from the canonical configuration at its default.",
-      "gates": [
-        "benchmark-gated"
-      ],
-      "source_struct": "ExtractConfig"
     },
     {
       "path": "extract.fixed_scan_window",
@@ -2727,13 +2269,12 @@
       "optional": false,
       "default": "true",
       "default_text": "`true`",
-      "help": "Learn the MS1 precursor mass offset from the confident seed anchors before extract and centre every MS1 isotope read on it (`stages::ms1cal`). On by default since 2026-10-08. `true` (the default) learns one offset, the median signed ppm error of the anchors; `false` reads at the library m/z. `\"surface\"` fits the error as a smooth function of precursor m/z and retention time instead (an additive robust LOESS of the anchors' errors, sampled on grids), and every MS1 read of extract takes the offset at its own m/z and retention time; the residuals before and after are logged and recorded in the extract report. Measured on a ZenoTOF 8600 run: the error drifted by about 1 ppm over the gradient and 0.8 ppm over m/z (docs/09_extract.md, \"MS1 mass calibration\"). `\"surface\"` is opt-in until it is measured on entrapment and a second acquisition. `true` and `false` keep the configuration hash they had.",
+      "help": "Learn the MS1 precursor mass offset from the confident seed anchors before extract and centre every MS1 isotope read on it (`stages::ms1cal`). On by default since 2026-10-08. `true` (the default) learns one offset, the median signed ppm error of the anchors; `false` reads at the library m/z.",
       "gates": [],
       "source_struct": "ExtractConfig",
       "choices": [
         "false",
-        "true",
-        "surface"
+        "true"
       ]
     },
     {
@@ -2747,21 +2288,6 @@
       "default_text": "0.0",
       "help": "MS1 precursor mass offset in ppm (observed - theoretical) applied to every MS1 isotope read. Set by `ms1_calibrate` in `run` / `run-experiment`; 0 by default.",
       "gates": [],
-      "source_struct": "ExtractConfig"
-    },
-    {
-      "path": "extract.prec_tol_auto",
-      "name": "prec_tol_auto",
-      "section": "extract",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "Set `prec_tol_ppm` from the anchors' MS1 errors after the calibration of `ms1_calibrate` (its offset or its surface): `3` times their robust standard deviation (1.4826 times the median absolute deviation, refined once on the residuals within four of them), clamped to 1-15 ppm. The fixed 3 ppm default suits an Orbitrap, whose residuals sit near 1 ppm; a ZenoTOF's are about 2.5 ppm. Needs `ms1_calibrate`; with too few anchors the configured `prec_tol_ppm` stays. Default false. Benchmark-gated. Omitted from the canonical configuration at its default.",
-      "gates": [
-        "benchmark-gated"
-      ],
       "source_struct": "ExtractConfig"
     },
     {
@@ -2845,7 +2371,7 @@
       "optional": false,
       "default": true,
       "default_text": "true",
-      "help": "Evidence-count apex selection: choose the apex scan by the NUMBER of distinct co-eluting predicted fragments present (breadth of evidence), using observed signature-ion intensity only as a sub-integer tiebreak. In wide-window DIA a single fragment m/z channel is chimeric, so the tallest scan is often a co-isolated interferent; the scan where the most of the peptide's own predicted transitions co-elute is a more reliable apex. Default `true`, on correctness grounds rather than a count: `false` keeps the legacy signature-intensity apex, whose score is 0.0 at every qualifying scan when none of the top-K predicted fragments is observed, so the strict `>` never replaces the first candidate and the apex silently becomes the LOWEST-RT qualifying scan. The rolling distinct-fragment count (`apex_count_window`) still gates which scans qualify in both modes.",
+      "help": "Evidence-count apex selection: choose the apex scan by the NUMBER of distinct co-eluting predicted fragments present (breadth of evidence), using observed signature-ion intensity only as a sub-integer tiebreak. In wide-window DIA a single fragment m/z channel is chimeric, so the tallest scan is often a co-isolated interferent; the scan where the most of the peptide's own predicted transitions co-elute is a more reliable apex. Must be `true`: `false`, the legacy signature-intensity apex, was removed in 0.15.0 and is refused. Its score was 0.0 at every qualifying scan when none of the top-K predicted fragments is observed, so the apex silently became the LOWEST-RT qualifying scan. The rolling distinct-fragment count (`apex_count_window`) gates which scans qualify.",
       "gates": [],
       "source_struct": "ExtractConfig"
     },
@@ -3098,19 +2624,6 @@
       "source_struct": "FeaturesConfig"
     },
     {
-      "path": "features.prec_tol_ppm",
-      "name": "prec_tol_ppm",
-      "section": "features",
-      "rust_type": "f64",
-      "kind": "float",
-      "optional": false,
-      "default": 20.0,
-      "default_text": "20.0",
-      "help": "",
-      "gates": [],
-      "source_struct": "FeaturesConfig"
-    },
-    {
       "path": "features.bound_features",
       "name": "bound_features",
       "section": "features",
@@ -3148,32 +2661,6 @@
       "default": 0,
       "default_text": "0",
       "help": "Grace when walking the elution-peak boundary: number of consecutive sub-threshold scans to BRIDGE before stopping. 0 (default) stops at the first scan below `bound_peak_fraction` (brittle on jagged/gappy profiles); 1 bridges a single-scan dip (DIA sampling gap / noise), giving steadier boundaries.",
-      "gates": [],
-      "source_struct": "FeaturesConfig"
-    },
-    {
-      "path": "features.bound_from_confident",
-      "name": "bound_from_confident",
-      "section": "features",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "Elution-peak boundary source. When false (default since 2026-10-04) each candidate detects its own peak boundary from its top-3-predicted-fragment profile. When true, a single set of left/right half-widths (seconds) is learned once from the confident seed PSMs (`spectrum_q <= 0.01`, target-only, the set that anchors RT calibration) and applied to EVERY candidate around its own apex, so a peptide whose peak is wider than the median is cut short. The shared width was introduced to stop a chimeric decoy from fitting its own boundaries; the entrapment measurement below shows no FDR cost from per-candidate bounds. Measured 2026-10-03 (doxy, 5 NN seeds per arm, benchmark config): per-candidate bounds gave Astral REP1 on the HYE library +2.20% peptides at 1% (Welch t +15.7) and the Orbitrap AIF entrapment run +0.17% (t +0.9) at an unchanged entrapment FDP (0.989% -> 1.000%, 2 SE 0.039); the share of IDs whose above-half-maximum peak extends past the bounds fell from 20% / 26% (left / right) to 2% / 6% on Astral. If the seed yields < 20 confident anchors when true, the stage logs a warning and falls back to per-candidate detection for that run.",
-      "gates": [],
-      "source_struct": "FeaturesConfig"
-    },
-    {
-      "path": "features.bound_confident_pct",
-      "name": "bound_confident_pct",
-      "section": "features",
-      "rust_type": "f64",
-      "kind": "float",
-      "optional": false,
-      "default": 50.0,
-      "default_text": "50.0",
-      "help": "Percentile (0-100) of the confident-set half-widths taken as the global left/ right elution half-width when `bound_from_confident` is true. 50 = median (typical real peak width); higher percentiles widen the shared window.",
       "gates": [],
       "source_struct": "FeaturesConfig"
     },
@@ -3226,21 +2713,6 @@
       ]
     },
     {
-      "path": "features.q1_features",
-      "name": "q1_features",
-      "section": "features",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "The Q1-profile family of scanning-quadrupole spectra: `q1_corr`, `q1_offset`, `q1_frag_sd` and `q1_bin_frac` from psms_extracted v5 (`extract.q1_profile`, which it needs), appended after every other column of the `extended` set. Default false. Benchmark-gated (docs/09_extract.md, \"Scanning-quadrupole data\"). Omitted from the canonical configuration at its default.",
-      "gates": [
-        "benchmark-gated"
-      ],
-      "source_struct": "FeaturesConfig"
-    },
-    {
       "path": "features.q1_fragment_features",
       "name": "q1_fragment_features",
       "section": "features",
@@ -3257,21 +2729,6 @@
         "true",
         "false"
       ]
-    },
-    {
-      "path": "features.ms1_envelope",
-      "name": "ms1_envelope",
-      "section": "features",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "The MS1 isotope-envelope family (`ms1e_*`): extract reads the precursor's isotopes M-1 to M+4 and the half-spacing positions in the MS1 scans around the apex (the nearest one and two either side), at the calibrated MS1 m/z (`extract.ms1_calibrate`, the surface under `\"surface\"`) within twice `extract.prec_tol_ppm` (at least 10 ppm), and writes the evidence to psms_extracted v7; the features stage derives the envelope's agreement with the averagine envelope over five isotopes (`ms1e_env_r2`), the isotopes found in a row from M0 (`ms1e_env_n`), the M-1 share (`ms1e_m1_share`), the share at the half-spacing positions (`ms1e_half_share`, a species of twice the charge), the spacing error of the isotopes found (`ms1e_spacing_ppm`), the monoisotopic m/z error after the calibration (`ms1e_mono_ppm`, signed, and `ms1e_mono_ppm_abs`), the observed envelope's mean isotope index against averagine (`ms1e_ibar_dev`) and, under `extract.q1_fragments`, the fitted Q1 centre against the centre the observed envelope predicts (`ms1e_q1_agree`, steps; 0 without the decisions), appended after every other column of the `extended` set. Refused on spectra that carry 1/K0. Default false. Benchmark-gated (docs/10_features.md). Omitted from the canonical configuration at its default.",
-      "gates": [
-        "benchmark-gated"
-      ],
-      "source_struct": "FeaturesConfig"
     },
     {
       "path": "features.q1_precursor",
@@ -3318,7 +2775,7 @@
       "optional": false,
       "default": "auto",
       "default_text": "`auto`",
-      "help": "The Q1-deconvolved evidence family of scanning-quadrupole spectra (`q1d_*`): every MS2 peak is given the Q1 centroid of its trace along the sweep (`stages::q1dec`, the evidence of `extract.q1_deconvolved`), and at each row's apex, over the scans of the apex cycle and the two either side whose window covers the precursor, extract reads for every library fragment the nearest peak and whether its centroid lies within the tolerance the Q1 calibration learns of the fragment's expected Q1 centre: the fragments with such a consistent match (`q1d_n_frag`), those matched only inconsistently (`q1d_n_incons`), the consistent share of the matched intensity (`q1d_share`, and in the apex cycle alone `q1d_apex_share`) and the predicted-intensity share of the fragments with a consistent match (`q1d_pred_share`), written to psms_extracted v8 and appended after every other column of the `extended` set. The extraction itself is unchanged (unlike `extract.q1_deconvolved`, which counts only the consistent peaks). Needs `extract.q1_fragments`. `\"auto\"` (the default since 0.12.0): on for a ZT Scan search under the `extended` set with `extract.q1_fragments` on, off for every other search (`ZtSwitch`, docs/37_ztscan.md, \"Automatic for ZT Scan files\"). Omitted from the canonical configuration unless on.",
+      "help": "The Q1-deconvolved evidence family of scanning-quadrupole spectra (`q1d_*`): every MS2 peak is given the Q1 centroid of its trace along the sweep (`stages::q1dec`), and at each row's apex, over the scans of the apex cycle and the two either side whose window covers the precursor, extract reads for every library fragment the nearest peak and whether its centroid lies within the tolerance the Q1 calibration learns of the fragment's expected Q1 centre: the fragments with such a consistent match (`q1d_n_frag`), those matched only inconsistently (`q1d_n_incons`), the consistent share of the matched intensity (`q1d_share`, and in the apex cycle alone `q1d_apex_share`) and the predicted-intensity share of the fragments with a consistent match (`q1d_pred_share`), written to psms_extracted v8 and appended after every other column of the `extended` set. The extraction itself is unchanged. Needs `extract.q1_fragments`. `\"auto\"` (the default since 0.12.0): on for a ZT Scan search under the `extended` set with `extract.q1_fragments` on, off for every other search (`ZtSwitch`, docs/37_ztscan.md, \"Automatic for ZT Scan files\"). Omitted from the canonical configuration unless on.",
       "gates": [],
       "source_struct": "FeaturesConfig",
       "choices": [
@@ -3344,19 +2801,6 @@
         "true",
         "false"
       ]
-    },
-    {
-      "path": "features.q1_separable",
-      "name": "q1_separable",
-      "section": "features",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "The separable model of scanning-quadrupole spectra (`q1s_*`, `stages::q1trace`): each row's Q1 patch (the per-fragment decision's RT x step patch, which it needs) fitted as one elution profile shared by the decision's fragments times each fragment's calibrated Q1 transmission, with an amplitude and a floor per fragment. Ten `q1s_*` columns (the set's R^2, the predicted-intensity-weighted R^2 and interference share of the present fragments, the explained and floor shares, the amplitudes' agreement with the prediction, the fragments fitted, the profile's width and its apex against the row's) appended to the `extended` set after the `q1d_*` columns (before `q1_consistency`'s), and per row the profile, its cycles' retention times and each fragment's amplitude, R^2 and interference share as lists (psms_extracted v9). Needs `extract.q1_fragments`; refused on any input that is not a ZT Scan run. Default false: measured within the seed spread (docs/37_ztscan.md, section 15). Omitted from the canonical configuration at its default.",
-      "gates": [],
-      "source_struct": "FeaturesConfig"
     },
     {
       "path": "compete.group_by",
@@ -3571,19 +3015,6 @@
       "default": "null",
       "default_text": "null",
       "help": "",
-      "gates": [],
-      "source_struct": "RescoreConfig"
-    },
-    {
-      "path": "rescore.percolator_bin",
-      "name": "percolator_bin",
-      "section": "rescore",
-      "rust_type": "Option<String>",
-      "kind": "other",
-      "optional": true,
-      "default": "null",
-      "default_text": "null",
-      "help": "Path to an external `percolator` executable. Parsed and never read: no stage launches percolator, and `RescorerKind` has no variant that would. It is the only silently inert config field in the tree, since the three MBR ones warn (see `validate`). Kept rather than deleted because the external-percolator path is still intended; `validate` now warns when it is set.",
       "gates": [],
       "source_struct": "RescoreConfig"
     },
@@ -3998,12 +3429,11 @@
       "optional": false,
       "default": "per_candidate",
       "default_text": "`per_candidate`",
-      "help": "Per-candidate window vs a consensus width derived from confident peptides.",
+      "help": "The walked window of each candidate (`per_candidate`, the only value since `consensus` was removed in 0.15.0). Kept so that the configuration hash does not move.",
       "gates": [],
       "source_struct": "QuantConfig",
       "choices": [
-        "per_candidate",
-        "consensus"
+        "per_candidate"
       ]
     },
     {
@@ -4015,7 +3445,7 @@
       "optional": false,
       "default": 0.001,
       "default_text": "0.001",
-      "help": "Peptide q-value cutoff defining the \"confident\" set that calibrates the consensus half-widths (Consensus mode only). Tighter than `q_threshold`.",
+      "help": "Read by nothing since `peak_window_mode = consensus` was removed in 0.15.0. Kept so that the configuration hash does not move.",
       "gates": [],
       "source_struct": "QuantConfig"
     },
@@ -4290,7 +3720,7 @@
       "optional": false,
       "default": false,
       "default_text": "false",
-      "help": "Scanning-quadrupole spectra (SCIEX ZT Scan DIA): quantify from the per-fragment Q1 decisions of `extract.q1_fragments` (which it needs; psms_extracted v6). Every fragment trace of an accepted candidate is first collapsed to one value per cycle: the steps of a cycle (the interleaved samples of the windows that cover the precursor) are combined as the least-squares amplitude `sum(w x) / sum(w^2)` under the weights `w` of `q1_step_weights` (the calibrated isotope-envelope transmission at the precursor's calibrated expected Q1 centre, by default), at the mean retention time of the cycle. On those cycle traces the fragments that do not belong (interfered or absent) are left out of the quantity when at least `q1_min_belonging` fragments belong: out of the profile that centres the window, out of the top-N ranking and out of the pattern fit in that run (the pattern set and its scale stay those of the experiment). With fewer, the candidate keeps every fragment (`q1_quant = fallback` in peptide_quant v4). The fixed window then counts cycles, not steps. Reads the run's `psms_extracted` (its report records the Q1 model) and its spectra_ms2 v3 (step and cycle of each sample): `run` and `run-experiment` pass them, `mumdia quant` takes `--psms-extracted` and `--spectra-ms2`. Refused with `fragment_selection = cross_run` (its weights would read a left-out fragment as zero). Default false. Benchmark-gated: no known-ratio ZT Scan data has been measured (docs/12, \"Quantification from the fragments that belong\"). Omitted from the canonical configuration at its default.",
+      "help": "Scanning-quadrupole spectra (SCIEX ZT Scan DIA): quantify from the per-fragment Q1 decisions of `extract.q1_fragments` (which it needs; psms_extracted v6). Every fragment trace of an accepted candidate is first collapsed to one value per cycle: the steps of a cycle (the interleaved samples of the windows that cover the precursor) are combined as the least-squares amplitude `sum(w x) / sum(w^2)` under the weights `w` (the calibrated isotope-envelope transmission at the precursor's calibrated expected Q1 centre), at the mean retention time of the cycle. On those cycle traces the fragments that do not belong (interfered or absent) are left out of the quantity when at least `q1_min_belonging` fragments belong: out of the profile that centres the window, out of the top-N ranking and out of the pattern fit in that run (the pattern set and its scale stay those of the experiment). With fewer, the candidate keeps every fragment (`q1_quant = fallback` in peptide_quant v4). The fixed window then counts cycles, not steps. Reads the run's `psms_extracted` (its report records the Q1 model) and its spectra_ms2 v3 (step and cycle of each sample): `run` and `run-experiment` pass them, `mumdia quant` takes `--psms-extracted` and `--spectra-ms2`. Refused with `fragment_selection = cross_run` (its weights would read a left-out fragment as zero). Default false. Benchmark-gated: no known-ratio ZT Scan data has been measured (docs/12, \"Quantification from the fragments that belong\"). Omitted from the canonical configuration at its default.",
       "gates": [
         "benchmark-gated"
       ],
@@ -4308,40 +3738,6 @@
       "help": "`q1_fragments`: the fewest fragments that belong for the quantity to be restricted to them; a candidate with fewer keeps every fragment, on the same cycle traces. At least 1. Default 3 (75.6% of the accepted targets on the ZT Scan K562 run, 0.8% of the decoys). Omitted from the canonical configuration at its default.",
       "gates": [],
       "source_struct": "QuantConfig"
-    },
-    {
-      "path": "quant.q1_step_weights",
-      "name": "q1_step_weights",
-      "section": "quant",
-      "rust_type": "Q1StepWeights",
-      "kind": "enum",
-      "optional": false,
-      "default": "transmission",
-      "default_text": "`transmission`",
-      "help": "`q1_fragments`: how the steps of a cycle are weighted when they are collapsed. `transmission` (default): the expected Q1 profile of the fragment (the calibrated trapezoid transmission summed over the precursor's isotopes) at its calibrated expected centre and width (the row's own fitted centre carries its fit noise into each run's value); `uniform`: every step alike (the mean of the cycle's steps). The two measured the same replicate precision on the ZT Scan K562 runs. Omitted from the canonical configuration at its default.",
-      "gates": [],
-      "source_struct": "QuantConfig",
-      "choices": [
-        "transmission",
-        "uniform"
-      ]
-    },
-    {
-      "path": "quant.q1_integration",
-      "name": "q1_integration",
-      "section": "quant",
-      "rust_type": "Q1Integration",
-      "kind": "enum",
-      "optional": false,
-      "default": "trapezoid",
-      "default_text": "`trapezoid`",
-      "help": "`q1_fragments`: how a cycle trace is integrated over the fixed window. `trapezoid` (default): the trapezoid rule over the window's cycles, as every other trace. `elution_fit`: one Gaussian elution profile per candidate and run, fitted (a weighted parabola of the log intensity) to the summed window samples of the fragments it quantifies, and each fragment's area its least-squares amplitude under that profile times the profile's area; the trapezoid where the fit fails. Needs the scan form of the fixed window. Omitted from the canonical configuration at its default.",
-      "gates": [],
-      "source_struct": "QuantConfig",
-      "choices": [
-        "trapezoid",
-        "elution_fit"
-      ]
     },
     {
       "path": "quant.q1_cycle_halfwidth",
@@ -4370,10 +3766,7 @@
       "source_struct": "MbrConfig",
       "choices": [
         "none",
-        "second_pass",
-        "empirical_library",
-        "rt_transfer",
-        "full"
+        "second_pass"
       ]
     },
     {
@@ -4385,7 +3778,7 @@
       "optional": false,
       "default": 0.01,
       "default_text": "0.01",
-      "help": "The first-pass cut (validated at 0.01). Under `second_pass`, the experiment-wide `precursor_q` at which a target enters the empirical library, and the `run_psm_q` at which one run's apex counts toward its consensus retention time. Under the transfer variants, the q-value for a precursor to become a cross-run anchor.",
+      "help": "The first-pass cut (validated at 0.01). Under `second_pass`, the experiment-wide `precursor_q` at which a target enters the empirical library, and the `run_psm_q` at which one run's apex counts toward its consensus retention time.",
       "gates": [],
       "source_struct": "MbrConfig"
     },
@@ -4398,7 +3791,7 @@
       "optional": false,
       "default": 2,
       "default_text": "2",
-      "help": "Transfer variants only: minimum number of OTHER runs a precursor must be confident in to transfer.",
+      "help": "Read by nothing since the transfer was removed in 0.15.0; kept so the canonical configuration does not move. `validate()` warns when it is set.",
       "gates": [],
       "source_struct": "MbrConfig"
     },
@@ -4411,45 +3804,9 @@
       "optional": false,
       "default": 0.01,
       "default_text": "0.01",
-      "help": "Transfer variants only: accept threshold for a transfer's q-value.",
+      "help": "Read by nothing since 0.15.0, like `min_anchor_runs`.",
       "gates": [],
       "source_struct": "MbrConfig"
-    },
-    {
-      "path": "mbr.rt_window_s",
-      "name": "rt_window_s",
-      "section": "mbr",
-      "rust_type": "f64",
-      "kind": "float",
-      "optional": false,
-      "default": 20.0,
-      "default_text": "20.0",
-      "help": "NOT YET WIRED. Transfer RT half-window (seconds) around the cross-run-predicted RT. The M2 leave-target-out residual was ~17 s at p95, ~15x tighter than the search window, which is where this default comes from -- but no code reads this field yet, so setting it has no effect. Kept as the recorded design value for the MBR transfer tier; `validate()` warns if it is changed from the default. See CLAUDE.md, \"MBR transfer/re-extraction remains benchmark-gated\".",
-      "gates": [
-        "benchmark-gated",
-        "not yet wired"
-      ],
-      "source_struct": "MbrConfig"
-    },
-    {
-      "path": "mbr.decoy_transfer",
-      "name": "decoy_transfer",
-      "section": "mbr",
-      "rust_type": "DecoyTransfer",
-      "kind": "enum",
-      "optional": false,
-      "default": "permuted_rt",
-      "default_text": "`permuted_rt`",
-      "help": "NOT YET WIRED. Which decoy-transfer null would estimate the false-transfer rate (M4). No code reads this field yet; `validate()` warns if it is changed.",
-      "gates": [
-        "not yet wired"
-      ],
-      "source_struct": "MbrConfig",
-      "choices": [
-        "permuted_rt",
-        "reverse_sequence",
-        "both"
-      ]
     },
     {
       "path": "mbr.consensus_corr_min",
@@ -4460,23 +3817,8 @@
       "optional": false,
       "default": 0.0,
       "default_text": "0.0",
-      "help": "Minimum correlation of the observed fragment pattern to the empirical consensus for a transfer to be accepted (interference guard; 0 disables).",
+      "help": "Read by nothing since 0.15.0, like `min_anchor_runs`.",
       "gates": [],
-      "source_struct": "MbrConfig"
-    },
-    {
-      "path": "mbr.requant_all",
-      "name": "requant_all",
-      "section": "mbr",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "NOT YET WIRED. Would requantify already-identified precursors too (fill the matrix), not only transferred ones, under `strategy = Full`. No code reads this field yet; `validate()` warns if it is changed.",
-      "gates": [
-        "not yet wired"
-      ],
       "source_struct": "MbrConfig"
     },
     {
@@ -4488,7 +3830,7 @@
       "optional": true,
       "default": "null",
       "default_text": "null",
-      "help": "Python interpreter for the `mbr_worker.py` sidecar (pandas/pyarrow/numpy; e.g. the `py312_mumdia` env). Required by the transfer variants only; `second_pass` and `none` run no sidecar.",
+      "help": "Read by nothing since 0.15.0, like `min_anchor_runs`. Interpreter resolution still clears an `\"auto\"` to null.",
       "gates": [],
       "source_struct": "MbrConfig"
     },
@@ -4617,8 +3959,7 @@
       "gates": [],
       "source_struct": "GroupsConfig",
       "choices": [
-        "global",
-        "per_group"
+        "global"
       ]
     },
     {
@@ -4643,11 +3984,10 @@
       "optional": false,
       "default": "once_per_run",
       "default_text": "`once_per_run`",
-      "help": "How often the library's retention times are adapted under `calibration = global`: `once_per_run` (the default since 2026-09-27) runs one DeepLC sidecar per run over the union of the bands, `per_band` (the previous default) one per band. `per_group` calibration always adapts per band. Each per-band sidecar starts an interpreter, imports torch and DeepLC, reads the pooled seed, refits the same heads on the same anchors (head 2503 in every band of the HYE sweep) and predicts every sequence of its band, so a sequence whose charge states fall in two bands is predicted twice (10.9M HYE rows are 4.91M unique sequences). On HYE Astral the multi-head step took about 13 min unbanded and 19-24 min at 2-16 bands. `once_per_run` fits once, predicts the union once and writes each band's table under the name a per-band run gives it (`groups/gNN/lib_precursors_multihead.parquet` or `lib_precursors_deeplc.parquet`), so the shared-band reuse of later runs and the seed refresh are unchanged. Under `run-experiment` with the multi-head calibration off, the library is re-predicted once for the experiment, and the bands then keep those values instead of each band of each run re-predicting them. Float-equivalent, not bit-identical: a sequence is predicted in different company, and torch's CPU kernels round by batch. On a synthetic library, one call over contiguous bands writes exactly the whole-library column band by band (`tests/python/test_deeplc_predict.py`). Measured before the default changed (EPYC 9354, 128 threads): a six-run Astral experiment at 16 bands 36:06 -> 25:39 and an eight-band entrapment run 5:44 -> 3:45; 0.8% of the band rows moved, by at most 0.07 s (0.6%, at most 2.9 s, on the entrapment library), with the same heads; and the peptides at 1% +0.35% (3 seeds) and +0.24% (10 seeds, the entrapment FDP +0.022 pp against two standard errors of 0.027).",
+      "help": "How often the library's retention times are adapted: `once_per_run` (the default since 2026-09-27, and since 0.15.0 the only value) runs one DeepLC sidecar per run over the union of the bands. `per_band`, one sidecar per band, was removed in 0.15.0. Each per-band sidecar started an interpreter, imported torch and DeepLC, read the pooled seed, refitted the same heads on the same anchors (head 2503 in every band of the HYE sweep) and predicted every sequence of its band, so a sequence whose charge states fell in two bands was predicted twice (10.9M HYE rows are 4.91M unique sequences). On HYE Astral the multi-head step took about 13 min unbanded and 19-24 min at 2-16 bands. `once_per_run` fits once, predicts the union once and writes each band's table under the name a per-band run gives it (`groups/gNN/lib_precursors_multihead.parquet` or `lib_precursors_deeplc.parquet`), so the shared-band reuse of later runs and the seed refresh are unchanged. Under `run-experiment` with the multi-head calibration off, the library is re-predicted once for the experiment, and the bands then keep those values instead of each band of each run re-predicting them. Float-equivalent, not bit-identical: a sequence is predicted in different company, and torch's CPU kernels round by batch. On a synthetic library, one call over contiguous bands writes exactly the whole-library column band by band (`tests/python/test_deeplc_predict.py`). Measured before the default changed (EPYC 9354, 128 threads): a six-run Astral experiment at 16 bands 36:06 -> 25:39 and an eight-band entrapment run 5:44 -> 3:45; 0.8% of the band rows moved, by at most 0.07 s (0.6%, at most 2.9 s, on the entrapment library), with the same heads; and the peptides at 1% +0.35% (3 seeds) and +0.24% (10 seeds, the entrapment FDP +0.022 pp against two standard errors of 0.027).",
       "gates": [],
       "source_struct": "GroupsConfig",
       "choices": [
-        "per_band",
         "once_per_run"
       ]
     },
@@ -4716,7 +4056,7 @@
       "optional": false,
       "default": false,
       "default_text": "false",
-      "help": "Let the bands extract with unbounded retention-time windows. Default `false`: when the fit a band extracts with has fewer than two target anchors (the pooled seed under `calibration = global`, the band's own seed under `per_group`), the run stops with an error before a band extracts with it. The seeds are counted right after `seed-pool`, before any DeepLC sidecar or extraction, and the fit itself is checked again before its windows are written. `true` keeps the previous behaviour and logs a warning that names this key. The default refuses because the memory of such a run has no bound. With fewer than two anchors `rt-im-train` falls back to unbounded windows, and a seed without anchors usually has no fragment calibrants either, so extract also searches at the configured `search_seed.fragment_tol_ppm` instead of a learned tolerance. Every band then extracts every candidate over the whole gradient. Measured 2026-10-23 on one Astral immunopeptidomics run (63 bands, `parallel` 8, a 203M-precursor 8-12-mer library) whose seed gave no anchors: a 150 GB watchdog stopped the extraction at 153 GB on v0.8.0 and at 156 GB on the earlier engine 6333855, and a sweep job reached 507.6 GB before the host's out-of-memory guard stopped it. On a file whose seed gave anchors the same configuration peaked at 34-35 GB on v0.8.0 and 49 GB on 6333855. Single unbounded bands had already reached 560 GB, and 664 GB when one aborted at the host's commit limit (`docs/33_window_groups.md` section 8). Check the seed first: the library and its decoys, the seed's fragment tolerance and the input file. A run without a confident seed can be searched ungrouped (`window_groups = 1`), which keeps the unbounded fallback: on an ordinary library it fits in memory, and single-cell blank wells are searched that way. Under `per_group`, `calibration = global` fits one calibration on the anchors of every band. Omitted from the canonical configuration at its default, so the config hash of every configuration that does not set it is unchanged (`docs/33_window_groups.md` section 4c).",
+      "help": "Let the bands extract with unbounded retention-time windows. Default `false`: when the fit the bands extract with has fewer than two target anchors (on the pooled seed), the run stops with an error before a band extracts with it. The seeds are counted right after `seed-pool`, before any DeepLC sidecar or extraction, and the fit itself is checked again before its windows are written. `true` keeps the previous behaviour and logs a warning that names this key. The default refuses because the memory of such a run has no bound. With fewer than two anchors `rt-im-train` falls back to unbounded windows, and a seed without anchors usually has no fragment calibrants either, so extract also searches at the configured `search_seed.fragment_tol_ppm` instead of a learned tolerance. Every band then extracts every candidate over the whole gradient. Measured 2026-10-23 on one Astral immunopeptidomics run (63 bands, `parallel` 8, a 203M-precursor 8-12-mer library) whose seed gave no anchors: a 150 GB watchdog stopped the extraction at 153 GB on v0.8.0 and at 156 GB on the earlier engine 6333855, and a sweep job reached 507.6 GB before the host's out-of-memory guard stopped it. On a file whose seed gave anchors the same configuration peaked at 34-35 GB on v0.8.0 and 49 GB on 6333855. Single unbounded bands had already reached 560 GB, and 664 GB when one aborted at the host's commit limit (`docs/33_window_groups.md` section 8). Check the seed first: the library and its decoys, the seed's fragment tolerance and the input file. A run without a confident seed can be searched ungrouped (`window_groups = 1`), which keeps the unbounded fallback: on an ordinary library it fits in memory, and single-cell blank wells are searched that way. Omitted from the canonical configuration at its default, so the config hash of every configuration that does not set it is unchanged (`docs/33_window_groups.md` section 4c).",
       "gates": [],
       "source_struct": "GroupsConfig"
     },
@@ -4774,21 +4114,6 @@
       "default_text": "true",
       "help": "Also rebuild the MS1 isotope traces (`ms1_mono`, `ms1_iso1`, `ms1_iso2`) and their apex scalars. False copies the centroid MS1 rows and keeps extract's MS1 scalars. Default true; kept as a switch until an engine ablation of the raw MS1 band confirms the prototype's +1.6%.",
       "gates": [],
-      "source_struct": "RetraceConfig"
-    },
-    {
-      "path": "retrace.apex_features",
-      "name": "apex_features",
-      "section": "retrace",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "Write `imc_ref_w` into `psms_extracted`, the agreement of the fragments' raw 1/K0 profiles at the apex, which the ion-mobility feature family then carries as its tenth feature. Needs `enabled` and a `features.im_features` other than `off`. Default false. Benchmark-gated: alone it measured +1.3% peptides, and the added peptides carried about 2.7% FDP.",
-      "gates": [
-        "benchmark-gated"
-      ],
       "source_struct": "RetraceConfig"
     },
     {
@@ -4992,19 +4317,6 @@
       "default": 0.0,
       "default_text": "0.0",
       "help": "Divisor of the log-likelihoods before the softmax: a number, or `\"auto\"` (also written `0`), which fits it to the data. 1 is the likelihood as fitted; above 1 flattens the posterior. `\"auto\"` chooses the temperature at which the model's expected wrong calls match the decoy residue's estimate of them at 0.75, over the quarter of the run's (in `run-experiment`, the pooled runs') peaks with a choice of site that see the largest share of their site-determining ions, pulled towards 1 by a prior so that few decoy-residue wins leave it near 1 (docs/36_ptm_localisation.md section 3); the fitted value is in the report. Default `\"auto\"`.",
-      "gates": [],
-      "source_struct": "LocaliseConfig"
-    },
-    {
-      "path": "localise.neutral_loss",
-      "name": "neutral_loss",
-      "section": "localise",
-      "rust_type": "bool",
-      "kind": "bool",
-      "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "Neutral-loss ions as evidence: for Phospho, the loss of phosphoric acid (97.9769 Da) from every b and y ion that carries a phosphoserine or -threonine (and the decoy residue, which stands in for them), scored as four ion classes of their own with their own detection and false-presence rates. Other modifications have no neutral loss. Default false: on the synthetic phosphopeptides it localised no more peaks at a given true false localisation rate (docs/36_ptm_localisation.md section 7).",
       "gates": [],
       "source_struct": "LocaliseConfig"
     },

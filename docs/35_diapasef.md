@@ -317,7 +317,8 @@ family fails the rescore schema check, whose message names the family. Evidence:
 E. coli (P5, three seeds), entrapment only with the block on, one unpaired HYE seed; the default
 moves to `auto` with arm T12 and seeds on a second acquisition. The IM branch's 1/K0 peak-shape
 block (P7, `im_shape_features`: -0.9%, re-test -0.1%) is not ported. `imc_ref_w`, the retrace
-apex co-elution in 1/K0, is the family's tenth feature under `retrace.apex_features` (section 6). An open question is a pooled
+apex co-elution in 1/K0, was the family's tenth feature under `retrace.apex_features`
+(removed in 0.15.0, section 6). An open question is a pooled
 `|im_error| / w_im` feature, by analogy with `rtw_*`: the IM branch dropped it as constant
 within one run, but `run-experiment` pools runs by default.
 
@@ -367,15 +368,13 @@ its place in the diaPASEF work and its measurements.
   `extract.retain_top_peaks` sidecar peaks, the peak whose best 1/K0 band agrees best with
   the library, and moves `apex_rt` and `apex_im` there before the traces are rebuilt.
 - `psms_extracted` is patched once, in place (v4 kept): the re-picked apex, the apex scalars
-  read from the rebuilt traces, and under `retrace.apex_features` the column `imc_ref_w`,
-  which the ion-mobility feature family carries as its tenth feature.
+  read from the rebuilt traces.
 
 Keys: `retrace.enabled` (false), `retrace.repick` (false), `retrace.im_half_width` (0.015,
-fragments and MS1), `retrace.ms1` (true) and `retrace.apex_features` (false), all omitted
+fragments and MS1), and `retrace.ms1` (true), all omitted
 from the canonical configuration at their defaults. `Config::validate` refuses `repick`
 without `extract.retain_top_peaks >= 2`, with `extract.apex_refine_intensity`, and
-`repick` or `apex_features` without `enabled`; `apex_features` with
-`features.im_features = off`; and `enabled` with `groups.window_groups > 1` or with
+`repick` without `enabled`; and `enabled` with `groups.window_groups > 1` or with
 `extract.promote_top_peaks > 1`. A run whose spectra were not read natively from a `.d`
 is refused when the chain reaches retrace, with the reason.
 
@@ -432,7 +431,7 @@ Levers measured on the retrace base:
   retrace, so a table never holds raw traces beside centroid scalars.
 - `imc_ref_w` alone: +1.3%, both together +1.8% (13,920); entrapment for both +2.2% real
   peptides at an FDP of 0.43-0.51% against 0.40-0.44%. The added peptides carried about 2.7%
-  FDP, so `retrace.apex_features` stays off until an entrapment recheck of the added set.
+  FDP, so `retrace.apex_features` was removed in 0.15.0.
 - The raw MS1 band: +1.6% (three seeds, entrapment-clean) at 20 ppm and the nearest frame.
   `retrace.ms1` stays a switch until an engine ablation confirms it (arm T10, which also
   compares `ms1_scan_halfwidth` 0 with 1 and 3 ppm with the diaPASEF value).
@@ -683,10 +682,10 @@ the 3D version and its exact bytes. docs/15 has the column definitions.
 | `seed_psms` | v1 | v2 | `observed_im` |
 | `run_windows` | v1 | v1 | `im_pred_cal`, `im_lo`, `im_hi` filled |
 | `cal.json` | | | `im_*` block, `w_im_sizing`; `im_window_floor` in the second pass |
-| `psms_extracted` | v2 | v4 | `apex_im`, `apex_im_mad`, `ms1_apex_im`, `im_pred_cal`; `imc_ref_w` only under `retrace.apex_features`; retrace patches values in place |
+| `psms_extracted` | v2 | v4 | `apex_im`, `apex_im_mad`, `ms1_apex_im`, `im_pred_cal`; retrace patches values in place |
 | `chromatograms` | v1, v2 | v3 (v1 + `im`), v4 (v2 + `im_trimmed`) | per-point 1/K0, written only while a consumer is on |
 | `chromatograms.centroid.parquet` | | | extract's table before retrace; deleted after retrace succeeds |
-| `features` | | | the `ion_mobility` family (nine columns, ten with `imc_ref_w`) |
+| `features` | | | the `ion_mobility` family (nine columns) |
 | `fragment_quant` | v1 | v1 | v5 under the cross-run export, v6 under a pattern rule, on any acquisition (section 8) |
 | `empirical_library.json` | | | `im` (consensus offsets and counts) and `diagnostics`, on experiments with 1/K0 |
 
@@ -1066,8 +1065,8 @@ IM branch's E. coli diaPASEF library, 0.574592 for the recipe's), so it is compu
   slots of a scheme have disjoint m/z ranges (section 3).
 - **Memory.** Retrace holds every frame inside the candidates' RT windows (21 GB on the
   E. coli run on the IM branch; the E. coli runs with retrace on main peaked at 18.7-18.8 GB;
-  36-39 GB per HYE run on the IM branch). The pooled HYE rescore needed `MUMDIA_NN_STORE=f16` on a 64 GB node on the
-  IM branch.
+  36-39 GB per HYE run on the IM branch). The pooled HYE rescore needed an f16 feature store on a 64 GB node on the
+  IM branch; main has no such switch (`MUMDIA_NN_STORE` is not read).
 - **Evidence.** Most HYE numbers are one seed, no multi-run diaPASEF entrapment exists, and
   the quantification record rests on one known-ratio dataset.
 
@@ -1396,8 +1395,7 @@ real peptides at an entrapment FDP of 0.30-0.38% against 0.39-0.46%.
 ## 17. Mobilograms
 
 No artifact holds a 1/K0 profile: convert keeps one intensity-weighted 1/K0 per centroid,
-extract and retrace one per trace point, and the apex profiles of `retrace.apex_features` are
-scored and dropped. `mumdia mobilogram` reads the profile of a few candidates from the raw
+extract and retrace one per trace point. `mumdia mobilogram` reads the profile of a few candidates from the raw
 events of the `.d`. It is read-only and meant for inspection; visDIA calls it for the
 precursor page of a diaPASEF run (`mumdia-viewer --engine`, or `MUMDIA_BIN`, which the
 desktop application sets to its own engine).

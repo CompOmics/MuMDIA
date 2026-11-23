@@ -216,6 +216,57 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **Release and CI hardening (docs/14, "Release workflow").** A release now gets its files
+  in one `publish` job after every archive and installer built, so a failed build no longer
+  leaves a half-filled release; a release published by hand before the tag is held as
+  pre-release until then, and a draft is filled and published. The container image is built
+  and pushed by `release.yml` after the tag gate, not on the tag by itself, and is built and
+  smoke-tested on pull requests that change its inputs. The tag gate waits up to an hour for
+  main's `ci.yml` run on the tagged commit, checks the desktop version, and runs the advisory
+  scan strictly (`ci/cargo_audit.sh`, which drops seven stale zip ignores); on pull requests
+  the scan is strict only when a lockfile changes. The desktop installers carry `LICENSE`,
+  both third-party notices (the new `desktop/THIRD_PARTY_LICENSES.md`, with the MPL-2.0
+  source notice), the SBOM and uv's licences, are built with `tauri-cli` `=2.12.4` from a
+  `--locked` lockfile, and take their version from `desktop/src-tauri/Cargo.toml` alone. CI
+  resolves the desktop environments with the bundled uv version, installs the three
+  `env/mumdia-*.yml` specifications, skips macOS on pushes to main, and the Dockerfile's
+  compiler image matches `rust-toolchain.toml`.
+
+- **mokapot trains logistic regression on every install (docs/13).** The worker's default
+  model was the sklearn MLP; only the Docker image set `MUMDIA_RESCORE_MODEL=logreg`, so one
+  configuration with `rescore.classifier = mokapot` trained logistic regression in Docker and
+  an MLP in the conda environment, the desktop application and the release archive.
+  `logreg` is now the worker's default and the engine's model-identity fallback, and the
+  image no longer sets it. A mokapot run outside Docker therefore changes model: its scores
+  change, and `model_identity` reads `mokapot-logreg` instead of `mokapot-nn`.
+  `MUMDIA_RESCORE_MODEL=nn` keeps the MLP.
+- **The sidecar workers hold less memory and share one copy of their DeepLC helpers (docs/13).**
+  `ms2pip_worker.py` writes each predicted chunk as it comes instead of keeping every chunk
+  and concatenating them at the end, which held the fragment table twice.
+  `peptdeep_worker.py` no longer parses the whole request into a Python tuple per row before
+  the first prediction: a first pass, chunk by chunk, finds the supported rows and their
+  modifications (both refusals still come before any prediction), and each prediction call
+  parses its own rows, the same rows as before. `deeplc_finetune.py` holds only the
+  `peptidoform` and `predicted_irt` columns through the prediction and reads the whole
+  precursor table again to write it. The version floor, the one-time base-model load, the
+  blank-progress filter and the sequence rules that `deeplc_worker.py` and
+  `deeplc_finetune.py` copied character for character (and `mh_shard_predict.py` and
+  `im2deep_worker.py` in part) live in one stdlib-only module, `scripts/_deeplc_common.py`,
+  which the release bundle checks now require; each worker still imports `deeplc` (or
+  `im2deep`) first. The fine-tune's three shard runners share one helper. The libraries, the
+  predictions and the scores are unchanged (checked on the fleet against main's workers).
+- **The NN rescorer's streaming backend uses the in-memory loader.** For a parquet or raw
+  handoff the streaming memmap is filled by the same threaded row-group loader as the
+  in-memory matrix (the per-row metadata is still read in batches), instead of a second,
+  slower pandas loop with its own copies of the moment and standardisation code. Its float64
+  moments are now summed over the loader's blocks, so a streamed pool can differ from an
+  earlier streamed run in the last bits; it now scores as the in-memory backend does, byte
+  for byte. Only pools above `MUMDIA_NN_STREAM_GB` (twice the free memory unless set) stream.
+- **Worker docstrings and help match the code.** The NN worker's (the raw handoff is the
+  default, the in-memory backend's threshold, warm starts, the training knobs the engine
+  sets), the mokapot worker's (hidden layers `128,64,64,32`, `MUMDIA_BREW_ITERS` 20), the
+  DeepLC workers' floor (4.5.0) and the `--shards` help, which called the automatic count
+  unmeasured.
 - **Quant and report code keep one copy of each helper (#358, docs/12).** The candidate audit no
   longer looks for `<psms>.audit.parquet`, which nothing writes, so every extraction loss is
   `DID_NOT_SURVIVE_EXTRACTION` as before, and it writes the library's columns as read instead
@@ -226,6 +277,41 @@ than a number. Both are recorded in every run's `manifest.json`.
   writers share one atomic writer and one transfer-cell formatter, the report's stripped
   sequence is `quant_lfq::base_sequence`, and the stable-set fit and the shifts report
   share one minimum-runs rule. Every output is byte-identical.
+- **The MS2PIP and AlphaPeptDeep readback holds 4 bytes per fragment row for the ion type.**
+  It built one `String` per row, about 16 GB for the roughly 500 million rows MS2PIP returns
+  for a 10-million-precursor library; the column is now read interned. The library tables are
+  byte-identical.
+- **predict-frag removes its worker tables once read back (docs/06).** The request and output
+  tables of every MS2PIP, AlphaPeptDeep, DeepLC and IM2Deep call (`<tag>_in_<PID>.parquet`,
+  `<tag>_out_<PID>.parquet`, several GB for a whole-proteome library) stayed in the work
+  directory. They are removed as the rescore handoff is, unless `MUMDIA_KEEP_HANDOFF=1`; a
+  failed worker leaves them in place.
+- **The CLI, the caches and the sidecar code keep one copy of what they kept twice.** The
+  library cache sweeps its directory with the engine cache's leftover rule
+  (`cache::remove_stale_leftovers`: an hour unwritten, which a set-aside `.broken-` directory
+  whose first removal failed now waits too) and names its temporary directories with the same
+  function. `quant-lfq` groups conditions with `run-experiment`'s function, `localise` and
+  `report --experiment-dir` read the experiment manifest through one helper, and a role's
+  interpreter field is one match (`Role::slot`). `report` and `sub-library`, which start no
+  sidecar and hash no configuration, no longer probe interpreters.
+- **The rescore worker loses a guard that never ran (docs/11).** `ChildGuard` promised to kill
+  the NN or mokapot worker when `mumdia` was killed, but it released the child before waiting
+  and a killed process runs no destructor. Ctrl-C reaches the worker through the terminal's
+  process group, the desktop stops a run's whole process tree, and per-invocation file names
+  keep an orphan from breaking a later rescore.
+
+- **`run-experiment`: the second pass and quant no longer inherit a one-run-at-a-time plan.**
+  When the per-run chains run one at a time under `parallel_runs = auto` because each adapts
+  its own library in a DeepLC worker (`rt_library_scope = per_run`, or no run with seed
+  anchors), the second pass, which starts no such worker, now runs its first run alone and sizes
+  the rest from its measured peak, and quant takes that plan. Scheduling only; no table changes.
+- **`run-experiment` internals (no output change).** The multi-head head count is resolved once
+  and handed to every run's chain; the unreachable ungrouped tail of the per-run chain is gone
+  (`process_grouped_run`); the second-pass result selection is one function that returns the
+  scored table with the chromatograms its candidate ids index; the manifest records the first
+  pass's scored table with the hash its rescore already computed instead of reading it again;
+  the dead fallback after the transfer worker is removed (the worker writes its scored table on
+  every return); the module documentation describes the default second pass.
 - **The engine's shared crates lose code nothing used (docs/02, docs/03).** `mumdia-core`
   drops `ppm_match`, the `AMMONIA` constant and the five candidate-audit reason codes nothing
   produced (`PEPTIDE_NOT_GENERATED`, `MODIFICATION_NOT_ALLOWED`, `CHARGE_OUT_OF_RANGE`,
@@ -432,6 +518,71 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Removed
 
+Options that measured neutral or worse, or that nothing read, are removed. A configuration,
+saved desktop setup or manifest that sets a removed key at its old default still loads (the
+key is dropped before parsing); any other value, and a removed value of a kept key, is refused
+with the release and the reason. Removing the keys that were written at their defaults moves
+the configuration hash of every run once (`features.bound_from_confident`,
+`features.bound_confident_pct`, `features.prec_tol_ppm`, four never-read keys and the
+prescreen keys below); no table of a default, diaPASEF or ZT Scan search changes.
+
+- **The Q1 sweep model (`extract.q1_cycles`, `extract.q1_profile`,
+  `extract.q1_gate_max_offset`, `features.q1_features`).** Summed cycles lost 11-14% of the
+  precursors and the profile family stayed inside seed noise (docs/09 section 10).
+- **`features.ms1_envelope`, `features.q1_separable`.** Both feature families measured inside
+  the four-seed spread on a ZT Scan run (docs/37).
+- **`extract.q1_deconvolved`, `search_seed.q1_deconvolved`.** Counting only Q1-consistent
+  peaks lost 2.5-38% of the precursors; `features.q1_deconvolved` stays.
+- **`extract.apex_evidence_rank = false`.** The legacy apex, which fell back to the lowest-RT
+  scan, pushed 27.6% more candidates through extract for 1.0% fewer peptides; `false` is
+  refused.
+- **`quant.q1_integration`, `quant.q1_step_weights`.** The elution fit measured a worse
+  replicate CV than the trapezoid (0.133 against 0.120) and uniform weights equalled the
+  transmission; `quant.q1_fragments` stays.
+- **`MUMDIA_QUANT_SELECTIVE_READ` and the page-selective chromatogram read.** Every page of
+  the measured tables held an accepted row, so it skipped nothing. Outputs are unchanged.
+- **`quant.peak_window_mode = consensus`.** It changed no quantity under the default fixed
+  window; the value is refused.
+- **`features.bound_from_confident`, `features.bound_confident_pct`.** One learned elution
+  half-width measured 2.20% fewer peptides than per-candidate bounds (#162, docs/10).
+- **`features.prec_tol_ppm`.** It was never read; `extract.prec_tol_ppm` sets the tolerance.
+- **`groups.calibration = per_group`, `groups.rt_adaptation = per_band`.** Per-group
+  calibration was kept only for comparison and stopped on bands without anchors; per-band
+  adaptation was slower than `once_per_run` at the same peptides (docs/33).
+- **`extract.ms1_calibrate = "surface"`, `extract.prec_tol_auto`.** Inside seed noise on the
+  one acquisition measured (docs/09 section 11). The default one-offset calibration stays.
+- **`mumdia align`.** Nothing read `alignment.parquet`.
+- **`mbr.rt_window_s`, `mbr.decoy_transfer`, `mbr.requant_all`, `rescore.percolator_bin`.**
+  No stage read them. `mbr.strategy = empirical_library` and `full` are read as
+  `rt_transfer`.
+- **`retrace.apex_features`, `localise.neutral_loss`.** The apex features added peptides at
+  about 2.7% FDP (docs/35 section 6); neutral-loss ions localised no more peaks (docs/36).
+- **`MUMDIA_WIDE_SCAN` and the coalesced span-cache reader.** From the page cache: plain
+  1.54 s, row groups 1.58 s, coalesced 2.50 s (docs/03). The default reader is unchanged.
+- **The rescuable-tier MBR transfer: `mbr.strategy = rt_transfer` (and `empirical_library`,
+  `full`), `mumdia mbr`, `scripts/mbr_worker.py`, `MUMDIA_PYTHON_MBR`.** Its transfers
+  measured 2.3-2.7% entrapment FDP; the default `second_pass` replaces it (docs/12). The
+  strategy is refused; the other `mbr` keys still load and do nothing, and the TSV columns
+  `is_transferred` and `transfer_q` stay.
+- **`scripts/merge_libraries.py` and the desktop "spectral library + predicted library"
+  input.** The merged library reported 1% at a measured FDP of 1.43% and found no more at a
+  matched FDP (docs/13).
+- **The experimental prescreen components (docs/34 section 5):** the evidence bonuses
+  (`prescreen.complement_bonus`, `tag_bonus`, `fasta_bonus`, `flank_bonus`),
+  `prescreen.mass_hypotheses.*` and `--ms1`, `prescreen.trace.*`, `prescreen.retrieval`,
+  `rescue`, `delayed_modforms`, `prescreen.localization`, `prescreen.tags.gap_edges`,
+  `positioned`, `positioned_residues`, `rms_sigma_da`, `prescreen.top_peaks` and
+  `--top-peaks`, and `--sample-candidates`. None kept more references than the plain
+  fragment-rarity score. `configs/examples/prescreen-components.json` is gone.
+
+- **`deeplc_finetune.py --predict-limit` and `--skip-predict`, and the per-shard refit of
+  `mh_shard_predict.py predict`.** The two flags were hand-run smoke-test options nothing
+  passes. `predict` now requires `--calibration`: a refit per shard repeated the fit and
+  could select another head at rank 80.
+- **The desktop application no longer offers to download DIA-NN 1.8.1.** Every DIA-NN feature
+  of the application refuses that version, so the download installed something nothing could
+  use. A copy an earlier version downloaded stays listed under Managed data for one release,
+  so it can be removed.
 - **`MUMDIA_PARQUET_PLAN` (docs/03).** It turned off the float-encoding plan of capped
   writers, for a byte comparison against binaries from before 0.5.0; release checks compare
   decoded tables. A set variable is now ignored.
@@ -439,8 +590,8 @@ than a number. Both are recorded in every run's `manifest.json`.
   already refused it ("rescore.classifier=percolator is not wired"), so no configuration
   that loaded could select it. A configuration naming it now fails to parse with an
   unknown-variant error instead, and the desktop application, which builds its options from
-  `configs/config-schema.json`, no longer offers it. `rescore.percolator_bin` stays a dead
-  field.
+  `configs/config-schema.json`, no longer offers it. `rescore.percolator_bin` is removed
+  as well (see below).
 - **The index form of the per-run q for a source column that decreases**, which `rescore`
   never builds (it refuses such inputs, and its row gathers keep the order); such a column
   is now a panic rather than a second code path. Also the per-row percolator reference
@@ -491,6 +642,53 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **The mokapot worker uses `rescore.folds` and `rescore.train_fdr`, and the report says how
+  many iterations it ran.** The engine passed `folds`, `num_iter` and `train_fdr` and recorded
+  them in `psms_scored.parquet.report.json`, but the worker ignored all three (3 folds, 0.01
+  and `MUMDIA_BREW_ITERS` 20 whatever the configuration said). It now reads the folds and the
+  training FDR, which changes its output only for non-default values; the iterations stay
+  `MUMDIA_BREW_ITERS`, and the report's `num_iter` for a mokapot run now records that count
+  instead of `rescore.num_iter`. The `percolator` model is built as `mokapot.brew` builds its
+  default, with the configured training FDR.
+- **An entrapment rescore with `MUMDIA_ENTRAPMENT_MODEL=nn` is reported as the MLP it ran.**
+  The engine wrote `model_identity = entrapment-gbm-sidecar-v1` whatever the worker trained;
+  it now reads the variable as the worker does and writes `entrapment-nn-sidecar-v1` for
+  the MLP. `classifier_used` stays `entrapment_gbm`, and the GBM default is unchanged.
+- **`MUMDIA_NN_THREAD_CAP=inf` no longer stops the NN rescorer.** The cap was parsed with
+  `int(float(...))` catching only `ValueError`, so `inf` raised `OverflowError` and failed
+  the rescore, and a value such as `eight` was ignored without a word; both now warn and
+  take the automatic cap, as the DeepLC and IM2Deep caps do.
+- **The fresh-interpreter import test of the DeepLC workers ran (tests/python).** It
+  imported each worker with the scripts directory off `sys.path`, so the import of
+  `_torch_threads` failed and the test skipped "for an unrelated reason" in every
+  environment; the import order it exists to check (`import deeplc` before numpy and
+  pyarrow) was never exercised. The subprocess now puts the script's directory first, as
+  `python <script>` does.
+- **Desktop: a Python environment whose base interpreter was deleted no longer counts as
+  installed.** On Windows a uv environment starts the Python named in its `pyvenv.cfg`; when
+  that folder was removed, every search failed with "uv trampoline failed to spawn Python"
+  while the Setup screen showed the components as installed. The Setup screen, the
+  pre-flight check, the library conversion and visDIA now say the environment cannot start
+  and ask for Install, which repairs it in place without downloading the packages again.
+  Installations in the user's own folder now take their interpreter from uv's managed
+  Pythons in `<components>/uv-python`, as the program-folder installation already did.
+- **Desktop: a retried library build no longer reuses the outputs of the failed attempt.**
+  `scripts/predict_decoys.py` deletes its own `decoys.*` outputs before DIA-NN runs, and the
+  desktop deletes a stale `lib.parquet` before the prediction. A finished library also no
+  longer keeps its scratch tables, about three times its own size.
+- **Desktop: a batch of separate searches without a results folder is refused** instead of
+  writing each file's folder to the drive root; the engine call refuses a relative results
+  folder as well. Stop works during every search of the batch, and the progress line names
+  the file and its position.
+- **Desktop Settings: text defaults are shown and compared as values,** not as JSON text, so
+  the presets no longer show `predict_frag.sidecar_script_dir` as changed, a string default
+  no longer shows quotes that would then be saved, and clearing an optional setting unsets it.
+- **Desktop: the window no longer waits on DIA-NN, the converters or the engine.** The commands
+  that start processes run off the window thread, and a working ThermoRawFileParser is probed
+  once per installation instead of before every engine call. Closing the window stops a
+  running library build; a second visDIA for the same folder stops the first; on Linux and
+  macOS, Stop reaches DIA-NN under the library helper scripts; the free-space check no longer
+  flashes a console window; "reveal" opens folders only.
 - **`run-experiment` refuses a `quant.normalisation_rank` the run count cannot carry before
   it searches (#358).** The cross-run normalisation needs a rank of at most the number of runs less
   two and checked it only when it ran, after every run's search, rescore and quant, so two
@@ -509,6 +707,48 @@ than a number. Both are recorded in every run's `manifest.json`.
   `run-experiment` split tables (#358).** Their precursor and peptide q are experiment-wide, on one
   winning row across all runs, so an audit of one of them failed most accepted precursors of
   the run; the message names a single-file `run` output.
+- **`mumdia doctor` checks the worker scripts the default library search runs (docs/14).** The
+  check covered required roles only, so with the default configuration it printed `[skip]`,
+  and a library search with a discoverable DeepLC then stopped after the seed search on a
+  missing `deeplc_finetune.py`. It now covers every role the run will use: a required one, and
+  a wanted one whose interpreter resolved (DeepLC under `library_irt = auto`, IM2Deep under
+  `im_predictor = auto`).
+- **`mumdia doctor --temp-dir` fails an unusable directory.** The flag's error stopped every
+  other command but was only logged for `doctor`, which then checked the system temporary
+  directory and reported the configuration runnable. `MUMDIA_TEMP_DIR` (and
+  `MUMDIA_CACHE_DIR`) are now set before the directory is probed.
+- **`mumdia doctor` says what IM2Deep is for.** A wanted IM2Deep role printed the DeepLC
+  retention-time texts, and the line of a role with a warning could print as `[note]`.
+- **`mumdia extract` calibrates MS1 as `run` does (docs/09).** With `extract.ms1_calibrate` on,
+  the default, the standalone stage read MS1 at offset 0 inside the 3 ppm window.
+  Given `--ms1` and the seed's `--mass-cal`, it now learns the offset from the seed table that
+  `<seed>.masscal.json` is named after, and warns when that table is missing.
+- **`mumdia pool` orders more than 100 bands by number.** The band directories (`g00` ...)
+  were sorted as text, so `g100` came between `g10` and `g11`; directories that are not `g`
+  and digits are ignored.
+- **The automatic extract footprint ceiling sees a SLURM or systemd job's memory limit
+  (docs/09).** It read `/sys/fs/cgroup/memory.max` only, the limit of a container but not of a
+  job's cgroup or of a cgroup v1 hierarchy, and compared against the whole node's memory. It
+  now takes the tightest limit on the process's cgroup path, which the planner of concurrent
+  runs already read (`sched.rs`).
+- **Interpreter discovery asks for what the workers import.** The MS2PIP role probed pandas,
+  which `ms2pip_worker.py` does not import, and not pyarrow or psm_utils, which it does; the
+  entrapment classifier required mokapot, which `entrapment_worker.py` never imports.
+- **Every Python worker runs with UTF-8 I/O.** MS2PIP and AlphaPeptDeep ran
+  without `PYTHONUTF8`, so with its output piped (the desktop) a worker on Windows could stop
+  on a printed path the code page cannot encode.
+
+- **`run-experiment`: a first run without seed anchors no longer makes every run adapt its own
+  retention-time library.** Under `rt_library_scope = first_run_only` the first run adapts the
+  library for the rest. When its seed was short of anchors (a blank, a failed or short
+  injection) the multi-head calibration was skipped, nothing was shared, and every other run ran
+  its own calibration, one at a time. The first run whose seed has the anchors now adapts for
+  every run, the first included, sequentially and overlapped; the experiment manifest reads that
+  run's anchor choice. Outputs change only in that case.
+- **CI: the applied second pass is tested.** A smoke arm whose second pass applies (a noisier
+  second fixture and gate 0) asserts that every quantified candidate id is an empirical-library
+  row with a second-pass chromatogram; stub arms cover a near-blank first run, sequential and
+  overlapped.
 - **Desktop: a diaPASEF search is no longer split into bands (#351).** "Bands: Automatic" (the
   default) planned the search from the machine's memory alone, so a large search space on a timsTOF
   diaPASEF `.d` was given several bands, and the engine stopped it after Start: bands are refused on
@@ -884,6 +1124,24 @@ than a number. Both are recorded in every run's `manifest.json`.
 - **`mumdia localise --experiment-dir --sources` requires `--out-dir`.** In place, a subset
   overwrote those runs' tables and the experiment-level table with a fit on the subset, while
   the manifest still presented them as the whole experiment's.
+
+### Documentation
+
+- **The developer guide states the current defaults.** It said that the library recipe
+  fine-tunes DeepLC per run and gates at `apex_pearson` 0.2, that `compete.group_by`
+  defaults to `base_peptide` (`precursor`), that match-between-runs is off and a stub, that
+  `quant.fragment_selection` defaults to `observed_area`, that the DeepLC fine-tune sets no
+  seed, that worker scripts are found in the working directory first, and that
+  `DID_NOT_SURVIVE_EXTRACTION` proves a `presence_min_fragments` failure. It now gives the
+  shipped recipe (`configs/examples/diann-library.json`), the `peptidoform_charge` and
+  `second_pass` defaults, the pattern-fit quantification, the `rng_seed` seeding, the
+  config-directory, executable, working-directory order, and the catch-all meaning of that
+  audit label. The docs also no longer tell users to export `MUMDIA_NN_SEEDS`,
+  `MUMDIA_NN_FOLDS` or `MUMDIA_NN_ITERS`, which the engine overwrites from `rescore.seeds`,
+  `rescore.folds` and `rescore.num_iter`. The schema-version tables are merged into one
+  registry in docs/15; the rescore sidecar contract, the environment specifications, the
+  example configuration list, the Extended feature count and the importer's kept
+  modifications match the code. No output changes.
 
 ### Security
 

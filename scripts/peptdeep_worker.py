@@ -270,35 +270,43 @@ def main():
     # AlphaPeptDeep spells its own request "gpu" and falls back to CPU on its own.
     device = "cpu" if want == "cpu" else "gpu"
 
+    # Rows per prediction call. Streamed rather than concatenated at the end: a whole
+    # proteome is tens of millions of precursors and hundreds of millions of fragment
+    # rows, and holding all of them as arrays before the first byte is written is how
+    # the MS2PIP worker once reached 13 GB of Python objects.
+    chunk = 200_000
     tbl = pq.read_table(in_path)
-    ids = tbl.column("id").to_pylist()
-    pforms = tbl.column("peptidoform").to_pylist()
-    charges = tbl.column("charge").to_pylist()
-
-    parsed, kept_ids, kept_charges, unsupported = [], [], [], []
-    for rid, pform, charge in zip(ids, pforms, charges):
-        p = parse_peptidoform(pform)
-        if p is None:
-            unsupported.append(pform)
-        else:
-            parsed.append(p)
-            kept_ids.append(rid)
-            kept_charges.append(charge)
+    # A first pass, chunk by chunk, finds the rows AlphaPeptDeep can express and the
+    # modifications they name, so both checks below still run before any prediction; the
+    # rows are parsed again per chunk in the prediction loop rather than held as a Python
+    # tuple each for the whole request.
+    supported = np.zeros(tbl.num_rows, dtype=bool)
+    unsupported, mod_specs = [], set()
+    for start in range(0, tbl.num_rows, chunk):
+        pforms = tbl.column("peptidoform").slice(start, chunk).to_pylist()
+        for i, pform in enumerate(pforms, start):
+            p = parse_peptidoform(pform)
+            if p is None:
+                unsupported.append(pform)
+            else:
+                supported[i] = True
+                mod_specs.add(p[1])
+    kept = np.flatnonzero(supported)
     if unsupported:
         show = ", ".join(sorted(set(unsupported))[:5])
         print(
-            f"peptdeep_worker: {len(unsupported)} of {len(ids)} peptidoforms are not "
+            f"peptdeep_worker: {len(unsupported)} of {tbl.num_rows} peptidoforms are not "
             f"expressible for AlphaPeptDeep and are left unpredicted (e.g. {show}). "
             "The engine drops each with its pair and fails above 2%.",
             flush=True,
         )
-    if not parsed:
+    if not len(kept):
         pq.write_table(pa.table([], schema=OUT_SCHEMA), out_path, compression="snappy")
         print("peptdeep_worker: nothing to predict")
         return
 
     known = set(MOD_DF.index)
-    missing = check_vocabulary([m for _, m, _ in parsed], known)
+    missing = check_vocabulary(mod_specs, known)
     if missing:
         raise SystemExit(
             "peptdeep_worker: alphabase does not define these modifications, so their "
@@ -327,23 +335,21 @@ def main():
         )
 
     writer = pq.ParquetWriter(out_path, OUT_SCHEMA, compression="snappy")
-    # Rows per prediction call. Streamed rather than concatenated at the end: a whole
-    # proteome is tens of millions of precursors and hundreds of millions of fragment
-    # rows, and holding all of them as arrays before the first byte is written is how
-    # the MS2PIP worker once reached 13 GB of Python objects.
-    chunk = 200_000
     n_rows = 0
     try:
-        for start in range(0, len(parsed), chunk):
-            end = min(start + chunk, len(parsed))
-            block = parsed[start:end]
+        # Chunks of the supported rows: every prediction call gets the rows it got when
+        # they were all parsed up front.
+        for start in range(0, len(kept), chunk):
+            end = min(start + chunk, len(kept))
+            rows = tbl.take(kept[start:end])
+            block = [parse_peptidoform(p) for p in rows.column("peptidoform").to_pylist()]
             df = pd.DataFrame(
                 {
-                    "mumdia_id": np.asarray(kept_ids[start:end], dtype=np.uint32),
+                    "mumdia_id": np.asarray(rows.column("id").to_pylist(), dtype=np.uint32),
                     "sequence": [p[0] for p in block],
                     "mods": [p[1] for p in block],
                     "mod_sites": [p[2] for p in block],
-                    "charge": np.asarray(kept_charges[start:end], dtype=np.int32),
+                    "charge": np.asarray(rows.column("charge").to_pylist(), dtype=np.int32),
                     "nce": np.float32(nce),
                     "instrument": instrument,
                 }
@@ -363,12 +369,12 @@ def main():
                 writer.write_table(to_table(part))
                 n_rows += part[0].size
             print(
-                f"peptdeep_worker: {end}/{len(parsed)} peptidoforms predicted",
+                f"peptdeep_worker: {end}/{len(kept)} peptidoforms predicted",
                 flush=True,
             )
     finally:
         writer.close()
-    print(f"peptdeep_worker: {len(parsed)} peptidoforms -> {n_rows} fragment rows")
+    print(f"peptdeep_worker: {len(kept)} peptidoforms -> {n_rows} fragment rows")
 
 
 if __name__ == "__main__":

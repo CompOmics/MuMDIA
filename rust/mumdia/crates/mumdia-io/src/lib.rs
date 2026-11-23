@@ -6,7 +6,6 @@ pub mod hash;
 pub mod json;
 pub mod publish;
 pub mod report;
-pub mod span_cache;
 pub mod table;
 
 use anyhow::Result;
@@ -52,7 +51,7 @@ pub fn init_logging_level(level: Option<&str>) {
 /// There was no path-equality check anywhere in the workspace, so
 /// `mumdia prescan --lib-precursors lib/x.parquet --out lib/x.parquet` replaced a full
 /// precursor library with a two-column survivors table and exited 0 -- the library had
-/// already been read into memory, so nothing failed. `align` has the same shape, and in
+/// already been read into memory, so nothing failed. In
 /// FASTA mode `run --out-dir lib` truncated the precursor library before the digest had
 /// produced a row. Comparing canonicalised paths catches the aliases (`./lib/x.parquet`,
 /// a symlink, a different drive-letter case on Windows) that a string compare misses; a

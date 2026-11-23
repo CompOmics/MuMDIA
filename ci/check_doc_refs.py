@@ -37,11 +37,7 @@ from collections import defaultdict
 # Files that legitimately name Markdown documents which do not exist yet: the
 # release plan lists deliverables that release work will create. Keep this list
 # short, and delete an entry as soon as its file lands.
-ALLOWED_MISSING = {
-    "CODE_OF_CONDUCT.md",
-    "23_cli_reference.md",
-    "24_config_reference.md",
-}
+ALLOWED_MISSING: set[str] = set()
 
 # Documents that are untracked BY POLICY, and the few files allowed to name them.
 # Those files explain the policy, so they have to say which document it applies to;

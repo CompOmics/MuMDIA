@@ -11,14 +11,14 @@ mkdir -p "$O"
 while pgrep -f "$BIN .*rescore" > /dev/null; do sleep 20; done
 t() { local name=$1; shift; /usr/bin/time -v -o "$O/time_$name.txt" "$@" > "$O/$name.log" 2>&1; echo "$(date +%T) $name exit $?" >> "$O/progress.log"; }
 for rep in 1 2; do
-  for arm in OFF CAP300 SEN BAL STR AGG; do
+  for arm in OFF SEN BAL STR AGG; do
     R=""; [ "$arm" != OFF ] && R="--restrict-candidates $ROOT/$arm/survivors.parquet"
     t "extract_${arm}_r$rep" "$BIN" --threads "$THREADS" extract --ms2 "$S/spectra_ms2.parquet" \
       --ms1 "$S/spectra_ms1.parquet" --lib-precursors "$LIB" --lib-fragments "$LIBF" \
       --run-windows "$B/run_windows.parquet" --mass-cal "$B/seed_psms.parquet.masscal.json" \
       --out-psms "$O/psms.parquet" --out-chromatograms "$O/chrom.parquet" $R --config "$CFG"
   done
-  for p in "CAP300 --preset balanced --top-peaks 300" "SEN --preset sensitive" "BAL --preset balanced" "AGG --preset aggressive"; do
+  for p in "SEN --preset sensitive" "BAL --preset balanced" "AGG --preset aggressive"; do
     set -- $p; arm=$1; shift
     t "screen_${arm}_r$rep" "$BIN" --threads "$THREADS" prescreen --ms2 "$S/spectra_ms2.parquet" \
       --lib-precursors "$LIB" --run-windows "$B/run_windows.parquet" --out "$O/surv.parquet" \

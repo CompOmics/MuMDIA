@@ -172,23 +172,6 @@
       </div>
 
       <p class="hint" id="diann-where"></p>
-
-      <div id="diann-get" hidden>
-        <div class="rule"></div>
-        <div class="card-head">
-          <div>
-            <div class="card-title">Don't have it? Download 1.8.1</div>
-            <div class="card-sub" id="diann-get-sub"></div>
-          </div>
-          <button class="btn quiet" id="diann-download">Download</button>
-        </div>
-        <div class="bar" id="diann-get-bar" hidden><i></i></div>
-        <p class="hint" id="diann-get-step"></p>
-        <div id="diann-get-error" class="banner bad" hidden></div>
-        <div class="card logcard sub-card" id="diann-get-log-card" hidden>
-          <pre class="log" id="diann-get-log"></pre>
-        </div>
-      </div>
     </div>
 
     <h1 class="section-h">Storage folder</h1>
@@ -441,7 +424,8 @@
           third time to remove it. Each extra variable site multiplies the peptidoforms to
           predict and search, so a large selection is where a prescreen before prediction
           and bands (Settings, below) pay off. DIA-NN builds predict the same selection
-          (one library per selection, cached). Terminal modifications are not supported.
+          (one library per selection, cached). N-terminal modifications are offered where the
+          catalogue lists them; C-terminal ones are not supported.
         </p>
 
         <div class="rule"></div>
@@ -509,11 +493,6 @@
           <span><b>DIA-NN library</b> — a spectral library DIA-NN wrote (.parquet or
             .speclib), converted into the two tables first.</span>
         </label>
-        <label class="check">
-          <input type="radio" name="libin" id="libin-merge" value="merge" />
-          <span><b>Spectral library + predicted library</b> — an empirical library merged
-            with a library predicted from a FASTA into one pair of tables first.</span>
-        </label>
 
         <div id="libin-tables-pane">
           <div class="picker">
@@ -566,56 +545,6 @@
             conversion without it. No FASTA is needed, because the proteins come from the
             library unless a FASTA to re-map to is chosen. Use an empty output folder; the
             two tables are selected for the search when the conversion finishes.
-          </p>
-        </div>
-
-        <div id="libin-merge-pane" hidden>
-          <div class="picker">
-            <div class="picked" id="p-merge-ep">No empirical precursor table selected</div>
-            <button class="btn quiet" data-pick="merge_emp_p">Empirical precursors…</button>
-          </div>
-          <div class="picker">
-            <div class="picked" id="p-merge-ef">No empirical fragment table selected</div>
-            <button class="btn quiet" data-pick="merge_emp_f">Empirical fragments…</button>
-          </div>
-          <div class="picker">
-            <div class="picked" id="p-merge-pp">No predicted precursor table selected</div>
-            <button class="btn quiet" data-pick="merge_pred_p">Predicted precursors…</button>
-          </div>
-          <div class="picker">
-            <div class="picked" id="p-merge-pf">No predicted fragment table selected</div>
-            <button class="btn quiet" data-pick="merge_pred_f">Predicted fragments…</button>
-          </div>
-          <div class="picker">
-            <div class="picked" id="p-merge-out">No folder selected</div>
-            <button class="btn quiet" data-pick="merge_out">Output folder…</button>
-          </div>
-          <div class="row">
-            <label for="merge-precedence">An entry in both takes</label>
-            <select id="merge-precedence">
-              <option value="empirical" selected>the empirical spectrum and retention time</option>
-              <option value="predicted">the predicted spectrum and retention time</option>
-            </select>
-          </div>
-          <div class="actions">
-            <button class="btn" id="merge-libraries">Merge the libraries</button>
-            <span class="hint inline" id="merge-note"></span>
-          </div>
-          <div id="merge-error" class="banner bad" hidden></div>
-          <p class="hint">
-            Both libraries are MuMDIA library tables: convert a DIA-NN library first (the
-            option above), and build the predicted library from a FASTA on the FASTA tab
-            (Build library only). Every entry of the predicted library is searched, with the
-            empirical spectrum and retention time where the empirical library has the entry;
-            entries only the empirical library has are added. The empirical retention times
-            are mapped onto the predicted scale through the entries both share, and the
-            decoys of the merged targets are built again and predicted by DIA-NN, so the
-            same DIA-NN 2.x requirement as for a conversion applies. Use an empty output
-            folder; the merged tables are selected for the search when the merge finishes.
-            The reported FDR of a merged library is optimistic when the empirical library
-            holds false identifications of the search that made it: on an entrapment
-            benchmark the measured FDP at a reported 1% was 1.43%. Prefer an empirical
-            library from a strict search or from other samples.
           </p>
         </div>
       </div>

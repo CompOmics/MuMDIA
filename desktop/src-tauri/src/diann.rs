@@ -1,4 +1,4 @@
-//! Obtaining, locating, and driving DIA-NN.
+//! Locating and driving DIA-NN.
 //!
 //! # Why this is not an install like the Python components
 //!
@@ -10,26 +10,11 @@
 //! DIA-NN is closed source. Releases from 1.9 onward forbid redistribution, which
 //! is why it is absent from Bioconda; from 1.9.2 it requires a licence file to
 //! activate; and 2.x is split into a paid Enterprise edition and an Academia
-//! edition restricted to non-profit academic research. 1.8.1, the last release
-//! predating activation, is commonly described as "the redistributable one", and
-//! that is wrong: its own LICENSE.txt bars derivative works and bars renting,
-//! leasing, lending and sublicensing, permitting only a one-time permanent transfer
-//! of all rights. The claim comes from community container images, not from the
-//! licence text.
+//! edition restricted to non-profit academic research.
 //!
-//! So MuMDIA never ships DIA-NN bytes, never mirrors them, and never proxies them.
-//! Two things it does do, and both avoid distributing anything:
-//!
-//!   - **Locate** a DIA-NN the user installed and licensed themselves, and drive
-//!     it. Running a program already on the machine redistributes nothing.
-//!   - **Fetch** the pinned 1.8.1 asset from the vendor's own release URL onto the
-//!     user's machine. The vendor distributes; the user obtains; the application
-//!     automates a download the user could perform by hand.
-//!
-//! That second one is a deliberate, narrow judgement and not a general licence to
-//! bundle. If it is ever widened -- a mirror, a vendored copy, a "latest" lookup,
-//! another host -- the reasoning above no longer covers it. `LICENCE_NOTICE` and
-//! the tests around `asset()` exist to make that hard to do by accident.
+//! So MuMDIA never ships, mirrors, proxies or downloads DIA-NN. It **locates** a
+//! DIA-NN the user installed and licensed themselves, and drives it. Running a
+//! program already on the machine redistributes nothing.
 //!
 //! # What it produces
 //!
@@ -57,10 +42,7 @@ The DIA-NN \"Academia\" edition is free for non-profit academic research only. \
 Commercial and industrial use requires a paid Enterprise licence. If you are not \
 certain which applies to you, check before continuing.
 
-If you use the download button, MuMDIA fetches DIA-NN 1.8.1 from the author's own \
-release page and checks it against a known checksum. It is not hosted, mirrored or \
-altered by MuMDIA, and accepting this notice is not a substitute for DIA-NN's own \
-licence terms.
+Accepting this notice is not a substitute for DIA-NN's own licence terms.
 
 DIA-NN's version affects the library it predicts, and therefore affects your \
 results. Record the version you used.";
@@ -94,8 +76,6 @@ struct Saved {
 /// An explicit answer always wins. Without one, a DIA-NN that is installed and runs
 /// is taken as acknowledged: someone who installed DIA-NN has accepted its licence
 /// from the vendor, and asking again before the first library build only adds a step.
-/// The download offered here (`install`) never relies on the assumption, because
-/// nothing is installed at that point.
 fn effective_licence(saved: Option<bool>, runs: bool) -> (bool, bool) {
     match saved {
         Some(answer) => (answer, false),
@@ -261,14 +241,6 @@ fn candidates(saved: &Saved) -> Vec<(String, PathBuf)> {
     out
 }
 
-/// Run the binary and read the version out of its banner.
-///
-/// DIA-NN has no `--version`; it prints `DIA-NN 1.8.1 (Data-Independent
-/// Acquisition by Neural Networks)` on startup and then exits complaining that it
-/// has nothing to do. A non-zero exit is therefore expected and is not a failure:
-/// the question this answers is only "does this file execute on this machine",
-/// which catches a Linux binary on Windows, a truncated download, and a 1.9.2+
-/// build with no licence file, all of which otherwise surface hours later.
 /// How long a probe may take before it is assumed not to be a console program.
 ///
 /// DIA-NN prints its banner and exits within a second. Ten seconds is slow enough
@@ -485,7 +457,7 @@ fn detect_unacknowledged(saved: &Saved) -> Status {
 /// 1.8.x cannot, and that matters more than a version note: `build` needs a Parquet
 /// library, the re-export step is the only way to get one from a predicted
 /// `.speclib`, and 1.8.x will not perform it. Without this check the interface
-/// offered the download, predicted a whole proteome, ran the re-export, and only then
+/// predicted a whole proteome, ran the re-export, and only then
 /// failed -- after the expensive step, on a path it had recommended.
 ///
 /// Parsed from the banner (`DIA-NN 1.8.1 (...)`). An unparseable banner is treated as
@@ -535,371 +507,6 @@ pub fn acknowledge_licence(accepted: bool) -> Result<Status, String> {
     saved.licence_acknowledged = Some(accepted);
     store(&saved)?;
     Ok(detect())
-}
-
-// ── obtaining 1.8.1 ─────────────────────────────────────────────────────────
-//
-// The only version this will fetch, and the reason is the licence rather than a
-// preference for old software.
-//
-// 1.8.1 is the last release predating the activation requirement introduced in
-// 1.9.2, and the last that a user can obtain and run without a licence file. It is
-// not, however, freely redistributable: its own LICENSE.txt bars derivative works
-// and bars renting, leasing, lending and sublicensing, permitting only a one-time
-// permanent transfer of all rights. The widespread claim that "1.8.1 is the
-// redistributable one" comes from community container images, not from that text.
-//
-// So MuMDIA does not ship these bytes and does not mirror them. What this does is
-// fetch the vendor's own release asset, from the vendor's own URL, onto the user's
-// machine. Nothing is redistributed: the vendor distributes, the user obtains, and
-// the application automates a download the user could perform by hand. That
-// distinction is the whole basis on which this is offered, so do not "simplify" it
-// later by vendoring the asset or proxying it through another host.
-//
-// Two further rules hold it together:
-//
-//   - the URL and digest are PINNED. Never resolve "latest": a newer release is
-//     one this reasoning has not been applied to, and it would also silently change
-//     the predicted library.
-//   - on Windows the vendor's own installer is launched rather than silently
-//     extracted, because that installer presents the vendor's own licence terms and
-//     takes the user's acceptance directly. Ours is not a substitute for theirs.
-
-/// What to do with the asset once it is on disk.
-#[derive(Clone, Copy, PartialEq)]
-enum AssetKind {
-    /// The vendor's installer. Launched interactively so its own licence screen is
-    /// the one the user accepts.
-    Installer,
-    /// A flat tarball, extracted into the managed directory. Needs no root.
-    Tarball,
-}
-
-struct Asset {
-    url: &'static str,
-    /// Verified before the bytes are executed or extracted.
-    sha256: &'static str,
-    size: u64,
-    kind: AssetKind,
-    file_name: &'static str,
-}
-
-/// The pinned 1.8.1 asset for this platform, if there is one.
-///
-/// Digests taken from the release assets on 2026-08-30. A mismatch is a hard
-/// failure: these bytes get executed.
-fn asset() -> Option<Asset> {
-    if cfg!(windows) {
-        Some(Asset {
-            url:
-                "https://github.com/vdemichev/DiaNN/releases/download/1.8.1/DIA-NN.1_8_1.Setup.exe",
-            sha256: "83c788d532b5b173c0945467fd18ff12e2fc3d337d1ca328ffe20016d1fc0fb3",
-            size: 137_983_408,
-            kind: AssetKind::Installer,
-            file_name: "DIA-NN.1_8_1.Setup.exe",
-        })
-    } else if cfg!(target_os = "linux") {
-        Some(Asset {
-            url: "https://github.com/vdemichev/DiaNN/releases/download/1.8.1/diann_1.8.1.tar.gz",
-            sha256: "fb239a1191ae9f3aa497d4e933ef9435bd9fd4795222f100530d1e22e550bb2c",
-            size: 142_368_752,
-            kind: AssetKind::Tarball,
-            file_name: "diann_1.8.1.tar.gz",
-        })
-    } else {
-        None
-    }
-}
-
-/// Progress of an install, polled by the interface.
-#[derive(Serialize, Clone, Debug, Default)]
-pub struct InstallState {
-    /// `idle` | `running` | `done` | `failed` | `handoff`
-    ///
-    /// `handoff` is the Windows outcome: the vendor's installer was launched and
-    /// the rest is between the user and it, so there is nothing further to report.
-    pub status: String,
-    pub step: String,
-    /// 0-100 for the download, which is the only part with a known length.
-    pub percent: u8,
-    pub log: Vec<String>,
-    pub error: Option<String>,
-}
-
-#[derive(Default)]
-pub struct Installer {
-    state: Mutex<InstallState>,
-}
-
-impl Installer {
-    /// Drop a finished install's outcome, after the files it produced were removed.
-    ///
-    /// The state is deliberately sticky so a caller polling for `done` cannot miss it;
-    /// without this, a DIA-NN removed from the Setup screen would go on reporting
-    /// itself installed until the application restarted.
-    pub fn forget(&self) {
-        if let Ok(mut s) = self.state.lock() {
-            *s = InstallState::default();
-        }
-    }
-
-    pub fn snapshot(&self) -> InstallState {
-        self.state
-            .lock()
-            .map(|s| s.clone())
-            .unwrap_or_else(|_| InstallState {
-                status: "failed".into(),
-                error: Some("internal state is poisoned".into()),
-                ..Default::default()
-            })
-    }
-
-    fn log(&self, line: String) {
-        if let Ok(mut s) = self.state.lock() {
-            s.log.push(line);
-            if s.log.len() > 500 {
-                let drop = s.log.len() - 500;
-                s.log.drain(0..drop);
-            }
-        }
-    }
-
-    fn set(&self, status: &str, step: &str) {
-        if let Ok(mut s) = self.state.lock() {
-            s.status = status.into();
-            s.step = step.into();
-        }
-    }
-
-    fn fail(&self, msg: String) {
-        if let Ok(mut s) = self.state.lock() {
-            s.status = "failed".into();
-            s.error = Some(msg);
-        }
-    }
-}
-
-/// Where a managed 1.8.1 is extracted. Per-user, so no administrator rights.
-fn managed_dir() -> PathBuf {
-    crate::components::tools_dir().join(MANAGED_DIR_NAME)
-}
-
-/// Whether this platform can be offered the download at all, and what it costs.
-pub fn offer() -> serde_json::Value {
-    match asset() {
-        Some(a) => serde_json::json!({
-            "available": true,
-            "version": "1.8.1",
-            "url": a.url,
-            "download_bytes": a.size,
-            // The Linux tarball unpacks to about 490 MB, nearly all of it
-            // libtorch_cpu.so, and someone on a small volume should be told before
-            // a 142 MB download rather than after it.
-            "disk_bytes": if a.kind == AssetKind::Tarball { 500_000_000u64 } else { a.size * 2 },
-            "hands_off": a.kind == AssetKind::Tarball,
-        }),
-        None => serde_json::json!({ "available": false }),
-    }
-}
-
-/// Stream the asset to `dest`, hashing as it goes, and verify the digest.
-fn download_verified(installer: &Arc<Installer>, a: &Asset, dest: &Path) -> Result<(), String> {
-    use sha2::{Digest, Sha256};
-
-    installer.log(format!("== downloading {}", a.url));
-    let resp = ureq::get(a.url)
-        .call()
-        .map_err(|e| format!("the download failed: {e}"))?;
-    let mut reader = resp.into_body().into_reader();
-
-    let mut file =
-        std::fs::File::create(dest).map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
-    let mut total: u64 = 0;
-    let mut last_report: u64 = 0;
-
-    loop {
-        let n = std::io::Read::read(&mut reader, &mut buf)
-            .map_err(|e| format!("the download was interrupted: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-        std::io::Write::write_all(&mut file, &buf[..n])
-            .map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
-        total += n as u64;
-
-        if let Ok(mut s) = installer.state.lock() {
-            s.percent = ((total.min(a.size) as f64 / a.size as f64) * 100.0) as u8;
-        }
-        // Every 16 MB, so a slow link still shows movement without flooding the log.
-        if total - last_report >= 16 << 20 {
-            last_report = total;
-            installer.log(format!(
-                "   {} MB of {} MB",
-                total / 1_000_000,
-                a.size / 1_000_000
-            ));
-        }
-    }
-    std::io::Write::flush(&mut file).map_err(|e| e.to_string())?;
-    drop(file);
-
-    let got = crate::components::hex(hasher.finalize());
-    if got != a.sha256 {
-        // The file is removed rather than left for someone to run by hand.
-        let _ = std::fs::remove_file(dest);
-        return Err(format!(
-            "the downloaded file does not match the expected checksum and has been \
-             deleted. Expected {}, got {got}. Do not run it; download DIA-NN from \
-             the vendor instead.",
-            a.sha256
-        ));
-    }
-    installer.log(format!("== checksum verified ({} bytes)", total));
-    Ok(())
-}
-
-/// Fetch DIA-NN 1.8.1 from the vendor's release and make it usable.
-///
-/// Refuses until the licence notice has been acknowledged, in the backend, for the
-/// same reason `build` does: a disabled button is not an enforcement point.
-pub fn install(installer: Arc<Installer>) -> Result<(), String> {
-    // Only an explicit answer: with nothing installed there is nothing to assume from.
-    if load().licence_acknowledged != Some(true) {
-        return Err("the DIA-NN licence notice has not been acknowledged".into());
-    }
-    let Some(a) = asset() else {
-        return Err("no DIA-NN 1.8.1 release is published for this platform".into());
-    };
-
-    {
-        let mut s = installer
-            .state
-            .lock()
-            .map_err(|_| "internal state is poisoned".to_string())?;
-        if s.status == "running" {
-            return Err("an install is already running".into());
-        }
-        *s = InstallState {
-            status: "running".into(),
-            step: "downloading DIA-NN 1.8.1".into(),
-            ..Default::default()
-        };
-    }
-
-    std::thread::spawn(move || {
-        // The user's own folder in both scopes. On Windows this is the vendor's installer,
-        // which installs DIA-NN where it chooses and asks for its own permission, so nothing
-        // here needs the program folder; the Linux archive is unpacked into `managed_dir`,
-        // and Linux has no machine scope.
-        let dir = crate::storage::user_tools_dir();
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            installer.fail(format!("cannot create {}: {e}", dir.display()));
-            return;
-        }
-        let archive = dir.join(a.file_name);
-
-        if let Err(e) = download_verified(&installer, &a, &archive) {
-            installer.fail(e);
-            return;
-        }
-
-        match a.kind {
-            // Hand over to the vendor's installer. It shows the vendor's licence and
-            // takes the acceptance, which ours does not replace.
-            AssetKind::Installer => {
-                installer.set("running", "starting the DIA-NN installer");
-                installer.log("== launching the DIA-NN installer".into());
-                match crate::engine::command(&archive).spawn() {
-                    Ok(_) => {
-                        installer.set("handoff", "finish in the DIA-NN installer");
-                        installer.log(
-                            "== the DIA-NN installer is now running. Complete it, accept \
-                             DIA-NN's own licence, then press Locate."
-                                .into(),
-                        );
-                    }
-                    Err(e) => installer.fail(format!("could not start the installer: {e}")),
-                }
-            }
-
-            AssetKind::Tarball => {
-                installer.set("running", "extracting");
-                let target = managed_dir();
-                // A previous partial extraction would otherwise leave a mixture of
-                // two versions' libraries in one directory.
-                let _ = std::fs::remove_dir_all(&target);
-                if let Err(e) = std::fs::create_dir_all(&target) {
-                    installer.fail(format!("cannot create {}: {e}", target.display()));
-                    return;
-                }
-                installer.log(format!("== extracting into {}", target.display()));
-                // `tar` rather than a Rust decoder: it is present on every Linux
-                // this application supports, and the archive is flat, so there is
-                // nothing here a dedicated crate would handle better.
-                let out = std::process::Command::new("tar")
-                    .arg("xzf")
-                    .arg(&archive)
-                    .arg("-C")
-                    .arg(&target)
-                    .output();
-                match out {
-                    Ok(o) if o.status.success() => {}
-                    Ok(o) => {
-                        installer.fail(format!(
-                            "extraction failed: {}",
-                            String::from_utf8_lossy(&o.stderr).trim()
-                        ));
-                        return;
-                    }
-                    Err(e) => {
-                        installer.fail(format!("could not run tar: {e}"));
-                        return;
-                    }
-                }
-                let _ = std::fs::remove_file(&archive);
-
-                let Some(exe) = first_exe_in(&target) else {
-                    installer.fail(format!(
-                        "the archive extracted but no DIA-NN binary was found in {}",
-                        target.display()
-                    ));
-                    return;
-                };
-                // The tarball carries permissions, but an extraction that lost them
-                // would leave a binary that cannot be executed.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Ok(md) = std::fs::metadata(&exe) {
-                        let mut perms = md.permissions();
-                        perms.set_mode(perms.mode() | 0o755);
-                        let _ = std::fs::set_permissions(&exe, perms);
-                    }
-                }
-
-                // Verify by running it, so a broken install is reported now and not
-                // at the start of a two-hour prediction.
-                let (runs, version, err) = probe(&exe);
-                if !runs {
-                    installer.fail(err.unwrap_or_else(|| {
-                        format!("{} did not run after extraction", exe.display())
-                    }));
-                    return;
-                }
-                if let Err(e) = set_path(Some(&exe.display().to_string())) {
-                    installer.fail(e);
-                    return;
-                }
-                installer.log(format!("== installed: {}", version.unwrap_or_default()));
-                installer.set("done", "installed");
-            }
-        }
-    });
-
-    Ok(())
 }
 
 /// What to predict, and how. The defaults match `README.md`'s worked example.
@@ -1408,7 +1015,7 @@ fn mark_cache_complete(dir: &Path, req: &BuildRequest, version: &str) {
 ///
 /// Answered before anything is started, so the interface can say "this will take a
 /// while" or "this is already built" rather than discovering it afterwards.
-pub fn library_plan(mut req: BuildRequest) -> Result<serde_json::Value, String> {
+pub fn library_plan(req: BuildRequest) -> Result<serde_json::Value, String> {
     let status = detect();
     if !status.runs {
         return Err("no working DIA-NN was found".into());
@@ -1428,7 +1035,6 @@ pub fn library_plan(mut req: BuildRequest) -> Result<serde_json::Value, String> 
     }
     let version = status.version.clone().unwrap_or_default();
     let dir = library_cache_dir(&req, &version)?;
-    req.out_dir = dir.display().to_string();
 
     let cached = cached_library(&dir);
     Ok(serde_json::json!({
@@ -1578,6 +1184,12 @@ fn run_step(
         c
     };
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Its own process group, so Stop reaches DIA-NN under a helper script (`run::kill_tree`).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     if let Some(d) = cwd {
         cmd.current_dir(d);
     }
@@ -1949,6 +1561,9 @@ pub fn build(builder: Arc<Builder>, req: BuildRequest) -> Result<(), String> {
         let version_for_cache = status.version.clone();
         builder.log(format!("== DIA-NN: {}", status.version.unwrap_or_default()));
         builder.log(format!("== {} {}", exe.display(), args.join(" ")));
+        // A failed or stopped earlier build in this folder may have left its Parquet,
+        // which `library_parquet` would take before this run's `.speclib`.
+        let _ = std::fs::remove_file(out_dir.join(format!("{stem}.parquet")));
         if let Err(e) = run_step(&builder, &exe, &args, Some(&out_dir), true) {
             builder.fail(e);
             return;
@@ -2158,6 +1773,11 @@ fn conversion_tools() -> Result<(PathBuf, PathBuf), String> {
                     conversion needs them"
                 .into(),
         );
+    }
+    if let Some(e) = crate::components::base_interpreter_gone(&crate::components::venv_dir(
+        crate::components::Env::Primary,
+    )) {
+        return Err(e);
     }
     let scripts = crate::engine::scripts_dir()
         .ok_or_else(|| "the conversion scripts were not found".to_string())?;
@@ -2445,6 +2065,8 @@ fn convert(
     c: &Conversion,
     source: Source,
 ) -> Result<(PathBuf, PathBuf), String> {
+    // The user's own Parquet library is never deleted; a prediction or re-export is ours.
+    let own = !matches!(source, Source::Chosen(DiannLibrary::Parquet(_)));
     let predicted = library_parquet(builder, c, source)?;
     // An empty library made the importer fail with "no target b/y fragment rows survived
     // the filters", which says nothing about why. Only a footer that reads is trusted.
@@ -2457,6 +2079,20 @@ fn convert(
         }
         builder.log(format!("== {title}"));
         run_step(builder, &c.python, &args, Some(&c.scripts), false)?;
+    }
+    // Each step's input is scratch once the two tables exist, about three times their
+    // size. Delete errors are ignored: a finished library must not fail on cleanup.
+    for name in [
+        "lib_precursors_targets.parquet",
+        "lib_fragments_targets.parquet",
+        "lib_precursors_copied_decoys.parquet",
+        "lib_fragments_copied_decoys.parquet",
+    ] {
+        let _ = std::fs::remove_file(c.out_dir.join(name));
+    }
+    let _ = std::fs::remove_dir_all(c.out_dir.join("decoy_prediction"));
+    if own {
+        let _ = std::fs::remove_file(&predicted);
     }
     Ok(final_tables(&c.out_dir))
 }
@@ -2708,20 +2344,6 @@ pub fn import_refusal(status: &Status, library: &DiannLibrary) -> Result<PathBuf
     diann_refusal(status, WHY, what)
 }
 
-/// Why a merge of two libraries cannot run with this DIA-NN, or else the DIA-NN it runs: the
-/// decoys of the merged targets are predicted by DIA-NN, as an import's are.
-pub fn merge_refusal(status: &Status) -> Result<PathBuf, String> {
-    const WHY: &str = "Merging two libraries needs a working DIA-NN, because MuMDIA builds \
-         the decoys of the merged targets again and has DIA-NN predict their spectra: decoys \
-         that copy their targets' fragment intensities make the reported FDR optimistic, so \
-         the merge does not fall back to them.";
-    diann_refusal(
-        status,
-        WHY,
-        "write its prediction of the decoys' spectra in a form MuMDIA reads, nor re-export one",
-    )
-}
-
 /// The DIA-NN a step that predicts decoy spectra runs, or why it cannot: `why` opens every
 /// refusal, `what` says what a DIA-NN without Parquet output cannot do.
 fn diann_refusal(status: &Status, why: &str, what: &str) -> Result<PathBuf, String> {
@@ -2875,212 +2497,9 @@ pub fn import(builder: Arc<Builder>, req: ImportRequest) -> Result<(), String> {
     Ok(())
 }
 
-// ── merging an empirical library with a predicted one (#320) ────────────────
-//
-// An empirical library (spectra and retention times observed in earlier runs) covers what was
-// identified there; a predicted library covers the whole digest. `merge_libraries.py` searches
-// both as one: every predicted entry, with the empirical spectrum and retention time where the
-// empirical library has the entry, and the decoys of the merged targets built again and
-// predicted by DIA-NN. Both inputs are MuMDIA library tables (a DIA-NN library is converted
-// first, a FASTA library is built first).
-
-/// The two libraries to merge, and where to write the merged tables.
-#[derive(Deserialize, Clone, Debug)]
-pub struct MergeRequest {
-    pub empirical_precursors: String,
-    pub empirical_fragments: String,
-    pub predicted_precursors: String,
-    pub predicted_fragments: String,
-    pub out_dir: String,
-    #[serde(default = "d_threads")]
-    pub threads: u32,
-    /// Which library an entry in both takes its spectrum and retention time from:
-    /// `empirical` (the default) or `predicted`.
-    #[serde(default)]
-    pub precedence: Option<String>,
-}
-
-impl MergeRequest {
-    /// The four input tables, each checked to be a file.
-    fn inputs(&self) -> Result<[PathBuf; 4], String> {
-        let named = [
-            ("empirical precursor table", &self.empirical_precursors),
-            ("empirical fragment table", &self.empirical_fragments),
-            ("predicted precursor table", &self.predicted_precursors),
-            ("predicted fragment table", &self.predicted_fragments),
-        ];
-        let mut out: Vec<PathBuf> = Vec::new();
-        for (what, path) in named {
-            if path.trim().is_empty() {
-                return Err(format!("choose the {what}"));
-            }
-            let p = PathBuf::from(path);
-            if !p.is_file() {
-                return Err(format!("the {what}, {path}, is not a file"));
-            }
-            out.push(p);
-        }
-        Ok([
-            out[0].clone(),
-            out[1].clone(),
-            out[2].clone(),
-            out[3].clone(),
-        ])
-    }
-
-    fn precedence(&self) -> Result<&str, String> {
-        match self.precedence.as_deref().unwrap_or("empirical") {
-            p @ ("empirical" | "predicted") => Ok(p),
-            other => Err(format!(
-                "unknown precedence '{other}': empirical or predicted"
-            )),
-        }
-    }
-}
-
-/// The `merge_libraries.py` command line of a merge.
-fn merge_args(
-    scripts: &Path,
-    inputs: &[PathBuf; 4],
-    out_dir: &Path,
-    exe: &Path,
-    threads: u32,
-    precedence: &str,
-) -> Vec<String> {
-    let (prec, frag) = final_tables(out_dir);
-    let mut a = vec![scripts.join("merge_libraries.py").display().to_string()];
-    for (flag, path) in [
-        "--empirical-precursors",
-        "--empirical-fragments",
-        "--predicted-precursors",
-        "--predicted-fragments",
-    ]
-    .iter()
-    .zip(inputs.iter())
-    {
-        a.push(flag.to_string());
-        a.push(path.display().to_string());
-    }
-    a.extend([
-        "--out-precursors".into(),
-        prec.display().to_string(),
-        "--out-fragments".into(),
-        frag.display().to_string(),
-        "--precedence".into(),
-        precedence.to_string(),
-        "--diann".into(),
-        exe.display().to_string(),
-        "--threads".into(),
-        threads.to_string(),
-        "--work-dir".into(),
-        out_dir.join("merge_work").display().to_string(),
-        "--summary".into(),
-        out_dir.join("merge_summary.json").display().to_string(),
-    ]);
-    a
-}
-
-/// Merge an empirical and a predicted library into the two tables a search reads, with the
-/// builder's progress.
-pub fn merge(builder: Arc<Builder>, req: MergeRequest) -> Result<(), String> {
-    let inputs = req.inputs()?;
-    let precedence = req.precedence()?.to_string();
-    let status = detect();
-    let exe = merge_refusal(&status)?;
-    let (python, scripts) = conversion_tools()?;
-    if req.out_dir.trim().is_empty() {
-        return Err("choose a folder for the merged library".into());
-    }
-    let out_dir = PathBuf::from(&req.out_dir);
-    check_import_out_dir(&out_dir)?;
-    std::fs::create_dir_all(&out_dir)
-        .map_err(|e| format!("cannot create {}: {e}", out_dir.display()))?;
-
-    begin(&builder, "merging the libraries")?;
-
-    std::thread::spawn(move || {
-        let version = status.version.clone().unwrap_or_default();
-        builder.log(format!("== DIA-NN: {version}"));
-        let args = merge_args(&scripts, &inputs, &out_dir, &exe, req.threads, &precedence);
-        let title = "merging the libraries and predicting the decoys";
-        if let Ok(mut s) = builder.state.lock() {
-            s.step = title.into();
-        }
-        builder.log(format!("== {title}"));
-        let result = run_step(&builder, &python, &args, Some(&scripts), false)
-            .map(|_| final_tables(&out_dir));
-        finish(&builder, result, |dir| {
-            let body = serde_json::json!({
-                "source": "library-merge",
-                "empirical_precursors": req.empirical_precursors,
-                "predicted_precursors": req.predicted_precursors,
-                "precedence": precedence,
-                "diann_version": version,
-                "recipe_version": RECIPE_VERSION,
-            });
-            if let Ok(text) = serde_json::to_string_pretty(&body) {
-                let _ = std::fs::write(dir.join(CACHE_MARKER), text);
-            }
-        });
-    });
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_merge_runs_the_merge_script_with_dia_nn_decoys() {
-        let inputs = [
-            PathBuf::from("/e/p.parquet"),
-            PathBuf::from("/e/f.parquet"),
-            PathBuf::from("/p/p.parquet"),
-            PathBuf::from("/p/f.parquet"),
-        ];
-        let a = merge_args(
-            Path::new("/app/scripts"),
-            &inputs,
-            Path::new("/out"),
-            Path::new("/opt/diann"),
-            6,
-            "empirical",
-        );
-        assert!(a[0].ends_with("merge_libraries.py"));
-        let val = |flag: &str| {
-            let i = a.iter().position(|x| x == flag).unwrap();
-            a[i + 1].clone()
-        };
-        assert_eq!(val("--empirical-precursors"), "/e/p.parquet");
-        assert_eq!(val("--predicted-fragments"), "/p/f.parquet");
-        assert_eq!(val("--diann"), "/opt/diann");
-        assert_eq!(val("--precedence"), "empirical");
-        assert!(val("--out-precursors").ends_with("lib_precursors.parquet"));
-        // Never the copied-intensity path: the decoys are predicted.
-        assert!(!a.iter().any(|x| x == "none"));
-    }
-
-    #[test]
-    fn a_merge_request_checks_its_inputs() {
-        let req: MergeRequest = serde_json::from_str(
-            r#"{"empirical_precursors": "", "empirical_fragments": "x",
-                "predicted_precursors": "y", "predicted_fragments": "z", "out_dir": "o"}"#,
-        )
-        .unwrap();
-        assert!(req
-            .inputs()
-            .unwrap_err()
-            .contains("empirical precursor table"));
-        assert_eq!(req.precedence().unwrap(), "empirical");
-        let mut r = req.clone();
-        r.empirical_precursors = "/no/such/file.parquet".into();
-        assert!(r.inputs().unwrap_err().contains("not a file"));
-        r.precedence = Some("newest".into());
-        assert!(r.precedence().is_err());
-        let e = merge_refusal(&a_status(false, false, "")).unwrap_err();
-        assert!(e.starts_with("Merging two libraries"), "{e}");
-    }
 
     #[test]
     fn the_licence_notice_says_what_mumdia_does_not_do() {
@@ -3090,12 +2509,6 @@ mod tests {
         assert!(
             n.contains("does not include, modify or redistribute"),
             "the notice must state that MuMDIA does not ship DIA-NN: {n}"
-        );
-        // It must not claim MuMDIA never downloads DIA-NN, because the download
-        // button does exactly that. An inaccurate notice is worse than none.
-        assert!(
-            n.contains("release page") && n.contains("checksum"),
-            "the notice must describe the download honestly: {n}"
         );
         assert!(
             n.contains("Academia") && n.contains("non-profit"),
@@ -3246,58 +2659,6 @@ mod tests {
     }
 
     #[test]
-    fn the_download_is_pinned_to_one_version_from_the_vendors_own_host() {
-        // Three properties, each of which the module comment says the legality of
-        // offering this rests on, and each of which is easy to break later.
-        let Some(a) = asset() else { return };
-
-        // Not a mirror, not a proxy, not our own storage.
-        assert!(
-            a.url
-                .starts_with("https://github.com/vdemichev/DiaNN/releases/download/"),
-            "the asset must come from the vendor's own release: {}",
-            a.url
-        );
-        // Pinned, never "latest": a newer release is one this reasoning has not been
-        // applied to, and it would silently change the predicted library.
-        assert!(a.url.contains("/1.8.1/"), "pinned to 1.8.1: {}", a.url);
-        assert!(!a.url.contains("latest"), "never resolve latest: {}", a.url);
-        // The bytes get executed, so the digest must be a real one.
-        assert_eq!(a.sha256.len(), 64, "a sha256 is 64 hex characters");
-        assert!(a.sha256.chars().all(|c| c.is_ascii_hexdigit()));
-        assert!(a.size > 0);
-    }
-
-    #[test]
-    fn an_install_is_refused_until_the_licence_is_acknowledged() {
-        // Same enforcement point as `build`: the interface disables the button, but
-        // the button is not the thing that must hold.
-        if load().licence_acknowledged == Some(true) {
-            return;
-        }
-        let err = install(Arc::new(Installer::default())).unwrap_err();
-        assert!(
-            err.contains("licence"),
-            "refused for the licence reason: {err}"
-        );
-    }
-
-    #[test]
-    fn the_offer_is_honest_about_what_it_costs() {
-        let o = offer();
-        if !o["available"].as_bool().unwrap_or(false) {
-            return;
-        }
-        assert_eq!(o["version"], "1.8.1");
-        // The Linux tarball is 142 MB and unpacks to roughly 490 MB, nearly all of
-        // it libtorch. Reporting only the download would understate it threefold.
-        let dl = o["download_bytes"].as_u64().unwrap();
-        let disk = o["disk_bytes"].as_u64().unwrap();
-        assert!(dl > 100_000_000, "the real asset is over 100 MB");
-        assert!(disk >= dl, "disk cost is never less than the download");
-    }
-
-    #[test]
     fn the_state_file_is_the_users_own() {
         // In the user scope beside the components, as it always was, so an existing
         // licence answer and located path are still found.
@@ -3306,117 +2667,6 @@ mod tests {
             crate::components::tools_dir().join(STATE_FILE_NAME)
         );
         assert!(state_file().starts_with(crate::storage::user_tools_dir()));
-    }
-
-    #[test]
-    fn the_managed_install_is_per_user_and_not_beside_the_application() {
-        // Program Files needs administrator rights, and an install that needs them
-        // is not the easy installation this exists to provide.
-        let d = managed_dir();
-        assert!(d.starts_with(crate::components::data_dir()));
-        assert!(d.to_string_lossy().contains("1.8.1"));
-    }
-
-    #[test]
-    fn the_linux_binary_name_from_the_tarball_is_recognised() {
-        // The 1.8.1 tarball is flat and names its binary `diann-1.8.1`, which the
-        // detection search has to know or a managed install becomes invisible.
-        if cfg!(windows) {
-            return;
-        }
-        assert!(exe_names().contains(&"diann-1.8.1"));
-    }
-
-    /// A one-request HTTP server on loopback, so the download path is exercised for
-    /// real -- streaming, hashing, verification -- without touching the network or
-    /// pulling 142 MB in a test.
-    fn serve_once(body: Vec<u8>) -> String {
-        use std::io::Write as _;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            if let Ok((mut sock, _)) = listener.accept() {
-                let mut head = Vec::new();
-                // Read past the request head; the body is irrelevant for GET.
-                let mut buf = [0u8; 1024];
-                loop {
-                    match std::io::Read::read(&mut sock, &mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            head.extend_from_slice(&buf[..n]);
-                            if head.windows(4).any(|w| w == b"\r\n\r\n") {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                let _ = write!(
-                    sock,
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = sock.write_all(&body);
-                let _ = sock.flush();
-            }
-        });
-        format!("http://127.0.0.1:{port}/asset")
-    }
-
-    fn tmp_path(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("mumdia-diann-{name}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d.join("asset.bin")
-    }
-
-    #[test]
-    fn a_download_that_matches_its_digest_is_kept() {
-        use sha2::{Digest, Sha256};
-        let body = b"the quick brown fox jumps over the lazy dog".to_vec();
-        let digest = crate::components::hex(Sha256::digest(&body));
-        let url: &'static str = Box::leak(serve_once(body.clone()).into_boxed_str());
-        let sha: &'static str = Box::leak(digest.into_boxed_str());
-
-        let dest = tmp_path("ok");
-        let a = Asset {
-            url,
-            sha256: sha,
-            size: body.len() as u64,
-            kind: AssetKind::Tarball,
-            file_name: "asset.bin",
-        };
-        download_verified(&Arc::new(Installer::default()), &a, &dest).unwrap();
-        assert_eq!(std::fs::read(&dest).unwrap(), body);
-        let _ = std::fs::remove_dir_all(dest.parent().unwrap());
-    }
-
-    #[test]
-    fn a_download_that_fails_its_digest_is_deleted_not_left_to_be_run() {
-        // The whole point of pinning: these bytes would otherwise be executed, or
-        // handed to the operating system's installer. A mismatch must not leave a
-        // runnable file behind for someone to double-click.
-        let body = b"not what was expected".to_vec();
-        let url: &'static str = Box::leak(serve_once(body.clone()).into_boxed_str());
-
-        let dest = tmp_path("bad");
-        let a = Asset {
-            url,
-            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
-            size: body.len() as u64,
-            kind: AssetKind::Installer,
-            file_name: "asset.bin",
-        };
-        let err = download_verified(&Arc::new(Installer::default()), &a, &dest).unwrap_err();
-        assert!(
-            err.contains("checksum"),
-            "the reason must be the checksum: {err}"
-        );
-        assert!(
-            !dest.exists(),
-            "a file that failed verification must not be left on disk"
-        );
-        let _ = std::fs::remove_dir_all(dest.parent().unwrap());
     }
 
     #[test]

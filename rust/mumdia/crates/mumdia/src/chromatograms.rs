@@ -42,10 +42,7 @@
 //! The rule restarts at every row group, so **each row group can be read on its own**. That
 //! is what makes the layout safe at the seams the readers cut. Quant reads the table row
 //! group by row group, the pool splices whole row groups, and the features main pass starts
-//! every chunk at a candidate's first row. Only the features confident-bounds pass starts
-//! inside a candidate, because its sub-chunks follow an absolute row grid; it first reads
-//! the rows between the start of the row group and its own first row through
-//! [`Decoder::skip`] (`features::ChromStream::open_at`).
+//! every chunk at a candidate's first row.
 //!
 //! [`Decoder::row`] turns every v2 row back into its v1 row: the same axis values and the
 //! same full trace, bit for bit. Every stage downstream of extract builds its in-memory
@@ -535,8 +532,7 @@ impl Decoder {
     }
 
     /// Check one stored row and follow its axis, without rebuilding its trace: for a row
-    /// the caller does not keep, and for the rows before a read that starts inside a
-    /// candidate.
+    /// the caller does not keep.
     pub fn skip(
         &mut self,
         cid: u32,

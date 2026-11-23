@@ -6,14 +6,17 @@
 #   # then point the config's rescore.python at this env's interpreter, e.g.
 #   #   "python": ".../envs/mumdia-rescore/bin/python"   (or ...\\python.exe on Windows)
 #
-# The worker itself is scripts/mokapot_worker.py (MUMDIA_RESCORE_MODEL=logreg).
+# The worker itself is scripts/mokapot_worker.py (logistic regression unless
+# MUMDIA_RESCORE_MODEL says otherwise).
 name: mumdia-rescore
 channels:
   - conda-forge
 dependencies:
   - python=3.12
   - numpy
-  - pandas
+  # mokapot 0.10.0 calls pd.to_numeric(errors="ignore"), which pandas 3 removed
+  # ("invalid error value" while parsing the PIN). Found once CI installed this file.
+  - pandas<3
   - pyarrow
   - scikit-learn
   - pip

@@ -283,7 +283,6 @@ fn features_compete_rescore_run_on_crafted_input() {
         out: &feats,
         out_pin: &pin,
         cfg: &cfg.features,
-        imc_ref_w: false,
         q1_tolerances: None,
     })
     .unwrap();
@@ -432,7 +431,6 @@ fn search_stages_return_the_hashes_of_the_files_they_wrote() {
         out: &feats,
         out_pin: &tmp("hashed.pin"),
         cfg: &cfg.features,
-        imc_ref_w: false,
         q1_tolerances: None,
     })
     .unwrap();
@@ -497,7 +495,6 @@ fn downstream_bytes(psms: &str, chrom: &str, cfg: &Config, tag: &str) -> Vec<Vec
         out: &feats,
         out_pin: "",
         cfg: &cfg.features,
-        imc_ref_w: false,
         q1_tolerances: None,
     })
     .unwrap();
@@ -776,7 +773,6 @@ fn features_chunking_is_value_preserving() {
                 out: &feats,
                 out_pin: &pin,
                 cfg: &cfg.features,
-                imc_ref_w: false,
                 q1_tolerances: None,
             },
             chunk_rows,
@@ -929,8 +925,8 @@ fn assert_ms1_identical(after: &[Ms1Scan], fresh: &[Ms1Scan]) {
 ///   `craft_library_inner(true)` gives the target and the decoy a fragment in common so
 ///   the strategy has a peak to take away from one of them. The assertion below that the
 ///   claim changes the output is what keeps this honest.
-/// - `groups.calibration = per_group` is the grouped mode most exposed to a write-back,
-///   because each band applies its own `MassOffset` to the SAME shared peaks. Two
+/// - bands that apply different `MassOffset`s to the SAME shared peaks are the case most
+///   exposed to a write-back (the removed `groups.calibration = per_group` did that). Two
 ///   calibrations are alternated over one buffer here, and each arm has to equal the
 ///   arm that decoded for itself under the same calibration. Under a write-back of
 ///   `peak.mz / factor_at(peak.mz)` the second arm would see peaks the first had already
@@ -998,7 +994,7 @@ fn extract_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
     );
 
     // One decode, lent to four extracts in a row under alternating calibrations, as a
-    // grouped run under `calibration = per_group` lends it to its bands.
+    // grouped run lends it to its bands.
     let ms2_scans = mumdia::spectra::load_ms2(&ms2).unwrap();
     let ms1_scans = mumdia::spectra::load_ms1(&ms1).unwrap();
     let shared = stages::extract::SharedScans {
@@ -2830,7 +2826,6 @@ fn a_trace_pad_widens_the_traces_and_nothing_the_scores_read() {
             out: &out,
             out_pin: "",
             cfg: &cfg.features,
-            imc_ref_w: false,
             q1_tolerances: None,
         })
         .unwrap();

@@ -337,7 +337,7 @@ class EnumVariant:
 # variant in a configuration file.
 CUSTOM_SERDE_SPELLING = {
     "BaselineSubtract": {"Off": "false", "On": "true", "Auto": "auto"},
-    "Ms1Calibrate": {"Off": "false", "Offset": "true", "Surface": "surface"},
+    "Ms1Calibrate": {"Off": "false", "Offset": "true"},
     "ZtSwitch": {"Auto": "auto", "On": "true", "Off": "false"},
 }
 
@@ -1238,18 +1238,13 @@ COMPUTED_ENV_DEFAULTS: dict[str, str] = {
         "snappy. `zstd`, or `uncompressed` / `none`, changes the codec (`table.rs` `codec`)"
     ),
     "MUMDIA_PARQUET_DECODE_THREADS": (
-        "automatic column groups, up to the codec pool's threads; one reader for a "
-        "coalesced scan or inside a rayon pool. `k` asks for k groups, `1` is one reader "
+        "automatic column groups, up to the codec pool's threads; one reader inside a "
+        "rayon pool. `k` asks for k groups, `1` is one reader "
         "(`table.rs` `automatic_decode_groups`)"
     ),
     "MUMDIA_PARQUET_THREADS": (
         "min(`--threads`, 8), or min(cores, 8) without `--threads`. `0` or `1` is serial "
         "(`codec.rs` `codec_threads`)"
-    ),
-    "MUMDIA_QUANT_SELECTIVE_READ": (
-        "on (quant skips, unread, the chromatogram data pages that hold no kept row). "
-        "`0` reads every page of every row group it opens; the outputs are the same "
-        "(`stages/quant.rs` `selective_read_enabled`)"
     ),
     "MUMDIA_REPICK_DUMP": (
         "off. Diagnostic: a path makes `retrace.repick` write every peak it scored there "
@@ -1271,12 +1266,6 @@ COMPUTED_ENV_DEFAULTS: dict[str, str] = {
         "set by the desktop environment, often unset; an absolute value puts the engine's "
         "caches in `$XDG_CACHE_HOME/mumdia` on Linux when MUMDIA_CACHE_DIR is unset "
         "(`cache.rs` `root`)"
-    ),
-    "MUMDIA_WIDE_SCAN": (
-        "`plain`: the plain reader with its parallel decode for rescore's feature "
-        "stream and compete's pass-through copy. `rowgroup` decodes the feature stream "
-        "one row group a batch; `coalesced` reads each row group's projected column "
-        "chunks in one sequential read (`stages/mod.rs` `WideScan`)"
     ),
 }
 
@@ -2317,7 +2306,13 @@ def build_schema(config_text: str) -> dict:
             "source_struct": struct.name,
         }
         if base in enums:
-            entry["choices"] = [enums[base].serde_name(v.name) for v in enums[base].variants]
+            # A variant kept only so old configurations serialise ("Removed in ...") is refused,
+            # so the desktop does not offer it.
+            entry["choices"] = [
+                enums[base].serde_name(v.name)
+                for v in enums[base].variants
+                if not v.doc.startswith("Removed in")
+            ]
         return entry
 
     fields: list[dict] = []
@@ -2458,6 +2453,14 @@ def main(argv: list[str] | None = None) -> int:
         sys.exit(
             "error: COMPUTED_ENV_DEFAULTS names variables no code reads: "
             + ", ".join(stats["stale_computed_env"])
+        )
+    if stats["warnings"]:
+        # An unparsed member drops out of both outputs, so the desktop would lose the
+        # setting while --check still compared equal texts.
+        _, _, warnings = parse_config_rs(inputs.config_text)
+        sys.exit(
+            "error: the config source has members this generator cannot parse:\n  "
+            + "\n  ".join(sorted(set(warnings)))
         )
     out_path = Path(args.out)
     schema = schema_text(inputs.config_text)

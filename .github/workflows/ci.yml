@@ -164,6 +164,9 @@ jobs:
         working-directory: rust/mumdia
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The merge commit and the base it merges into, for ci/ci_scope.sh.
+          fetch-depth: 2
 
       - name: Cache cargo-audit
         id: audit-bin
@@ -176,64 +179,22 @@ jobs:
         if: steps.audit-bin.outputs.cache-hit != 'true'
         run: cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked --force
 
-      # Vulnerabilities fail the build. Unmaintained-crate warnings do not: `paste`
-      # is a compile-time proc macro whose 1.0.15 is its final release, so there is
-      # nothing to bump to and a hard failure would only train people to ignore
-      # this job. Deny the class that has a fix.
-      #
-      # Four advisories are ignored deliberately: RUSTSEC-2026-0367, -0368, -0369 and
-      # -0429 in zip 6.0.0 (SUID/SGID bits kept, symlinks outside the destination, Unix
-      # permissions applied through symlinks, and an abort on a symlink entry with a
-      # large declared size, all during extraction). zip is only a
-      # build dependency of nethost-sys 0.7.3, reached only under the opt-in `thermo`
-      # feature (mzdata -> thermorawfilereader -> netcorehost ^0.18 -> nethost-sys): its
-      # build script downloads Microsoft's nethost NuGet package from nuget.org over TLS
-      # and unpacks it. Nothing extracts an archive at run time, and release builds do
-      # not enable the feature. The fix is zip 9.0, and no release in the chain reaches
-      # it (nethost-sys 0.8.0 still requires zip ^8.3). Drop the ignores when
-      # thermorawfilereader moves to a netcorehost whose nethost-sys requires zip >= 9.
-      #
-      # Three more zip 6.0.0 advisories on the same path are ignored for the same reason
-      # and because the build script never reaches the affected code: RUSTSEC-2026-0545
-      # (AES entries not authenticated when truncated; the script reads no encrypted
-      # entry), -0547 (legacy Shrink/Reduce/Implode decoders; the `legacy-zip` feature is
-      # off) and -0548 (`ZipStreamReader` uses local-header names; the script reads with
-      # `ZipArchive::by_index`, which uses the central directory, and keeps only the
-      # nethost library files). Their fix is zip 9.0.5. Tracked in #329.
-      #
-      # Thirteen zstd advisories are ignored deliberately, all on zstd 0.13.3 /
-      # zstd-safe 7.3.0, which only timsrust 0.4.2 (the diaPASEF reader) pulls in:
-      # RUSTSEC-2026-0391 (data of an abandoned stream on a reused context), -0398 and
-      # -0396 (Seekable), -0403 (failed streaming decode of a legacy frame), and the
-      # unsound -0395, -0397, -0399, -0400, -0401, -0402, -0404, -0405, -0406
-      # (dictionaries, cloned or multithreaded contexts, OutBuffer/InBuffer positions,
-      # dictionary training). timsrust calls only `zstd::decode_all`, a fresh one-shot
-      # decoder per TDF frame, with no dictionary, Seekable, cloning, multithreading or
-      # context reuse. parquet's zstd is on the fixed 0.14.3 / zstd-safe 8.2.0. The fix
-      # for the timsrust path is zstd >= 0.14.3, which needs timsrust >= 0.6; drop these
-      # ignores when the reader moves there.
-      - name: Audit
-        run: >-
-          cargo audit --deny unsound --deny yanked
-          --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369
-          --ignore RUSTSEC-2026-0429
-          --ignore RUSTSEC-2026-0545 --ignore RUSTSEC-2026-0547 --ignore RUSTSEC-2026-0548
-          --ignore RUSTSEC-2026-0391 --ignore RUSTSEC-2026-0395 --ignore RUSTSEC-2026-0396
-          --ignore RUSTSEC-2026-0397 --ignore RUSTSEC-2026-0398 --ignore RUSTSEC-2026-0399
-          --ignore RUSTSEC-2026-0400 --ignore RUSTSEC-2026-0401 --ignore RUSTSEC-2026-0402
-          --ignore RUSTSEC-2026-0403 --ignore RUSTSEC-2026-0404 --ignore RUSTSEC-2026-0405
-          --ignore RUSTSEC-2026-0406
+      # Strict when the change touches a lockfile or the ignore list, and on the weekly
+      # schedule and a dispatch; advisory otherwise, for the reason the pip-audit step
+      # below gives: a new advisory lands independently of any change, and a strict gate
+      # fails every open pull request and main until someone handles it. The tag gate in
+      # release.yml runs the same script strictly, so a release cannot ship it unhandled.
+      - name: Is the audit strict for this change?
+        id: scope
+        working-directory: .
+        env:
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: bash ci/ci_scope.sh audit
 
-      # The desktop application has its own lockfile, which the step above does not
-      # read (docs/29, work package C). One advisory is ignored deliberately:
-      # RUSTSEC-2024-0429, an unsound iterator in glib 0.18's `VariantStrIter`. Tauri
-      # 2's Linux toolkit is gtk 0.18, which pins glib 0.18; the fix is glib 0.20; and
-      # the application never touches a GVariant. Drop the ignore when Tauri moves to
-      # gtk4 / glib 0.20.
-      - name: Audit the desktop lockfile
-        run: >-
-          cargo audit --file ../../desktop/Cargo.lock --deny unsound --deny yanked
-          --ignore RUSTSEC-2024-0429
+      - name: Audit both lockfiles
+        working-directory: .
+        continue-on-error: ${{ steps.scope.outputs.run != 'true' }}
+        run: bash ci/cargo_audit.sh
 
   build-test:
     name: build + test (${{ matrix.os }})
@@ -241,7 +202,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # macOS on pull requests, the weekly schedule and a dispatch, not on a push to
+        # main: when GitHub has no macOS arm64 runner the leg is cancelled unstarted, main
+        # goes red, and the release gate refuses the commit. Branch protection requires an
+        # up-to-date branch, so the pull request's macOS run already tested the merged
+        # tree; the weekly run covers admin-bypassed merges, and release.yml builds and
+        # smoke-tests the macOS archive before publishing it.
+        os: ${{ fromJSON(github.event_name == 'push' && '["ubuntu-latest","windows-latest"]' || '["ubuntu-latest","macos-latest","windows-latest"]') }}
     defaults:
       run:
         working-directory: rust/mumdia
@@ -452,6 +419,22 @@ jobs:
             import_check: >-
               import mokapot, ms2pip, numpy, pyarrow;
               print('mokapot', mokapot.__version__)
+          # The host specifications README.md and docs/13 tell users to install.
+          - env_name: mumdia-deeplc
+            env_file: env/mumdia-deeplc.yml
+            import_check: >-
+              import deeplc, im2deep, ms2pip, numpy, pyarrow, torch, psm_utils;
+              print('deeplc', deeplc.__version__, '| torch', torch.__version__)
+          - env_name: mumdia-peptdeep
+            env_file: env/mumdia-peptdeep.yml
+            import_check: >-
+              import peptdeep, torch, pyarrow;
+              print('peptdeep', peptdeep.__version__, '| torch', torch.__version__)
+          - env_name: mumdia-rescore
+            env_file: env/mumdia-rescore.yml
+            import_check: >-
+              import mokapot, numpy, pandas, pyarrow, sklearn;
+              print('mokapot', mokapot.__version__)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -475,7 +458,7 @@ jobs:
           fi
           base="${{ github.event.pull_request.base.sha || 'HEAD~1' }}"
           if git diff --name-only "$base" HEAD \
-             | grep -Eq '^(scripts/|env/|tests/python/|Dockerfile$)'; then
+             | grep -Eq '^(scripts/|env/|tests/python/|Dockerfile$|\.github/workflows/ci\.yml$)'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
@@ -625,7 +608,7 @@ jobs:
       - name: Clippy
         if: steps.scope.outputs.run == 'true'
         working-directory: desktop/src-tauri
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       # Library tests only. The end-to-end tests skip themselves without an engine
       # binary, which would make this job look like it covered more than it does; a
@@ -633,7 +616,7 @@ jobs:
       - name: Unit tests
         if: steps.scope.outputs.run == 'true'
         working-directory: desktop/src-tauri
-        run: cargo test --lib
+        run: cargo test --lib --locked
 
       # The frontend has no build step, so these are its whole check: the names it
       # shares with the backend, and the Setup screen driven in Node (the runner's own;
@@ -679,8 +662,8 @@ jobs:
     name: desktop app (windows)
     runs-on: windows-latest
     env:
-      # The bundler, pinned so its cache can be keyed on it. release.yml installs the newest
-      # 2.x; move this with it. Before, the job reused whichever cargo-tauri.exe its cache
+      # The bundler, pinned so its cache can be keyed on it. release.yml pins the same
+      # version in its own TAURI_CLI_VERSION; move the two together. Before, the job reused whichever cargo-tauri.exe its cache
       # held, so its version was an accident of when the cache was written.
       TAURI_CLI_VERSION: 2.12.4
     steps:
@@ -735,7 +718,7 @@ jobs:
       - name: Clippy (windows)
         if: steps.scope.outputs.run == 'true'
         working-directory: desktop/src-tauri
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       # Includes the Windows-only tests: Windows' own judgement of real signatures (a
       # system binary passes, an unsigned file does not) and the hold on the downloaded
@@ -743,7 +726,7 @@ jobs:
       - name: Unit tests (windows)
         if: steps.scope.outputs.run == 'true'
         working-directory: desktop/src-tauri
-        run: cargo test --lib
+        run: cargo test --lib --locked
 
       # The "Install Visual C++ runtime" button's whole sequence against Microsoft's
       # server: download, signature, elevated launch, exit code. The runner already has a
@@ -755,7 +738,7 @@ jobs:
         # The hosted runners do not show one; this bounds the case where they start to.
         timeout-minutes: 10
         working-directory: desktop/src-tauri
-        run: cargo test --lib -- --ignored real_runtime_install --nocapture
+        run: cargo test --lib --locked -- --ignored real_runtime_install --nocapture
 
       - name: Locate the Visual C++ runtime merge module
         if: steps.scope.outputs.run == 'true'
@@ -800,6 +783,8 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
+          # `cargo tauri build` resolves without --locked; this fails on a stale lockfile.
+          cargo fetch --locked || exit 1
           log="$RUNNER_TEMP/msi-build.log"
           for attempt in 1 2 3; do
             cargo tauri build --bundles msi --config src-tauri/tauri.vcruntime.conf.json 2>&1 | tee "$log"
@@ -1048,8 +1033,9 @@ jobs:
       # The desktop application installs env/console-*.txt with uv, which resolves
       # differently from pip and from conda, and nothing else in CI reads those files.
       # A v0.3.0 installer shipped unable to resolve its primary environment at all.
+      # The uv the installers bundle (release.yml's UV_VERSION), not the newest one.
       - name: Install uv
-        run: python -m pip install --quiet uv
+        run: python -m pip install --quiet "uv==$(grep -m1 -oE 'UV_VERSION=[0-9.]+' .github/workflows/release.yml | cut -d= -f2)"
 
       - name: The desktop Python environments resolve
         run: python ci/check_console_envs.py
@@ -1095,9 +1081,8 @@ jobs:
       # The workers are invoked over a positional-file contract that nothing else
       # checks. Tests needing torch, mokapot, deeplc or ms2pip skip here rather
       # than fail, which is honest but means CI covers the contracts that need only
-      # numpy and pyarrow: the whole mbr_worker suite, including the regression for
-      # the q-column bug that left 34,280 of 34,664 transfers unquantified, the
-      # library-recipe encoding contracts, and the import-order checks.
+      # numpy and pyarrow: the library-recipe encoding contracts and the import-order
+      # checks.
       - name: Sidecar contract tests
         run: |
           python -m pip install --quiet -r tests/python/requirements.txt
@@ -1126,10 +1111,16 @@ jobs:
       # which the generator reads directly, so its output is the same here as on a
       # machine that has built.
       - name: Fetch the crate sources the generators read
-        run: cargo fetch --locked --manifest-path rust/mumdia/Cargo.toml
+        run: |
+          cargo fetch --locked --manifest-path rust/mumdia/Cargo.toml
+          cargo fetch --locked --manifest-path desktop/Cargo.toml
 
+      # The engine's notices, and the desktop application's, which the installers ship
+      # beside the engine's.
       - name: Third-party licences are current
-        run: python ci/gen_third_party_licenses.py --check
+        run: |
+          python ci/gen_third_party_licenses.py --check
+          python ci/gen_third_party_licenses.py --desktop --check
 
       # THIRD_PARTY_LICENSES.md is a notice document for a human reader. The SBOM
       # answers the machine question: given a published binary, which exact versions

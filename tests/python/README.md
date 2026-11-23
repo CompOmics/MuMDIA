@@ -39,7 +39,7 @@ environment therefore reports "sklearn is not usable here: PydanticUserError:
 
 | needs | skips | unlocks |
 |---|---|---|
-| nothing | never | `test_mbr_worker.py`, `test_import_diann_lib.py`, `test_decoy_builders.py`, `test_gen_config_reference.py`, the static half of `test_predictor_workers.py` |
+| nothing | never | `test_import_diann_lib.py`, `test_decoy_builders.py`, `test_gen_config_reference.py`, the static half of `test_predictor_workers.py` |
 | scikit-learn | `test_entrapment_worker.py` | the entrapment rescorer |
 | mokapot | `test_mokapot_worker.py` | mokapot coverage + model selection |
 | torch | `test_nn_rescore_worker.py` | `nn_torch` coverage, three input paths |
@@ -64,33 +64,6 @@ state reproduces the very `WinError 1114` the ordering rule exists to prevent.
 
 ## What each file asserts
 
-### `test_mbr_worker.py` (no ML dependency, always runs)
-
-`scripts/mbr_worker.py` aborts `mumdia mbr` on any nonzero exit: no strict gate,
-no fallback.
-
-* **M5 augmentation** (the reason this suite exists). `q_value`, `run_psm_q` and
-  `experiment_psm_q` must every one be lowered on an accepted transfer, and
-  `is_transferred` set. Lowering only `q_value` left 34,280 of 34,664 transfers
-  unquantified on the HYE pooled run, because quant gates on `run_psm_q`.
-* The augmentation is a **minimum, not an assignment**: a q already below
-  `transfer_q` must not be raised.
-* Only the matching **`(candidate_id, source)`** row may change. The fixture
-  carries a fourth run holding the same `candidate_id` values with high q and no
-  extraction, which a `candidate_id`-keyed augmentation would wrongly promote.
-* A scored table **missing** `run_psm_q` and/or `experiment_psm_q` must still
-  work, and the worker must not invent the absent column.
-* `transferred.parquet` row count equals the number of accepted transfers, and
-  its documented columns are present.
-* The **permuted-RT decoy null** accepts the RT-concordant candidates and
-  rejects the ~500 s discordant ones; every accepted row satisfies
-  `--q-transfer`; the accepted set is monotone in that threshold.
-* `binned_map` removes a systematic inter-run RT offset, and below its
-  200-shared-anchor floor it silently falls back to the identity, leaving the
-  full offset in the prediction.
-* Determinism for a fixed `--seed`; empty-transfer case writes an empty table
-  and no `--out-scored` file; a missing psms path exits nonzero.
-
 ### `test_nn_rescore_worker.py` (needs torch)
 
 The hard contract from `CLAUDE.md`, enforced by `align_sidecar_scores`
@@ -106,9 +79,11 @@ The worker's default-path speed-ups must not move a score. The worker is run wit
 every switch back to the replaced code (`MUMDIA_NN_FINAL_POOL_SCORE=1`,
 `MUMDIA_NN_GATHER=numpy`, `MUMDIA_NN_SCAN_THREADS=1`, `MUMDIA_NN_LOAD_THREADS=0`,
 `MUMDIA_NN_SELECT=full`) and with the defaults, for the in-memory and the streaming
-backend; and the worker as it was before those changes, extracted with `git show`
-from `REFERENCE_COMMIT`, is run against the current one, for the in-memory,
-streaming and TSV paths (skipped when the clone lacks that commit). The score bytes
+backend; the worker as it was before those changes, extracted with `git show` from
+`REFERENCE_COMMIT` (and `SERIAL_REFERENCE_COMMIT` for the serial loop), is run against
+the current one, for the in-memory and TSV paths (skipped when the clone lacks that
+commit); and the streaming backend, which fills its memmap with the in-memory loader, is
+run against the in-memory one. The score bytes
 must be equal, on a pool with several row groups, non-finite cells, a float64
 overflow column, nulls, ties, a constant column and subnormal cells, and the default
 arm must run the threaded init scan (`MUMDIA_NN_SCAN_ROWS_PER_THREAD=500`). These are
@@ -134,7 +109,7 @@ positive selection equals the full `tda_q` selection or declines.
 The same complete-coverage contract, and that the out-of-fold branch ran (there
 is deliberately no in-sample fallback). Plus model selection:
 `MUMDIA_RESCORE_MODEL=logreg` and its aliases build a `LogisticRegression`, the
-unset default is the sklearn MLP, `percolator`/`linear`/`svm` mean `model=None`,
+unset default is also logistic regression, `nn` the sklearn MLP, `percolator`/`linear`/`svm` mean `model=None`,
 and an unknown name aborts instead of falling back.
 
 ### `test_entrapment_worker.py` (needs scikit-learn)
@@ -215,7 +190,7 @@ became a no-op.
 * Fixtures and helpers live in `conftest.py`: `run_worker` /
   `run_worker_ok(script, *args, env=None)` returning `(rc, stdout, stderr)` with
   stderr in the failure message, PIN and parquet-handoff writers mirroring
-  `rescore.rs`, scored/psms writers mirroring `mbr_worker.py`'s inputs, the
+  `rescore.rs`, the
   `align_sidecar_scores` mirror, the `index.rs` load-invariant checks, and the
   independent peptide mass arithmetic.
 * Every test is deterministic. Anything random is seeded, and no test asserts an
@@ -227,9 +202,6 @@ became a no-op.
 
 ## Not covered
 
-* The MBR fragment-consensus guard (`--frag-csv` / `--consensus-corr-min`) and
-  the re-extraction tier (`--emit-transfer-targets`); `run_mbr` passes the
-  former only when both flags are supplied and never passes the latter.
 * Real predictor behaviour: MS2PIP intensity values and DeepLC retention times
   are not checked against reference numbers, only the output schema.
 * `deeplc_finetune.py` end to end. Fine-tuning is not deterministic and needs a

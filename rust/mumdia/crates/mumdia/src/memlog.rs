@@ -48,12 +48,13 @@ pub fn report(what: &str, parts: &[(&str, usize)]) {
     );
 }
 
-/// The machine's physical memory in bytes, or the cgroup limit when a container imposes a
-/// smaller one; `None` when it cannot be read. The ceiling `extract.max_footprint_gib`
+/// The machine's physical memory in bytes, or the smallest memory limit of the cgroup the
+/// process runs in and of its ancestors (a container, a SLURM or systemd job) when that is
+/// smaller; `None` when it cannot be read. The ceiling `extract.max_footprint_gib`
 /// falls back to when it is unset.
 ///
 /// The workspace forbids `unsafe` and has no `sysinfo` dependency, so this reads
-/// `/proc/meminfo` (and the cgroup v2 `memory.max`) on Linux and asks the platform's own
+/// `/proc/meminfo` (and the cgroup limits, `sched::cgroup_memory_limit`) on Linux and asks the platform's own
 /// tool elsewhere: `sysctl -n hw.memsize` on macOS, Windows PowerShell's
 /// `Win32_ComputerSystem.TotalPhysicalMemory` on Windows, as `storage::free_space` asks for
 /// free space. A tool that is missing or refuses gives `None`.
@@ -62,9 +63,7 @@ pub fn total_memory() -> Option<u64> {
         let total = std::fs::read_to_string("/proc/meminfo")
             .ok()
             .and_then(|m| parse_meminfo_total(&m));
-        let limit = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok());
+        let limit = crate::sched::cgroup_memory_limit();
         return match (total, limit) {
             (Some(t), Some(l)) => Some(t.min(l)),
             (t, _) => t,

@@ -13,22 +13,23 @@ interpreter with torch + pandas + pyarrow.
 Algorithm (per CV fold, so every PSM is scored out-of-fold by a model that never
 trained on it): initialise from the best single feature+sign, then iterate
 {recompute target-decoy q on the training folds -> targets at q<=train_fdr are
-positives, all decoys negatives -> train the MLP from scratch -> rescore} for
-`iters` rounds; score the held-out fold with the final model.
+positives, decoys negatives -> train the MLP (from scratch, or warm-started from the
+previous round under MUMDIA_NN_WARM_START) -> rescore} for `iters` rounds; score the
+held-out fold with the final model.
 
 MEMORY (multi-run / large PINs): two feature backends behind one accessor.
-    - in-memory (default for PINs <= MUMDIA_NN_STREAM_GB, 4 GB): the full standardised
-      feature matrix is held in RAM, and not much else: one n x features float32 block plus
-      one fold's gathered training rows. The load is streamed row group by row group and
-      its transients are returned to the OS before training starts. Mean/std standardisation, the same as the streaming
-      backend: one transform for every backend and every handoff, so a score does not
-      depend on which one ran (docs/31 F5).
-    - streaming memmap (large PINs, or MUMDIA_NN_STREAM=1): the PIN is read ONCE in
-      chunks into a disk-backed float32 memmap (the same mean/std, accumulated in the
-      same pass); training and scoring then draw MINIBATCHES indexed into the
-      memmap, so peak RAM is one batch + per-row metadata, NOT the whole matrix.
-      This is what makes combining many runs into one rescoring tractable: the full
-      PIN never lives in RAM at once.
+    - in-memory (the default, unless the decoded matrix exceeds MUMDIA_NN_STREAM_GB):
+      one n x features float32 block plus one fold's gathered training rows. The load is
+      streamed row group by row group (at most two decoded groups held) and its transients
+      are returned to the OS before training starts. Under MUMDIA_NN_PARALLEL (the
+      default) the block is a disk-backed memmap the training processes share. Mean/std
+      standardisation: one transform for every backend and every handoff, so a score does
+      not depend on which one ran (docs/31 F5).
+    - streaming memmap (large PINs, or MUMDIA_NN_STREAM=1): the matrix is a disk-backed
+      float32 memmap, filled by the in-memory loader from a parquet or raw handoff (a
+      tab-separated PIN is read once in chunks), with the per-row metadata read in
+      batches; training and scoring then draw MINIBATCHES indexed into the memmap, so
+      peak RAM is one batch + per-row metadata, NOT the whole matrix.
 
 Determinism note (docs/14_build_test_deploy_gotchas.md): NN training is only
 approximately reproducible. Set MUMDIA_NN_SEEDS>1 to ensemble seeds and average
@@ -39,7 +40,7 @@ file extension (.parquet / .pq). Parquet avoids serialising the whole feature ma
 measured at 34% of a rescore on a 1.5M-row subset, and worse at full scale where a 30 GB text
 PIN also forced the streaming backend. Column names and semantics are identical either way.
 
-A third form, the raw handoff (`rescore.handoff = raw`, opt-in), is given as a
+A third form, the raw handoff (`rescore.handoff = raw`, the default), is given as a
 `<name>.raw.json` description: the features as one row-major little-endian float32 `.npy`
 matrix (rows x features), the metadata columns (SpecId, Label, ScanNr, ExpMass, CalcMass,
 Peptide, Proteins) in a small parquet beside it, and in the JSON the feature names, the
@@ -49,7 +50,8 @@ worker's matrix with no parquet decode and no column-to-row transpose, and the f
 moments are summed over the same partition as the parquet load, so the matrix, mean, std
 and scores are byte-identical to a parquet handoff of the same rows.
 
-Env knobs (all optional):
+Env knobs (all optional). The engine sets the training knobs from `rescore.*` on every
+run, so the defaults below are those of the worker run by hand:
     MUMDIA_NN_FOLDS       = 3        cross-validation folds
     MUMDIA_NN_ITERS       = 5        semi-supervised self-training iterations
     MUMDIA_NN_EPOCHS      = 25       NN epochs per iteration
@@ -405,8 +407,9 @@ def torch_thread_cap():
     if raw not in ("", "auto"):
         try:
             return max(0, int(float(raw))), "MUMDIA_NN_THREAD_CAP"
-        except ValueError:
-            pass
+        except (ValueError, OverflowError):
+            print("WARNING: MUMDIA_NN_THREAD_CAP=%r is not a number, 0 or auto; "
+                  "using auto" % raw, flush=True)
     p_cores = performance_cores()
     if p_cores:
         return p_cores, f"{p_cores} performance cores on a hybrid CPU"
@@ -2288,16 +2291,14 @@ def main():
         _idx = [_pos[c] for c in feat_cols]
         if _idx != list(range(len(RAW["features"]))):
             raw_idx = np.asarray(_idx, dtype=np.intp)
-    if not stream:
-        # ---- in-memory backend (median/IQR standardisation) ----
-        if IS_PQ or IS_RAW:
-            # ---- Parquet in-memory: one float32 matrix, standardised in place ----
-            # Metadata columns first; they are small as long as they stay Arrow. The
-            # previous `to_pylist()` round trips made a Python string per row out of SpecId
-            # and Peptide (~0.7 GB on a 3M-row pool) that then sat in the allocator's
-            # high-water mark for the whole run. Peptide is only needed when there is no
-            # fold-key table to fold on.
-            _cols = ["SpecId", "Label"] + ([] if fold_keys is not None else ["Peptide"])
+    if IS_PQ or IS_RAW:
+        # ---- Parquet or raw handoff: one float32 matrix, standardised in place ----
+        # Metadata columns first; they are small as long as they stay Arrow. The previous
+        # `to_pylist()` round trips made a Python string per row out of SpecId and Peptide
+        # (~0.7 GB on a 3M-row pool) that then sat in the allocator's high-water mark for
+        # the whole run. Peptide is only needed when there is no fold-key table to fold on.
+        _cols = ["SpecId", "Label"] + ([] if fold_keys is not None else ["Peptide"])
+        if not stream:
             _tb = pq.read_table(meta_path, columns=_cols)
             y = (_tb.column("Label").to_numpy() == 1).astype(np.float32)
             n = len(y)
@@ -2307,85 +2308,90 @@ def main():
             else:
                 fold = _folds(_tb.column("Peptide").to_pylist())
             del _tb
-            if PARALLEL != 0:
-                # The children map this file read-only instead of each copying the matrix.
-                mm_path = os.path.abspath(out_path + ".feat.mm")
-                _LEFTOVERS.append(mm_path)
-                Xs = np.memmap(mm_path, dtype=np.float32, mode="w+", shape=(n, nf))
-            else:
-                Xs = np.empty((n, nf), np.float32)
-            if IS_RAW:
-                s1, s2 = fill_raw_matrix(
-                    RAW["matrix"], raw_idx, n, CHUNK, Xs, int(RAW["row_group_rows"]),
-                    threads=LOAD_THREADS, initializer=_fp_thread_init,
-                )
-            elif LOAD_THREADS == 0:
-                s1, s2 = _fill_parquet_matrix_legacy(pin_path, feat_cols, n, CHUNK, Xs)
-            else:
-                s1, s2 = fill_parquet_matrix(
-                    pin_path, feat_cols, n, CHUNK, Xs, threads=LOAD_THREADS,
-                    read_ahead=READ_AHEAD, pre_buffer=PRE_BUFFER,
-                    initializer=_fp_thread_init,
-                )
-            if IS_RAW:
-                # Copied into `Xs`: the mapping is not read again.
-                RAW.pop("matrix", None)
-            # The decoded Arrow buffers are garbage now; hand them back before training
-            # starts, or they stay in RSS for the whole run.
-            _release_allocator_slack()
-            _ts = time.time()
-            mean, std = moments_to_mean_std(s1, s2, n)
-            standardise_matrix(Xs, mean, std, CHUNK, threads=LOAD_THREADS,
-                               initializer=_fp_thread_init)
-            _detail("load: standardise", time.time() - _ts)
         else:
-            pin = pd.read_csv(pin_path, sep=chr(9))
-        if not (IS_PQ or IS_RAW):
-            y = (pin["Label"].to_numpy() == 1).astype(np.float32)
-            cids = np.array(
-                [int(s.rsplit("_", 1)[-1]) for s in pin["SpecId"].astype(str)], np.int64
-            )
-            fold = _folds(pin["Peptide"].tolist())
-            X = np.nan_to_num(
-                pin[feat_cols].to_numpy(np.float32), nan=0.0, posinf=0.0, neginf=0.0
-            )
-            del pin
-            # Mean/std, the same transform as the parquet and streaming backends.
-            #
-            # This path used median/IQR while the other two used mean/std, so the same PSM
-            # pool produced different scores depending on `rescore.handoff` and on which
-            # side of MUMDIA_NN_STREAM_GB the matrix fell: a 3.99 GB PIN was standardised
-            # one way and a 4.01 GB PIN the other, with nothing in the log to say which
-            # (docs/31 F5). Converging on mean/std leaves the shipped default (parquet)
-            # and every published benchmark unchanged, and only moves this legacy path.
-            mean = X.mean(axis=0, dtype=np.float64).astype(np.float32)
-            std = X.std(axis=0, dtype=np.float64).astype(np.float32)
-            std[std == 0] = 1.0
-            Xs = np.clip((X - mean) / std, -8, 8).astype(np.float32)
-            del X
-            n = len(y)
-            if PARALLEL != 0:
-                mm_path = os.path.abspath(out_path + ".feat.mm")
-                _LEFTOVERS.append(mm_path)
-                _mm = np.memmap(mm_path, dtype=np.float32, mode="w+", shape=Xs.shape)
-                _mm[:] = Xs
-                Xs = _mm
-                del _mm
-    else:
-        # ---- streaming memmap backend (mean/std, one text pass) ----
+            # The streaming backend reads the metadata in CHUNK-row batches as well, so no
+            # whole column is held.
+            n = int(pq.read_metadata(meta_path).num_rows)
+            y = np.empty(n, np.float32)
+            cids = np.empty(n, np.int64)
+            fold = np.empty(n, np.int16)
+            off = 0
+            for _b in pq.ParquetFile(meta_path).iter_batches(batch_size=CHUNK, columns=_cols):
+                k = _b.num_rows
+                y[off:off + k] = _b.column("Label").to_numpy() == 1
+                cids[off:off + k] = _row_ids(_b.column("SpecId"))
+                fold[off:off + k] = _folds(range(k) if fold_keys is not None
+                                           else _b.column("Peptide").to_pylist(), off)
+                off += k
+        if stream or PARALLEL != 0:
+            # On disk: the streaming backend's memmap, and under parallel training the file
+            # the children map read-only instead of each copying the matrix. Resolved
+            # absolutely, so a rescore launched from another directory can create it.
+            mm_path = os.path.abspath(out_path + ".feat.mm")
+            _LEFTOVERS.append(mm_path)
+            Xs = np.memmap(mm_path, dtype=np.float32, mode="w+", shape=(n, nf))
+        else:
+            Xs = np.empty((n, nf), np.float32)
         if IS_RAW:
-            n = int(RAW["rows"])
-        elif IS_PQ:
-            n = int(pq.read_metadata(pin_path).num_rows)
+            s1, s2 = fill_raw_matrix(
+                RAW["matrix"], raw_idx, n, CHUNK, Xs, int(RAW["row_group_rows"]),
+                threads=LOAD_THREADS, initializer=_fp_thread_init,
+            )
+            # Copied into `Xs`: the mapping is not read again.
+            RAW.pop("matrix", None)
         else:
-            with open(pin_path, "rb") as fh:
-                n = sum(1 for _ in fh) - 1
-        # Resolve ABSOLUTELY: this used to be a path relative to the caller's cwd, so a
-        # rescore launched from a different directory failed with a bare
-        # `OSError: [Errno 22]` naming a path it could not create.
+            s1, s2 = fill_parquet_matrix(
+                pin_path, feat_cols, n, CHUNK, Xs, threads=LOAD_THREADS,
+                initializer=_fp_thread_init,
+            )
+        # The decoded Arrow buffers are garbage now; hand them back before training
+        # starts, or they stay in RSS for the whole run.
+        _release_allocator_slack()
+        _ts = time.time()
+        mean, std = moments_to_mean_std(s1, s2, n)
+        standardise_matrix(Xs, mean, std, CHUNK, threads=LOAD_THREADS,
+                           initializer=_fp_thread_init)
+        _detail("load: standardise", time.time() - _ts)
+    elif not stream:
+        # ---- the tab-separated PIN, in memory ----
+        pin = pd.read_csv(pin_path, sep=chr(9))
+        y = (pin["Label"].to_numpy() == 1).astype(np.float32)
+        cids = np.array(
+            [int(s.rsplit("_", 1)[-1]) for s in pin["SpecId"].astype(str)], np.int64
+        )
+        fold = _folds(pin["Peptide"].tolist())
+        X = np.nan_to_num(
+            pin[feat_cols].to_numpy(np.float32), nan=0.0, posinf=0.0, neginf=0.0
+        )
+        del pin
+        # Mean/std, the same transform as the parquet and streaming backends.
+        #
+        # This path used median/IQR while the other two used mean/std, so the same PSM
+        # pool produced different scores depending on `rescore.handoff` and on which
+        # side of MUMDIA_NN_STREAM_GB the matrix fell: a 3.99 GB PIN was standardised
+        # one way and a 4.01 GB PIN the other, with nothing in the log to say which
+        # (docs/31 F5). Converging on mean/std leaves the shipped default (parquet)
+        # and every published benchmark unchanged, and only moves this legacy path.
+        mean = X.mean(axis=0, dtype=np.float64).astype(np.float32)
+        std = X.std(axis=0, dtype=np.float64).astype(np.float32)
+        std[std == 0] = 1.0
+        Xs = np.clip((X - mean) / std, -8, 8).astype(np.float32)
+        del X
+        n = len(y)
+        if PARALLEL != 0:
+            mm_path = os.path.abspath(out_path + ".feat.mm")
+            _LEFTOVERS.append(mm_path)
+            _mm = np.memmap(mm_path, dtype=np.float32, mode="w+", shape=Xs.shape)
+            _mm[:] = Xs
+            Xs = _mm
+            del _mm
+    else:
+        # ---- the tab-separated PIN, streamed into a memmap (mean/std, one text pass) ----
+        with open(pin_path, "rb") as fh:
+            n = sum(1 for _ in fh) - 1
         mm_path = os.path.abspath(out_path + ".feat.mm")
         _LEFTOVERS.append(mm_path)
-        mm = np.memmap(mm_path, dtype=np.float32, mode="w+", shape=(n, nf))
+        Xs = np.memmap(mm_path, dtype=np.float32, mode="w+", shape=(n, nf))
         y = np.empty(n, np.float32)
         cids = np.empty(n, np.int64)
         fold = np.empty(n, np.int16)
@@ -2393,52 +2399,22 @@ def main():
         s2 = np.zeros(nf, np.float64)
         keep = set(["SpecId", "Label", "Peptide"] + feat_cols)
         off = 0
-        def _chunks():
-            "Yield fixed-size frames from either backing format."
-            if IS_RAW:
-                # The metadata parquet in CHUNK-row batches, as `iter_batches` cuts the
-                # parquet handoff (across its row groups), with the same rows of the matrix:
-                # the float32 values the parquet path takes out of its frame.
-                pf = pq.ParquetFile(meta_path)
-                mat = RAW["matrix"]
-                r0 = 0
-                for batch in pf.iter_batches(batch_size=CHUNK,
-                                             columns=["SpecId", "Label", "Peptide"]):
-                    k = batch.num_rows
-                    block = mat[r0:r0 + k] if raw_idx is None else mat[r0:r0 + k][:, raw_idx]
-                    r0 += k
-                    yield batch.to_pandas(), block
-            elif IS_PQ:
-                pf = pq.ParquetFile(pin_path)
-                cols = ["SpecId", "Label", "Peptide"] + feat_cols
-                for batch in pf.iter_batches(batch_size=CHUNK, columns=cols):
-                    yield batch.to_pandas(), None
-            else:
-                for ch in pd.read_csv(pin_path, sep=chr(9),
-                                      usecols=lambda c: c in keep, chunksize=CHUNK):
-                    yield ch, None
-
-        for chunk, block in _chunks():
+        for chunk in pd.read_csv(pin_path, sep=chr(9), usecols=lambda c: c in keep,
+                                 chunksize=CHUNK):
             k = len(chunk)
-            if block is None:
-                block = chunk[feat_cols].to_numpy(np.float32)
-            xf = np.nan_to_num(np.asarray(block, dtype=np.float32), nan=0.0, posinf=0.0,
+            xf = np.nan_to_num(chunk[feat_cols].to_numpy(np.float32), nan=0.0, posinf=0.0,
                                neginf=0.0)
-            mm[off:off + k] = xf
+            Xs[off:off + k] = xf
             _accumulate_moments(xf, s1, s2)
             y[off:off + k] = (chunk["Label"].to_numpy() == 1).astype(np.float32)
             cids[off:off + k] = [int(s.rsplit("_", 1)[-1]) for s in chunk["SpecId"].astype(str)]
             fold[off:off + k] = _folds(chunk["Peptide"].tolist(), off)
             off += k
-        if IS_RAW:
-            RAW.pop("matrix", None)
-        mean = (s1 / n).astype(np.float32)
-        std = np.sqrt(np.maximum(s2 / n - (s1 / n) ** 2, 1e-12)).astype(np.float32)
-        std[std == 0] = 1.0
+        mean, std = moments_to_mean_std(s1, s2, n)
         # standardise the memmap in place, chunked (binary, sequential, low RAM)
         for i in range(0, n, CHUNK):
-            mm[i:i + CHUNK] = np.clip((mm[i:i + CHUNK] - mean) / std, -8, 8)
-        mm.flush()
+            Xs[i:i + CHUNK] = np.clip((Xs[i:i + CHUNK] - mean) / std, -8, 8)
+        Xs.flush()
     _t = _tick("1_pin_read_standardise", _t)
     init_sample_limit = env_i("MUMDIA_NN_INIT_SAMPLE", 300000)
     print(f"nn_rescore_worker: device={DEVICE} backend={'stream' if stream else 'in-memory'} "
@@ -2455,7 +2431,7 @@ def main():
         SCAN_ROWS_PER_THREAD=SCAN_ROWS_PER_THREAD, SCAN_MEM_BYTES=SCAN_MEM_BYTES,
         INIT_SAMPLE=init_sample_limit,
     )
-    X = mm if stream else Xs
+    X = Xs
     side_paths = _LEFTOVERS
     run_fold = None
     try:
@@ -2496,7 +2472,7 @@ def main():
         # Drop every reference to the memmap (the trainer's torch view included) before
         # removing its file: Windows refuses to delete a file that is still mapped. On an
         # error the traceback still references it; `_entry` retries once that is released.
-        mm = Xs = X = run_fold = None
+        Xs = X = run_fold = None
         _remove_leftovers()
     _print_timers()
     print(f"nn_rescore_worker: {n} PSMs rescored (targets+decoys), {N_SEEDS} seed(s), "

@@ -69,16 +69,16 @@ temporal agreement, orthogonal to intensity-pattern agreement.
 **competition key (`compete.group_by`)**. The grouping over which `compete`
 resolves rival candidates, keeping only the highest `prelim_score` member of each
 group and deleting the rest before rescore and before any FDR estimate
-(`rust/mumdia/crates/mumdia/src/stages/compete.rs:319-340`). The default variant
-is named `precursor` but is a misnomer: the key is
-`(base_peptide_id, label_code, 0, peak_rank)`
-(`rust/mumdia/crates/mumdia/src/stages/compete.rs:88`), and `base_peptide_id` is
-the stripped-sequence identity, so every charge and every modification variant of
-one peptide collapses to a single winner. `peptidoform_charge`
-(`rust/mumdia/crates/mumdia/src/stages/compete.rs:93-98`) keys
-`(pform_id, label, charge, peak_rank)` instead and is required, not optional, for
-a PTM or modification search, where the default would delete the modified form
-whenever an unmodified sibling scored higher. Competition is within label, so it
+(`rust/mumdia/crates/mumdia/src/stages/compete.rs:319-340`). The default is
+`peptidoform_charge` (since 2026-09-06), which keys
+`(pform_id, label, charge, peak_rank)`, so each peptidoform and charge competes
+only against its own alternative peaks. It is required, not optional, for a PTM
+or modification search. `base_peptide` (renamed from `precursor`, which is no
+longer accepted) is the explicit peptide-level option: its key is
+`(base_peptide_id, label_code, 0, peak_rank)`, and `base_peptide_id` is the
+stripped-sequence identity, so every charge and every modification variant of
+one peptide collapses to a single winner, and the modified form is deleted
+whenever an unmodified sibling scores higher. Competition is within label, so it
 never eliminates a target against its own decoy. See
 `docs/11_compete_rescore_fdr.md`.
 
@@ -177,17 +177,15 @@ unchanged identifications (`rust/mumdia/crates/mumdia-core/src/config.rs:34`,
 `rust/mumdia/crates/mumdia/src/matchers/fragindex.rs:1`). Both apply the same
 f32-stored / f64-verify ppm predicate.
 
-**MBR / transfer (match-between-runs)**. A cross-run step (Stage D3) that transfers
-an identification confident in one run to a run where it scored below threshold,
-gaining sensitivity. In MuMDIA it is a stub with config hooks and a Python sidecar
-contract (`mbr_worker.py`); the default is no MBR and it needs at least two runs
-(`rust/mumdia/crates/mumdia/src/sidecar.rs:157`,
-`rust/mumdia/crates/mumdia-core/src/config.rs:845`). A transferred PSM is flagged
-`is_transferred` with its q-value lowered
-(`rust/mumdia/crates/mumdia/src/main.rs:249`).
+**MBR (match-between-runs)**. A cross-run step that identifies in one run a precursor
+confident in others. In MuMDIA it is the second pass of `run-experiment`
+(`mbr.strategy = second_pass`, the default): every run is searched again on an empirical
+library of the first pass (docs/12, "Second pass"). The earlier transfer of sub-threshold
+PSMs (`mumdia mbr`, `mbr_worker.py`) was removed in 0.15.0.
 
 **mokapot**. An opt-in Python rescoring sidecar (`RescorerKind::Mokapot`) run over
-the PIN file with a logistic-regression default; the default `rescore.strict=true`
+the PIN file, with the sklearn MLP as the worker default (logreg in the Docker
+image); the default `rescore.strict=true`
 makes failure fatal. Setting strict false explicitly enables native compatibility
 fallback
 (`rust/mumdia/crates/mumdia-core/src/config.rs:941`,
@@ -221,6 +219,7 @@ for `precursor_q` (peptidoform + charge,
 `rescore::run_hashed`) and the reporting unit of
 `peptides.tsv`, whose rows are precursors, not stripped sequences
 (`rust/mumdia/crates/mumdia/src/stages/report.rs:93`). Under the default
+`compete.group_by = peptidoform_charge`, `precursor_q` counts precursors. Under the explicit
 `compete.group_by = base_peptide`, however, competition has already deleted the
 charge and modification siblings by stripped peptide before rescore, so the
 surviving rows are precursor-shaped but effectively one per base peptide, and

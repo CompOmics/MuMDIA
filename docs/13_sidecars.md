@@ -1,4 +1,4 @@
-# Python sidecars (19 scripts + three shared modules) + conda envs
+# Python sidecars (16 scripts + four shared modules) + conda envs
 > Part of the MuMDIA developer documentation (see docs/README.md).
 
 ## Purpose
@@ -19,25 +19,26 @@ only the rescore sidecars fall back to a native rescorer, and only when
 strict gate, so a crashed MS2PIP, AlphaPeptDeep, DeepLC, IM2Deep, or DeepLC fine-tune aborts the
 whole run. The matrix in **Failure behavior** below is authoritative.
 
-The 18 scripts split into six groups. Nine are launched by the engine:
+The 16 scripts split into five groups. Eight are launched by the engine:
 **predictors** (`ms2pip_worker`, `peptdeep_worker`, `deeplc_worker`, `deeplc_finetune`,
 `im2deep_worker`) feed the run-independent library; **rescorers** (`mokapot_worker`,
-`nn_rescore_worker`, `entrapment_worker`) score the competed PSMs in Stage F; **MBR**
-(`mbr_worker`) transfers identifications across runs (Stage D3). Nine are run by hand:
+`nn_rescore_worker`, `entrapment_worker`) score the competed PSMs in Stage F. The MBR
+transfer worker (`mbr_worker`) was removed in 0.15.0. Eight are run by hand:
 the **DIA-NN recipe** (`import_diann_lib`, `make_reverse_decoys`, `predict_decoys`,
-`remap_library`, `merge_libraries`) is an offline,
+`remap_library`) is an offline,
 one-time toolchain that builds MuMDIA's target+decoy library schema from a user-produced
 DIA-NN library, with `remap_library` mapping any
-library's peptides to the proteins of another FASTA, and `merge_libraries` merging an
-empirical library with a predicted one; the **library-scale recipes**
+library's peptides to the proteins of another FASTA (`merge_libraries`, which merged an
+empirical library with a predicted one, was removed in 0.15.0); the **library-scale recipes**
 (`sort_fragments`, `mz_range_survivors`,
 `mh_shard_predict`) reshape very large tables (docs/32); the **post-run tool**
 (`prune_outputs`) reduces a finished output directory to a retention tier (docs/01, "Output
-retention"). The three shared modules are
+retention"). The four shared modules are
 imported, never run: `_lib_io` (the parquet writer and the peptidoform and fragment-table rules the recipe
 scripts share),
-`_torch_threads` (the torch CPU thread policy) and `_unimod` (the modification
-catalogue).
+`_torch_threads` (the torch CPU thread policy), `_deeplc_common` (the DeepLC helpers the
+two DeepLC workers, the IM2Deep worker and the shard recipe share) and `_unimod` (the
+modification catalogue).
 
 ## Failure behavior
 
@@ -53,7 +54,6 @@ that `Err` aborts or is caught.
 | deeplc_worker (predict-frag) | aborts run | none | none: `run_deeplc(...)?` propagates (`predict_frag.rs:291`) |
 | im2deep_worker (predict-frag) | aborts run | none | none: `run_im2deep(...)?` propagates (`predict_frag.rs`, `ImRequest::call`) |
 | deeplc_finetune (run) | aborts run | none | none: `run_deeplc_finetune(...)?` propagates (`run.rs:253-263`) |
-| mbr_worker (`mumdia mbr`) | aborts command | none | none: `run_mbr(...)?` propagates (`main.rs:697-710`) |
 | mokapot_worker (rescore) | falls back / bails | `rescore.strict` | `native_tda` when `strict=false`, else bail (`strict_or_warn`) |
 | nn_rescore_worker (rescore) | falls back / bails | `rescore.strict` | `native_tda` when `strict=false`, else bail (`strict_or_warn`) |
 | entrapment_worker (rescore) | falls back / bails | `rescore.strict` | native linear entrapment rescorer (still `QMode::Entrapment`) when `strict=false`, else bail (`strict_or_warn`) |
@@ -74,13 +74,12 @@ the column it keys the readback on.
 | deeplc_worker | `<in.parquet> <out.parquet> [threads]` (`sidecar.rs`, `run_deeplc`; `threads` is the engine's thread count, capped by the worker, see **DeepLC thread cap**) | `deeplc_out.parquet` | `id` |
 | im2deep_worker | `<in.parquet> <out.parquet> [threads]` (`sidecar.rs`, `run_im2deep`; `threads` is the engine's thread count, capped by the worker under `MUMDIA_IM2DEEP_THREAD_CAP`, see **DeepLC thread cap**) | `im2deep_out.parquet` | `id` |
 | deeplc_finetune | `<lib_in> <seed> <lib_out> --epochs --patience --q-train --batch --window-holdout-frac --seed --predict-threads [--shards K]` (`sidecar.rs`, `run_deeplc_finetune`; `--shards` only when `rt_im_train.deeplc_predict_shards` is not 1, for all three modes) | `<lib_out>` (= `fragment_library_precursors_ft.parquet`) | `peptidoform` (new table with replaced `predicted_irt`; input unchanged) |
-| mokapot_worker / nn_rescore_worker | `<rescore.pin> <out.parquet>` + env `MUMDIA_NN_FOLDS/ITERS/TRAIN_FDR` (`run_pin_sidecar`) | `rescore_sidecar_out.parquet` | `candidate_id` (echoes the flat row index) |
+| mokapot_worker / nn_rescore_worker | `<handoff> <out.parquet>`: a PIN (mokapot), or for nn_torch a raw f32 matrix (`.features.raw.json` + `.npy`, the default) or a features parquet; env `MUMDIA_NN_*` from `rescore.*`, among them `MUMDIA_NN_FOLD_KEYS` (`run_pin_sidecar`) | `rescore_<tag>_out.parquet` | `candidate_id` (echoes the flat row index) |
 | entrapment_worker | `<in.parquet> <out.parquet> <folds>` (`run_entrapment_gbm`) | `entrapment_out.parquet` | `row_id` |
-| mbr_worker | `<scored> <psms_csv> <out> --q-anchor --min-anchor-runs --q-transfer --seed [--out-scored] [--frag-csv --consensus-corr-min]` (`sidecar.rs:193-211`) | `<out>.parquet` | `candidate_id` |
 
 For the mapping from each conda environment to the config field that points at it
 (`predict_frag.ms2pip_python`, `predict_frag.deeplc_python`,
-`predict_frag.im2deep_python`, `rescore.python`, `mbr.python`) and the interpreter paths on this machine, see
+`predict_frag.im2deep_python`, `rescore.python`) and the interpreter paths on this machine, see
 `docs/19_getting_started.md`.
 
 ## Files
@@ -91,26 +90,25 @@ For the mapping from each conda environment to the config field that points at i
 | `scripts/peptdeep_worker.py` | Predictor: AlphaPeptDeep b/y fragment intensities per peptidoform+charge, conditioned on collision energy and instrument |
 | `scripts/deeplc_worker.py` | Predictor: DeepLC iRT per peptidoform (uncalibrated) |
 | `scripts/im2deep_worker.py` | Predictor: IM2Deep 1/K0 per (peptidoform, charge), from the single-conformer CCS converted at the precursor m/z (uncalibrated); only under `predict_frag.im_predictor` |
+| `scripts/_deeplc_common.py` | Shared module: the DeepLC version floor (`require_version`, also IM2Deep's check), the one-time base-model load, the blank-progress filter and the sequence rules (`MOD_RE`, `library_bases`, `unique_standard_bases`) that the two DeepLC workers and the shard recipe share |
 | `scripts/_torch_threads.py` | Shared module: the torch CPU thread policy (physical-core count, `thread_cap`, `capped_threads`) the DeepLC and IM2Deep workers cap their pools with and the NN rescorer reads its core count from |
 | `scripts/deeplc_finetune.py` | Predictor: transfer-learn DeepLC on this run's seed and rewrite the library iRT; with `--no-finetune` (seed `-`) rewrite it with base-model predictions instead (`rt_im_train.library_irt`) |
-| `scripts/mokapot_worker.py` | Rescorer: mokapot brew over a PIN (model env-switchable: nn/logreg/xgb/percolator) |
+| `scripts/mokapot_worker.py` | Rescorer: mokapot brew over a PIN (model env-switchable: logreg/nn/xgb/percolator) |
 | `scripts/nn_rescore_worker.py` | Rescorer: PyTorch semi-supervised MLP over a PIN, in-memory or streaming memmap |
 | `scripts/entrapment_worker.py` | Rescorer: GBM/NN on real-target-vs-spike-in negatives, out-of-fold by base peptide |
-| `scripts/mbr_worker.py` | MBR (Stage D3): cross-run RT transfer + permuted-RT decoy-transfer FDR |
 | `scripts/import_diann_lib.py` | Recipe: DIA-NN fragment-level parquet -> MuMDIA target `lib_precursors`+`lib_fragments`; streams the input row group by row group (two passes), so peak memory is the precursor table, not the fragment table |
 | `scripts/make_reverse_decoys.py` | Recipe: reverse-sequence decoys with no-target-overlap invariant; their intensities are copied, so `predict_decoys.py` runs on its output before a search |
 | `scripts/predict_decoys.py` | Recipe (default since 2026-10-09): replace the reverse decoys' copied intensities with DIA-NN's prediction for their sequences |
 | `scripts/remap_library.py` | Recipe: map a library's peptides to the proteins of another FASTA (I/L-aware, cleavage-specific, Met excision and protein N-terminal groups as the digest), decoys following their targets; drops or keeps as `UNASSIGNED` what the FASTA lacks (#319) |
-| `scripts/merge_libraries.py` | Recipe: merge an empirical library with a predicted one (empirical spectrum and RT where both have an entry, RT calibrated onto the predicted scale), then rebuild and predict the decoys of the merged targets (#320) |
 | `scripts/sort_fragments.py` | Recipe: rewrite a fragment table in `candidate_id` order (streaming bucket sort, in place); the writers above do this themselves since the range load, this is for tables written before |
 | `scripts/mz_range_survivors.py` | Recipe: candidate ids inside the run's isolation range, as a prescan-style survivors table (docs/32) |
 | `scripts/prune_outputs.py` | Post-run: reduce a finished output directory to the `results` or `viewer` retention tier (dry run by default, `--apply`, record in `pruned.json`; docs/01) |
 | `scripts/mh_shard_predict.py` | Recipe: deduplicated, sharded multi-head DeepLC calibration of a very large precursor table (`uniq` / `fit` / `predict --calibration` / `merge`; reuses `deeplc_finetune.py`). The engine shards the same prediction itself under `rt_im_train.deeplc_predict_shards`; the recipe streams the library by row group, which matters at 1e8 rows |
-| `rust/mumdia/crates/mumdia/src/sidecar.rs` | Rust clients: `resolve_script`, `run_ms2pip`, `run_peptdeep`, `run_deeplc`, `run_im2deep`, `run_deeplc_finetune`, `run_mbr`, `run_worker`; the shared `fragment_request` (the `id, peptidoform, charge` request, with an optional extra column) and `read_fragment_intensities` the intensity predictors use; and `read_id_scalars`, the one `id -> value` reader behind DeepLC and IM2Deep |
+| `rust/mumdia/crates/mumdia/src/sidecar.rs` | Rust clients: `resolve_script`, `run_ms2pip`, `run_peptdeep`, `run_deeplc`, `run_im2deep`, `run_deeplc_finetune`, `run_worker`; the shared `fragment_request` (the `id, peptidoform, charge` request, with an optional extra column) and `read_fragment_intensities` the intensity predictors use; and `read_id_scalars`, the one `id -> value` reader behind DeepLC and IM2Deep |
 | `rust/mumdia/crates/mumdia/src/stages/predict_frag.rs` | Call sites for MS2PIP, AlphaPeptDeep, DeepLC and IM2Deep (Stage C) |
 | `rust/mumdia/crates/mumdia/src/stages/run.rs` | Call site for DeepLC fine-tune (between search-seed and rt-im-train) |
 | `rust/mumdia/crates/mumdia/src/stages/rescore.rs` | Call sites for mokapot/nn_torch (PIN) + entrapment (Parquet) sidecars |
-| `rust/mumdia/crates/mumdia/src/main.rs` | Call site for MBR (`Cmd::Mbr`) + `doctor` env probe |
+| `rust/mumdia/crates/mumdia/src/main.rs` | `doctor` env probe |
 | `env/docker-rescore.yml` | Docker env `rescore`: mokapot 0.10.0 + ms2pip 4.2.0 (py3.11) |
 | `env/docker-deeplc.yml` | Docker env `deeplc`: `deeplc==4.5.0` (PyPI; the engine's floor) + `im2deep>=2.0.0` + CPU torch (py3.11) |
 | `env/mumdia-rescore.yml` | Minimal portable env for the mokapot logreg rescore path (py3.12) |
@@ -185,19 +183,26 @@ code.
   load is part of `fit`.
 
 **mokapot_worker** / **nn_rescore_worker** (`run_pin_sidecar`)
-- IN `rescore.pin`: Percolator tab-separated. Fixed columns
+- IN, two positionals: the handoff path and the output path. File names are per
+  invocation, `rescore_<tag>.*` in the work directory. The handoff is one of three
+  kinds (`rescore.handoff`): `raw` (the default; for nn_torch a row-major f32
+  `.npy` matrix described by `rescore_<tag>.features.raw.json`), `parquet`
+  (`rescore_<tag>.features.parquet`), or a PIN (`rescore_<tag>.pin`, always for
+  mokapot). The PIN is Percolator tab-separated, with fixed columns
   `SpecId Label ScanNr ExpMass CalcMass <features...> Peptide Proteins`
   (`HandoffWriter`). `SpecId = psm_<i>`, `ScanNr = <i>` where `i` is the
   unique flat row index (NOT `candidate_id`, which repeats across runs);
   `ExpMass=CalcMass=precursor_mz` (`{:.5}`); features are `{:.6}`; `Label` +1
   target / -1 decoy; `Peptide = -.<peptidoform>.-` (Percolator flanking dots);
-  `Proteins = <protein>` (single column). `nn_rescore_worker.py`
-  builds its fold key from the `Peptide` column, stripping the mod brackets and
-  the `X.`/`.X` flanks (`strip_pep`, `nn_rescore_worker.py:70-74`) before the
-  `md5 % FOLDS` hash. The feature column order is taken from the first competed
+  `Proteins = <protein>` (single column). The engine writes the fold keys to
+  `rescore_<tag>.foldkeys.parquet` and passes the path in `MUMDIA_NN_FOLD_KEYS`, so
+  a target and its decoy share a fold. Only when that variable is absent (a
+  standalone run) does `nn_rescore_worker.py` build its fold key from the
+  `Peptide` column, stripping the mod brackets and the `X.`/`.X` flanks
+  (`strip_pep`) before an `md5 % FOLDS` hash. The feature column order is taken from the first competed
   input's `FeatureSchema` companion (`FeatureSchema::read`), so all competed inputs must
   share one schema.
-- OUT `rescore_sidecar_out.parquet`: `candidate_id` u32 (echoes the SpecId tail =
+- OUT `rescore_<tag>_out.parquet`: `candidate_id` u32 (echoes the SpecId tail =
   row index), `score` f64, `q_value` f64 (written as zeros; Rust computes q). Rust
   maps `score` back by row index and validates exact/unique/finite coverage
   (`align_sidecar_scores`).
@@ -208,24 +213,6 @@ code.
   then one f32 column per feature (`run_entrapment_gbm`; the worker widens them to f64).
 - OUT `entrapment_out.parquet`: `row_id` u32, `candidate_id` u32, `score` f64.
   Rust maps back by `row_id` (`align_sidecar_scores`).
-
-**mbr_worker** (`sidecar.rs:162` `run_mbr`)
-- IN `<scored_combined>`: experiment-wide scored table, columns read =
-  `candidate_id, source, label, q_value, peptidoform, charge, protein_group`
-  (`mbr_worker.py:81-82`). `<psms_csv>`: comma-joined per-run psms.parquet paths
-  in `source` order, each read for `candidate_id, apex_rt` (`mbr_worker.py:96`).
-  Optional `--frag-csv`: per-run fragment_quant paths
-  (`candidate_id, fragment_name, quantity`).
-- OUT `<out>.parquet`: one row per accepted transfer with
-  `candidate_id, source, peptidoform, charge, protein_group, label, expected_rt,
-  observed_rt, rt_delta, transfer_q` (`mbr_worker.py:254-265`). Optional
-  `--out-scored` writes the scored table with accepted transfers' PSM q columns
-  lowered to `transfer_q`, an `is_transferred` flag and a `transfer_q` column (NaN
-  on non-transferred rows) added; with no transfer candidates the transfer table has
-  its ten columns and zero rows and the augmented table is the input, unflagged. Optional
-  `--emit-transfer-targets` writes per-run `run_windows`-format tables
-  (`candidate_id, rt_pred_cal, rt_lo, rt_hi, im_*`) plus a permuted-RT decoy file
-  for the re-extraction tier (`mbr_worker.py:142-151`).
 
 **import_diann_lib** (offline; no Rust caller)
 - IN `<diann_lib.parquet>`: DIA-NN fragment-level speclib (columns
@@ -340,35 +327,12 @@ desktop import call its `remap_files`)
   the output that is not the input's is removed. `--summary <json>` writes the counts. A
   0.85M-target library against a 31,470-protein FASTA takes about 30 s.
 
-**merge_libraries** (offline; the desktop's "Spectral library + predicted library" input
-runs it)
-- IN two MuMDIA libraries, `--empirical-precursors/--empirical-fragments` (an empirical
-  library imported with `import_diann_lib`, such as the `report-lib.parquet` a DIA-NN search
-  writes) and `--predicted-precursors/--predicted-fragments` (imported or FASTA-built). Only
-  their targets are read; the decoys are rebuilt for the merged targets.
-- Entries are keyed on `(peptidoform, charge)`. An entry in both takes the spectrum,
-  retention time and 1/K0 of `--precedence` (`empirical`, the default, or `predicted`) and
-  the predicted library's protein; an empirical-only entry is kept (`--empirical-only drop`
-  removes it) with its own protein. `remap_library.py` maps the result to one FASTA when the
-  proteins disagree.
-- `--rt calibrate` (default) maps the empirical iRT onto the predicted scale with the
-  monotone binned-median curve of the second-pass consensus (docs/12), fitted on the shared
-  entries (`--rt-min-shared`, default 50), and reports the median and p95 absolute residual;
-  `--rt keep` leaves it. Under the default `rt_im_train.library_irt = auto` with a DeepLC
-  interpreter the search re-predicts every entry's retention time anyway, so only the
-  spectra differ; `library_irt = library` keeps the merged values.
-- Intensities max-normalised per precursor, `base_peptide_id` from the stripped sequence and
-  `peptidoform_id` from the peptidoform over the merged set, `candidate_id` contiguous in
-  `precursor_mz` order, `n_fragments` and `cardinality` recomputed.
-- Decoys: `--decoys diann --diann <exe>` (default) runs `make_reverse_decoys.py` and
-  `predict_decoys.py build`; there is no copied-intensity path. `--decoy-fragments match`
-  (default) then trims each decoy to its target's fragment count (most intense first), so an
-  empirical target with few observed fragments and its predicted decoy keep equal counts;
-  `all` keeps every predicted decoy fragment. `--decoys none` writes the targets only.
-- Memory: both target tables are held in pandas (fragments included), which is fine for
-  libraries of a few million precursors and not for the 1e8-row libraries of docs/32. The
-  merge of a 12.6k-entry empirical library into the 1.21M-target entrapment library took
-  10.4 min at a 6.9 GB peak, most of it the DIA-NN prediction of the 1.21M decoys.
+**merge_libraries** (removed in 0.15.0)
+- `scripts/merge_libraries.py` merged an empirical library with a predicted one: every
+  predicted entry, with the empirical spectrum and retention time where the empirical library
+  had the entry, and the decoys of the merged targets predicted again. The desktop offered it
+  as the "Spectral library + predicted library" input. It was removed because the merged
+  library made the reported 1% optimistic, with no gain at a matched FDP:
 - Measured 2026-11-16 (single run `LFQ_Orbitrap_AIF_Ecoli_01`, the E. coli + human
   entrapment library `ecoli-human-entrap_tryp_diann-2.7_revpred_mz390-1010` of the benchmark
   collection, NN seeds 0-2, default configuration; empirical library: a DIA-NN search of the
@@ -394,9 +358,7 @@ runs it)
   its 12,618 targets are entrapment peptides) with spectra and retention times observed for
   them, while their decoys are predicted and were never selected; the target-decoy null then
   underestimates the false entries among the empirical ones. The decoy trim does not change
-  this (1.47% without it), and keeping the library retention times makes it worse. The merge
-  is therefore opt-in and not a sensitivity default; compare its counts at a measured FDP,
-  and prefer an empirical library from a stricter search (a lower q) or from other samples.
+  this (1.47% without it), and keeping the library retention times makes it worse.
 
 ## How it works
 
@@ -537,10 +499,7 @@ CLI-only knobs that `run` never sets:
 `--device cpu|cuda` (cuda aborts with `SystemExit` if `torch.cuda.is_available()`
 is false, `deeplc_finetune.py:79-81`), `--threads` (torch training pool, defaults to
 `DEEPLC_FT_THREADS`; the engine passes it only in the multi-head and re-prediction
-modes), `--max-ref N` (cap reference PSMs), `--predict-limit N`
-(cap peptidoforms predicted), and `--skip-predict` (fine-tune only, exercise the
-crash path without the full-library prediction, `deeplc_finetune.py:71-76,
-131-133`). The long
+modes) and `--max-ref N` (cap reference PSMs). The long
 docstring and the thread-cap block at the top exist to prevent an intermittent
 machine crash: numpy's OpenBLAS (GNU OpenMP) and torch's Intel OpenMP coexist
 under `KMP_DUPLICATE_LIB_OK=TRUE`, and without pinning `OMP/MKL/OPENBLAS` to 1
@@ -582,7 +541,7 @@ to 21:04 with the peptides inside the seed spread, which is why `K = 0` is the d
 since 2026-09-27 (`docs/08_rt_im_train.md`, "Sharded whole-library prediction").
 
 **Band lists** (`groups.rt_adaptation = once_per_run`, `--bands <tsv>`). A grouped run
-under global calibration can adapt all its bands in one call:
+adapts all its bands in one call:
 `deeplc_finetune.py - <seed|-> - --bands <tsv> (--multihead N | --no-finetune)`, where
 each TSV line is `lib_in<TAB>lib_out` and the positional `lib_in` and `lib_out` are `-`.
 The worker reads each band's `peptidoform` column, fits the calibration once, predicts the
@@ -719,9 +678,13 @@ in `docs/08_rt_im_train.md` section 4d.
 
 **mokapot** and **nn_torch** share the exact PIN contract via `run_pin_sidecar`
 and `HandoffWriter`. Rust concatenates the competed feature tables, writes the
-PIN, spawns the worker, and passes `MUMDIA_NN_FOLDS/ITERS/TRAIN_FDR` from
-`rescore.{folds,num_iter,train_fdr}` as env vars so the
-report's recorded params match what ran; mokapot ignores those three. On success
+handoff, spawns the worker, and passes the `MUMDIA_NN_*` variables of
+`NN_ENV_SET_BY_ENGINE` (folds, rounds, train FDR, the training-set knobs, seeds
+and fold keys) from `rescore.*` as env vars, overwriting any exported value, so
+the report's recorded params match what ran. mokapot reads the folds and the training FDR
+(`brew(folds=..., test_fdr=...)` and the model's `train_fdr`); its semi-supervised
+iterations are `MUMDIA_BREW_ITERS` (20), which the report records as `num_iter` for a
+mokapot run instead of `rescore.num_iter`. On success
 the classifier label and `model_identity` are recorded; on failure the path falls
 back to `native_scores` only when `rescore.strict = false`; strict is the
 production default. The authoritative actual path is recorded in
@@ -732,10 +695,12 @@ none). `MUMDIA_NN_SEED`, `MUMDIA_NN_THREADS` (set from `--threads`) and
 `MUMDIA_NN_PARALLEL` change the scores and reach the worker only this way.
 
 - `mokapot_worker.py` reads the PIN with `mokapot.read_pin`, builds a model
-  chosen by `MUMDIA_RESCORE_MODEL` (`make_model`, `mokapot_worker.py:35-98`:
-  `nn` -> sklearn `MLPClassifier`; `logreg` -> `LogisticRegression`; `xgb` ->
-  `XGBClassifier`; `percolator`/`linear`/`svm` -> mokapot's default, `model=None`),
-  runs `mokapot.brew(..., rng=0, max_workers=MUMDIA_MOKAPOT_WORKERS)`, and uses
+  chosen by `MUMDIA_RESCORE_MODEL` (`make_model`):
+  `logreg` (the default) -> `LogisticRegression`; `nn` -> sklearn `MLPClassifier`;
+  `xgb` -> `XGBClassifier`; `percolator`/`linear`/`svm` -> mokapot's own
+  `PercolatorModel`; any other value is refused),
+  runs `mokapot.brew(..., folds=rescore.folds, test_fdr=rescore.train_fdr, rng=0,
+  max_workers=MUMDIA_MOKAPOT_WORKERS)`, and uses
   mokapot's **out-of-fold** confidence scores only (each PSM scored by the fold
   that did not train on it, `mokapot_worker.py:128-163`). There is deliberately no
   in-sample fallback: `_oof_scores` raises `RuntimeError` unless the merged
@@ -773,9 +738,9 @@ none). `MUMDIA_NN_SEED`, `MUMDIA_NN_THREADS` (set from `--threads`) and
   worker refuses it, and its `.npy` matrix is memory-mapped and copied into the
   worker's matrix (`fill_raw_matrix`) group by group, each group of `row_group_rows`
   rows cut into the same moment sub-blocks the parquet load uses, so the float64 sums,
-  the mean, the std and the scores are the parquet handoff's. The streaming backend
-  takes the matrix in the `MUMDIA_NN_CHUNK`-row chunks that `iter_batches` cuts the
-  parquet into. The constant-column drop reads the description's min/max through
+  the mean, the std and the scores are the parquet handoff's, on either backend (the
+  streaming backend fills its memmap with the same loaders). The constant-column drop
+  reads the description's min/max through
   float32, as pyarrow hands a float32 footer statistic to Python, so flush-to-zero
   treats a column of zeros and subnormals as it does there. What it saves is the
   parquet encode in the engine and the decode and strided column-to-row fill in the
@@ -814,7 +779,9 @@ single class is an error, never a gap filled with in-sample scores (docs/29 #3),
 a final model fit on all non-decoy PSMs scores the decoys only. Model is `gbm`
 (`HistGradientBoostingClassifier`, `early_stopping=False` so `random_state=0` is
 reproducible) or `nn` (StandardScaler + MLP pipeline) via
-`MUMDIA_ENTRAPMENT_MODEL` (`entrapment_worker.py:28-60`). The rationale: spike-in
+`MUMDIA_ENTRAPMENT_MODEL` (`entrapment_worker.py:28-60`); the report's `model_identity`
+names the one that ran (`entrapment-gbm-sidecar-v1` or `entrapment-nn-sidecar-v1`). The
+rationale: spike-in
 negatives experience the same chimeric DIA interference as real targets, so a
 flexible model helps (AUC ~0.97 vs ~0.62 on in-silico decoys), unlike the
 decoy-trained regime, where a native linear model is all in-silico decoys can
@@ -827,56 +794,19 @@ reported IDs are the real targets only (spike-in excluded, `is_reported`).
 The report also records `entrapment_peptides_at_1pct`, a leak check on spike-in
 peptides passing the 1% gate (`count_distinct`).
 
-### MBR (Stage D3)
+### MBR (Stage D3, removed in 0.15.0)
 
-`mbr_worker.py` (`main.rs:671-711` `Cmd::Mbr`, `sidecar.rs:162` `run_mbr`).
-Requires `mbr.strategy != none`, `>= 2` runs, and `mbr.python`
-(`main.rs:680-692`). Reads the experiment-wide scored table and per-run apex RTs.
-It builds per-run to-reference / from-reference RT maps by monotone binned-median
-calibration against run 0 (`binned_map`, `mbr_worker.py:31-43`, needs >= 200
-shared anchors else identity). For a precursor confident (target, `q<=q_anchor`)
-in `>= min_anchor_runs` OTHER runs but sub-threshold in a target run where it was
-still extracted (the **rescuable** tier), it predicts RT as the from-ref map of
-the median of the other runs' to-ref-mapped apex RTs (`expected_rt`,
-`mbr_worker.py:116-121`). The false-transfer FDR uses a **permuted-RT
-decoy-transfer null**: each candidate is assigned a shuffled candidate's predicted
-RT, and transfer q is standard target/decoy competition on `|observed - predicted|`
-(`mbr_worker.py:190-199`). An optional fragment-consensus cosine guard
-(`--frag-csv`/`--consensus-corr-min`) rejects RT-concordant interference
-(`mbr_worker.py:209-241`). `--emit-transfer-targets` instead emits per-run
-`run_windows` for the **absent** set (confident elsewhere, not extracted here) so
-`extract --restrict-candidates --run-windows` can re-extract them (the
-re-extraction tier). `run_mbr` (`sidecar.rs:162-213`) drives only the **rescuable
-tier**: it passes `<scored> <psms_csv> <out>`, the `--q-anchor/--min-anchor-runs/
---q-transfer/--seed` values, and optionally `--out-scored` and (only when `frag`
-paths are given and `consensus_corr_min > 0`) `--frag-csv/--consensus-corr-min`.
-It never passes `--emit-transfer-targets` or `--rt-window`, so the re-extraction
-tier is a manual worker invocation. `--seed` receives the engine-wide
-`rng_seed` (`main.rs:709`), not an MBR-specific field. Note the MBR sidecar is
-validated as a prototype but Stage D3 is a stub in the engine (config hooks only;
-not in the `run` chain).
-
-Every lookup the worker makes is for a candidate that is a confident target of some
-run (`allc`, the union of the per-run confident sets), so the per-run apex maps and
-the per-candidate metadata hold only those candidates, and rescore's selected-peak
-lookup is built only for a run whose competed table has several peaks of one
-candidate (never under the default `extract.promote_top_peaks = 1`). The accepted
-transfers are flagged in the augmented scored table by one sorted-key lookup on
-`(source, candidate_id)` instead of a Python loop over every row (`flag_transfers`),
-and the frames the flagging no longer needs are released before the whole scored
-table is loaded. On the 258.75M-row pooled immunopeptidomics experiment the
-survey estimated about 100 GB of worker memory and 4-6 minutes of Python loops for
-what these replace. The confident sets, and so the iteration order of `allc` that the
-permuted-RT null depends on, are built from the same rows in the same order as before;
-`test_the_worker_writes_the_reference_workers_bytes` compares every output, with and
-without retained top-K peaks, byte for byte against the worker before the change.
+`mbr_worker.py`, the `mumdia mbr` command and `sidecar::run_mbr` were removed in 0.15.0,
+with `mbr.strategy = rt_transfer`. Their transfers measured 2.3-2.7% entrapment FDP at a 1%
+cut; the second pass of `run-experiment` replaces them (docs/12, "Second pass").
 
 ### DIA-NN recipe (offline, license-clean)
 
 Run once by the user, who must hold their own DIA-NN license (MuMDIA ships no
 DIA-NN). `import_diann_lib.py` filters to targets, b/y no-loss fragments, and
-peptides carrying only Carbamidomethyl/Oxidation (the only mapped mods,
-`import_diann_lib.py:28-37`), rewrites `(UniMod:4/35)` to ProForma bracket names,
+peptides whose modifications are all kept: UniMod 4, 35, 44, 48 and 376 by
+default, or the accessions `--keep-unimod` names. It rewrites `(UniMod:N)` to
+ProForma bracket names,
 sorts precursors by m/z with a stable mergesort and assigns contiguous
 `candidate_id` (`:52-56`), derives `base_peptide_id` by factorizing
 `Stripped.Sequence` (`:55`), and builds each fragment `name` as
@@ -885,9 +815,9 @@ sorts precursors by m/z with a stable mergesort and assigns contiguous
 ProteoBench metric. Then the decoy builder adds the null population:
 `make_reverse_decoys.py` reverses each target keeping the C-terminal residue,
 recomputes the real b/y m/z of the reversed sequence from a 20-residue monoisotopic
-mass table plus a `UNIMOD` mod-mass dict (Carbamidomethyl, Oxidation, Acetyl,
-Phospho, Deamidated, Methyl, Dimethyl, Carbamyl; an unknown bracket name falls
-back to parsing a numeric `+mass` string, `make_reverse_decoys.py:26-50`),
+mass table plus the modification masses of `_unimod.py` (a numeric `+mass` delta is
+still parsed; a precursor with an unknown modification name gets no decoy, with a
+warning),
 validated against the library's own target m/z to < 5 ppm at the 99th percentile
 over the first 500 target precursors (`make_reverse_decoys.py:97-107`), and
 enforces a hard no-overlap
@@ -909,7 +839,7 @@ search.
 
 | name | file:line | what it does |
 |---|---|---|
-| `resolve_script` | `sidecar.rs:20` | Resolve a worker path: CWD-relative dir, then `<exe_dir>/<dir>`, then `<exe_dir>/scripts`, else CWD-relative fallback |
+| `resolve_script` | `sidecar.rs:20` | Resolve a worker path: an absolute dir as given, else `<exe_dir>/<dir>`, then `<exe_dir>/scripts`, and the CWD-relative path last |
 | `run_worker` | `sidecar.rs:217` | Spawn `python <script> <argv...>`; `utf8=true` sets `PYTHONUTF8`/`PYTHONIOENCODING` (DeepLC/Keras crash on Windows cp1252) |
 | `run_ms2pip` | `sidecar.rs:42` | Write ms2pip_in.parquet, run worker, fold output to `HashMap<u32,HashMap<(u8,u16),f32>>` |
 | `run_deeplc` | `sidecar.rs:81` | Write deeplc_in.parquet, run worker with the engine's thread count, return `HashMap<u32,f32>` (`utf8=true`) |
@@ -917,22 +847,19 @@ search.
 | `read_id_scalars` | `sidecar.rs` | Read a worker's `id -> value` table: requested ids only, each once, an optional finite-positive check |
 | `model_identity` | `sidecar.rs` | `<module>-<version>-<suffix>` for a sidecar model; `deeplc_identity` is its DeepLC case |
 | `run_deeplc_finetune` | `sidecar.rs:111` | Run `deeplc_finetune.py <lib_in> <seed> <lib_out> --epochs --patience --q-train --batch --window-holdout-frac --seed --predict-threads` (`utf8=true`) |
-| `run_mbr` | `sidecar.rs:162` | Run `mbr_worker.py <scored> <psms_csv> <out> [--out-scored] [--frag-csv --consensus-corr-min] --q-anchor --min-anchor-runs --q-transfer --seed` |
 | `run_pin_sidecar` | `rescore.rs` | Write PIN keyed by row index, run mokapot/nn worker, map `score` back by row index |
 | `run_entrapment_gbm` | `rescore.rs` | Write features+meta Parquet, run entrapment worker, map `score` back by `row_id` |
 | `align_sidecar_scores` | `rescore.rs` | Validate + align a sidecar's `(row_id, score)`: exact, unique, finite coverage or bail |
 | `make_model` | `mokapot_worker.py:35` | Build the mokapot model from `MUMDIA_RESCORE_MODEL` (nn/logreg/xgb/percolator) |
 | `tda_q` | `nn_rescore_worker.py:77` | Target-decoy q: `(decoys+1)/max(1,targets)`, running min from the tail |
 | `one_pass` | `nn_rescore_worker.py:225` | One CV pass -> OOF scores; per fold iterate positive re-selection + MLP retrain |
-| `binned_map` | `mbr_worker.py:31` | Monotone binned-median RT calibration x->y (80 bins) |
-| `expected_rt` | `mbr_worker.py:116` | Cross-run predicted RT of a candidate in a run from the other runs' anchors |
 | `frag_mz` / `reverse_keep_cterm` / `stable_seed` / `splitmix` | `make_reverse_decoys.py:58/56/74/65` | Residue-mass b/y m/z; C-term-fixed reversal; process-independent FNV-1a seed; seeded PRNG for scramble |
 
 ## Interpreter resolution
 
 Each sidecar role has one config field naming the Python that runs it:
 `rescore.python`, `predict_frag.deeplc_python`, `predict_frag.ms2pip_python`,
-`predict_frag.peptdeep_python`, `predict_frag.im2deep_python`, `mbr.python`. Implemented in `rust/mumdia/crates/mumdia/src/python.rs`.
+`predict_frag.peptdeep_python`, `predict_frag.im2deep_python`. Implemented in `rust/mumdia/crates/mumdia/src/python.rs`.
 
 A field may hold an absolute path, which is used as given and never
 second-guessed, or the string `"auto"` (or be absent), which asks the engine to
@@ -940,7 +867,7 @@ find one. Discovery order, from `python.rs`:
 
 | order | source | provenance reported |
 |---|---|---|
-| 1 | `MUMDIA_PYTHON_RESCORE` / `_DEEPLC` / `_MS2PIP` / `_PEPTDEEP` / `_IM2DEEP` / `_MBR` | the variable name |
+| 1 | `MUMDIA_PYTHON_RESCORE` / `_DEEPLC` / `_MS2PIP` / `_PEPTDEEP` / `_IM2DEEP` | the variable name |
 | 2 | `MUMDIA_PYTHON` (all roles) | `MUMDIA_PYTHON` |
 | 3 | `CONDA_PREFIX`: `bin/python`, `python.exe`, `Scripts/python.exe` | `CONDA_PREFIX` |
 | 4 | `VIRTUAL_ENV`, same three layouts | `VIRTUAL_ENV` |
@@ -958,7 +885,6 @@ stage hours later. The module lists live on `Role::modules` and are the same one
 | `DeepLc` | deeplc, numpy, pandas, pyarrow, torch, psm_utils |
 | `Ms2pip` | ms2pip, numpy, pandas |
 | `Peptdeep` | peptdeep, alphabase, torch, numpy, pandas, pyarrow |
-| `Mbr` | numpy, pyarrow |
 | `Im2deep` | im2deep, psm_utils, torch, numpy, pyarrow |
 
 Discovery reuses no other role's interpreter on its own: IM2Deep is found where the
@@ -972,7 +898,7 @@ with a log line rather than an error.
 A role is resolved only when the configuration actually uses it
 (`Role::required_by`): the rescorer classifier for `Rescore`;
 `rt_predictor`, `finetune_deeplc`, `library_irt = deeplc` or an explicit multi-head head
-count for `DeepLc`; `predictor` for `Ms2pip` and `Peptdeep`; `mbr.strategy` for `Mbr`; and
+count for `DeepLc`; `predictor` for `Ms2pip` and `Peptdeep`; and
 `im_predictor = im2deep` for `Im2deep`. A role can also be wanted without being required
 (`Role::wanted_by`: DeepLC under `library_irt = auto`, IM2Deep under `im_predictor = auto`),
 in which case a miss is a log line, not an error. A default native run therefore
@@ -1028,18 +954,12 @@ configured.
 | `rescore.entrapment_exclude` | `None` | substring that un-marks the sample's own species |
 | `rescore.entrapment_contaminant_markers` | `[]` | substrings for genuine contaminants (kept as real targets) |
 | `rescore.entrapment_ratio` | `1.0` | `N_real_lib / N_entrap_lib` scaling of the entrapment FDR |
-| `mbr.strategy` | `none` | `empirical_library`/`rt_transfer`/`full` engage `mbr_worker.py` |
-| `mbr.python` | `None` | interpreter for MBR (required when `strategy != none`) |
-| `mbr.q_anchor` / `min_anchor_runs` / `q_transfer` | `0.01` / `2` / `0.01` | `--q-anchor` / `--min-anchor-runs` / `--q-transfer` (anchor/transfer FDR + min supporting runs) |
-| `mbr.consensus_corr_min` | `0.0` | `--consensus-corr-min` fragment-consensus guard threshold (0 = off; only passed when `frag` paths are also supplied, `sidecar.rs:209`) |
-| `mbr.rt_window_s` | `20.0` | transfer half-window (>= p95 M2 residual ~17 s) for the `--emit-transfer-targets` re-extraction tier. **Not wired through `run_mbr`** (`sidecar.rs:193-211` passes neither `--rt-window` nor `--emit-transfer-targets`); the worker uses its own `--rt-window` default of 20.0 when run by hand. |
-| `mbr.decoy_transfer` | `permuted_rt` | `DecoyTransfer` enum (`permuted_rt`/`reverse_sequence`/`both`, `config.rs:857-869`) selecting the false-transfer null. **Unwired**: `run_mbr` never passes it and the worker implements only the permuted-RT null (`mbr_worker.py:176-199`). |
-| `mbr.requant_all` | `false` | requantify already-identified precursors, not only transfers; only meaningful for `strategy = full`. **Unwired** in the current `mbr_worker.py`. |
+| `mbr.python` | `None` | read by nothing since the MBR transfer worker was removed in 0.15.0; an `"auto"` is still cleared to null |
 
 **Worker-only env knobs** (not config fields; set in the process environment).
-`mokapot_worker.py`: `MUMDIA_RESCORE_MODEL` (default `nn`; accepts the aliases
-`logreg`/`logistic`/`lr`, `xgb`/`xgboost`, and `percolator`/`linear`/`svm`,
-`mokapot_worker.py:36-76`), `MUMDIA_BREW_ITERS` (20, the `Model.max_iter`
+`mokapot_worker.py`: `MUMDIA_RESCORE_MODEL` (default `logreg`; accepts `nn` and the aliases
+`logreg`/`logistic`/`lr`, `xgb`/`xgboost`, and `percolator`/`linear`/`svm`),
+`MUMDIA_BREW_ITERS` (20, the `Model.max_iter`
 semi-supervised count), `MUMDIA_NN_HIDDEN` (`128,64,64,32`), `MUMDIA_NN_SOLVER`
 (adam), `MUMDIA_NN_MAX_ITER` (200), `MUMDIA_NN_ALPHA` (1e-4); logreg reads
 `MUMDIA_LR_C` (1.0) and `MUMDIA_LR_MAX_ITER` (1000); xgb reads `MUMDIA_XGB_TREES`
@@ -1061,10 +981,14 @@ back to the pre-2026-09-25 code paths
 (`MUMDIA_NN_FINAL_POOL_SCORE`, `MUMDIA_NN_GATHER`, `MUMDIA_NN_SCAN_THREADS`,
 `MUMDIA_NN_LOAD_THREADS`, `MUMDIA_NN_READ_AHEAD`, `MUMDIA_NN_PRE_BUFFER`,
 `MUMDIA_NN_SELECT`),
-plus the three the Rust caller injects: `MUMDIA_NN_FOLDS` (worker default
-3), `MUMDIA_NN_ITERS` (worker default 5, but `run_pin_sidecar` overrides it with
-`rescore.num_iter` = 10), `MUMDIA_NN_TRAIN_FDR` (0.01). These worker defaults
-apply only when the sidecar is run standalone. `entrapment_worker.py`:
+plus the eleven the Rust caller sets from `rescore.*` (`NN_ENV_SET_BY_ENGINE`):
+`MUMDIA_NN_FOLDS` (worker default 3), `MUMDIA_NN_ITERS` (worker default 5, but the
+engine passes `rescore.num_iter` = 10), `MUMDIA_NN_TRAIN_FDR` (0.01),
+`MUMDIA_NN_NEG_RATIO`, `MUMDIA_NN_NEG_SELECT`, `MUMDIA_NN_TRAIN_SUB`,
+`MUMDIA_NN_WARM_START`, `MUMDIA_NN_WARM_EPOCHS`, `MUMDIA_NN_MARGIN_FRAC`,
+`MUMDIA_NN_SEEDS` (`rescore.seeds`) and `MUMDIA_NN_FOLD_KEYS`. The engine
+overwrites an exported value of any of these without a warning; set the `rescore.*`
+key instead. The worker defaults apply only when the sidecar is run standalone. `entrapment_worker.py`:
 `MUMDIA_ENTRAPMENT_MODEL` (`gbm`|`nn`). `ms2pip_worker.py` and `peptdeep_worker.py`:
 `MUMDIA_MODEL_DIR`, unset by default, moves the model files each downloads on first use
 from `~/.ms2pip` and `~/peptdeep` to `<MUMDIA_MODEL_DIR>/ms2pip` (MS2PIP's `model_dir`)
@@ -1074,11 +998,11 @@ locates its model archive). Every worker inherits the temporary directory the en
 chose: with `--temp-dir` or `MUMDIA_TEMP_DIR` the engine sets `TMP`, `TEMP`, `TMPDIR` and,
 unless set, `MPLCONFIGDIR` before it starts a worker (docs/14, "Where MuMDIA writes").
 `deeplc_finetune.py`: `DEEPLC_FT_THREADS`
-(8, the training pool) plus argparse flags. Note the mokapot worker's **code default
-model is `nn`** (the sklearn MLP inside mokapot), even though the recommended portable path
-(`env/mumdia-rescore.yml`) sets `MUMDIA_RESCORE_MODEL=logreg`; the Rust caller
-does not set `MUMDIA_RESCORE_MODEL`, so unless the environment sets it you get the
-MLP. Set it explicitly for the logreg path.
+(8, the training pool) plus argparse flags. The mokapot worker's default model is
+logistic regression on every install (Docker image, conda env, desktop, release archive);
+before 2026-11-20 only the Docker image set `MUMDIA_RESCORE_MODEL=logreg` and every other
+install trained the sklearn MLP. The Rust caller does not set the variable, and records the
+model as `mokapot-<MUMDIA_RESCORE_MODEL or logreg>`.
 
 ## Invariants, determinism, gotchas
 
@@ -1090,15 +1014,11 @@ MLP. Set it explicitly for the logreg path.
   index (`SpecId=psm_<i>`, `ScanNr=<i>`, `HandoffWriter::push_row`) and the entrapment
   Parquet carries a separate `row_id` (`run_entrapment_gbm`). Keying on
   `candidate_id` would collide and collapse runs.
-- **resolve_script Windows-path gotcha.** The build target dir is redirected off
-  the OneDrive tree (`C:/Users/robbi/mumdia_build/...`), while `scripts/` lives
-  under the OneDrive project. So `<exe_dir>/scripts` does NOT exist next to the
-  binary on this machine; `resolve_script` finds the workers only via the
-  CWD-relative branch (`sidecar.rs:19-21`). Run from the project root, or set
-  `predict_frag.sidecar_script_dir` (and it is reused for rescore/MBR) to an
-  absolute path, e.g. `/opt/mumdia/scripts` in the Docker configs. If none of the
-  three candidates exist it returns the CWD-relative path so the eventual spawn
-  error names it (`sidecar.rs:32`).
+- **Worker script resolution.** An absolute `sidecar_script_dir` is used as
+  given; a relative one is tried against the config file's directory, then next to
+  the executable, and the working directory last (configs/README.md, "Where the
+  worker scripts have to be"). `predict_frag.sidecar_script_dir` is reused for
+  rescore and MBR.
 - **UTF-8.** `run_deeplc`/`run_deeplc_finetune` pass `utf8=true`; the PIN and
   entrapment sidecars set `PYTHONUTF8=1` directly. MS2PIP and MBR do not
   (`sidecar.rs:63, 99, 152, 212`).
@@ -1255,7 +1175,10 @@ MLP. Set it explicitly for the logreg path.
     buffer (0.1 GB at 387 features) for the duration of the load, and one extra decoded
     row group is resident; with one fill thread the buffer is the main thread's and is
     released when the load ends. `MUMDIA_NN_LOAD_THREADS=0` restores the old serial loop
-    without read-ahead.
+    without read-ahead. The streaming backend fills its memmap with the same loader (and
+    the raw handoff's), reading only the per-row metadata in batches of its own; before
+    2026-11-20 it had a slower loader whose float64 moments were summed over other blocks,
+    so a streamed pool can differ from earlier runs in the last bits.
   - `MUMDIA_NN_SELECT` (default `window`): each round's positives are the targets up
     to the last position of the stable descending order whose FDR
     `(decoys+1)/max(targets,1)` is at or below the training FDR, so only a top window
@@ -1277,23 +1200,26 @@ MLP. Set it explicitly for the logreg path.
     float32 to that subnormal where the main thread gives 0.0, and a scan thread ranks
     a float32 subnormal above 0.0 where the main thread ties them.
 
-  Three tests in `tests/python` (they need torch) hold the default path to the old
-  scores on the host that runs them. `test_default_speedups_leave_scores_byte_identical`
-  runs the worker with every switch set back and with the defaults, for the in-memory
-  and the streaming backend. `test_default_path_scores_as_the_reference_worker` runs the
+  Tests in `tests/python` (they need torch) hold the default path to the old scores on
+  the host that runs them. `test_default_speedups_leave_scores_byte_identical` runs the
+  worker with every switch set back and with the defaults, for the in-memory and the
+  streaming backend. `test_default_path_scores_as_the_reference_worker` runs the
   worker as it was before these changes (extracted with `git show` from
   `REFERENCE_COMMIT`, skipped without the history) against the current one, for the
-  in-memory, streaming and TSV paths, which also covers the refactors that have no
-  switch (the training loop moved into `_build_trainer`, the `_entry` wrapper). Both use
+  in-memory and TSV paths, which also covers the refactors (the training loop moved into
+  `_build_trainer`, the `_entry` wrapper); `test_the_serial_loop_scores_as_the_serial_reference_worker`
+  does the same for `MUMDIA_NN_PARALLEL=0`, and
+  `test_the_streaming_backend_scores_as_the_in_memory_backend` holds the streaming
+  backend to the in-memory scores, since both fill the matrix with one loader. They use
   a pool with several row groups, non-finite and subnormal cells, nulls and ties, and
-  make the default arm run the threaded init scan. `test_thread_pools_compute_under_the_main_threads_flush_to_zero`
+  the default arm runs the threaded init scan. `test_thread_pools_compute_under_the_main_threads_flush_to_zero`
   compares the threaded fill, standardisation and scan with the serial code under
   flush-to-zero, on inputs where the thread state decides the bytes. When a later
   change moves the default scores on purpose, `REFERENCE_COMMIT` is moved to the
   commit that made it.
 - **Concurrent fold training is the default** (`MUMDIA_NN_PARALLEL=auto` since
   2026-09-27; `0` is the serial loop, the default before). Serially the folds, and the
-  seeds when `MUMDIA_NN_SEEDS > 1`, train one after another on at most 16 threads, while
+  seeds when `rescore.seeds > 1`, train one after another on at most 16 threads, while
   the MLP does not get faster past 16 (8 on an EPYC 9354), so most of a large host idles
   through the rescore. The worker trains the (seed, fold) tasks in spawned processes at
   `MUMDIA_NN_PARALLEL_THREADS` torch threads each (default: the serial worker's
@@ -1381,10 +1307,8 @@ MLP. Set it explicitly for the logreg path.
   threading the NN scores drift slightly; logreg is near bit-exact.
   `nn_rescore_worker.py` seeds torch/numpy per seed and the fold split is a
   content hash, but training is only approximately reproducible (use
-  `MUMDIA_NN_SEEDS>1` to average out variance). `entrapment_worker.py` GBM is
+  `rescore.seeds > 1` to average out variance). `entrapment_worker.py` GBM is
   reproducible (`early_stopping=False`, `random_state=0`); the NN variant is not.
-  `mbr_worker.py` is deterministic given `--seed` (`np.random.default_rng(seed)`
-  for the permuted-RT null).
 - **make_reverse_decoys scramble is deterministic and process-independent.** The
   re-scramble PRNG for the collision/palindrome path is a SplitMix64 (`splitmix`,
   `make_reverse_decoys.py:65`) seeded from a process-independent FNV-1a hash of the

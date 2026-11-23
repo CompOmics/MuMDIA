@@ -10,7 +10,11 @@ edit it, and pass it with `--config`. Every field not mentioned keeps its defaul
 | `examples/fasta-sidecars.json` | MS2PIP, DeepLC, nn_torch | Digest a FASTA, predict fragment intensities with MS2PIP and retention time with DeepLC, rescore with `nn_torch`. One environment (`env/mumdia-deeplc.yml`) serves all three. |
 | `examples/diann-library.json` | DeepLC, PyTorch | Consume an imported DIA-NN library, re-predict its retention times once with the DeepLC base model (`rt_im_train.library_irt = auto`; DeepLC >= 4.5.0) and calibrate them per run, rescore with the PyTorch NN. This is the highest-sensitivity workflow measured so far (`docs/20_sensitivity_and_quantification_playbook.md`). |
 | `examples/fasta-peptdeep.json` | AlphaPeptDeep, DeepLC, PyTorch | The FASTA workflow with AlphaPeptDeep fragment intensities (`env/mumdia-peptdeep.yml`) in place of MS2PIP. |
-| `examples/diapasef.json` | AlphaPeptDeep, DeepLC, IM2Deep, PyTorch | diaPASEF (timsTOF `.d`, read natively): the FASTA workflow with AlphaPeptDeep at the timsTOF settings, IM2Deep 1/K0, the 1/K0 gate and features, retrace with the re-pick, the second pass and the cross-run quant selectors. On diaPASEF input the MS1 noise filter and search anchors are on by default; the other TIMS keys it sets, and the diaPASEF support gate (off since 2026-11-19), are off by default. Keep its `rt_window_multiplier` of 1.0: the 1.5 of the Orbitrap examples costs peptides on diaPASEF (`docs/35_diapasef.md` section 9). |
+| `examples/diapasef.json` | AlphaPeptDeep, DeepLC, IM2Deep, PyTorch | diaPASEF (timsTOF `.d`, read natively): the FASTA workflow with AlphaPeptDeep at the timsTOF settings, IM2Deep 1/K0, the 1/K0 gate and features, retrace with the re-pick and the second pass; it uses the default quantification. On diaPASEF input the MS1 noise filter and search anchors are on by default; the other TIMS keys it sets, and the diaPASEF support gate (off since 2026-11-19), are off by default. Keep its `rt_window_multiplier` of 1.0: the 1.5 of the Orbitrap examples costs peptides on diaPASEF (`docs/35_diapasef.md` section 9). |
+| `examples/ztscan.json` | DeepLC, PyTorch | SCIEX ZT Scan DIA: the imported-library workflow with the ZT Scan keys written out. A search of ZT Scan files resolves the same keys automatically; this file states them (`docs/37_ztscan.md`). |
+| `examples/prescreen-balanced.json` | DeepLC, PyTorch | The imported-library workflow with the RT-free prescreen at its `balanced` preset (`docs/34_prescreen.md`). |
+| `examples/prescreen-components.json` | DeepLC, PyTorch | As `prescreen-balanced.json`, with the tag retrieval, rescue and localisation components of the prescreen turned on and its scores written (`docs/34_prescreen.md`). |
+| `examples/prescreen-oxidation.json` | DeepLC, PyTorch | A custom prescreen restricted to oxidised-methionine peptidoforms (`docs/34_prescreen.md`). |
 
 Check any of them before a long run:
 
@@ -29,7 +33,7 @@ find one that can import what that worker imports. The search order is
 
 1. the role's own environment variable: `MUMDIA_PYTHON_RESCORE`,
    `MUMDIA_PYTHON_DEEPLC`, `MUMDIA_PYTHON_MS2PIP`, `MUMDIA_PYTHON_PEPTDEEP`,
-   `MUMDIA_PYTHON_IM2DEEP`, `MUMDIA_PYTHON_MBR`;
+   `MUMDIA_PYTHON_IM2DEEP`;
 2. `MUMDIA_PYTHON`, for all roles at once;
 3. an activated environment, via `CONDA_PREFIX` or `VIRTUAL_ENV`;
 4. `python3`, then `python`, on `PATH`.

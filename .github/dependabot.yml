@@ -60,6 +60,13 @@ updates:
     schedule:
       interval: monthly
     open-pull-requests-limit: 2
+    ignore:
+      # The rust tag follows rust/mumdia/rust-toolchain.toml (see the Dockerfile).
+      - dependency-name: rust
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+          - version-update:semver-patch
 
   # No `pip` entry, deliberately. The Python dependency surface lives in the pip
   # sections of the conda specifications under `env/`, which Dependabot does not

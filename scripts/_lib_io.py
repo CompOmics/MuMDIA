@@ -68,8 +68,7 @@ def narrow_table(table: pa.Table) -> pa.Table:
     """An arrow Table cast to the 32-bit-offset encoding the engine accepts.
 
     Separate from `to_engine_table` because not every producer starts from pandas:
-    `mbr_worker.py` builds its transfers table with `pa.array` calls directly, and a
-    string built by `pa.array` from a numpy object array is just as likely to come out
+    a table built with `pa.array` calls directly, and a string built by `pa.array` from a numpy object array is just as likely to come out
     `large_string` as one pandas chose.
     """
     schema = pa.schema(

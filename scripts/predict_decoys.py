@@ -335,6 +335,11 @@ def build(a):
     work = a.work or os.path.join(os.path.dirname(os.path.abspath(a.out_prec)), "decoy_prediction")
     os.makedirs(work, exist_ok=True)
     stem = "decoys"
+    # A failed or stopped earlier attempt may have left its outputs here, and
+    # find_parquet would take them before this run's prediction.
+    for old in glob.glob(os.path.join(work, f"{stem}*")):
+        if os.path.isfile(old):
+            os.remove(old)
     lib_tsv = os.path.join(work, f"{stem}.tsv")
     tsv(a.in_prec, a.in_frag, lib_tsv)
     prec = pd.read_parquet(a.in_prec, columns=["peptidoform", "label"])

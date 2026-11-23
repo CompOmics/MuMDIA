@@ -55,7 +55,7 @@ pub fn is_mzml(path: &str) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("mzml"))
 }
 
-/// Probe one file with `census` (the engine's peak census of its first 2,000 spectra).
+/// Probe one file with `census` (the engine's peak census of its first `PROBE_SPECTRA` spectra).
 fn probe_with(
     path: &str,
     census: &(dyn Fn(&str) -> Result<serde_json::Value, String> + Sync),

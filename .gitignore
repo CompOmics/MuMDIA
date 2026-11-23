@@ -47,7 +47,6 @@ scripts/_probe*.py
 !/CHANGELOG.md
 !/CONTRIBUTING.md
 !/SECURITY.md
-!/CODE_OF_CONDUCT.md
 !/THIRD_PARTY_LICENSES.md
 # local archive of superseded working docs (not published)
 /_archive/

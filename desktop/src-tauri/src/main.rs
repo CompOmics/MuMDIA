@@ -20,7 +20,6 @@ struct AppState {
     next_id: AtomicU64,
     installer: Arc<components::Installer>,
     diann: Arc<diann::Builder>,
-    diann_installer: Arc<diann::Installer>,
     thermo: Arc<thermo::Installer>,
     viewers: Arc<viewer::Viewers>,
     vcruntime: Arc<mumdia_console::vcruntime::Installer>,
@@ -63,20 +62,20 @@ async fn diann_status() -> Result<serde_json::Value, String> {
 }
 
 /// Remember a DIA-NN the user pointed at, or forget it when `path` is absent.
-#[tauri::command]
+#[tauri::command(async)]
 fn diann_set_path(path: Option<String>) -> Result<diann::Status, String> {
     diann::set_path(path.as_deref())
 }
 
 /// Record that the licence notice was read and accepted. Nothing runs before it is.
-#[tauri::command]
+#[tauri::command(async)]
 fn diann_acknowledge(accepted: bool) -> Result<diann::Status, String> {
     diann::acknowledge_licence(accepted)
 }
 
 /// Predict a spectral library from a FASTA with the user's DIA-NN, then convert it
 /// into the two tables a search consumes.
-#[tauri::command]
+#[tauri::command(async)]
 fn diann_build(state: tauri::State<'_, AppState>, req: diann::BuildRequest) -> Result<(), String> {
     diann::build(Arc::clone(&state.diann), req)
 }
@@ -84,7 +83,7 @@ fn diann_build(state: tauri::State<'_, AppState>, req: diann::BuildRequest) -> R
 /// Convert a DIA-NN library the user already has (`.parquet` or `.speclib`) into the two
 /// tables a search consumes, with DIA-NN predicting the decoys' spectra. Progress is the
 /// library build's (`diann_build_state`).
-#[tauri::command]
+#[tauri::command(async)]
 fn diann_import(
     state: tauri::State<'_, AppState>,
     req: diann::ImportRequest,
@@ -92,40 +91,10 @@ fn diann_import(
     diann::import(Arc::clone(&state.diann), req)
 }
 
-/// Merge an empirical library with a predicted one into the two tables a search consumes,
-/// with DIA-NN predicting the decoys of the merged targets (#320). Progress is the library
-/// build's (`diann_build_state`).
-#[tauri::command]
-fn diann_merge(state: tauri::State<'_, AppState>, req: diann::MergeRequest) -> Result<(), String> {
-    diann::merge(Arc::clone(&state.diann), req)
-}
-
 /// Progress of the library build, polled while it runs.
 #[tauri::command]
 fn diann_build_state(state: tauri::State<'_, AppState>) -> diann::BuildState {
     state.diann.snapshot()
-}
-
-/// Whether this platform can be offered the pinned DIA-NN 1.8.1 download, and what
-/// it costs in bandwidth and disk.
-#[tauri::command]
-fn diann_offer() -> serde_json::Value {
-    diann::offer()
-}
-
-/// Fetch DIA-NN 1.8.1 from the vendor's own release URL onto this machine.
-///
-/// MuMDIA neither ships nor mirrors those bytes; see the module comment in
-/// `diann.rs` for why that distinction is the entire basis for offering this.
-#[tauri::command]
-fn diann_install(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    diann::install(Arc::clone(&state.diann_installer))
-}
-
-/// Progress of the download, polled while it runs.
-#[tauri::command]
-fn diann_install_state(state: tauri::State<'_, AppState>) -> diann::InstallState {
-    state.diann_installer.snapshot()
 }
 
 /// Whether the Thermo `.raw` converter is installed, and the last install's progress.
@@ -194,7 +163,7 @@ fn vendor_of(path: String) -> serde_json::Value {
 }
 
 /// Path to msconvert, if the engine can find one.
-#[tauri::command]
+#[tauri::command(async)]
 fn msconvert_status() -> Option<String> {
     thermo::msconvert_available()
 }
@@ -203,7 +172,7 @@ fn msconvert_status() -> Option<String> {
 ///
 /// Asked before the search starts, so the interface can say "already built" or "this
 /// takes a while" instead of the user discovering which after pressing Start.
-#[tauri::command]
+#[tauri::command(async)]
 fn diann_library_plan(req: diann::BuildRequest) -> Result<serde_json::Value, String> {
     diann::library_plan(req)
 }
@@ -218,7 +187,7 @@ fn diann_cancel(state: tauri::State<'_, AppState>) {
 }
 
 /// Which engine will be used, and does it execute.
-#[tauri::command]
+#[tauri::command(async)]
 fn engine_info() -> Result<engine::Info, String> {
     engine::info()
 }
@@ -366,9 +335,6 @@ fn managed_work_in_progress(state: &AppState) -> Option<String> {
     if state.thermo.busy() {
         return Some("the Thermo converter is being installed".into());
     }
-    if state.diann_installer.snapshot().status == "running" {
-        return Some("DIA-NN is being downloaded".into());
-    }
     if state.diann.snapshot().status == "running" {
         return Some("a spectral library is being built".into());
     }
@@ -398,7 +364,7 @@ async fn components_removable() -> Result<serde_json::Value, String> {
 
 /// The storage folder: where it is, how much room it has, and whether it can be written
 /// (`storage::info`).
-#[tauri::command]
+#[tauri::command(async)]
 fn storage_info() -> mumdia_console::storage::Info {
     mumdia_console::storage::info()
 }
@@ -411,7 +377,7 @@ fn storage_info() -> mumdia_console::storage::Info {
 /// would carry on in the old place. Nothing is copied: the caches, libraries and models
 /// are rebuilt or downloaded again where the new folder is, and the old folder can be
 /// cleared from the Managed data card before the change or removed by hand.
-#[tauri::command]
+#[tauri::command(async)]
 fn storage_set(
     state: tauri::State<'_, AppState>,
     folder: Option<String>,
@@ -422,6 +388,9 @@ fn storage_set(
             "{busy}. Wait for it to finish, or stop it, before changing the storage folder."
         ));
     }
+    // Off the window thread now, so two clicks could otherwise interleave their writes.
+    static SET: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = SET.lock().unwrap_or_else(|e| e.into_inner());
     mumdia_console::storage::set(folder.as_deref(), move_environments)?;
     // The install trackers keep a terminal state that describes the old folders.
     for env in [
@@ -432,7 +401,6 @@ fn storage_set(
         state.installer.forget(env);
     }
     state.thermo.forget();
-    state.diann_installer.forget();
     state.diann.forget();
     Ok(mumdia_console::storage::info())
 }
@@ -465,7 +433,6 @@ async fn components_remove(
         "ms2pip" => state.installer.forget(components::Env::Ms2pip),
         "visdia" => state.installer.forget(components::Env::Visdia),
         "thermo" => state.thermo.forget(),
-        "diann" => state.diann_installer.forget(),
         "libraries" => state.diann.forget(),
         _ => {}
     }
@@ -480,7 +447,7 @@ async fn components_remove(
 ///
 /// Checked here rather than at the moment of starting, so the interface can explain
 /// and offer a fix instead of reporting a failure.
-#[tauri::command]
+#[tauri::command(async)]
 fn preflight(
     state: tauri::State<'_, AppState>,
     req: run::Request,
@@ -631,14 +598,14 @@ fn running_dirs(state: &AppState) -> Vec<String> {
 /// a search moved on disk, one that failed or one still running is listed with the
 /// reason rather than silently left out (#282): completed searches first, newest first,
 /// then the others.
-#[tauri::command]
+#[tauri::command(async)]
 fn history(state: tauri::State<'_, AppState>, dirs: Vec<String>) -> Vec<run::HistoryItem> {
     run::history_list(&dirs, &running_dirs(&state))
 }
 
 /// Classify one folder the user picked with "Add an existing output folder", so the
 /// interface can add it to History or say why it does not.
-#[tauri::command]
+#[tauri::command(async)]
 fn history_check(state: tauri::State<'_, AppState>, dir: String) -> run::HistoryItem {
     let key = run::dir_key(&dir);
     let running = running_dirs(&state).iter().any(|d| run::dir_key(d) == key);
@@ -647,7 +614,7 @@ fn history_check(state: tauri::State<'_, AppState>, dir: String) -> run::History
 
 /// Peaks per MS2 spectrum for a chosen file, so the peak cap can be set from the
 /// file rather than from another acquisition.
-#[tauri::command]
+#[tauri::command(async)]
 fn peak_census(mzml: String) -> Result<serde_json::Value, String> {
     pf::peak_census(&mzml)
 }
@@ -951,8 +918,9 @@ async fn copy_library(
 #[tauri::command]
 fn reveal(path: String) -> Result<(), String> {
     let p = Path::new(&path);
-    if !p.exists() {
-        return Err(format!("{path} does not exist"));
+    // A folder only: opening a file would start whatever program it is.
+    if !p.is_dir() {
+        return Err(format!("{path} is not a folder"));
     }
     #[cfg(windows)]
     let r = std::process::Command::new("explorer").arg(p).spawn();
@@ -971,7 +939,7 @@ fn reveal(path: String) -> Result<(), String> {
 /// Found rather than hard-coded: the release archive carries `configs/examples/`, and
 /// listing what is actually there means a preset cannot be offered that does not
 /// exist. An empty list is a valid answer and the interface says so.
-#[tauri::command]
+#[tauri::command(async)]
 fn presets() -> Vec<serde_json::Value> {
     let mut dirs: Vec<std::path::PathBuf> = Vec::new();
 
@@ -1219,11 +1187,7 @@ fn main() {
             diann_acknowledge,
             diann_build,
             diann_import,
-            diann_merge,
             diann_build_state,
-            diann_offer,
-            diann_install,
-            diann_install_state,
             thermo_status,
             thermo_install,
             open_url,
@@ -1250,6 +1214,8 @@ fn main() {
                     }
                     // A viewer has no window of its own; nothing else would stop it.
                     state.viewers.stop_all();
+                    // A library build runs DIA-NN, which would outlive the window too.
+                    state.diann.cancel();
                 }
             }
         })

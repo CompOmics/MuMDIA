@@ -23,41 +23,9 @@ use crate::rescoring::{
 };
 use crate::stages::features::FeatureSchema;
 
-/// Fewest rows per decoded batch while streaming the ~390 feature columns of a competed
+/// Rows per decoded batch while streaming the ~390 feature columns of a competed
 /// table (~16k rows x 387 f64 is about 50 MB per batch).
 const FEATURE_BATCH_ROWS: usize = 1 << 14;
-
-/// Most rows per decoded batch of that stream: the competed row-group cap
-/// (`compete::COMPETED_ROW_GROUP_ROWS`), ~400 MB of decoded f64 at 387 features.
-const FEATURE_BATCH_ROWS_MAX: usize = 1 << 17;
-
-/// Rows per decoded batch of the feature stream over `t` under the wide-scan mode `mode`.
-///
-/// 16,384 rows (~50 MB of decoded f64) under the plain reader (the default) and the
-/// coalesced one. Under `MUMDIA_WIDE_SCAN=rowgroup` a batch is one row group: the largest
-/// row group of `t`, clamped to `[FEATURE_BATCH_ROWS, FEATURE_BATCH_ROWS_MAX]`. The arrow
-/// reader fills a batch column by column, so a batch that covers a whole row group reads
-/// every page of one column chunk before it moves to the next, which is a near-forward
-/// sweep through the row group; a 16,384-row batch visits every column chunk of the group
-/// once per batch instead (step 1 of R1 in the 2026-09-25 survey). The competed table
-/// carries the features file's 65,536-row groups or compete's own 131,072. The coalesced
-/// reader reads a row group with one sequential read whatever the batch size, so it keeps
-/// the floor. Measured from the page cache on the HYE competed table (879,018 rows,
-/// 131,072-row groups): 1.54 s plain at 16,384 rows, 1.58 s plain at a row group, 2.50 s
-/// coalesced at 16,384 rows and 2.76 s coalesced at a row group, so the larger batch buys
-/// no time where the read is not the limit and costs ~350 MB of decoded f64; whether it
-/// buys time on a seek-bound disk is not measured.
-///
-/// The rows reach the closure one at a time in file order whatever the batch size, so the
-/// handoff and the matrix are unchanged
-/// (`every_read_mode_streams_the_same_feature_rows` covers both readers and several sizes).
-fn feature_batch_rows(t: &TableFile, mode: super::WideScan) -> usize {
-    if mode != super::WideScan::RowGroup {
-        return FEATURE_BATCH_ROWS;
-    }
-    let largest = t.row_group_rows().into_iter().max().unwrap_or(0);
-    largest.clamp(FEATURE_BATCH_ROWS, FEATURE_BATCH_ROWS_MAX)
-}
 
 /// Payload bytes of the per-PSM metadata columns that stay resident beside the feature
 /// matrix for the whole stage.
@@ -872,8 +840,8 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
                 Ok(s) => {
                     info!("rescore: using Mokapot scores");
                     classifier_used = "mokapot";
-                    let estimator =
-                        std::env::var("MUMDIA_RESCORE_MODEL").unwrap_or_else(|_| "nn".to_string());
+                    let estimator = std::env::var("MUMDIA_RESCORE_MODEL")
+                        .unwrap_or_else(|_| "logreg".to_string());
                     model_identity = format!("mokapot-{estimator}");
                     s
                 }
@@ -966,7 +934,8 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
                                 "rescore: using entrapment GBM sidecar scores"
                             );
                             classifier_used = "entrapment_gbm";
-                            model_identity = "entrapment-gbm-sidecar-v1".to_string();
+                            model_identity =
+                                format!("entrapment-{}-sidecar-v1", entrapment_model());
                             qmode = QMode::Entrapment;
                             s
                         }
@@ -1270,7 +1239,11 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
         "classifier_requested": format!("{:?}", p.cfg.classifier),
         "strict": p.cfg.strict,
         "folds": p.cfg.folds,
-        "num_iter": p.cfg.num_iter,
+        "num_iter": if classifier_used == "mokapot" {
+            mokapot_brew_iters()
+        } else {
+            p.cfg.num_iter
+        },
         "train_fdr": p.cfg.train_fdr,
         "feature_schema_id": expected_schema.schema_id,
         "train_neg_ratio": p.cfg.train_neg_ratio,
@@ -2148,28 +2121,6 @@ fn run_entrapment_gbm(
     Ok(aligned)
 }
 
-/// Owns a spawned sidecar child and kills it on drop unless it was already awaited.
-/// Without this, a `mumdia` process that dies mid-rescore (Ctrl-C, kill, panic) leaves
-/// the Python worker alive holding its feature memmap, and every later rescore then fails
-/// on a file it cannot delete.
-struct ChildGuard(Option<std::process::Child>);
-
-impl ChildGuard {
-    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        let mut c = self.0.take().expect("child awaited twice");
-        c.wait()
-    }
-}
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if let Some(mut c) = self.0.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-    }
-}
-
 /// The feature matrix, for the paths that read it.
 ///
 /// It is absent in exactly two situations, both of them `rescore.strict` with a PIN
@@ -2894,14 +2845,12 @@ fn for_each_feature_row(
     feat_names: &[String],
     f: impl FnMut(usize, &[f32]) -> Result<()>,
 ) -> Result<()> {
-    // Every feature column of every row: the widest read of the stage, read as
-    // `MUMDIA_WIDE_SCAN` says (`WideScan`); the batches are the plain reader's either way.
-    let mode = super::WideScan::from_env();
+    // Every feature column of every row: the widest read of the stage.
     for_each_feature_row_with(
         competed,
         feat_names,
-        &mode.options(),
-        |t| feature_batch_rows(t, mode),
+        &mumdia_io::table::ScanOptions::default(),
+        |_| FEATURE_BATCH_ROWS,
         f,
     )
 }
@@ -3057,12 +3006,11 @@ fn for_each_feature_batch(
     keep: Option<&[bool]>,
     f: impl FnMut(&FeatureBatch<'_>) -> Result<()>,
 ) -> Result<()> {
-    let mode = super::WideScan::from_env();
     for_each_feature_batch_with(
         competed,
         feat_names,
-        &mode.options(),
-        |t| feature_batch_rows(t, mode),
+        &mumdia_io::table::ScanOptions::default(),
+        |_| FEATURE_BATCH_ROWS,
         keep,
         f,
     )
@@ -3355,7 +3303,7 @@ pub fn sidecar_work_dir(default: &str) -> String {
 
 /// Whether `MUMDIA_KEEP_HANDOFF` asks to keep the sidecar files once the scores are read
 /// back (`1`, `true`, `yes` or `on`).
-fn keep_handoff() -> bool {
+pub(crate) fn keep_handoff() -> bool {
     env_flag(std::env::var("MUMDIA_KEEP_HANDOFF").ok().as_deref())
 }
 
@@ -3376,12 +3324,13 @@ fn env_flag(v: Option<&str>) -> bool {
 /// removed only after `align_sidecar_scores` has accepted the worker's output, so a failed
 /// worker still leaves its input behind for a rerun or a look at it; `MUMDIA_KEEP_HANDOFF=1`
 /// keeps them on success too. A file that cannot be removed is reported and does not fail
-/// the stage, which has its scores.
-fn remove_sidecar_files(files: &[&str], keep: bool) -> u64 {
+/// the stage, which has its scores. The predictor workers' request and output tables
+/// (`sidecar.rs`) go the same way once read back.
+pub(crate) fn remove_sidecar_files(files: &[&str], keep: bool) -> u64 {
     if keep {
         info!(
             files = ?files,
-            "rescore: kept the sidecar files (MUMDIA_KEEP_HANDOFF)"
+            "sidecar: kept the worker files (MUMDIA_KEEP_HANDOFF)"
         );
         return 0;
     }
@@ -3391,13 +3340,13 @@ fn remove_sidecar_files(files: &[&str], keep: bool) -> u64 {
         match std::fs::remove_file(f) {
             Ok(()) => freed += bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => warn!(file = %f, error = %e, "rescore: could not remove a sidecar file"),
+            Err(e) => warn!(file = %f, error = %e, "sidecar: could not remove a worker file"),
         }
     }
     info!(
         freed = %human_bytes(freed as f64),
         files = files.len(),
-        "rescore: removed the sidecar files (set MUMDIA_KEEP_HANDOFF=1 to keep them)"
+        "sidecar: removed the worker files (set MUMDIA_KEEP_HANDOFF=1 to keep them)"
     );
     freed
 }
@@ -3929,11 +3878,11 @@ fn run_pin_sidecar(
     }
 
     let script = crate::sidecar::resolve_script(p.script_dir, script_name);
-    // Spawn (not `status()`) so the child handle is owned by a guard that kills it if we
-    // unwind or are dropped: a killed `mumdia` used to leave the Python worker running,
-    // holding its multi-GB memmap open, which made every subsequent rescore fail on a
-    // stale lock with no hint about which PID held it.
-    let child = std::process::Command::new(python)
+    // A killed `mumdia` runs no destructor, so nothing here can stop this worker: Ctrl-C
+    // reaches it through the terminal's process group, and the desktop stops a run's whole
+    // process tree. An orphan cannot break a later rescore, whose files are named apart
+    // (`sidecar_paths`).
+    let mut child = std::process::Command::new(python)
         .arg(&script)
         .arg(pin)
         .arg(outp)
@@ -3941,8 +3890,9 @@ fn run_pin_sidecar(
         // Pass the configured NN hyperparameters so the worker uses them instead
         // of its own defaults, and so the folds/num_iter/train_fdr recorded in the
         // report reflect the values actually used
-        // (docs/18_findings_and_decisions.md). Ignored by mokapot_worker.py,
-        // which shares this PIN contract. `NN_ENV_SET_BY_ENGINE` lists these names.
+        // (docs/18_findings_and_decisions.md). mokapot_worker.py, which shares this PIN
+        // contract, reads the folds and the training FDR; its iterations are
+        // MUMDIA_BREW_ITERS (`mokapot_brew_iters`). `NN_ENV_SET_BY_ENGINE` lists these names.
         .env("MUMDIA_NN_FOLDS", p.cfg.folds.to_string())
         .env("MUMDIA_NN_ITERS", p.cfg.num_iter.to_string())
         .env("MUMDIA_NN_TRAIN_FDR", p.cfg.train_fdr.to_string())
@@ -3979,8 +3929,7 @@ fn run_pin_sidecar(
             anyhow::anyhow!("spawning sidecar failed: {python} {script}: {e}")
         })?;
     let t_worker = Instant::now();
-    let mut guard = ChildGuard(Some(child));
-    let status = guard.wait()?;
+    let status = child.wait()?;
     let remove_files = || {
         let files = paths.files();
         remove_sidecar_files(
@@ -4041,6 +3990,24 @@ const NN_ENV_SET_BY_ENGINE: [&str; 11] = [
     "MUMDIA_NN_SEEDS",
     "MUMDIA_NN_FOLD_KEYS",
 ];
+
+/// The semi-supervised iterations `mokapot_worker.py` runs: `MUMDIA_BREW_ITERS`, default 20,
+/// as the worker reads it. It does not read `rescore.num_iter`, so the report records this.
+fn mokapot_brew_iters() -> usize {
+    std::env::var("MUMDIA_BREW_ITERS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(20)
+}
+
+/// The model `entrapment_worker.py` trains, as it reads `MUMDIA_ENTRAPMENT_MODEL`: `nn` (the
+/// MLP pipeline) or, for any other value or none, `gbm`.
+fn entrapment_model() -> &'static str {
+    match std::env::var("MUMDIA_ENTRAPMENT_MODEL") {
+        Ok(v) if v.to_lowercase() == "nn" => "nn",
+        _ => "gbm",
+    }
+}
 
 /// The `MUMDIA_NN_*` variables in `vars` that the NN worker inherits from this process on
 /// top of the ones `run_pin_sidecar` sets, sorted by name.
@@ -4809,43 +4776,9 @@ b
     }
 
     #[test]
-    fn the_feature_batch_follows_the_row_groups_within_its_bounds() {
-        let names: Vec<String> = ["f0", "f1", "f2"].iter().map(|s| s.to_string()).collect();
-        use super::super::WideScan;
-        let (rowgroup, plain, coalesced) =
-            (WideScan::RowGroup, WideScan::Plain, WideScan::Coalesced);
-        let small = scratch("fbr_small.parquet");
-        crafted_competed(&small, 7, 100.0, &names, false);
-        // A tiny table still reads in batches of the floor.
-        assert_eq!(
-            feature_batch_rows(&TableFile::open(&small).unwrap(), rowgroup),
-            FEATURE_BATCH_ROWS
-        );
-        // One batch per row group between the floor and the cap.
-        let mid = scratch("fbr_mid.parquet");
-        let mut w = mumdia_io::table::TableWriter::new(&mid).with_row_group_rows(40_000);
-        w.write_cols(vec![Col::F64("f0".into(), vec![1.0; 100_000])])
-            .unwrap();
-        w.close().unwrap();
-        let mid = TableFile::open(&mid).unwrap();
-        assert_eq!(feature_batch_rows(&mid, rowgroup), 40_000);
-        // The default plain reader keeps the floor, and so does the coalesced reader,
-        // which reads the group whole whatever the batch.
-        assert_eq!(feature_batch_rows(&mid, plain), FEATURE_BATCH_ROWS);
-        assert_eq!(feature_batch_rows(&mid, coalesced), FEATURE_BATCH_ROWS);
-        // A table written as one huge group is read in batches of the cap.
-        let big = scratch("fbr_big.parquet");
-        write_table(&big, vec![Col::F64("f0".into(), vec![1.0; 200_000])]).unwrap();
-        assert_eq!(
-            feature_batch_rows(&TableFile::open(&big).unwrap(), rowgroup),
-            FEATURE_BATCH_ROWS_MAX
-        );
-    }
-
-    #[test]
     fn every_read_mode_streams_the_same_feature_rows() {
-        // The coalesced reader, the plain reader with its parallel column groups, and any
-        // batch size have to hand the closure the same rows: the handoff and the matrix are
+        // The plain reader, with or without its parallel column groups, and any batch size
+        // have to hand the closure the same rows: the handoff and the matrix are
         // built from them one at a time.
         let names: Vec<String> = ["f0", "f1", "f2"].iter().map(|s| s.to_string()).collect();
         let a = scratch("modes_a.parquet");
@@ -4872,95 +4805,12 @@ b
         assert_eq!(reference.len(), 12);
         for scan in [
             mumdia_io::table::ScanOptions::default().with_decode_threads(2),
-            mumdia_io::table::ScanOptions::coalesced(),
-            mumdia_io::table::ScanOptions::coalesced().with_decode_threads(3),
+            mumdia_io::table::ScanOptions::default().with_decode_threads(3),
         ] {
             for rows in [1, 3, 16_384] {
                 assert_eq!(collect(&scan, rows), reference, "{scan:?}, {rows} rows");
             }
         }
-    }
-
-    /// The feature stream over a real competed table, by read mode and batch size.
-    ///
-    /// `MUMDIA_BENCH_PARQUET=<psms_competed.parquet> cargo test -p mumdia --release
-    /// bench_feature_stream -- --ignored --nocapture`. Every arm narrows every value and
-    /// folds its bits into a checksum, which the arms must agree on; the minimum of
-    /// `MUMDIA_BENCH_REPS` (3) interleaved rounds is printed.
-    #[test]
-    #[ignore = "benchmark; needs MUMDIA_BENCH_PARQUET"]
-    fn bench_feature_stream_a_real_artifact() {
-        let Ok(src) = std::env::var("MUMDIA_BENCH_PARQUET") else {
-            println!("set MUMDIA_BENCH_PARQUET to a real competed table to run this");
-            return;
-        };
-        let reps: usize = std::env::var("MUMDIA_BENCH_REPS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(3);
-        let names = FeatureSchema::read(&src).unwrap().feature_columns;
-        let competed = vec![src.clone()];
-        let t = TableFile::open(&src).unwrap();
-        println!(
-            "{src}: {} rows, {} features, row groups {:?}",
-            t.nrows,
-            names.len(),
-            t.row_group_rows().iter().take(4).collect::<Vec<_>>()
-        );
-        type Arm = (&'static str, mumdia_io::table::ScanOptions, bool);
-        let arms: Vec<Arm> = vec![
-            (
-                "plain, 16,384 rows",
-                mumdia_io::table::ScanOptions::default(),
-                false,
-            ),
-            (
-                "plain, row group",
-                mumdia_io::table::ScanOptions::default(),
-                true,
-            ),
-            (
-                "coalesced, 16,384 rows",
-                mumdia_io::table::ScanOptions::coalesced(),
-                false,
-            ),
-            (
-                "coalesced, row group",
-                mumdia_io::table::ScanOptions::coalesced(),
-                true,
-            ),
-        ];
-        let mut best = vec![f64::INFINITY; arms.len()];
-        let mut sums: Vec<u64> = vec![0; arms.len()];
-        for _ in 0..reps {
-            for (k, (_, scan, aligned)) in arms.iter().enumerate() {
-                let t0 = std::time::Instant::now();
-                let mut sum = 0u64;
-                let sizing = |t: &TableFile| {
-                    if *aligned {
-                        feature_batch_rows(t, super::super::WideScan::RowGroup)
-                    } else {
-                        FEATURE_BATCH_ROWS
-                    }
-                };
-                for_each_feature_row_with(&competed, &names, scan, sizing, |_, v| {
-                    for x in v {
-                        sum = sum.wrapping_add(u64::from(x.to_bits()));
-                    }
-                    Ok(())
-                })
-                .unwrap();
-                best[k] = best[k].min(t0.elapsed().as_secs_f64());
-                sums[k] = sum;
-            }
-        }
-        for (k, (name, _, _)) in arms.iter().enumerate() {
-            println!("{name:>24}: {:7.2} s", best[k]);
-        }
-        assert!(
-            sums.windows(2).all(|w| w[0] == w[1]),
-            "arms disagree: {sums:?}"
-        );
     }
 
     #[test]
@@ -5017,12 +4867,8 @@ b
             );
 
             // The batch form the stage uses: whole decoded batches staged column by column,
-            // with batches smaller than, straddling and larger than the 5-row blocks, under
-            // both readers.
-            for scan in [
-                mumdia_io::table::ScanOptions::default(),
-                mumdia_io::table::ScanOptions::coalesced(),
-            ] {
+            // with batches smaller than, straddling and larger than the 5-row blocks.
+            for scan in [mumdia_io::table::ScanOptions::default()] {
                 for batch in [1usize, 3, 16_384] {
                     let from_batches = SidecarPaths {
                         handoff: scratch(if use_pq { "b.parquet" } else { "b.pin" }),

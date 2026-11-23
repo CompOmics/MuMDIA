@@ -72,13 +72,13 @@ hardcoded in Rust; it comes from the config
 (`predict_frag.ms2pip_python`, `predict_frag.deeplc_python`, `rescore.python`,
 defined at `rust/mumdia/crates/mumdia-core/src/config.rs:263`, `:265`, `:921`).
 
-Two environment specifications ship with the repository, and between them they
-cover every sidecar this document uses:
+Three environment specifications for local use ship with the repository:
 
 | Spec | Creates | Covers |
 |---|---|---|
-| `env/mumdia-rescore.yml` | `mumdia-rescore` (python 3.12) | the mokapot rescore path; no torch, no DeepLC, no MS2PIP |
-| `env/mumdia-deeplc.yml` | `mumdia-deeplc` (python 3.11) | `deeplc_worker.py` and `deeplc_finetune.py`, with DeepLC 4.1.1 and CPU torch. The same interpreter satisfies the `nn_torch` rescorer, which needs torch, numpy, pandas and pyarrow |
+| `env/mumdia-rescore.yml` | `mumdia-rescore` (python 3.12) | the mokapot rescore path (mokapot 0.10.0); no torch, no DeepLC, no MS2PIP |
+| `env/mumdia-deeplc.yml` | `mumdia-deeplc` (python 3.11) | `deeplc_worker.py` and `deeplc_finetune.py` with DeepLC 4.5.0 and CPU torch 2.14.0, MS2PIP 4.2.0, IM2Deep, and the `nn_torch` rescorer, which needs torch, numpy, pandas and pyarrow |
+| `env/mumdia-peptdeep.yml` | `mumdia-peptdeep` (python 3.11) | the AlphaPeptDeep fragment predictor (`peptdeep_worker.py`, peptdeep 1.5.1) |
 
 ```
 conda env create -f env/mumdia-deeplc.yml
@@ -88,9 +88,7 @@ DeepLC must be 4.5.0 or newer. The 4.0.0a2 multitask preview overfits per-run
 fine-tuning badly enough to invert retention-time model rankings, the multi-head
 calibration needs 4.4.0 and the default projection cache 4.5.0, so an older version
 changes results and not only speed; `mumdia doctor` fails on one, and the
-engine refuses to launch the DeepLC workers with it. MS2PIP is pinned only in the Docker specification
-(`env/docker-rescore.yml`), because the native fragment predictor is the default
-and MS2PIP is opt-in.
+engine refuses to launch the DeepLC workers with it.
 
 You usually do not have to name the interpreters at all. A field set to `"auto"`,
 which is what `configs/examples/*.json` use, resolves through
@@ -106,18 +104,9 @@ and says so, and `doctor` shows a `[note]` rather than a failure.
 Notes:
 
 - The `nn_torch` rescorer requires `rescore.python` to point at an interpreter
-  with torch (validated at `config.rs:1073-1082`, and re-checked before compute in
-  `rust/mumdia/crates/mumdia/src/stages/run.rs:68-75`); `py312_mumdia` satisfies this.
-- Use `deeplc_mt`, not the older `deeplc_multitask`, for the fine-tune: prediction
-  crashes in `deeplc_multitask` on this machine (`CLAUDE.md`, ML predictors
-  section). `deeplc_finetune.py` pins OpenMP/BLAS threads to avoid an
-  oversubscription crash specific to this env
-  (`scripts/deeplc_finetune.py:22-28`).
-- The `ms2rescore` environment named in `CLAUDE.md` is not present here. mokapot
-  and MS2PIP are importable in `py311_workshop` and in `deeplc_mt` if you want the
-  mokapot rescorer or the MS2PIP predictor. The best-workflow config in Section 4
-  uses `nn_torch` plus the imported library's own fragment intensities, so this
-  environment is not required for it.
+  with torch; `mumdia-deeplc` satisfies this.
+- The library workflow in Section 4 uses `nn_torch` plus the imported library's
+  own fragment intensities, so neither MS2PIP nor mokapot is required for it.
 
 ### Locating and creating environments
 
@@ -139,13 +128,13 @@ mumdia doctor --config configs/examples/diann-library.json
 
 ### Environment to config-field mapping
 
-| Config field | Value on this machine | Effect |
+| Config field | Value in `diann-library.json` | Effect |
 |---|---|---|
-| `rescore.python` | `py312_mumdia` python | interpreter for the `nn_torch` sidecar |
+| `rescore.python` | `"auto"` | interpreter for the `nn_torch` sidecar |
 | `rescore.classifier` | `nn_torch` | selects the PyTorch semi-supervised rescorer |
-| `predict_frag.deeplc_python` | `deeplc_mt` python | interpreter for the DeepLC fine-tune / prediction |
-| `rt_im_train.finetune_deeplc` | `true` | enables the per-run DeepLC fine-tune (requires `deeplc_python`, enforced at `rust/mumdia/crates/mumdia/src/stages/run.rs:62-67`) |
-| `predict_frag.ms2pip_python` | unset | would point at an env with MS2PIP; not used by the library run |
+| `predict_frag.deeplc_python` | `"auto"` | interpreter for the library iRT re-prediction and the multi-head calibration |
+| `rt_im_train.finetune_deeplc` | not set (default `false`) | the optional DeepLC fine-tune stays off |
+| `predict_frag.ms2pip_python` | not set | would point at an env with MS2PIP; not used by the library run |
 
 ## 2. Converting vendor files to centroided mzML
 
@@ -223,7 +212,9 @@ library recipe): a DIA-NN predicted E. coli library was imported with
 `scripts/import_diann_lib.py`, then reverse decoys were added and the table
 re-sorted and re-indexed with `scripts/make_reverse_decoys.py`. Each target
 carries a paired `DECOY_`-prefixed reverse decoy, and contaminant entries are
-kept (visible as `Cont_` proteins). MuMDIA does not contain or redistribute
+kept (visible as `Cont_` proteins). The reverse decoys copy their targets'
+fragment intensities, so `scripts/predict_decoys.py` must replace them with
+predicted decoy spectra before a search (`docs/13_sidecars.md`). MuMDIA does not contain or redistribute
 DIA-NN; the user runs DIA-NN under their own academic license to predict the
 source library.
 
@@ -248,8 +239,8 @@ calibration and set per-candidate windows
 (`rust/mumdia/crates/mumdia/src/stages/rt_im_train.rs:65-83`), and raw iRT
 gives poor windows.
 
-Interaction with the per-run fine-tune (the best-workflow config sets
-`rt_im_train.finetune_deeplc = true`): when the fine-tune is on, `run` fine-tunes
+Interaction with the optional per-run fine-tune
+(`rt_im_train.finetune_deeplc = true`, off in the shipped configs): when the fine-tune is on, `run` fine-tunes
 DeepLC on this run's confident seed PSMs and writes a new output table with
 replaced `predicted_irt` for every standard peptidoform before RT calibration
 (`rust/mumdia/crates/mumdia/src/stages/run.rs:242-280`;
@@ -267,7 +258,7 @@ built this library (144,821 candidate PSMs: `peptidoform, charge, label, score,
 spectrum_q, observed_rt, predicted_irt, matched_peaks, scan_index`, ...). The
 `run` orchestrator recomputes its own seed each time and does not read this file
 (`run.rs` computes search-seed internally), so it is provided for standalone
-stages (`rt-im-train`, `align`, `mbr`, `audit`) and for inspection.
+stages (`rt-im-train`, `mbr`, `audit`) and for inspection.
 `lib/seed_psms.parquet.masscal.json` is the per-run fragment mass recalibration
 written by `search-seed` (`{"frag_ppm_offset": 0.79, "frag_tol_ppm": 19.2,
 "n_dev": 65678}`); it likewise belongs to that prior run.
@@ -308,20 +299,24 @@ and the `smoke-cross-platform` CI job assert.
 carried elsewhere: on a 50-window Orbitrap DIA run the same cap cost 60% of the
 peptides (`docs/04_convert.md`).
 
-### 4b. Best-workflow library run
+### 4b. Library run
 
 Library-input mode plus the local sidecar config. `run` skips
 digest/peptidoforms/predict-frag and consumes the prebuilt library
 (`main.rs:208-215`). The config `configs/examples/diann-library.json` turns on:
 Extended features, the window-mean extraction gate at `gate_min_score = 0.6` (the
 default since 2026-10-08), rolling-window apex (5) and RT prior
-(120 s), the per-run DeepLC fine-tune, the `nn_torch` rescorer with
+(120 s), the `nn_torch` rescorer with
 `rescore.strict = true`, an RT-window multiplier of 1.5, and
-`quant.q_filter = run_psm_q`. Both interpreters are `"auto"`, so they are
+`quant.q_filter = run_psm_q`. It does no fine-tune. With a DeepLC interpreter,
+`run` re-predicts the library iRT with the DeepLC base model
+(`fragment_library_precursors_deeplc.parquet`) and fits the multi-head calibration
+for this run (`fragment_library_precursors_multihead.parquet`); no `_ft` table is
+written. Both interpreters are `"auto"`, so they are
 discovered from `MUMDIA_PYTHON_*`, an activated environment, or `PATH`, and a
 candidate is accepted only if it can import what the worker imports; name an
 absolute path instead if you prefer to pin one. Use a new output directory:
-`run` has no cache/resume and does not clear stale optional files from a reused
+`run` has no resume and does not clear stale optional files from a reused
 directory.
 
 ```
@@ -334,9 +329,9 @@ mumdia run \
   --top-peaks-ms2 300
 ```
 
-The raw precursor table is intentional: enabled fine-tuning writes a new
-`fragment_library_precursors_ft.parquet` in the output directory and rebinds
-downstream stages to it without modifying the input. The explicit conversion cap
+The raw precursor table is intentional: the re-prediction and the calibration
+write new precursor tables in the output directory and rebind downstream stages
+to them without modifying the input. The explicit conversion cap
 is also essential to this reproduction. Both `run` and standalone `convert`
 otherwise default to uncapped MS2 spectra; `search_seed.top_n_peaks=300` is a
 separate seed-only probe cap. Do not carry `--top-peaks-ms2 300` to your own
@@ -346,12 +341,9 @@ See docs/04_convert.md ("Choosing `--top-peaks-ms2`") before setting any cap.
 
 Expected result (documented, not re-verified here): approximately 10,300
 precursor-shaped report rows at peptide q <= 1% with the `nn_torch` rescorer.
-Runtime is roughly 10 minutes
-on this machine (the fine-tune dominates; without it the chain is under 3
-minutes). This run is nondeterministic: `deeplc_finetune.py` sets no torch/numpy
-seed, so the fine-tuned iRT and the final count vary slightly between runs
-(`CLAUDE.md`, ML predictors section). NnTorch itself seeds NumPy/Torch but is not
-guaranteed bit-deterministic.
+That count was measured with the earlier per-run fine-tune recipe, not with the
+current configuration. NnTorch seeds NumPy/Torch but is not guaranteed
+bit-deterministic, so the final count varies slightly between runs.
 
 The `run` stdout ends with a one-line summary, for example:
 
@@ -378,9 +370,9 @@ failure fatal, and the report is the source of truth.
 Start with `mumdia doctor --config configs/examples/diann-library.json`; it validates
 imports without launching a full run.
 
-Do not use `--max-spectra 20000` with the fine-tuning recipe as a sidecar smoke
+Do not use `--max-spectra 20000` with this recipe as a sidecar smoke
 test. `--max-spectra` reads the file head, and this run's early gradient contains
-no confident fine-tune anchors at that size, so the test can fail before it
+few confident retention-time anchors at that size, so the test can fail before it
 meaningfully exercises DeepLC or NnTorch. The flag cannot select a mid-gradient
 offset.
 
@@ -388,7 +380,7 @@ For a pipeline smoke test, externally prepare a centroided mid-gradient mzML
 slice containing real peptide signal and run the same Section 4b command against
 that file, still with `--top-peaks-ms2 300` and a fresh output directory. A
 plumbing-only alternative is a scratch config with
-`rt_im_train.finetune_deeplc=false`; do not compare its identification count to
+`rt_im_train.multihead_calibration = 0`; do not compare its identification count to
 the validated full-run target.
 
 Verify the requested sidecars through their logs and

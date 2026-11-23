@@ -1,7 +1,7 @@
 # Base requirements for the Python sidecar contract tests (tests/python).
 # These four are enough to run every test that does not need an ML dependency,
-# which includes the whole mbr_worker suite, the DIA-NN library recipe suite and
-# the predictor import-order suite.
+# which includes the DIA-NN library recipe suite and the predictor import-order
+# suite.
 pytest>=7.0
 pyarrow>=8.0
 pandas>=1.4
