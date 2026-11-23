@@ -556,7 +556,9 @@ so the single-sample rule is identical; an empty window integrates to 0.
 
 #### Fragment selection under interference
 
-The default quant block (`top_n_fragments = 3`, `fragment_selection = observed_area`,
+This subsection records the measurements behind the change of default on 2026-11-07
+(see "Default quantification recipe"). The default quant block before that date
+(`top_n_fragments = 3`, `fragment_selection = observed_area`,
 `baseline_subtract = false`) sums, in each run separately, the 3 fragments with the largest
 observed area. A fragment that also carries co-eluting signal from another precursor has a
 larger area, so the rule selects it preferentially. Its ratio is then pulled toward the
@@ -581,18 +583,18 @@ identical ion sets in every arm: Astral 132,079 ions, 127,830 finite ratios; AIF
 
 | data | rule | species-weighted | global | CV median | median log2 A/B yeast (+1) / E. coli (-2) |
 |---|---|---|---|---|---|
-| Astral | `observed_area` top 3 (default) | 0.355 | 0.238 | 0.151 | 0.87 / -1.43 |
+| Astral | `observed_area` top 3 (default before 2026-11-07) | 0.355 | 0.238 | 0.151 | 0.87 / -1.43 |
 | Astral | `predicted` top 3 | 0.301 | 0.249 | 0.172 | 0.95 / -1.68 |
 | Astral | `cross_run` | 0.291 | 0.246 | 0.161 | 0.98 / -1.71 |
-| AIF | `observed_area` top 3 (default) | 0.329 | 0.199 | 0.321 | 0.86 / -1.50 |
+| AIF | `observed_area` top 3 (default before 2026-11-07) | 0.329 | 0.199 | 0.321 | 0.86 / -1.50 |
 | AIF | `predicted` top 3 | 0.251 | 0.185 | 0.321 | 0.94 / -1.75 |
 | AIF | `cross_run` | 0.259 | 0.187 | 0.331 | 0.96 / -1.79 |
 
 On ProteoBench Low Input (human and yeast only) the species-weighted |eps| is 0.605 under
-the default, 0.469 under `predicted` and 0.496 under `cross_run` (41,670 ions), and the
+that default, 0.469 under `predicted` and 0.496 under `cross_run` (41,670 ions), and the
 human-yeast gap goes from 0.54 to 0.66 and 0.64 of its expected value. On ProteoBench
 diaPASEF, re-quantified offline from `fragment_quant`, `observed_area` top 3 gives 0.329
-(E. coli -1.43); the `configs/examples/diapasef.json` recipe, which uses `cross_run`, gives
+(E. coli -1.43); the `configs/examples/diapasef.json` recipe as it was until 2026-11-07, with `cross_run`, gave
 0.206.
 
 The interference-aware rules remove bias in the minor species, not noise. On Astral they
@@ -601,8 +603,8 @@ make the global |eps| and the CV worse, and the per-ion SD of the human log2 A/B
 E. coli is traded for variance in the weak ions of every species. On AIF the global |eps|
 improves as well and the CV is unchanged. `predicted` is better on AIF and Low Input,
 `cross_run` on Astral; the differences between them (0.008-0.03) rest on one seed and are not
-interpretable. `observed_area` stays the default until a rule is chosen with seeds on
-several acquisitions; report the global |eps|, the CV and the per-species medians next to
+interpretable. `observed_area` stayed the default until 2026-11-07, when the pattern fit
+replaced it (see "Default quantification recipe"); report the global |eps|, the CV and the per-species medians next to
 the species-weighted score when comparing rules. `baseline_source = experiment` on top of
 `cross_run` is not a remedy on Orbitrap data: it measured 0.296 against 0.291 on Astral and
 0.317 against 0.259 on AIF (E. coli over-corrected to -2.14).
@@ -706,10 +708,11 @@ instrument-agnostic in its code, but it was measured only on diaPASEF. A recomme
 diaPASEF or any other acquisition, needs a second known-ratio set. Quantification is
 deterministic on fixed identifications, so these keys need no entrapment arm.
 
-The diaPASEF recipe (`configs/examples/diapasef.json`) sets the measured base
+Until 2026-11-07 the diaPASEF recipe (`configs/examples/diapasef.json`) set the measured base
 (`fixed_scan_halfwidth 4`, `interference_envelope`, `baseline_subtract`) with
 `fragment_selection = cross_run` and `baseline_source = experiment`. The width
-(`fixed_scan_halfwidth_scale`) is left out of it as the next lever to confirm. The IM
+(`fixed_scan_halfwidth_scale`) was left out of it as the next lever to confirm. The
+recipe now has no quant block and uses the default quantification. The IM
 branch's quantification and match-between-runs record on the same data is condensed in
 docs/35_diapasef.md section 8.
 
@@ -1826,7 +1829,7 @@ FDR/reporting); `audit.rs` tests the stages in that order and keeps the first lo
 | `qcell` | report.rs:39 | quantity cell formatting (1 decimal; empty on NaN) |
 | `AuditParams` / `audit::run` | audit.rs:28 / 64 | candidate loss ladder |
 | `RejectionReason` | rejection.rs:22 | earliest-loss category enum (`code`) |
-| `resolve_script` | sidecar.rs:20 | locate a worker script relative to CWD or the binary |
+| `resolve_script` | sidecar.rs:20 | locate a worker script: an absolute dir as given, else next to the binary, and the CWD last |
 | `run_worker` | sidecar.rs:217 | spawn `python <script> <args>`; error on non-zero exit |
 
 ## Configuration

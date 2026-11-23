@@ -482,14 +482,18 @@ sensitivity and not a loosened threshold. For scale, the two counts are 32.3%
 and 80.3% of what a library-free DIA-NN 2.2.0 search reports on the same file.
 The mechanism is downstream: with most peaks gone, candidates cannot assemble
 enough distinct matched fragments to satisfy `extract.presence_min_fragments`
-(`config.rs:523`, default 3 at `config.rs:690`), so they fail peak-group
-formation and are recorded with rejection code `DID_NOT_SURVIVE_EXTRACTION`
-(`rejection.rs:62`). This was confirmed with `mumdia audit` on the capped arm,
+(default 3), so they fail peak-group formation. That reading rests on the cap
+dose-response, not on the audit label. The rejection code
+`DID_NOT_SURVIVE_EXTRACTION` is a catch-all for "did not survive extract": nothing
+writes the per-candidate reason table `mumdia audit` reads, so presence failures,
+matched-fraction failures and gate rejections all get this label (docs/09). The
+audit on the capped arm,
 restricted to the peptides that same DIA-NN search reports as present (78,782
 distinct `Stripped.Sequence` at DIA-NN `Q.Value` <= 0.01): 49,105 of 78,782 (62.3%) stopped at `candidate_generated` with `DID_NOT_SURVIVE_EXTRACTION`, against only
 5,380 lost to FDR and 355 to competition, and a counterfactual replay on the
 uncapped artifact recovered 41,948 (85.4%) of them. The loss is therefore
-extraction-side, not a scoring or competition effect. See docs/09_extract.md for
+extraction-side, not a scoring or competition effect; the audit does not say which
+extraction step lost it. See docs/09_extract.md for
 that side of the interaction.
 
 Dose-response on the same run, expressed as the fraction of the peptides lost at
@@ -603,7 +607,7 @@ vendor file was involved.
 | Input | Converter | State |
 |---|---|---|
 | mzML | none | supported |
-| Bruker timsTOF `.d` (dir) with diaPASEF frames | none: native reader (timsrust), ion mobility kept | supported; the 1/K0 calibration, gate, features, retrace and cross-run quant are opt-in (`configs/examples/diapasef.json`, docs/35_diapasef.md) |
+| Bruker timsTOF `.d` (dir) with diaPASEF frames | none: native reader (timsrust), ion mobility kept | supported; the 1/K0 calibration, gate, features and retrace are opt-in (`configs/examples/diapasef.json`, docs/35_diapasef.md) |
 | Thermo `.raw` (file) | ThermoRawFileParser, or msconvert; or none under `convert.thermo_native` in a build with the `thermo` feature (opt-in, below) | **exercised end to end** (doxy, 2026-09-06: a 3.7 GB Astral `.raw` through `mumdia convert --mzml x.raw`, ThermoRawFileParser 2.0.0 found by `auto`, 6:40 and 4.4 GB for the converter, 3.4 GB mzML renamed into place beside the input, reused by the next run in 1.3 s; `peak-census` on the same `.raw` likewise) |
 | Bruker `.d` (dir), any other | msconvert | wired, unverified; **ion mobility is discarded** |
 | SCIEX `.wiff` / `.wiff2` | msconvert | wired, unverified; a `.wiff` needs its `.wiff.scan` companion beside it, and the engine names that file when msconvert fails without it. ZT Scan DIA (scanning quadrupole): see "SCIEX ZT Scan DIA" below; an mzML from the SCIEX MS Data Converter needs `convert.isolation_half_width` |

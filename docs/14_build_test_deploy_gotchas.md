@@ -51,9 +51,9 @@ configurations in `configs/`, the container definition in `Dockerfile` +
 | `Dockerfile` | Two-stage image: Rust build stage + micromamba runtime with two sidecar envs |
 | `docker/config.dia.json` | Baked FASTA-digest config (MS2PIP + DeepLC + strict mokapot wired to in-image envs) |
 | `docker/config.diann-lib.json` | Baked library-input config (per-run RT calibration of the library iRT, no fine-tune; strict NnTorch through the torch-capable DeepLC env) |
-| `env/docker-rescore.yml` | Conda spec for the in-image `rescore` env (`python=3.11`, `mokapot==0.10.0` + `ms2pip==4.0.0.dev9`) |
+| `env/docker-rescore.yml` | Conda spec for the in-image `rescore` env (`python=3.11`, `mokapot==0.10.0` + `ms2pip==4.2.0`) |
 | `env/docker-deeplc.yml` | Conda spec for the in-image `deeplc` env (`python=3.11`, `torch==2.14.0+cpu` + `deeplc==4.5.0` from PyPI) |
-| `env/mumdia-rescore.yml` | Minimal host env for the default mokapot rescorer only (`python=3.12`, no torch/DeepLC/MS2PIP) |
+| `env/mumdia-rescore.yml` | Minimal host env for the mokapot rescorer only (`python=3.12`, no torch/DeepLC/MS2PIP) |
 | `env/mumdia-deeplc.yml` | Host env for the DeepLC, MS2PIP and nn_torch sidecars (`python=3.11`, `torch==2.14.0+cpu`, `deeplc==4.5.0`, `ms2pip==4.2.0`, `psm-utils`, `pyarrow`) |
 | `configs/examples/*.json` | Portable example configs (`native`, `fasta-sidecars`, `diann-library`), all using `"auto"` interpreters |
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | Sidecar subprocess clients + `resolve_script` path resolution |
@@ -381,13 +381,10 @@ _`mumdia`:_
 **Sidecar invocation contract.** `sidecar.rs` is a set of thin subprocess
 clients over a positional-CLI file contract: write an input Parquet, run
 `python <script> <args...>`, read an output Parquet keyed by id
-(`sidecar.rs:1-4`). `resolve_script` (`sidecar.rs:20`) finds a worker by trying
-the configured dir relative to CWD, then relative to the binary's own directory,
-then `<exe_dir>/scripts`, so a deployed binary locates its workers regardless of
-CWD. `python::resolve_script_dir` (`python.rs:372`) makes the same decision one
-level up, before any worker runs: it accepts the configured directory only if it
-actually holds a worker file, and otherwise tries the config file's own directory
-and the executable's directory, which is the layout of the release archive.
+(`sidecar.rs:1-4`). An absolute `sidecar_script_dir` is used as given; a relative
+one is tried against the config file's directory, then next to the executable, and
+the working directory last (`python::resolve_script_dir`, `sidecar::resolve_script`;
+configs/README.md, "Where the worker scripts have to be").
 `run_worker` (`sidecar.rs:233`) sets `PYTHONUTF8=1` and
 `PYTHONIOENCODING=utf-8` only when its `utf8` argument is set (the DeepLC calls)
 because Keras crashes on the Windows cp1252 console otherwise
@@ -953,9 +950,9 @@ and defeat the staleness check.
 | `python::discover` | `python.rs:245` | `"auto"` interpreter discovery: role env var, `MUMDIA_PYTHON`, `CONDA_PREFIX`/`VIRTUAL_ENV`, `PATH`; accepts only if the modules import |
 | `python::resolve` | `python.rs:280` | Resolves every needed role before the config hash is taken, so the manifest records the interpreter that ran |
 | `python::resolve_script_dir` | `python.rs:372` | Picks the worker directory: configured, then the config file's directory, then the exe's directory |
-| `sidecar::resolve_script` | `sidecar.rs:20` | CWD/exe-dir/`scripts` path resolution for a single worker |
+| `sidecar::resolve_script` | `sidecar.rs:20` | exe-dir, `<exe_dir>/scripts`, then CWD path resolution for a single worker; an absolute dir is used as given |
 | `sidecar::run_worker` | `sidecar.rs:222` | Spawns `python <script> <args>`; forces UTF-8 I/O only when its `utf8` arg is set (DeepLC calls) |
-| `sidecar::run_deeplc_finetune` | `sidecar.rs:111` | Positional-CLI DeepLC multitask fine-tune; a known nondeterministic path (no torch/numpy seed) |
+| `sidecar::run_deeplc_finetune` | `sidecar.rs:111` | Positional-CLI DeepLC multitask fine-tune; seeded from `rng_seed` (`--seed`), but not bit-for-bit reproducible because of kernel nondeterminism |
 | `make_decoy` | `digest.rs:119` | Reverse or seeded-scramble decoy generation |
 | `collision_safe_decoy` | `digest.rs:155` | Retries scrambles until the decoy collides with no target/other decoy; drops the pair if none exists |
 | `splitmix64` | `digest.rs:177` | Deterministic PRNG for the scramble Fisher-Yates shuffle |
@@ -968,35 +965,16 @@ This area reads very little config directly; it mostly enforces config validity
 and wires interpreters. The config surface was recently pruned of dead fields, so
 do not reintroduce removed knobs. The fields relevant here:
 
-- `Config::validate` (`config.rs:1434`) rejects twelve combinations, all of which
-  the committed defaults pass. Six are strategy, gate or quantification footguns:
-  `digest.decoy.strategy = diann_shift` (threaded but realized nowhere; would
-  yield zero decoys and an invalid FDR, `config.rs:1436`);
-  `rt_im_train.calibration_method = none` (silently falls through to the linear
-  fit, `config.rs:1445`); `extract.retain_top_peaks = 0` (must be >= 1, where 1 is
-  the legacy single-apex behaviour, `config.rs:1452`); `extract.gate_min_score`
-  outside `[0,1]` or non-finite (0 disables the gate, `config.rs:1459`);
-  `quant.fixed_window_s` non-finite or negative (`config.rs:1468`); and
-  `quant.baseline_quantile` non-finite or outside its range
-  (`config.rs:1475`). Six guard the rescore contract: `rescore.folds < 2` (every
-  PSM needs an out-of-fold score, `config.rs:1482`); `rescore.num_iter = 0`
-  (`config.rs:1489`); `rescore.train_fdr` non-finite or outside `(0,1]`
-  (`config.rs:1494`); `mokapot`/`nn_torch` without `rescore.python`
-  (`config.rs:1502`); `percolator` (declared but not wired, `config.rs:1512`); and
-  `entrapment` without `rescore.entrapment_marker` (`config.rs:1519`).
-- `validate` also warns without failing in four cases (`config.rs:1528-1578`),
-  which is how the inert and mutually-exclusive fields announce themselves rather
-  than silently doing nothing: a non-default `mbr.rt_window_s`,
-  `mbr.decoy_transfer` or `mbr.requant_all` (all three marked NOT YET WIRED at
-  `config.rs:1207,1210,1217`); a non-`none` `mbr.strategy`, whose tiers are not
-  distinguished; `quant.fixed_window_s` and `quant.fixed_scan_halfwidth` both set,
-  where the seconds form wins; and `quant.baseline_subtract` without a fixed
-  window to subtract inside.
+- `Config::validate` rejects the parameter combinations that would run but
+  produce a wrong or meaningless result (for example `rescore.folds < 2`, or an
+  external classifier without `rescore.python`), and warns without failing for
+  inert or mutually exclusive fields. The committed defaults pass it. The list
+  grows with the config; read `Config::validate` itself, or docs/24 for each
+  key's constraints, rather than a count here.
 - `apply_profile("dia")` sets `features.set = Extended`,
   `extract.apex_count_window = "auto"` (0), `extract.apex_rt_prior_s = 120.0`. Any
   other name is an error.
-- Deserialization uses `#[serde(deny_unknown_fields)]` throughout `config.rs` (20
-  occurrences), so an unknown or misspelled key is a hard load error rather than a
+- Deserialization uses `#[serde(deny_unknown_fields)]` throughout `config.rs`, so an unknown or misspelled key is a hard load error rather than a
   silently-ignored no-op (tested at `config.rs:1722`). This is also what makes
   `shipped_configs_parse` (`config.rs:1651`) a real check on every config the
   repository ships, and why the CI JSON-parse step is only a syntax floor beneath
@@ -1007,9 +985,11 @@ do not reintroduce removed knobs. The fields relevant here:
   actually ran rather than the word `auto`. That makes the config hash
   machine-specific for an `"auto"` config, which is correct: two runs whose
   rescorer came from different environments are not the same configuration.
-- The Docker default rescorer model is selected by the env var
-  `MUMDIA_RESCORE_MODEL=logreg` baked at `Dockerfile:57`; the NN worker also reads
-  `MUMDIA_NN_SEEDS` (`scripts/nn_rescore_worker.py:42`).
+- The Docker image selects the mokapot model through the env var
+  `MUMDIA_RESCORE_MODEL=logreg` in the `Dockerfile`. The NN worker's seed count,
+  folds and rounds come from `rescore.seeds`, `rescore.folds` and
+  `rescore.num_iter`: the engine sets `MUMDIA_NN_SEEDS`, `MUMDIA_NN_FOLDS` and
+  `MUMDIA_NN_ITERS` from them and overwrites any exported value.
 - Both `docker/*.json` configs open with the same DIA preset written out
   explicitly (`features.set = extended`, `extract.apex_rt_prior_s = 120.0`), matching
   `apply_profile("dia")`. They leave `extract.apex_count_window` at its `"auto"`
@@ -1026,8 +1006,8 @@ do not reintroduce removed knobs. The fields relevant here:
 - `docker/config.diann-lib.json` (library-input path) does NOT set
   `predictor`/`rt_predictor` (fragment intensities + iRT come from the imported
   library), configures only `deeplc_python` + `sidecar_script_dir` for the
-  optional iRT fine-tune, and additionally sets `rt_im_train.finetune_deeplc =
-  true` and `rt_im_train.rt_window_multiplier = 1.5`. It selects `nn_torch` using
+  library iRT re-prediction and the multi-head calibration, and additionally sets
+  `rt_im_train.finetune_deeplc = false` and `rt_im_train.rt_window_multiplier = 1.5`. It selects `nn_torch` using
   the torch-capable `/opt/conda/envs/deeplc/bin/python` and sets
   `rescore.strict = true`.
 - `configs/examples/{native,fasta-sidecars,diann-library}.json` are the portable
@@ -1063,9 +1043,9 @@ floats are summed (for example the digest stats use a `BTreeMap`,
 **Known nondeterministic paths (opt-in only).** Two paths are explicitly
 nondeterministic and are never on the default path. The DeepLC multitask
 fine-tune (`scripts/deeplc_finetune.py`, invoked by `sidecar::run_deeplc_finetune`
-at `sidecar.rs:111`) sets no torch/numpy seed. The PyTorch NN rescorer
+at `sidecar.rs:111`) is seeded from `rng_seed` (`--seed`), but not bit-for-bit reproducible because of kernel nondeterminism. The PyTorch NN rescorer
 (`scripts/nn_rescore_worker.py`) is only approximately reproducible; its own
-header says so (`nn_rescore_worker.py:29-30`) and offers `MUMDIA_NN_SEEDS>1` to
+header says so. `rescore.seeds > 1` (passed as `MUMDIA_NN_SEEDS`) is offered to
 ensemble seeds and average out-of-fold scores as mitigation. Enabling either
 breaks byte-reproducibility of the run; that is a known and accepted trade for the
 identification gain.

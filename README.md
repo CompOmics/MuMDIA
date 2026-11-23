@@ -137,7 +137,9 @@ experiment the TSVs are experiment-wide, with one quantity column per run. Detai
   ThermoRawFileParser, or read directly by a build with the opt-in `thermo` feature; other
   vendor formats go through ProteoWizard `msconvert` and are not verified end to end
   ([`docs/04_convert.md`](docs/04_convert.md)).
-- Wildcard and terminal variable modifications are not supported.
+- C-terminal modifications, N-terminal modifications restricted to one residue, and a `*`
+  residue outside an N-terminal rule are not supported
+  ([`docs/05`](docs/05_digest_peptidoforms.md), "Terminal modifications").
 - CI builds and tests the engine on three platforms and runs an end-to-end smoke test, but
   does not run the Python sidecars on data. The PyTorch rescorer and the DeepLC fine-tune
   are not bit-reproducible, so counts vary slightly between runs.

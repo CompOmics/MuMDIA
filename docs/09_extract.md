@@ -1576,16 +1576,17 @@ declutter" commit: `extract.scan_window_mode` (and the `ScanWindowMode` enum),
 | `alt_peak_min_separation_s` | 5.0 | Alternate apex must sit >= 5 s from the rank-0 apex (`config.rs:653`) |
 | `emit_candidate_audit` | false | Candidate-audit sidecar (diagnostic) |
 | `emit_gate_diagnostics` | false | Adds the four `gate_*` diagnostic columns |
-| `gate_mode` | `ApexPearson` | Which score `gate_min_score` thresholds (`GateMode`, `config.rs:735`) |
+| `gate_mode` | `WindowMean` | Which score `gate_min_score` thresholds (`GateMode`) |
 | `gate_coelution_min` | 0.5 | Second threshold for `GateMode::Combined` |
 | `q1_cycles`, `q1_profile`, `q1_gate_max_offset` | off | The scanning-quadrupole sweep model (section 10) |
-| `q1_fragments` | false | The per-fragment Q1 decision of every accepted row (psms_extracted v6); needs `rt_im_train.q1_calibrate` and spectra_ms2 v3 (section 12) |
+| `q1_fragments` | `"auto"` | On for a ZT Scan search, off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). The per-fragment Q1 decision of every accepted row (psms_extracted v6); needs `rt_im_train.q1_calibrate` and spectra_ms2 v3 (section 12) |
 | `q1_deconvolved` | false | Count only the peaks whose Q1 centroid sits where the matched fragment is expected, within the tolerance the Q1 calibration learns; needs `rt_im_train.q1_calibrate` and spectra_ms2 v3 (section 14) |
 | `im_gate` | `off` | The 1/K0 gate on fragment peaks (`off`, `fragments`, `auto`; section 8). Inert on 3D data. Omitted from the canonical configuration at its default |
 
-Note: `emit_candidate_audit` is not read in `extract.rs`; it gates the separate `audit`
-stage of a single-file `run` (also `mumdia audit`), and extract writes no per-candidate
-table for it.
+Note: `extract` itself does not read `emit_candidate_audit`. It gates the separate
+`audit` stage of a single-file `run` (also `mumdia audit`), which writes
+`candidate_audit.parquet` after compete; `run-experiment` warns that it has no effect
+there. Extract writes no per-candidate table for it.
 
 ### Default-off sensitivity knobs (index)
 

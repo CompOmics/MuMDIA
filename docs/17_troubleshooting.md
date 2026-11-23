@@ -28,10 +28,10 @@ is the source of truth if it has moved.
 | A short `--max-spectra` run finds almost nothing | The flag reads the file head and the early gradient is void | Use the full file or externally prepare a mid-gradient mzML slice; `--max-spectra` has no offset |
 | A reused `--out-dir` contains contradictory or stale sidecars | `run` recomputes named outputs but does not clear the directory; optional files can remain and a failed rerun can leave an old manifest | Use a fresh output directory for every `run`; reuse artifacts only through explicit standalone stage commands |
 | Config load fails with an unknown-field parse error | `#[serde(deny_unknown_fields)]` rejects any unknown or misspelled key (including a removed knob) | Fix or remove the key; check it against the current `config.rs`, not an old config |
-| Two runs of the same command give slightly different identification counts | A nondeterministic opt-in path is on: DeepLC fine-tune (no seed) or the PyTorch NN rescorer (approximately reproducible) | Accept the trade for the ID gain, or leave those paths off; set `MUMDIA_NN_SEEDS > 1` to average out NN variance |
-| Peptidoforms silently get iRT 0.0 | DeepLC returned no iRT for some peptidoforms; they are anchored at 0.0 with a warning | Check the DeepLC env and the `n_irt_missing` warning; unmatched peptidoforms are a known foot-gun |
+| Two runs of the same command give slightly different identification counts | A nondeterministic opt-in path is on: DeepLC fine-tune (seeded from `rng_seed`, but not bit-for-bit reproducible because of kernel nondeterminism) or the PyTorch NN rescorer (approximately reproducible) | Accept the trade for the ID gain, or leave those paths off; set `rescore.seeds > 1` to average out NN variance |
+| predict-frag warns that candidates without a prediction were dropped with their pairs | A predictor returned nothing for some peptidoforms; predict-frag drops them with their pairs, counts them in the library report, and stops above a ceiling | Check the predictor env and the dropped count in the library report; a large share points at unsupported modifications or a broken worker |
 | Peptide count is a fraction of expectation while the empirical decoy fraction still sits at the target | `--top-peaks-ms2` truncated the MS2 peaks at convert time and baked the truncation into the spectra artifact (`convert.rs:76-79`) | Reconvert uncapped or with a much larger cap; the right cap is acquisition-specific, not a universal preset |
-| `mumdia audit` attributes most missed peptides to `DID_NOT_SURVIVE_EXTRACTION` at `candidate_generated` | The same peak truncation leaves too few surviving fragments to satisfy `extract.presence_min_fragments` (`extract.rs:1926-1931`) | Raise or remove `--top-peaks-ms2` and reconvert; do not lower `presence_min_fragments` to compensate |
+| `mumdia audit` attributes most missed peptides to `DID_NOT_SURVIVE_EXTRACTION` at `candidate_generated` | Any extract loss: the label is a catch-all for "did not survive extract" (presence, matched fraction and every gate rejection; docs/09) | Check the conversion cap first (docs/04), then the gate; do not lower `presence_min_fragments` to compensate |
 | Every modified form of a peptide is missing from the output; `precursor_q` reports exactly 1.000 precursors per peptide | `compete.group_by = base_peptide` keys the stripped sequence, not the precursor (`compete.rs:88`), and deletes all but the top-scoring sibling before rescore (`compete.rs:319-340`) | Set `compete.group_by = peptidoform_charge` (`compete.rs:93-98`); required for any PTM search |
 | A phospho (PTM) search reports several site variants of one peptide, all accepted, at the same retention time | Positional isomers are separate candidates that do not compete (`compete.group_by = peptidoform_charge`), and shadow demotion exempts the own base peptide; the peptidoform-level q says nothing about the site | Count modified peptides on `isomer_group_q` and read the sites from `localisation.parquet` / `sites.tsv` (`localise.enabled`, docs/36_ptm_localisation.md); treat a peptidoform's site as unlocalised unless the stage localised it |
 | `localisation.parquet` calls many peaks `decoy_residue` | The best placement put the modification on the decoy residue (A by default), which is never searched: the site-determining ions do not support any real placement | Expected at a low rate; it feeds `site_flr_decoy`. A high rate means weak fragment evidence at the apex (check `n_sdi_observed`) rather than a fault |
@@ -84,14 +84,10 @@ a cmake/C toolchain requirement.
 
 ## Sidecar resolution and silent fallback
 
-**"Worker not found" and the git-bash path trap.** `resolve_script`
-(`sidecar.rs:20-38`) locates a worker by trying, in order: the configured dir
-relative to the CWD (`sidecar.rs:21-22`), then the same dir relative to the
-binary's own directory, then `<exe_dir>/scripts`. If none exist it returns the
-CWD-relative path so the eventual spawn error names it (`sidecar.rs:37`). Because
-the build target dir is redirected off OneDrive while `scripts/` lives under the
-project, `<exe_dir>/scripts` does not exist next to the binary on this machine, so
-resolution succeeds only via the CWD-relative branch. The specific trap: if
+**"Worker not found" and the git-bash path trap.** An absolute
+`sidecar_script_dir` is used as given; a relative one is tried against the config
+file's directory, then next to the executable, and the working directory last
+(configs/README.md, "Where the worker scripts have to be"). The specific trap: if
 `predict_frag.sidecar_script_dir` is a git-bash-style POSIX path such as
 `/c/Users/...`, `std::path::Path::exists` on Windows cannot stat it and returns
 false, so resolution falls through to the non-existent path and the worker spawn
@@ -221,12 +217,12 @@ propagate worker errors with `?` and abort the whole run:
 - **MS2PIP** hard-bails with `bail!("MS2PIP returned no predictions")` when the
   worker returns an empty map (`predict_frag.rs:342-344`); any other MS2PIP error
   propagates through the `?` at `predict_frag.rs:341`. There is no whole-run
-  native fallback (a single candidate that MS2PIP returned nothing for does fall
-  back per-candidate at `predict_frag.rs:387-389`, but an empty map aborts).
+  native fallback.
 - **DeepLC predict** propagates worker errors with the `?` at
-  `predict_frag.rs:291`. It does not bail on partial output: peptidoforms with no
-  returned iRT are anchored at `0.0` with an `n_irt_missing` warning
-  (`predict_frag.rs:293-308`), which is a known foot-gun rather than a stop.
+  `predict_frag.rs:291`.
+- For both predictors, a candidate the worker returned nothing for is dropped
+  from the library with its pair, warned about and counted in the library report;
+  predict-frag stops when the dropped share exceeds a ceiling (docs/13).
 - **DeepLC fine-tune** propagates errors with the `?` at `run.rs:253-263`, so a
   fine-tune failure aborts `run` with no fallback.
 - **MBR** likewise propagates its worker error and is not on the `run` chain.
@@ -317,7 +313,9 @@ difference, not a loosened threshold.
 
 The mechanism is peak-group formation, not scoring. With most peaks gone,
 `extract.presence_min_fragments` (default 3) cannot be met and the candidate
-returns no peak group (`extract.rs:1926-1931`). `mumdia audit` on the capped arm,
+returns no peak group (`extract.rs:1926-1931`). That reading rests on the cap
+dose-response, not on the audit label: `DID_NOT_SURVIVE_EXTRACTION` is a
+catch-all for any extract loss (docs/09). `mumdia audit` on the capped arm,
 restricted to peptides the reference search confirms are present, put
 49,105 of 78,782 (62.3%) at `candidate_generated` with `DID_NOT_SURVIVE_EXTRACTION`; only
 5,380 were lost to FDR and 355 to competition. A counterfactual replay against
@@ -576,8 +574,7 @@ estimate.
 
 ## Config load errors
 
-Every config struct in `config.rs` carries `#[serde(deny_unknown_fields)]` (15
-occurrences), and `Config::from_json` parses with unknown-key rejection before
+Every config struct in `config.rs` carries `#[serde(deny_unknown_fields)]`, and `Config::from_json` parses with unknown-key rejection before
 validating (`config.rs:1009`). An unknown or misspelled key is therefore a hard
 load error, not a silently-ignored no-op (tested at `config.rs:1146`). This bites
 most often after the config surface is pruned: a knob that was removed, or renamed,
@@ -595,7 +592,8 @@ The native engine is byte-reproducible; two opt-in paths are not, and neither is
 on the default path:
 
 - **DeepLC multitask fine-tune** (`scripts/deeplc_finetune.py`, invoked by
-  `sidecar::run_deeplc_finetune` at `sidecar.rs:111`) sets no torch or numpy seed,
+  `sidecar::run_deeplc_finetune` at `sidecar.rs:111`) is seeded from `rng_seed`
+  (`--seed`), but not bit-for-bit reproducible because of kernel nondeterminism,
   so the rewritten iRT and every downstream artifact vary run to run.
 - **PyTorch NN rescorer** (`scripts/nn_rescore_worker.py`) seeds torch and numpy
   per seed and uses a content-hash fold split, but training is only approximately
@@ -603,7 +601,7 @@ on the default path:
   `adam` solver plus BLAS threading drifts the scores slightly.
 
 Enabling either breaks byte-reproducibility; that is a known and accepted trade
-for the identification gain. To damp the NN variance, set `MUMDIA_NN_SEEDS > 1` to
+for the identification gain. To damp the NN variance, set `rescore.seeds > 1` to
 ensemble seeds and average the out-of-fold scores
 (`nn_rescore_worker.py:29-30`). If bit-exact reproducibility is required, leave
 `finetune_deeplc = false` and use `native_tda` or the near-bit-exact mokapot

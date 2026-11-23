@@ -21,11 +21,16 @@ human-readable report, and records provenance. Most stage commands can therefore
 be run standalone on prior outputs, on a different configuration, or on
 hand-crafted minimal files.
 
-`run` recomputes every stage on every invocation. There is no artifact caching,
-no skip-if-exists, and no resume: `run` calls each stage unconditionally and
-overwrites its outputs even when identical artifacts already exist in `--out-dir`
-(`run.rs:85-509`; no existence check precedes any stage call, and
-`std::fs::create_dir_all` at `run.rs:90` does not clear or skip). To reuse a
+`run` recomputes every stage on every invocation. There is no skip-if-exists and
+no resume: `run` calls each stage unconditionally and overwrites its outputs even
+when identical artifacts already exist in `--out-dir` (no existence check
+precedes any stage call, and creating the output directory does not clear or
+skip it). The two exceptions are the engine caches, both on by default: a
+FASTA-mode run reuses a library an earlier run built with the same inputs and
+settings (`predict_frag.library_cache`) and skips digest, peptidoforms and
+predict-frag, and DeepLC reuses its trunk projection
+(`rt_im_train.deeplc_projection_cache`). `MUMDIA_CACHE_DIR=off` turns both off
+(docs/14, "The engine's caches"). To reuse a
 prior artifact, invoke the downstream stage command standalone on it instead of
 rerunning `run`. Use a fresh output directory for each orchestrated run. Reusing
 one can leave a stale optional sidecar from an earlier configuration, and a
@@ -323,13 +328,12 @@ Which subcommands read `--config` (verified against `main.rs`):
 
 | Takes `--config` | No `--config` |
 |---|---|
-| `digest`, `peptidoforms`, `predict-frag`, `search-seed`, `rt-im-train`, `extract`, `features`, `compete`, `rescore`, `quant`, `run`, `run-experiment`, `align`, `mbr`, `doctor` (optional) | `convert`, `quant-lfq`, `inspect`, `audit`, `report` |
+| `convert`, `digest`, `peptidoforms`, `predict-frag`, `search-seed`, `rt-im-train`, `extract`, `features`, `compete`, `rescore`, `quant`, `run`, `run-experiment`, `align`, `mbr`, `doctor` (optional), `report` (optional) | `quant-lfq`, `inspect`, `audit` |
 
-The five with no `--config` are fixed-behavior: `convert` always runs on
-`Config::default()` (`main.rs:397`); `quant-lfq` takes typed string flags instead
-(`main.rs:642-658`); `inspect`, `audit`, and `report` load no config at all
-(`main.rs:712`, `main.rs:557`, `main.rs:715`). The full subcommand set, in source
-order:
+`quant-lfq` takes typed string flags instead; `inspect` and `audit` load no
+config. The table below covers the main stage commands. The complete subcommand
+set, with every flag, is `docs/23_cli_reference.md`, which is generated from the
+binary.
 
 | `mumdia <cmd>` | Inputs (flags) | Outputs (flags / artifacts) |
 |---|---|---|
@@ -357,16 +361,15 @@ order:
 
 Per-subcommand specifics that are easy to miss:
 
-- `convert` is the only stage command with no `--config`; it always runs on
-  `Config::default()` (`main.rs:397`). Because the three caps are not part of the
-  config, `convert` folds them into the artifact `config_hash` (`main.rs:402`,
+- `convert` reads the `convert.*` keys from `--config`. Because the three caps
+  are flags and not part of the config, `convert` folds them into the artifact
+  `config_hash` (`stages::convert::provenance_hash`,
   docs/18_findings_and_decisions.md) so two different caps do not collide on an
   identical hash.
   `top_peaks_ms2` is an irreversible conversion-time cap that also affects
   extraction/features/quant; `search_seed.top_n_peaks` is the seed-only
   alternative.
-- `quant-lfq`, `inspect`, `audit`, and `report` also take no `--config`.
-  `quant-lfq` validates its two string flags: `--method` must be `maxlfq` or
+- `quant-lfq` validates its two string flags: `--method` must be `maxlfq` or
   `directlfq` (`main.rs:649`) and `--normalize` is parsed by
   `NormalizeMethod::from_token` (`config.rs:754`), erroring on anything but
   `median_ratio`/`median`/`none` (`main.rs:652`).
@@ -402,12 +405,14 @@ Per-subcommand specifics that are easy to miss:
   manifest.
 - `align` uses `rt_im_train.q_train` for its training set and a hardcoded 100-knot
   grid (`main.rs:666-667`); it needs >=2 seeds and is not part of the `run` chain.
-- `mbr` (`main.rs:671`) is a wired standalone command, not part of `run`. It
-  hard-errors when `mbr.strategy = none` (`main.rs:680`), when fewer than two
+- `mbr` is a wired standalone command, not part of `run`. It runs only the
+  rescuable-tier transfer: it refuses any `mbr.strategy` other than
+  `empirical_library`, `rt_transfer` or `full` (so also the default
+  `second_pass`, which `run-experiment` runs itself), and it errors when fewer than two
   `--psms-extracted` are supplied (`main.rs:685`), or when `mbr.python` is unset
   (`main.rs:688`), then runs the `mbr_worker.py` sidecar with the `mbr.*`
   thresholds (`main.rs:697`). It transfers identifications across a run set
-  (Stage D3); see the extend section for its stub status inside `run`.
+  (Stage D3).
 - `doctor` (`main.rs:313`) probes three interpreters and prints `[ ok ]` /
   `[FAIL]` / `[skip]` per line, exiting nonzero if any fail: `rescore.python`
   (packages depend on the classifier: `torch,numpy,pandas,pyarrow` for `nn_torch`,
@@ -607,33 +612,9 @@ path-addressable, no stage depends on it to run (docs/18 B1).
 
 ### Current best workflow
 
-The validated best-performing configuration (docs/18 A1 and its "current best
-workflow") is library-input mode with:
-- an imported DIA-NN library (fragment intensities + iRT),
-- per-run DeepLC multitask fine-tune of iRT (`rt_im_train.finetune_deeplc = true`
-  + `predict_frag.deeplc_python`), which is essential in library mode because raw
-  DIA-NN iRT is locally noisy (~110 s MAD) and the fine-tune tightens it to
-  ~13-27 s (docs/18 A4),
-- the Extended feature set (`features.set = extended`, applied by `--profile dia`,
-  `config.rs:1101`),
-- the `nn_torch` PyTorch MLP rescorer (`rescore.classifier = nn_torch` +
-  `rescore.python`, with `rescore.strict = true`), which is the dominant
-  sensitivity lever and beats the native linear rescorer by ~8.5% (docs/18 A1),
-- a loose default apex-intensity Pearson gate
-  (`extract.gate_mode = apex_pearson`, `extract.gate_min_score = 0.2` set explicitly
-  by that arm's config), since
-  a strong nonlinear rescorer prefers recall and absorbs the loose-gate flood
-  (docs/18 A1/A2),
-- the conversion-time MS2 peak cap explicitly kept at 300 on AIF
-  (`--top-peaks-ms2 300`; both conversion entry points otherwise default to
-  uncapped). This is distinct from seed-only `search_seed.top_n_peaks`.
-
-On `LFQ_Orbitrap_AIF_Ecoli_01.mzML` this historically reaches ~10,300
-precursor-shaped `(peptidoform, charge)` report rows selected at
-`peptide_q_value <= 0.01`; it is not a precursor-q count or a universal preset.
-The zero-dependency native FASTA-digest mode (~1,213 rows under the same report
-definition) is the high-precision fallback. See docs/20 for the exact command,
-acceptance gates, and quantification-specific choices.
+The recommended library workflow is `configs/examples/diann-library.json`. Its
+contents and the history behind it are in docs/18, "Current best workflow"; the
+command and acceptance gates are in docs/20.
 
 ## Key types and functions
 
@@ -677,20 +658,20 @@ config (`main.rs:607`) before `run`. The fields this overview area touches:
 | `extract.bucket_size` | (see `ExtractConfig`) | Fragment-index bucket width; `search-seed` reads it too (`main.rs:473`). |
 | `rt_im_train.calibration_method` | `loess` | RT calibration; `none` is rejected by validation. |
 | `rt_im_train.q_train` | (see `RtImTrainConfig`) | Confident-seed q cutoff for the DeepLC fine-tune and the `align` reference set. |
-| `rt_im_train.finetune_deeplc` | `false` | Enables the per-run DeepLC fine-tune of iRT (best workflow). |
+| `rt_im_train.finetune_deeplc` | `false` | Enables the per-run DeepLC fine-tune of iRT. |
 | `rt_im_train.finetune_epochs` / `finetune_patience` | (see config) | DeepLC fine-tune schedule (`run.rs:259-260`). |
 | `rt_im_train.finetune_batch` | `0` | `0` auto-scales the fine-tune batch to seed size. |
 | `extract.gate_min_score` | `0.6` | Gate threshold of `extract.gate_mode`, default `window_mean` since 2026-10-08 (apex +-2 summed agreement minus an RT term). Under the previous `apex_pearson` gate the default was 0.2 (docs/18, "the gate optimum moved"). |
-| `extract.gate_mode` | `apex_pearson` | Which spectral score the gate thresholds (`GateMode`, `config.rs:591`). |
+| `extract.gate_mode` | `window_mean` | Which spectral score the gate thresholds (`GateMode`). |
 | `extract.retain_top_peaks` | `1` | `>1` writes the `<psms>.peaks.parquet` sidecar (not yet scored). |
 | `extract.emit_candidate_audit` | `false` | Emits `candidate_audit.parquet` in `run`. |
 | `extract.emit_gate_diagnostics` | `false` | Adds the four `gate_*` columns to `psms_extracted`. |
-| `features.set` | `minimal` | `minimal` (14) / `rich` (44) / `extended` (381, per the `feature_sets_sized` test `features.rs:1590-1598`); `dia` profile sets extended. |
+| `features.set` | `minimal` | `minimal` (14) / `rich` (44) / `extended` (426 with the default window families; derivation in docs/10 and the `feature_sets_sized` test); `dia` profile sets extended. |
 | `compete.mode` | `winner_take_all` | Within-group competition resolution (`CompetitionMode`). |
 | `rescore.classifier` | `native_tda` | Rescorer; `nn_torch` is the best lever, needs `rescore.python`. |
 | `rescore.python` | `None` | Interpreter for mokapot / nn_torch / entrapment sidecars. |
-| `mbr.strategy` | `none` | MBR mode; `none` makes the standalone `mumdia mbr` command error out (`main.rs:680`). |
-| `mbr.python` | `None` | `mbr_worker.py` interpreter; required when `strategy != none` (`main.rs:688`). |
+| `mbr.strategy` | `second_pass` | MBR mode; `run-experiment` searches every run again on the first pass's empirical library (docs/12, "Second pass"). The standalone `mumdia mbr` command refuses every strategy but `empirical_library`, `rt_transfer` and `full`. |
+| `mbr.python` | `None` | `mbr_worker.py` interpreter; required by the transfer strategies (`empirical_library`, `rt_transfer`, `full`). |
 | `quant.q_threshold` | `0.01` (`QuantConfig`) | q-value threshold for the human-readable report. |
 
 The config surface was recently pruned of dead or unwired fields (see
@@ -758,9 +739,6 @@ not part of the `run` chain and needs >=2 runs.
 - To wire a new sidecar: follow the positional-CLI file contract
   (`sidecar::resolve_script` + a worker in `scripts/`), gate it behind a config
   field, and check its prerequisites in `preflight` and `doctor`.
-- Stubs and unwired areas to be aware of: `mbr` has a wired standalone command
-  (`mumdia mbr` -> `mbr_worker.py`) but is a partial sidecar (not the full
-  experiment-wide flow) and is not in the `run` chain (needs >=2 runs); `align` is
-  likewise standalone-only (needs >=2 runs); ion mobility / 4D (diaPASEF) is
-  partial and lands in steps (docs/35_diapasef.md says which layers are in the
-  tree; IM columns are null on 3D runs). Do not document these as complete.
+- Standalone-only areas: `align` is a standalone command and is not in the `run`
+  chain (needs >=2 runs). For ion mobility / 4D (diaPASEF) see
+  docs/35_diapasef.md (IM columns are null on 3D runs).

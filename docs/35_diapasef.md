@@ -1066,8 +1066,8 @@ IM branch's E. coli diaPASEF library, 0.574592 for the recipe's), so it is compu
   slots of a scheme have disjoint m/z ranges (section 3).
 - **Memory.** Retrace holds every frame inside the candidates' RT windows (21 GB on the
   E. coli run on the IM branch; the E. coli runs with retrace on main peaked at 18.7-18.8 GB;
-  36-39 GB per HYE run on the IM branch). The pooled HYE rescore needed `MUMDIA_NN_STORE=f16` on a 64 GB node on the
-  IM branch.
+  36-39 GB per HYE run on the IM branch). The pooled HYE rescore needed an f16 feature store on a 64 GB node on the
+  IM branch; main has no such switch (`MUMDIA_NN_STORE` is not read).
 - **Evidence.** Most HYE numbers are one seed, no multi-run diaPASEF entrapment exists, and
   the quantification record rests on one known-ratio dataset.
 

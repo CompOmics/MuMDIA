@@ -148,7 +148,10 @@ sensitivity difference, not a loosened threshold.
 The mechanism is peak-group formation, not scoring. With most peaks removed,
 `extract.presence_min_fragments = 3`
 (`rust/mumdia/crates/mumdia-core/src/config.rs:523`, default at `:690`) cannot be
-satisfied, so real peptides never form a peak group. `mumdia audit` on the capped
+satisfied, so real peptides never form a peak group. That reading rests on the
+cap dose-response below, not on the audit label: `DID_NOT_SURVIVE_EXTRACTION` is a
+catch-all for any extract loss (presence, matched fraction and every gate
+rejection; docs/09). `mumdia audit` on the capped
 arm, restricted to peptides DIA-NN confirms are present, shows 49,105 of 78,782
 (62.3 percent) stopped at `candidate_generated` with `DID_NOT_SURVIVE_EXTRACTION`, against
 only 5,380 lost to FDR and 355 lost to competition. A counterfactual replay on
@@ -330,8 +333,10 @@ training epochs or an opened gate.
 
 The `nn_torch` training loop is seed x fold x round x epoch. The knobs:
 `rescore.folds` maps to `MUMDIA_NN_FOLDS`, `rescore.num_iter` maps to
-`MUMDIA_NN_ITERS` (rounds), `MUMDIA_NN_EPOCHS` is an environment variable only
-(not engine-set, default 25), and `MUMDIA_NN_SEEDS` defaults to 1.
+`MUMDIA_NN_ITERS` (rounds), `rescore.seeds` maps to `MUMDIA_NN_SEEDS` (default 1),
+and `MUMDIA_NN_EPOCHS` is an environment variable only (not engine-set, default
+25). The engine overwrites an exported `MUMDIA_NN_FOLDS`, `MUMDIA_NN_ITERS` or
+`MUMDIA_NN_SEEDS` with the config value.
 
 ### A11. `compete.group_by = base_peptide` is a misnomer and deletes modforms
 
@@ -386,8 +391,9 @@ docs/35_diapasef.md is the full record; these are the decisions that set its sha
   the ions a slot separates.
 - **Mobility gap of 30 scans.** The native centroiding splits a trace where two consecutive
   points are more than `convert.tdf_im_gap_scans` 30 scans apart, with
-  `tdf_min_points` 2 (1 cost 17% of peptides). Both rest on a peak census of one run and the
-  seed plateau, so they are provisional (docs/35 section 2).
+  `tdf_min_points` 1 since 2026-11-19 (single-ion centroids kept; docs/35 section 11,
+  "Low input"). The earlier value was 2, chosen when 1 cost 17% of peptides. The gap rests on a peak census of one run and the seed
+  plateau, so it is provisional (docs/35 section 2).
 - **The 1/K0 width and peak-shape features (P7) are closed.** -0.9% over three seeds, -0.1%
   on a re-test; not ported (docs/35 section 12).
 - **Fragment-model fine-tuning is open, not adopted.** +3.4% per run on HYE diaPASEF without
@@ -457,13 +463,14 @@ Concrete guarantees in code:
 
 Two known exceptions are nondeterministic by design and are documented as such:
 
-- The DeepLC multitask fine-tune (`scripts/deeplc_finetune.py`) sets no torch or
-  numpy seed, so refitting the RT model is not bit-reproducible.
+- The DeepLC multitask fine-tune (`scripts/deeplc_finetune.py`) is seeded from
+  `rng_seed` (`--seed`), but not bit-for-bit reproducible because of kernel
+  nondeterminism, so refitting the RT model is not bit-reproducible.
 - The `nn_torch` rescorer (`scripts/nn_rescore_worker.py`) sets
   `torch.manual_seed` and `np.random.seed` per pass
   (`scripts/nn_rescore_worker.py:197`, `:284`, `:285`), but its own header states
-  that NN training is only approximately reproducible, and it offers
-  `MUMDIA_NN_SEEDS > 1` to ensemble seeds and average rank-normalized
+  that NN training is only approximately reproducible, and `rescore.seeds > 1`
+  (passed as `MUMDIA_NN_SEEDS`) ensembles seeds and average rank-normalized
   out-of-fold scores for stability (`scripts/nn_rescore_worker.py:29` through
   `:30`). Treat `nn_torch` as seeded and approximately reproducible, but not
   bit-deterministic.
@@ -494,10 +501,9 @@ Concrete points in code:
 - The NN rescorer reads a PIN and writes the flat PIN-row ordinal back in its
   `candidate_id` column; Rust maps scores by that unique row index.
 
-Worker scripts are located by `sidecar::resolve_script`, which tries the
-configured directory relative to the working directory, then relative to the
-binary's own directory, then `<exe_dir>/scripts`
-(`rust/mumdia/crates/mumdia/src/sidecar.rs:20` through `:38`). On Windows, set
+An absolute `sidecar_script_dir` is used as given; a relative one is tried
+against the config file's directory, then next to the executable, and the working
+directory last (configs/README.md, "Where the worker scripts have to be"). On Windows, set
 `predict_frag.sidecar_script_dir` to an absolute path with a drive letter
 (`c:/...`), not a git-bash `/c/...` path, or the binary cannot find the worker
 and the strict default aborts. Only an explicit `rescore.strict=false`
@@ -507,26 +513,30 @@ compatibility config falls back to `native_tda`.
 
 ## Current best workflow and rationale
 
-Library-input mode is the recipe that wins:
+Library-input mode is the recipe that wins. The shipped form is
+`configs/examples/diann-library.json`:
 
 1. Import a DIA-NN predicted library (fragment intensities plus iRT) and generate
    paired decoys (license-clean: MuMDIA ships no DIA-NN; the user runs DIA-NN
    under their own license, then `import_diann_lib.py`, `make_reverse_decoys.py`
    and `predict_decoys.py`).
-2. Make sure the library iRT is DeepLC fine-tuned. The reference recipe does this
-   per run (`rt_im_train.finetune_deeplc = true`). Rationale: finding A4, raw iRT
-   is too noisy. On a multi-file experiment against a fixed library, fine-tuning
-   the library once and predicting it in full, then leaving
-   `finetune_deeplc = false`, matched the per-file residuals and saved about 36
-   minutes per file (finding A4).
+2. Replace the raw library iRT. Rationale: finding A4, raw iRT is too noisy. By
+   default (`rt_im_train.library_irt = auto`, with a DeepLC interpreter) the
+   library iRT is re-predicted with the DeepLC base model and the multi-head
+   calibration is fitted against the run (`rt_im_train.multihead_calibration`,
+   automatic); `finetune_deeplc` stays `false`. The August 2026 reference recipe
+   fine-tuned per run instead. A library fine-tuned once and predicted in full
+   remains an optional extra step on a large reference (finding A4; docs/08).
 3. Use the Extended feature set (`features.set = extended`).
 4. Use the `nn_torch` rescorer (`rescore.classifier = nn_torch`, with
    `rescore.python` pointing at a torch-capable interpreter and
    `rescore.strict = true`). Rationale: finding A1, the rescorer is the dominant
    lever; strict mode prevents a failed sidecar from masquerading as the intended
    model. Verify `params.classifier` in `psms_scored.parquet.report.json`.
-5. Use a loose extraction gate (`extract.gate_min_score` near 0.2). Rationale:
-   finding A1 and A2, the nonlinear rescorer prefers looser-is-better.
+5. Keep the default extraction gate (`extract.gate_mode = window_mean` at
+   `gate_min_score = 0.6`, since 2026-10-08; docs/09). The earlier finding that a
+   loose gate near 0.2 is best (A1, A2) was measured on the `apex_pearson` score.
+   0.2 on the window-mean score is a different and much looser gate.
 6. On this AIF file only, set the conversion-time MS2 peak cap to 300 by passing
    `--top-peaks-ms2 300`. Rationale: finding A3, uncapping adds interference on
    chimeric data. The seed-only `search_seed.top_n_peaks=300` is separate. On any
@@ -534,7 +544,7 @@ Library-input mode is the recipe that wins:
    sweep says otherwise; finding A3 measures a 300 cap costing 60 percent of the
    peptides on a 50-window Orbitrap DIA run.
 
-On `LFQ_Orbitrap_AIF_Ecoli_01` this historically reaches about 10,300
+On `LFQ_Orbitrap_AIF_Ecoli_01` the August 2026 reference recipe reached about 10,300
 `(peptidoform, charge)` rows in `peptides.tsv`, selected with
 `peptide_q_value <= 0.01`. That is a precursor-shaped report count under a
 peptide-level q filter, not a stripped-peptide count or a precursor-q count. The
@@ -552,17 +562,14 @@ ProteoBench precursor matrix, `run_psm_q` for cross-run quantification,
 1. **Rescorer.** The biggest lever (finding A1). Make a strong NN rescorer
    first-class and well-tested, and ideally deterministic (seed ensembling for
    stability).
-2. **Soft or budgeted extraction gate plus model-visible top-K peaks.** Replace
-   the hard `gate_min_score` drop with a score-ranked per-window candidate budget
-   and pass the gate score through as a feature (findings A1, A2). Promote the
-   retained top-K peaks (`extract.retain_top_peaks`, currently written to a
-   sidecar but not scored) into real `candidate_id + peak_rank` rows through
-   features and rescore, and collapse them in `compete` after scoring (finding
-   A6). Both need `precursor_q` to FDR-count correctly.
-3. **Wire match-between-runs fully and add a run-set orchestrator.** Forward the
-   unwired `MbrConfig` knobs, differentiate the `MbrStrategy` variants, keep the
-   transfer q as a separate column rather than overwriting `q_value`, and chain
-   transfer, search, and MBR under one config.
+2. **Soft or budgeted extraction gate plus model-visible top-K peaks.** A
+   score-ranked per-window candidate budget remains open (findings A1, A2).
+   Model-visible top-K peaks exist (`extract.promote_top_peaks`, through features,
+   compete and rescore, finding A6) and stay benchmark-gated at the default 1.
+3. **Match-between-runs and the run-set orchestrator: done.** `run-experiment`
+   pools the runs, and its default `mbr.strategy = second_pass` searches every run
+   again on the first pass's empirical library (docs/12, "Second pass"). The
+   rescuable-tier transfer (`rt_transfer`) stays opt-in.
 4. **Quantification maturity.** The current path now consumes the identified
    apex, preserves missing quantities as null with `quant_status`, and prevents
    sibling precursor forms from multiplying protein Top-N abundance. Next,
@@ -572,7 +579,8 @@ ProteoBench precursor matrix, `run_psm_q` for cross-run quantification,
 5. **Per-run figure-of-merit tolerance-optimization loop** (set each tolerance
    from a high percentile of the 1-percent-FDR error distribution and iterate to a
    stable precursor count).
-6. **Beyond-MVP:** learned protein-group FDR plus parsimony, and a native Thermo
-   `.raw` reader. Bruker diaPASEF TDF is read natively, with 1/K0 used in calibration,
+6. **Beyond-MVP:** learned protein-group FDR plus parsimony. A native Thermo
+   `.raw` reader exists behind the opt-in `thermo` build feature and
+   `convert.thermo_native` (docs/04_convert.md, "Native Thermo reading"). Bruker diaPASEF TDF is read natively, with 1/K0 used in calibration,
    extraction, features, retrace, the second pass and quantification (finding A13,
    docs/35_diapasef.md); its open arms are listed there.

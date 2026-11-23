@@ -901,6 +901,24 @@ than a number. Both are recorded in every run's `manifest.json`.
   overwrote those runs' tables and the experiment-level table with a fit on the subset, while
   the manifest still presented them as the whole experiment's.
 
+### Documentation
+
+- **The developer guide states the current defaults.** It said that the library recipe
+  fine-tunes DeepLC per run and gates at `apex_pearson` 0.2, that `compete.group_by`
+  defaults to `base_peptide` (`precursor`), that match-between-runs is off and a stub, that
+  `quant.fragment_selection` defaults to `observed_area`, that the DeepLC fine-tune sets no
+  seed, that worker scripts are found in the working directory first, and that
+  `DID_NOT_SURVIVE_EXTRACTION` proves a `presence_min_fragments` failure. It now gives the
+  shipped recipe (`configs/examples/diann-library.json`), the `peptidoform_charge` and
+  `second_pass` defaults, the pattern-fit quantification, the `rng_seed` seeding, the
+  config-directory, executable, working-directory order, and the catch-all meaning of that
+  audit label. The docs also no longer tell users to export `MUMDIA_NN_SEEDS`,
+  `MUMDIA_NN_FOLDS` or `MUMDIA_NN_ITERS`, which the engine overwrites from `rescore.seeds`,
+  `rescore.folds` and `rescore.num_iter`. The schema-version tables are merged into one
+  registry in docs/15; the rescore sidecar contract, the environment specifications, the
+  example configuration list, the Extended feature count and the importer's kept
+  modifications match the code. No output changes.
+
 ### Security
 
 - **RUSTSEC-2026-0545, -0547 and -0548 (zip 6.0.0) are audited and ignored, with their reason

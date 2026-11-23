@@ -36,8 +36,11 @@ or a precursor-q-controlled precursor table.
 
 **Validated reference.** The historical maximum-sensitivity result is scoped to
 `LFQ_Orbitrap_AIF_Ecoli_01.mzML`, an imported DIA-NN E. coli library with paired
-decoys, per-run DeepLC fine-tuning, Extended features, the default
-`apex_pearson` gate at 0.2, and strict NnTorch rescoring.
+decoys, per-run DeepLC fine-tuning, Extended features, the `apex_pearson` gate at
+0.2 (then the default), and strict NnTorch rescoring. The command below runs
+`configs/examples/diann-library.json` as it is today: no fine-tune (the library
+iRT is re-predicted and calibrated with the multi-head calibration) and the
+`window_mean` gate at 0.6. Its count is therefore not the historical one.
 
 Run from the repository root, using a fresh output directory:
 
@@ -62,11 +65,11 @@ The effective reference settings are:
 | Setting | AIF reference |
 |---|---|
 | `features.set` | `extended` |
-| `extract.gate_mode` | `apex_pearson` |
+| `extract.gate_mode` | `window_mean` (the default) |
 | `extract.gate_min_score` | `0.6` with `gate_mode = window_mean` (the default since 2026-10-08) |
 | `extract.apex_count_window` | `5` (`"auto"` resolves to 5 on this Q Exactive run) |
 | `extract.apex_rt_prior_s` | `120` seconds |
-| `rt_im_train.finetune_deeplc` | `true` |
+| `rt_im_train.finetune_deeplc` | `false` (the default; the multi-head calibration adapts the library iRT) |
 | `rt_im_train.rt_window_multiplier` | `1.5` |
 | `rescore.classifier` | `nn_torch` |
 | `rescore.strict` | `true` |
@@ -92,8 +95,9 @@ target-decoy sanity check, not an independent empirical-null validation.
 - Verify `params.classifier` and `model_identity` in
   `psms_scored.parquet.report.json`. The report is the source of truth for the
   model that actually ran.
-- Use a fresh output directory. `run` always recomputes, has no cache/resume, and
-  does not remove stale optional files from a reused directory.
+- Use a fresh output directory. `run` always recomputes its named outputs (the
+  library and DeepLC projection caches aside, docs/14 "The engine's caches"), has
+  no resume, and does not remove stale optional files from a reused directory.
 - Record the exact library and decoy provenance. Counts are uninterpretable
   without the search-space definition.
 - Repeat stochastic runs when comparing small gains. NnTorch seeds NumPy/Torch
@@ -108,8 +112,8 @@ Do not generalize the AIF settings without a sweep on the new acquisition:
 |---|---|---|
 | MS2 conversion cap | 300 slightly beat uncapped on chimeric AIF | Must be re-measured per acquisition type; a 300 cap cost 60% of peptides on a 50-window run |
 | Seed peak count | `search_seed.top_n_peaks=300` | Seed-only; not a conversion cap |
-| Extraction threshold | 0.2 was best with NnTorch; native peaked nearer 0.6 | Tune gate and classifier together |
-| Gate meaning | default is one-apex observed-vs-predicted intensity Pearson | Temporal co-elution requires `coelution`/`combined` |
+| Extraction threshold | under `apex_pearson`, 0.2 was best with NnTorch; the default `window_mean` gate is at 0.6 | Tune gate and classifier together |
+| Gate meaning | the default `window_mean` scores the spectrum summed over the apex +-2 scans; `apex_pearson` is one-apex observed-vs-predicted intensity Pearson | Temporal co-elution requires `coelution`/`combined` |
 | Apex window/prior | count window 5 and RT prior 120 s helped this AIF run | Validate correct-peak rate and RT residuals |
 | RT fine-tune | major imported-library sensitivity lever | Requires enough confident seed anchors; per-file refit is not required (see below) |
 | `--max-spectra` | reads the file head | Externally prepare a mid-gradient slice; there is no offset |
@@ -126,7 +130,7 @@ cannot be recovered by any downstream lever; re-conversion is required.
 
 The failure is not a scoring failure. When most peaks are gone,
 `extract.presence_min_fragments` (default `3`,
-`rust/mumdia/crates/mumdia-core/src/config.rs:523` and `:690`) cannot be met and
+`ExtractConfig::presence_min_fragments`) cannot be met and
 real peptides never form a peak group. On a 50-window Orbitrap DIA run, a cap of
 300 discarded 78.6% of all MS2 peaks and truncated 85.5% of spectra, and
 `mumdia audit` restricted to peptides DIA-NN 2.2.0 confirms are present showed
@@ -274,10 +278,14 @@ rounds, or open gates. Do not chase epoch or round counts.
 
 For reference, the NnTorch training loop is seed x fold x round x epoch:
 
-- folds: `rescore.folds`, overridable via `MUMDIA_NN_FOLDS`;
-- rounds: `rescore.num_iter`, overridable via `MUMDIA_NN_ITERS`;
+- folds: `rescore.folds`;
+- rounds: `rescore.num_iter`;
 - epochs: `MUMDIA_NN_EPOCHS` (environment only, not engine-set; default `25`);
-- seeds: `MUMDIA_NN_SEEDS` (default `1`).
+- seeds: `rescore.seeds` (default `1`).
+
+The engine passes folds, rounds and seeds to the worker as `MUMDIA_NN_FOLDS`,
+`MUMDIA_NN_ITERS` and `MUMDIA_NN_SEEDS`, and overwrites an exported value of any of
+them; set the `rescore.*` key instead.
 
 ## Competition and FDR
 
@@ -287,32 +295,25 @@ does not directly eliminate a target against its paired decoy. Later grouped-q
 reductions in `rescore` select representatives by the requested biological unit
 and then compare target and decoy populations to estimate q values.
 
-The default `compete.group_by=precursor` is named misleadingly. It keys on
-`(base_peptide_id, label_code, 0, peak_rank)`
-(`rust/mumdia/crates/mumdia/src/stages/compete.rs:88`), and `base_peptide_id` is
-the stripped sequence (`scripts/import_diann_lib.py:137` factorizes
-`Stripped.Sequence`). Only the highest-`prelim` row of each group survives; the
-rest are deleted before rescoring
-(`rust/mumdia/crates/mumdia/src/stages/compete.rs:321` through `:344`). Every
-charge and every modification variant of one peptide therefore collapses to a
-single winner pre-FDR, and the default cannot produce a precursor-level count.
+The default `compete.group_by = peptidoform_charge` (since 2026-09-06) keys
+`(pform_id, label_code, charge, peak_rank)` and is the true precursor-level
+competition: each peptidoform and charge competes only against its own alternative
+peaks. Only the highest-`prelim` row of each group survives; the rest are deleted
+before rescoring.
 
-`peptidoform_charge` keys `(peptidoform_id, label_code, charge, peak_rank)`
-(`rust/mumdia/crates/mumdia/src/stages/compete.rs:93` through `:98`) and is the
-true precursor-level competition. Measured on a modification-rich imported
-library, the default deleted 880,464 of 1,890,239 extracted candidates (46.6%),
-while `peptidoform_charge` removed 0 rows and moved precursors per peptide from
-1.000 to 1.174 (DIA-NN reports about 1.126 on comparable data). The peptide count
-was unchanged, so the precursor-level key cost nothing there.
+`base_peptide` (formerly `precursor`, which the config no longer accepts) keys
+`(base_peptide_id, label_code, 0, peak_rank)`, and `base_peptide_id` is the
+stripped sequence. Every charge and every modification variant of one peptide
+then collapses to a single winner pre-FDR, so it cannot produce a precursor-level
+count. Measured on a modification-rich imported library, `base_peptide` deleted
+880,464 of 1,890,239 extracted candidates (46.6%), while `peptidoform_charge`
+removed 0 rows and moved precursors per peptide from 1.000 to 1.174. The peptide
+count was unchanged, so the precursor-level key cost nothing there.
 
-**Recommended guardrail for PTM work.** Under the default key, a modified form is
-deleted whenever an unmodified or otherwise-modified sibling of the same stripped
-sequence scores higher, which is the usual case. Set
-`compete.group_by=peptidoform_charge` for any modification search, and for any
-precursor-level count or precursor matrix. It also changes the classifier and FDR
-population, so a base-peptide sensitivity benchmark should still report the
-default key as its comparison baseline, and a change of default remains
-benchmark-gated.
+**Guardrail for PTM work.** Under `base_peptide`, a modified form is deleted
+whenever an unmodified or otherwise-modified sibling of the same stripped sequence
+scores higher, which is the usual case. Never use it for a modification search,
+or for any precursor-level count or precursor matrix.
 
 Pooling more runs into one rescore does not tighten q. The estimator is
 `q = (n_decoys + 1) / max(1, n_targets)`, whose only pool-size-dependent term is
@@ -446,7 +447,6 @@ IDs so selection effects remain visible.
 |---|---|
 | Looser/alternative/soft extraction gate or MS1 rescue | multi-context sensitivity plus empirical-null FDR |
 | Model-visible top-K peaks | stable `candidate_id + peak_rank`, competition/FDR, and known-ratio quant |
-| `peptidoform_charge` competition as the global default | precursor-level FDR/entrapment plus completeness and ratio accuracy. Not gated for PTM searches or precursor-level counts, where it is required |
 | Adaptive RT windows or tolerance optimization | multiple gradients/instruments with no FDR inflation |
 | Shared consensus peak widths or ion sets | known-ratio bias, CV, and missingness across runs. The cross-run step (docs/12_quant_lfq_align_mbr_report_audit.md, "Cross-run fragment selection and background") runs by default for the pattern fit's dispersion and the automatic background; its fragment weights (`cross_run`) and widths (`fixed_scan_halfwidth_scale`) stay opt-in and are measured on one diaPASEF known-ratio set only |
 | Minimum clean-ion/interference rules | accuracy gain without unacceptable missingness |
