@@ -15,7 +15,9 @@ written at their defaults moves the configuration hash of every run once. The mo
 trains logistic regression on every install, so a mokapot rescore outside the Docker image
 changes model and scores. A pooled rescore of several runs (`run` with several `--mzml`, and
 `run-experiment`) now applies shadow demotion per run, so its scores and counts change; a single
-run writes the same tables. `proteins.tsv` leaves the cell of a run without the protein group
+run writes the same tables. A diaPASEF search read natively from a Bruker `.d` now keeps
+single-ion centroids and runs without the 1/K0 support gate, so it finds and quantifies
+differently, most at low load. `proteins.tsv` leaves the cell of a run without the protein group
 empty instead of writing zero, and the cross-run normalisation survives a run with no quantified
 precursor. The rest is two rounds of code cleanup without an output change, and fixes to the
 engine, the desktop application, the library helpers and the documentation.
@@ -231,6 +233,19 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **diaPASEF: the native reader keeps single-ion centroids, and the support gate is off
+  (docs/35 sections 11 and 16; commit cbc4b159, pushed to main without a PR).**
+  `convert.tdf_min_points` defaults to 1 (was 2): at low load most real fragment signal is a
+  single ion event, which 2 dropped, and extract then rejected the faint precursors at
+  presence. `extract.gate_support_min` is off when unset (it was 0.845 on spectra that carry
+  1/K0), and the diaPASEF recipe sets `extract.presence_min_coelution` 1. Measured with the
+  recipe, three NN seeds, precursors per run at `run_psm_q` 1%: 200 pg HeLa 3,422 -> 7,689,
+  1 ng 12,542 -> 19,270, 250 pg Ultra 6,912 -> 9,544, 50 ng 5-min Ultra 2 35,710 -> 35,346;
+  E. coli entrapment FDP 0.97%; no identification in three blank runs; the other-species
+  share rose on the 250 pg Ultra set (1.17% -> 1.40%) and fell elsewhere. The rescore
+  prefilter also starts from the best single feature column when its initial score passes no
+  target at 1%, instead of standing aside. A search of a Bruker `.d` read natively finds and
+  quantifies differently; a search without 1/K0 is unaffected.
 - **Release and CI hardening (#365, docs/14, "Release workflow").** A release now gets its files
   in one `publish` job after every archive and installer built, so a failed build no longer
   leaves a half-filled release; a release published by hand before the tag is held as
