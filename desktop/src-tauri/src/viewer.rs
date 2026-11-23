@@ -136,6 +136,9 @@ pub fn open(viewers: &Viewers, dir: &str, fasta: Option<&str>) -> Result<String,
                 .into(),
         );
     }
+    if let Some(e) = components::base_interpreter_gone(&components::venv_dir(Env::Visdia)) {
+        return Err(e);
+    }
     let root = Path::new(dir);
     if !root.is_dir() {
         return Err(format!("{dir} is not a folder"));
@@ -230,13 +233,17 @@ pub fn open(viewers: &Viewers, dir: &str, fasta: Option<&str>) -> Result<String,
 
     open_in_browser(&url)?;
     if let Ok(mut m) = viewers.live.lock() {
-        m.insert(
+        // A second open of the same folder replaced a viewer that had exited, or one
+        // started meanwhile; either way nothing else would stop the old process.
+        if let Some(old) = m.insert(
             key,
             Running {
                 child,
                 url: url.clone(),
             },
-        );
+        ) {
+            crate::run::kill_tree(old.child.id());
+        }
     }
     Ok(url)
 }
