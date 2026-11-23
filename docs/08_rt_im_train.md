@@ -612,7 +612,9 @@ experiment: 1.4x wall clock on AIF and 1.7x on Astral when every run pays it.
 Since 2026-09-14 it does not have to. `experiment.rt_library_scope` (default
 `first_run_only`, formerly `finetune_scope`) governs multi-head exactly as it already
 governed the fine-tune: the first run adapts the library, the rest reuse it and fit their
-own LOESS on top. What a shared library fixes is elution ORDER, which replicate injections
+own LOESS on top. When the first run's seed is short of the anchors the multi-head
+calibration needs (a blank, a failed injection), the first run whose seed has them adapts
+for every run instead, the first included. What a shared library fixes is elution ORDER, which replicate injections
 on one method share; a batch that genuinely reorders -- different gradients or columns, a
 method change part-way -- wants `per_run`, and so does a long batch where drift
 accumulates. The fine-tune's measured cost of sharing is the guide until the multi-head

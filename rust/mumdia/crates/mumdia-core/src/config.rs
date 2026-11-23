@@ -4399,6 +4399,9 @@ pub struct MbrConfig {
     pub decoy_transfer: DecoyTransfer,
     /// Minimum correlation of the observed fragment pattern to the empirical
     /// consensus for a transfer to be accepted (interference guard; 0 disables).
+    /// Applied by `mumdia mbr --frag` only: `run-experiment` refuses a value above 0
+    /// with a transfer strategy, because its quant writes the fragment tables after the
+    /// transfer.
     pub consensus_corr_min: f64,
     /// NOT YET WIRED. Would requantify already-identified precursors too (fill the
     /// matrix), not only transferred ones, under `strategy = Full`. No code reads this

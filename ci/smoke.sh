@@ -971,6 +971,51 @@ print(f"    ok: empirical library {lib['entries']} entries + {lib['decoys']} pai
       f"{lib['runs_aligned']} runs aligned; no decoy extracted, so the first pass stands")
 PYEOF
 
+# 5b. The applied second pass, the default multi-run path on real data. A second run with
+#     more noise drawn from the library's fragment m/z (60 peaks per spectrum; 40 is not
+#     enough) and the extraction gate open (gate_min_score 0) give the second pass chance
+#     decoys, so it applies: the experiment's scored table is then the second pass's rescore,
+#     and quant must read the second pass's chromatograms, whose candidate ids are the
+#     empirical library's.
+echo "=== smoke: second pass applied"
+"$PY" ci/make_fixture_mzml.py \
+    --precursors "$work/lib_prec.parquet" --fragments "$work/lib_frag.parquet" \
+    --out "$work/fixture_noisy.mzML" --n-planted 160 --windows 8 --library-noise-peaks 60 --quiet
+"$PY" - "$cfg" "$work/exp_sp.json" <<'PYEOF'
+import json, sys
+c = json.load(open(sys.argv[1]))
+c.setdefault("experiment", {}).update(parallel_runs=1, overlap_front_threads=0)
+c.setdefault("extract", {})["gate_min_score"] = 0.0
+json.dump(c, open(sys.argv[2], "w"), indent=2)
+PYEOF
+"$BIN" run-experiment --fasta test_data/fixture.fasta \
+    --mzml "$work/fixture.mzML" --mzml "$work/fixture_noisy.mzML" \
+    --run-names a --run-names b \
+    --out-dir "$work/exp_sp" --config "$work/exp_sp.json" > "$work/exp_sp.log" 2>&1 \
+    || { tail -30 "$work/exp_sp.log"; echo "run-experiment with an applied second pass failed"; exit 1; }
+"$PY" - "$work/exp_sp" <<'PYEOF'
+import json, sys
+import pyarrow.parquet as pq
+d = sys.argv[1]
+m = json.load(open(d + "/experiment_manifest.json"))
+assert m["model_identities"]["mbr"] == "SecondPass", m["model_identities"]["mbr"]
+assert m["experiment"]["second_pass"] is not None, "experiment.second_pass is null"
+lib = set(pq.read_table(d + "/second_pass/library/lib_precursors.parquet",
+                        columns=["candidate_id"]).column(0).to_pylist())
+n = 0
+for run in ("a", "b"):
+    ids = set(pq.read_table(f"{d}/{run}/peptide_quant.parquet",
+                            columns=["candidate_id"]).column(0).to_pylist())
+    chrom = set(pq.read_table(f"{d}/second_pass/{run}/chromatograms.parquet",
+                              columns=["candidate_id"]).column(0).to_pylist())
+    assert ids, f"run {run} quantified nothing"
+    assert ids <= lib, f"run {run}: quantified ids outside the empirical library"
+    assert ids <= chrom, f"run {run}: quantified ids without a second-pass chromatogram"
+    n += len(ids)
+print(f"    ok: second pass applied; {n} quantified precursors, all empirical-library ids "
+      f"with second-pass chromatograms")
+PYEOF
+
 # 5r. `output.retain` (docs/01, "Output retention"): the same experiment at `viewer` and at
 #     `results`, and the single run at `results`. The fixture's second pass does not apply,
 #     so the first pass's tables are the evidence: `viewer` keeps them, `results` drops them
@@ -1532,6 +1577,12 @@ arm("auto_seed", rt_im_train={"multihead_calibration": 2, "multihead_search_belo
 # The automatic multi-head calibration on a seed short of anchors at every anchor_q_ladder
 # rung: skipped, and the imported library searched on base-model retention times instead.
 arm("skip", rt_im_train={"min_seed_for_calibration": 1000000})
+# A first run short of seed anchors (a near-blank input): the first run that has them adapts
+# the library for every run, sequentially and overlapped.
+arm("short", rt_im_train={"multihead_calibration": 2, "multihead_anchors": "seed"},
+    experiment={"parallel_runs": 1, "overlap_front_threads": 0})
+arm("short_overlap", rt_im_train={"multihead_calibration": 2, "multihead_anchors": "seed"},
+    experiment={"overlap_front_threads": 1})
 # No trailing newline: on Windows it would arrive as CR LF, and $( ) strips the LF only.
 sys.stdout.write(os.path.join(root, "site"))
 PYEOF
@@ -1604,6 +1655,18 @@ grep -q "converting and seeding the other runs while the first adapts" "$stub/au
     || { echo "the auto_overlap arm did not keep the overlap"; exit 1; }
 grep -q "multihead_anchors = auto kept the seed anchors" "$stub/auto_seed.log" \
     || { tail -20 "$stub/auto_seed.log"; echo "the auto_seed arm did not keep the seed anchors"; exit 1; }
+# A near-blank first run (one planted precursor, far below min_seed_for_calibration).
+"$PY" ci/make_fixture_mzml.py \
+    --precursors "$work/lib_prec.parquet" --fragments "$work/lib_frag.parquet" \
+    --out "$work/blank.mzML" --n-planted 1 --windows 8 --quiet
+for a in short short_overlap; do
+    stub_run "$a" "$BIN" run-experiment \
+        --lib-precursors "$work/lib_prec.parquet" --lib-fragments "$work/lib_frag.parquet" \
+        --mzml "$work/blank.mzML" --mzml "$work/fixture.mzML" \
+        --run-names a --run-names b --out-dir "$stub/$a" \
+        --config "$stub/$a.json" --threads 2 \
+        || { tail -30 "$stub/$a.log"; echo "stub arm $a failed"; exit 1; }
+done
 # The skipped multi-head calibration, in `run-experiment` and in `run`.
 stub_experiment skip skip \
     || { tail -30 "$stub/skip.log"; echo "stub arm skip failed"; exit 1; }
@@ -1828,6 +1891,22 @@ if not same(m["artifacts"]["fragment_library_precursors"]["path"],
     fail("skip_run: the manifest records %r as the library"
          % m["artifacts"]["fragment_library_precursors"]["path"])
 
+# A short first run: one multi-head call, on run b's seed, and run a reads that library.
+for name in ("short", "short_overlap"):
+    c = calls(name)
+    if len(c) != 1 or c[0]["mode"] != "multihead" or c[0]["bands"]:
+        fail("%s: expected one multi-head call, got %r" % (name, c))
+    if not same(c[0]["seed"], stub / name / "b/seed_psms.parquet"):
+        fail("%s: calibrated against %r, not run b's seed" % (name, c[0]["seed"]))
+    if list((stub / name / "a").glob("fragment_library*")):
+        fail("%s: run a adapted a library of its own" % name)
+    if not (stub / name / "scored_combined.parquet").exists():
+        fail("%s: the experiment did not finish" % name)
+a = pq.read_table(stub / "short/scored_combined.parquet")
+b = pq.read_table(stub / "short_overlap/scored_combined.parquet")
+if not a.equals(b):
+    fail("short: the overlapped experiment scored differently from the sequential one")
+
 # The deferred build: one --bands multi-head call per run, over the two bands.
 for name in ("defer_fast", "defer_kept"):
     c = calls(name)
@@ -1835,10 +1914,12 @@ for name in ("defer_fast", "defer_kept"):
         fail("%s: expected one two-band multi-head call, got %r" % (name, c))
 print("    ok: once_per_run union, kept re-prediction, per-band slices reused, deferred "
       "library refused and accepted, overlap equal to sequential, search anchors refit and "
-      "fall back, a skipped calibration re-predicted (%d stub calls)"
+      "fall back, a skipped calibration re-predicted, a short first run adapted on the "
+      "next (%d stub calls)"
       % sum(len(calls(n)) for n in ("union", "keep", "perband", "seq", "overlap",
                                      "overlap_fail", "defer_fast", "defer_kept", "boot",
-                                     "boot_run", "boot_fallback", "skip", "skip_run")))
+                                     "boot_run", "boot_fallback", "skip", "skip_run",
+                                     "short", "short_overlap")))
 PYEOF
 
 # 5p. Protein annotations: the report of the run's scored table without the annotation table

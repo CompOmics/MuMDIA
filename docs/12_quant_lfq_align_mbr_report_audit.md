@@ -1655,7 +1655,9 @@ the psms paths into a comma-separated `psms_csv` and forwards a fixed set of fla
 `q_anchor` (`--q-anchor`), `min_anchor_runs` (`--min-anchor-runs`), `q_transfer`
 (`--q-transfer`), `consensus_corr_min` (`--consensus-corr-min`, only together with
 `--frag-csv` and only when `frag` is non-empty and `consensus_corr_min > 0`,
-`sidecar.rs:209`), plus `cfg.rng_seed` as `--seed` and the optional `--out-scored`.
+`sidecar.rs:209`; `run-experiment` has no fragment tables before its quant, so it refuses
+`consensus_corr_min > 0` with a transfer strategy and only `mumdia mbr --frag` applies the
+guard), plus `cfg.rng_seed` as `--seed` and the optional `--out-scored`.
 NOT forwarded (present in `MbrConfig`, `config.rs:873`, but dead in the wired path):
 - `strategy` beyond the None/not-None gate: `EmpiricalLibrary`, `RtTransfer`, `Full`
   are indistinguishable to the worker, which always runs the rescuable transfer tier.
