@@ -767,10 +767,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/clap@4.6.7",
+      "bom-ref": "pkg:cargo/clap@4.6.9",
       "name": "clap",
-      "version": "4.6.7",
-      "purl": "pkg:cargo/clap@4.6.7",
+      "version": "4.6.9",
+      "purl": "pkg:cargo/clap@4.6.9",
       "description": "A simple to use, efficient, and full-featured Command Line Argument Parser",
       "licenses": [
         {
@@ -805,10 +805,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/clap_derive@4.6.7",
+      "bom-ref": "pkg:cargo/clap_derive@4.6.9",
       "name": "clap_derive",
-      "version": "4.6.7",
-      "purl": "pkg:cargo/clap_derive@4.6.7",
+      "version": "4.6.9",
+      "purl": "pkg:cargo/clap_derive@4.6.9",
       "description": "Parse command line argument by defining a struct, derive crate.",
       "licenses": [
         {
@@ -2574,10 +2574,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/proc-macro2@1.0.106",
+      "bom-ref": "pkg:cargo/proc-macro2@1.0.107",
       "name": "proc-macro2",
-      "version": "1.0.106",
-      "purl": "pkg:cargo/proc-macro2@1.0.106",
+      "version": "1.0.107",
+      "purl": "pkg:cargo/proc-macro2@1.0.107",
       "description": "A substitute implementation of the compiler's `proc_macro` API to decouple token-based libraries from the procedural macro use case.",
       "licenses": [
         {
@@ -2612,10 +2612,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/quote@1.0.46",
+      "bom-ref": "pkg:cargo/quote@1.0.47",
       "name": "quote",
-      "version": "1.0.46",
-      "purl": "pkg:cargo/quote@1.0.46",
+      "version": "1.0.47",
+      "purl": "pkg:cargo/quote@1.0.47",
       "description": "Quasi-quoting macro quote!(...)",
       "licenses": [
         {
@@ -3214,10 +3214,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/syn@3.0.5",
+      "bom-ref": "pkg:cargo/syn@3.0.10",
       "name": "syn",
-      "version": "3.0.5",
-      "purl": "pkg:cargo/syn@3.0.5",
+      "version": "3.0.10",
+      "purl": "pkg:cargo/syn@3.0.10",
       "description": "Parser for Rust source code",
       "licenses": [
         {
@@ -4484,10 +4484,10 @@
       ]
     },
     {
-      "ref": "pkg:cargo/clap@4.6.7",
+      "ref": "pkg:cargo/clap@4.6.9",
       "dependsOn": [
         "pkg:cargo/clap_builder@4.6.7",
-        "pkg:cargo/clap_derive@4.6.7"
+        "pkg:cargo/clap_derive@4.6.9"
       ]
     },
     {
@@ -4500,12 +4500,12 @@
       ]
     },
     {
-      "ref": "pkg:cargo/clap_derive@4.6.7",
+      "ref": "pkg:cargo/clap_derive@4.6.9",
       "dependsOn": [
         "pkg:cargo/heck@0.5.0",
-        "pkg:cargo/proc-macro2@1.0.106",
-        "pkg:cargo/quote@1.0.46",
-        "pkg:cargo/syn@3.0.5"
+        "pkg:cargo/proc-macro2@1.0.107",
+        "pkg:cargo/quote@1.0.47",
+        "pkg:cargo/syn@3.0.10"
       ]
     },
     {
@@ -4614,8 +4614,8 @@
     {
       "ref": "pkg:cargo/displaydoc@0.1.7",
       "dependsOn": [
-        "pkg:cargo/proc-macro2@1.0.106",
-        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/proc-macro2@1.0.107",
+        "pkg:cargo/quote@1.0.47",
         "pkg:cargo/syn@1.0.109"
       ]
     },
@@ -4935,7 +4935,7 @@
         "pkg:cargo/anyhow@1.0.104",
         "pkg:cargo/arrow@60.1.0",
         "pkg:cargo/blake3@1.8.7",
-        "pkg:cargo/clap@4.6.7",
+        "pkg:cargo/clap@4.6.9",
         "pkg:cargo/mimalloc@0.1.52",
         "pkg:cargo/mumdia-core@0.14.0",
         "pkg:cargo/mumdia-io@0.14.0",
@@ -5119,8 +5119,8 @@
       "dependsOn": [
         "pkg:cargo/phf_generator@0.14.0",
         "pkg:cargo/phf_shared@0.14.0",
-        "pkg:cargo/proc-macro2@1.0.106",
-        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/proc-macro2@1.0.107",
+        "pkg:cargo/quote@1.0.47",
         "pkg:cargo/syn@2.0.118"
       ]
     },
@@ -5139,7 +5139,7 @@
       "dependsOn": []
     },
     {
-      "ref": "pkg:cargo/proc-macro2@1.0.106",
+      "ref": "pkg:cargo/proc-macro2@1.0.107",
       "dependsOn": [
         "pkg:cargo/unicode-ident@1.0.24"
       ]
@@ -5151,9 +5151,9 @@
       ]
     },
     {
-      "ref": "pkg:cargo/quote@1.0.46",
+      "ref": "pkg:cargo/quote@1.0.47",
       "dependsOn": [
-        "pkg:cargo/proc-macro2@1.0.106"
+        "pkg:cargo/proc-macro2@1.0.107"
       ]
     },
     {
@@ -5248,9 +5248,9 @@
     {
       "ref": "pkg:cargo/serde_derive@1.0.229",
       "dependsOn": [
-        "pkg:cargo/proc-macro2@1.0.106",
-        "pkg:cargo/quote@1.0.46",
-        "pkg:cargo/syn@3.0.5"
+        "pkg:cargo/proc-macro2@1.0.107",
+        "pkg:cargo/quote@1.0.47",
+        "pkg:cargo/syn@3.0.10"
       ]
     },
     {
@@ -5312,41 +5312,41 @@
     {
       "ref": "pkg:cargo/syn@1.0.109",
       "dependsOn": [
-        "pkg:cargo/proc-macro2@1.0.106",
-        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/proc-macro2@1.0.107",
+        "pkg:cargo/quote@1.0.47",
         "pkg:cargo/unicode-ident@1.0.24"
       ]
     },
     {
       "ref": "pkg:cargo/syn@2.0.118",
       "dependsOn": [
-        "pkg:cargo/proc-macro2@1.0.106",
-        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/proc-macro2@1.0.107",
+        "pkg:cargo/quote@1.0.47",
         "pkg:cargo/unicode-ident@1.0.24"
       ]
     },
     {
-      "ref": "pkg:cargo/syn@3.0.5",
+      "ref": "pkg:cargo/syn@3.0.10",
       "dependsOn": [
-        "pkg:cargo/proc-macro2@1.0.106",
-        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/proc-macro2@1.0.107",
+        "pkg:cargo/quote@1.0.47",
         "pkg:cargo/unicode-ident@1.0.24"
       ]
     },
     {
       "ref": "pkg:cargo/thiserror-impl@1.0.69",
       "dependsOn": [
-        "pkg:cargo/proc-macro2@1.0.106",
-        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/proc-macro2@1.0.107",
+        "pkg:cargo/quote@1.0.47",
         "pkg:cargo/syn@2.0.118"
       ]
     },
     {
       "ref": "pkg:cargo/thiserror-impl@2.0.21",
       "dependsOn": [
-        "pkg:cargo/proc-macro2@1.0.106",
-        "pkg:cargo/quote@1.0.46",
-        "pkg:cargo/syn@3.0.5"
+        "pkg:cargo/proc-macro2@1.0.107",
+        "pkg:cargo/quote@1.0.47",
+        "pkg:cargo/syn@3.0.10"
       ]
     },
     {
@@ -5388,8 +5388,8 @@
     {
       "ref": "pkg:cargo/tracing-attributes@0.1.31",
       "dependsOn": [
-        "pkg:cargo/proc-macro2@1.0.106",
-        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/proc-macro2@1.0.107",
+        "pkg:cargo/quote@1.0.47",
         "pkg:cargo/syn@2.0.118"
       ]
     },
@@ -5485,8 +5485,8 @@
       "ref": "pkg:cargo/wasm-bindgen-macro-support@0.2.126",
       "dependsOn": [
         "pkg:cargo/bumpalo@3.20.3",
-        "pkg:cargo/proc-macro2@1.0.106",
-        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/proc-macro2@1.0.107",
+        "pkg:cargo/quote@1.0.47",
         "pkg:cargo/syn@2.0.118",
         "pkg:cargo/wasm-bindgen-shared@0.2.126"
       ]
@@ -5494,7 +5494,7 @@
     {
       "ref": "pkg:cargo/wasm-bindgen-macro@0.2.126",
       "dependsOn": [
-        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/quote@1.0.47",
         "pkg:cargo/wasm-bindgen-macro-support@0.2.126"
       ]
     },
@@ -5527,16 +5527,16 @@
     {
       "ref": "pkg:cargo/windows-implement@0.60.2",
       "dependsOn": [
-        "pkg:cargo/proc-macro2@1.0.106",
-        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/proc-macro2@1.0.107",
+        "pkg:cargo/quote@1.0.47",
         "pkg:cargo/syn@2.0.118"
       ]
     },
     {
       "ref": "pkg:cargo/windows-interface@0.59.3",
       "dependsOn": [
-        "pkg:cargo/proc-macro2@1.0.106",
-        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/proc-macro2@1.0.107",
+        "pkg:cargo/quote@1.0.47",
         "pkg:cargo/syn@2.0.118"
       ]
     },
@@ -5569,8 +5569,8 @@
     {
       "ref": "pkg:cargo/zerocopy-derive@0.8.52",
       "dependsOn": [
-        "pkg:cargo/proc-macro2@1.0.106",
-        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/proc-macro2@1.0.107",
+        "pkg:cargo/quote@1.0.47",
         "pkg:cargo/syn@2.0.118"
       ]
     },
