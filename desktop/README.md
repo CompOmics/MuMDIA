@@ -346,7 +346,7 @@ installation passes the property, then installs the components from an elevated 
 deployment tool running as SYSTEM:
 
 ```powershell
-msiexec /i MuMDIA_0.14.0_x64_en-US.msi COMPONENTS_SCOPE=machine /qn
+msiexec /i MuMDIA_0.15.0_x64_en-US.msi COMPONENTS_SCOPE=machine /qn
 $p = Start-Process "C:\Program Files\MuMDIA\mumdia-console.exe" `
        -ArgumentList "--install-components", "primary,thermo" -Wait -PassThru
 $p.ExitCode   # 0 done, 1 failed, 2 bad arguments, 3 not run as administrator
@@ -1170,7 +1170,7 @@ receiver's memory may not hold.
   "format": "mumdia-desktop-settings",
   "version": 1,
   "name": "Phospho",
-  "created_by": "MuMDIA 0.14.0",
+  "created_by": "MuMDIA 0.15.0",
   "created": "2026-11-12T09:30:00Z",
   "settings": {
     "engine": {

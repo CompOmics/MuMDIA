@@ -27,7 +27,7 @@
   It prints what it found, so a CI log is the evidence.
 
 .EXAMPLE
-  pwsh ci/check_msi_scope.ps1 -Msi desktop/target/release/bundle/msi/MuMDIA_0.14.0_x64_en-US.msi
+  pwsh ci/check_msi_scope.ps1 -Msi desktop/target/release/bundle/msi/MuMDIA_0.15.0_x64_en-US.msi
 #>
 param(
     [Parameter(Mandatory = $true)][string]$Msi
