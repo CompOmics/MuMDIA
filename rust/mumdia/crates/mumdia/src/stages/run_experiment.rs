@@ -1171,7 +1171,7 @@ fn resolve_conditions(
 
 /// Each run's condition as an index, in order of first appearance, for the grouped size
 /// factors of `quant.normalisation_scope = condition`.
-fn condition_groups(conditions: &[Option<String>]) -> Vec<usize> {
+pub fn condition_groups(conditions: &[Option<String>]) -> Vec<usize> {
     let mut seen: Vec<&str> = Vec::new();
     conditions
         .iter()

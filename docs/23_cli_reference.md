@@ -450,7 +450,7 @@ Options:
           Optional MS1 spectra for isotope-envelope features
 
       --mass-cal <MASS_CAL>
-          Optional mass recalibration json (search-seed <seed>.masscal.json)
+          Optional mass recalibration json (search-seed <seed>.masscal.json). With --ms1 and extract.ms1_calibrate, the MS1 offset is learned from the <seed> table beside it, as `run` does
 
       --out-psms <OUT_PSMS>
 

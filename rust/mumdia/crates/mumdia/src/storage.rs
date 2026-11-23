@@ -404,7 +404,14 @@ pub fn apply(flags: &StorageFlags) -> Result<Decision> {
             .and_then(|(_, v)| v.clone())
     };
     let d = decide(flags, &lookup, &cwd);
+    // MUMDIA_CACHE_DIR and MUMDIA_TEMP_DIR are set before the probe: `doctor` reports an
+    // unusable directory instead of stopping on it, and must then check the one given, not
+    // the default. Every other command stops on the error.
+    if let Some(v) = &d.cache_dir {
+        std::env::set_var("MUMDIA_CACHE_DIR", v);
+    }
     if let Some((t, source)) = &d.temp_dir {
+        std::env::set_var("MUMDIA_TEMP_DIR", t);
         probe_writable(t).map_err(|f| {
             anyhow::anyhow!(
                 "the temporary directory from {source} is not usable: {f}. Point --temp-dir \
@@ -412,12 +419,7 @@ pub fn apply(flags: &StorageFlags) -> Result<Decision> {
                  system's temporary directory"
             )
         })?;
-    }
-    if let Some(v) = &d.cache_dir {
-        std::env::set_var("MUMDIA_CACHE_DIR", v);
-    }
-    if let Some((t, _)) = &d.temp_dir {
-        std::env::set_var("MUMDIA_TEMP_DIR", t);
+        // What the processes started from here read, so only once the directory is usable.
         for var in ["TMP", "TEMP", "TMPDIR"] {
             std::env::set_var(var, t);
         }

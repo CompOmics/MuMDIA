@@ -277,6 +277,29 @@ than a number. Both are recorded in every run's `manifest.json`.
   writers share one atomic writer and one transfer-cell formatter, the report's stripped
   sequence is `quant_lfq::base_sequence`, and the stable-set fit and the shifts report
   share one minimum-runs rule. Every output is byte-identical.
+- **The MS2PIP and AlphaPeptDeep readback holds 4 bytes per fragment row for the ion type.**
+  It built one `String` per row, about 16 GB for the roughly 500 million rows MS2PIP returns
+  for a 10-million-precursor library; the column is now read interned. The library tables are
+  byte-identical.
+- **predict-frag removes its worker tables once read back (docs/06).** The request and output
+  tables of every MS2PIP, AlphaPeptDeep, DeepLC and IM2Deep call (`<tag>_in_<PID>.parquet`,
+  `<tag>_out_<PID>.parquet`, several GB for a whole-proteome library) stayed in the work
+  directory. They are removed as the rescore handoff is, unless `MUMDIA_KEEP_HANDOFF=1`; a
+  failed worker leaves them in place.
+- **The CLI, the caches and the sidecar code keep one copy of what they kept twice.** The
+  library cache sweeps its directory with the engine cache's leftover rule
+  (`cache::remove_stale_leftovers`: an hour unwritten, which a set-aside `.broken-` directory
+  whose first removal failed now waits too) and names its temporary directories with the same
+  function. `quant-lfq` groups conditions with `run-experiment`'s function, `localise` and
+  `report --experiment-dir` read the experiment manifest through one helper, and a role's
+  interpreter field is one match (`Role::slot`). `report` and `sub-library`, which start no
+  sidecar and hash no configuration, no longer probe interpreters.
+- **The rescore worker loses a guard that never ran (docs/11).** `ChildGuard` promised to kill
+  the NN or mokapot worker when `mumdia` was killed, but it released the child before waiting
+  and a killed process runs no destructor. Ctrl-C reaches the worker through the terminal's
+  process group, the desktop stops a run's whole process tree, and per-invocation file names
+  keep an orphan from breaking a later rescore.
+
 - **The engine's shared crates lose code nothing used (docs/02, docs/03).** `mumdia-core`
   drops `ppm_match`, the `AMMONIA` constant and the five candidate-audit reason codes nothing
   produced (`PEPTIDE_NOT_GENERATED`, `MODIFICATION_NOT_ALLOWED`, `CHARGE_OUT_OF_RANGE`,
@@ -586,6 +609,39 @@ than a number. Both are recorded in every run's `manifest.json`.
   `run-experiment` split tables (#358).** Their precursor and peptide q are experiment-wide, on one
   winning row across all runs, so an audit of one of them failed most accepted precursors of
   the run; the message names a single-file `run` output.
+- **`mumdia doctor` checks the worker scripts the default library search runs (docs/14).** The
+  check covered required roles only, so with the default configuration it printed `[skip]`,
+  and a library search with a discoverable DeepLC then stopped after the seed search on a
+  missing `deeplc_finetune.py`. It now covers every role the run will use: a required one, and
+  a wanted one whose interpreter resolved (DeepLC under `library_irt = auto`, IM2Deep under
+  `im_predictor = auto`).
+- **`mumdia doctor --temp-dir` fails an unusable directory.** The flag's error stopped every
+  other command but was only logged for `doctor`, which then checked the system temporary
+  directory and reported the configuration runnable. `MUMDIA_TEMP_DIR` (and
+  `MUMDIA_CACHE_DIR`) are now set before the directory is probed.
+- **`mumdia doctor` says what IM2Deep is for.** A wanted IM2Deep role printed the DeepLC
+  retention-time texts, and the line of a role with a warning could print as `[note]`.
+- **`mumdia extract` calibrates MS1 as `run` does (docs/09).** With `extract.ms1_calibrate` on,
+  the default, the standalone stage read MS1 at offset 0 inside the 3 ppm window.
+  Given `--ms1` and the seed's `--mass-cal`, it now learns the offset from the seed table that
+  `<seed>.masscal.json` is named after, and warns when that table is missing.
+- **`mumdia pool` orders more than 100 bands by number.** The band directories (`g00` ...)
+  were sorted as text, so `g100` came between `g10` and `g11`; directories that are not `g`
+  and digits are ignored.
+- **The automatic extract footprint ceiling sees a SLURM or systemd job's memory limit
+  (docs/09).** It read `/sys/fs/cgroup/memory.max` only, the limit of a container but not of a
+  job's cgroup or of a cgroup v1 hierarchy, and compared against the whole node's memory. It
+  now takes the tightest limit on the process's cgroup path, which the planner of concurrent
+  runs already read (`sched.rs`).
+- **Interpreter discovery asks for what the workers import.** The MS2PIP role probed pandas,
+  which `ms2pip_worker.py` does not import, and not pyarrow or psm_utils, which it does; the
+  entrapment classifier required mokapot, which `entrapment_worker.py` never imports.
+- **Every Python worker runs with UTF-8 I/O.** MS2PIP, AlphaPeptDeep and the MBR worker ran
+  without `PYTHONUTF8`, so with its output piped (the desktop) a worker on Windows could stop
+  on a printed path the code page cannot encode.
+- **The MBR transfer refuses a run table path with a comma.** The worker splits its lists on
+  commas, so such a path became two wrong ones.
+
 - **Desktop: a diaPASEF search is no longer split into bands (#351).** "Bands: Automatic" (the
   default) planned the search from the machine's memory alone, so a large search space on a timsTOF
   diaPASEF `.d` was given several bands, and the engine stopped it after Start: bands are refused on

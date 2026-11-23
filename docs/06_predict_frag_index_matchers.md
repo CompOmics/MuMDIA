@@ -341,6 +341,10 @@ existed. An imported library reads no `predict_frag` setting and is never refuse
 
 Sidecars follow a positional-CLI Parquet contract (no JSON request file): write an
 input Parquet, invoke `python script arg...`, read an output Parquet keyed by id.
+The two tables of a predictor call (`<tag>_in_<PID>.parquet`, `<tag>_out_<PID>.parquet`
+in the work directory) are removed once the output has been read back, unless
+`MUMDIA_KEEP_HANDOFF=1`; a failed worker leaves them in place. Every worker runs with
+UTF-8 I/O (`PYTHONUTF8=1`, `PYTHONIOENCODING=utf-8`).
 
 - `run_ms2pip` (`sidecar.rs:42-78`): input columns `id` (u32), `peptidoform`
   (str), `charge` (i32); output columns `id`, `ion_type` (str), `ordinal` (i32),

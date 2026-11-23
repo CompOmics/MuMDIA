@@ -91,16 +91,17 @@ impl Role {
     /// discovered long after the run was launched.
     pub fn modules(self, cfg: &Config) -> &'static [&'static str] {
         match self {
-            // `nn_rescore_worker.py` needs torch; mokapot and the entrapment GBM
-            // need mokapot/sklearn instead.
+            // `nn_rescore_worker.py` needs torch, `mokapot_worker.py` mokapot and sklearn,
+            // `entrapment_worker.py` sklearn alone (and pandas, through `to_pandas`).
             Role::Rescore => match cfg.rescore.classifier {
                 RescorerKind::NnTorch => &["torch", "numpy", "pandas", "pyarrow"],
+                RescorerKind::Entrapment => &["sklearn", "numpy", "pandas", "pyarrow"],
                 _ => &["mokapot", "sklearn", "numpy", "pandas", "pyarrow"],
             },
             // `deeplc_finetune.py` imports pyarrow, torch and psm_utils on top of
             // deeplc itself.
             Role::DeepLc => &["deeplc", "numpy", "pandas", "pyarrow", "torch", "psm_utils"],
-            Role::Ms2pip => &["ms2pip", "numpy", "pandas"],
+            Role::Ms2pip => &["ms2pip", "psm_utils", "numpy", "pyarrow"],
             // `peptdeep_worker.py` imports torch directly to decide the device, and
             // alphabase to check a modification name against the installed vocabulary,
             // so both are probed rather than assumed from peptdeep's dependency tree.
@@ -134,25 +135,15 @@ impl Role {
         }
     }
 
-    fn get(self, cfg: &Config) -> Option<&str> {
+    /// The configuration field this role reads ([`Role::field`]).
+    pub fn slot(self, cfg: &mut Config) -> &mut Option<String> {
         match self {
-            Role::Rescore => cfg.rescore.python.as_deref(),
-            Role::DeepLc => cfg.predict_frag.deeplc_python.as_deref(),
-            Role::Ms2pip => cfg.predict_frag.ms2pip_python.as_deref(),
-            Role::Peptdeep => cfg.predict_frag.peptdeep_python.as_deref(),
-            Role::Mbr => cfg.mbr.python.as_deref(),
-            Role::Im2deep => cfg.predict_frag.im2deep_python.as_deref(),
-        }
-    }
-
-    fn set(self, cfg: &mut Config, value: String) {
-        match self {
-            Role::Rescore => cfg.rescore.python = Some(value),
-            Role::DeepLc => cfg.predict_frag.deeplc_python = Some(value),
-            Role::Ms2pip => cfg.predict_frag.ms2pip_python = Some(value),
-            Role::Peptdeep => cfg.predict_frag.peptdeep_python = Some(value),
-            Role::Mbr => cfg.mbr.python = Some(value),
-            Role::Im2deep => cfg.predict_frag.im2deep_python = Some(value),
+            Role::Rescore => &mut cfg.rescore.python,
+            Role::DeepLc => &mut cfg.predict_frag.deeplc_python,
+            Role::Ms2pip => &mut cfg.predict_frag.ms2pip_python,
+            Role::Peptdeep => &mut cfg.predict_frag.peptdeep_python,
+            Role::Mbr => &mut cfg.mbr.python,
+            Role::Im2deep => &mut cfg.predict_frag.im2deep_python,
         }
     }
 
@@ -163,14 +154,7 @@ impl Role {
     /// how `run-experiment` came to reject a config `run` accepted. None also records
     /// the truth in the manifest: no interpreter was selected, because none was needed.
     fn clear(self, cfg: &mut Config) {
-        match self {
-            Role::Rescore => cfg.rescore.python = None,
-            Role::DeepLc => cfg.predict_frag.deeplc_python = None,
-            Role::Ms2pip => cfg.predict_frag.ms2pip_python = None,
-            Role::Peptdeep => cfg.predict_frag.peptdeep_python = None,
-            Role::Mbr => cfg.mbr.python = None,
-            Role::Im2deep => cfg.predict_frag.im2deep_python = None,
-        }
+        *self.slot(cfg) = None;
     }
 
     /// Whether this run needs the role at all. A role that is not needed is never
@@ -675,7 +659,7 @@ pub fn resolve_with(cfg: &mut Config, strictness: Strictness) -> Result<Vec<Reso
     let mut out = Vec::new();
     for role in ALL_ROLES {
         let required = role.required_by(cfg);
-        let configured = role.get(cfg).map(str::to_string);
+        let configured = role.slot(cfg).clone();
         let wants_discovery = match configured.as_deref() {
             None => true,
             Some(v) => v.eq_ignore_ascii_case(AUTO),
@@ -732,7 +716,7 @@ pub fn resolve_with(cfg: &mut Config, strictness: Strictness) -> Result<Vec<Reso
                     source,
                     "python: resolved sidecar interpreter"
                 );
-                role.set(cfg, path.clone());
+                *role.slot(cfg) = Some(path.clone());
                 out.push(Resolution {
                     role,
                     python: Some(path),
@@ -983,6 +967,9 @@ mod tests {
         );
         cfg.rescore.classifier = RescorerKind::Mokapot;
         assert!(Role::Rescore.modules(&cfg).contains(&"mokapot"));
+        // The entrapment worker never imports mokapot.
+        cfg.rescore.classifier = RescorerKind::Entrapment;
+        assert!(!Role::Rescore.modules(&cfg).contains(&"mokapot"));
 
         // DeepLC is WANTED, not required, by default: `library_irt = auto` uses it for a
         // library-input run when it resolves and does without it otherwise.

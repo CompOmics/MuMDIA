@@ -307,7 +307,9 @@ enum Cmd {
         /// Optional MS1 spectra for isotope-envelope features.
         #[arg(long)]
         ms1: Option<String>,
-        /// Optional mass recalibration json (search-seed <seed>.masscal.json).
+        /// Optional mass recalibration json (search-seed <seed>.masscal.json). With --ms1 and
+        /// extract.ms1_calibrate, the MS1 offset is learned from the <seed> table beside it,
+        /// as `run` does.
         #[arg(long)]
         mass_cal: Option<String>,
         #[arg(long)]
@@ -1233,70 +1235,14 @@ fn doctor_report(
 
     let mut cfg = cfg.clone();
     let script_dir = python::resolve_script_dir(&cfg.predict_frag.sidecar_script_dir, config_path);
-    let dir_moved = script_dir != cfg.predict_frag.sidecar_script_dir;
     cfg.predict_frag.sidecar_script_dir = script_dir.clone();
 
     let mut ok = true;
-    let any_sidecar = ALL_ROLES.iter().any(|r| r.required_by(&cfg));
 
-    // 1. Worker scripts, checked before the interpreters because a missing script
-    //    directory makes every interpreter irrelevant. Skipped entirely when the
-    //    configuration needs no sidecar: the native predictors and `native_tda`
-    //    rescorer are the default, and that run must not be failed for a directory
-    //    it never opens.
-    let dir = std::path::Path::new(&script_dir);
-    let scripts = if !any_sidecar {
-        ScriptsReport {
-            status: "skip".into(),
-            dir: script_dir.clone(),
-            missing: Vec::new(),
-            needed: false,
-        }
-    } else if !dir.is_dir() {
-        ok = false;
-        ScriptsReport {
-            status: "fail".into(),
-            dir: script_dir.clone(),
-            missing: Vec::new(),
-            needed: true,
-        }
-    } else {
-        let mut missing: Vec<String> = Vec::new();
-        for role in ALL_ROLES {
-            if !role.required_by(&cfg) {
-                continue;
-            }
-            for worker in role.workers() {
-                if !dir.join(worker).exists() {
-                    missing.push(worker.to_string());
-                }
-            }
-        }
-        missing.sort_unstable();
-        missing.dedup();
-        if !missing.is_empty() {
-            ok = false;
-        }
-        ScriptsReport {
-            status: if missing.is_empty() { "ok" } else { "fail" }.into(),
-            dir: script_dir.clone(),
-            missing,
-            needed: true,
-        }
-    };
-    let _ = dir_moved;
-
-    // 2. Interpreters, one entry per role, resolving `auto` exactly as a run would.
+    // 1. Interpreters, one entry per role, resolving `auto` exactly as a run would.
     let mut roles = Vec::new();
     for role in ALL_ROLES {
-        let configured = match role {
-            Role::Rescore => cfg.rescore.python.clone(),
-            Role::DeepLc => cfg.predict_frag.deeplc_python.clone(),
-            Role::Ms2pip => cfg.predict_frag.ms2pip_python.clone(),
-            Role::Peptdeep => cfg.predict_frag.peptdeep_python.clone(),
-            Role::Mbr => cfg.mbr.python.clone(),
-            Role::Im2deep => cfg.predict_frag.im2deep_python.clone(),
-        };
+        let configured = role.slot(&mut cfg).clone();
         let required = role.required_by(&cfg);
         let wanted = role.wanted_by(&cfg);
         let modules: Vec<String> = role.modules(&cfg).iter().map(|m| m.to_string()).collect();
@@ -1476,6 +1422,55 @@ fn doctor_report(
         roles.push(r);
     }
 
+    // 2. Worker scripts, for every role the run will use: a required one, and a wanted one
+    //    whose interpreter resolved, which the default library search runs (the DeepLC
+    //    re-prediction and multi-head calibration). Skipped when there is none: the native
+    //    predictors and `native_tda` are the default, and that run must not be failed for
+    //    a directory it never opens.
+    let in_use: Vec<Role> = ALL_ROLES
+        .into_iter()
+        .zip(&roles)
+        .filter(|(_, r)| r.required || (r.wanted && r.python.is_some()))
+        .map(|(role, _)| role)
+        .collect();
+    let dir = std::path::Path::new(&script_dir);
+    let scripts = if in_use.is_empty() {
+        ScriptsReport {
+            status: "skip".into(),
+            dir: script_dir.clone(),
+            missing: Vec::new(),
+            needed: false,
+        }
+    } else if !dir.is_dir() {
+        ok = false;
+        ScriptsReport {
+            status: "fail".into(),
+            dir: script_dir.clone(),
+            missing: Vec::new(),
+            needed: true,
+        }
+    } else {
+        let mut missing: Vec<String> = Vec::new();
+        for role in &in_use {
+            for worker in role.workers() {
+                if !dir.join(worker).exists() {
+                    missing.push(worker.to_string());
+                }
+            }
+        }
+        missing.sort_unstable();
+        missing.dedup();
+        if !missing.is_empty() {
+            ok = false;
+        }
+        ScriptsReport {
+            status: if missing.is_empty() { "ok" } else { "fail" }.into(),
+            dir: script_dir.clone(),
+            missing,
+            needed: true,
+        }
+    };
+
     // The converters are probed but never gate `ok`: an mzML run does not need them,
     // and failing `doctor` for programs most configurations never call would train
     // people to ignore this command.
@@ -1558,7 +1553,14 @@ fn print_doctor(rep: &DoctorReport) {
     println!("sidecar interpreters");
     for r in &rep.roles {
         let label = &r.field;
+        // What a wanted role does: IM2Deep the library's 1/K0, DeepLC its retention times.
+        let im2deep = r.role == "im2deep";
         match (r.status.as_str(), &r.python) {
+            ("skip", _) if r.wanted && im2deep => println!(
+                "  [note] {label}: no interpreter found; a diaPASEF run builds its library \
+                 without predicted 1/K0.\n\x20        Set {}, or name one, to enable it.",
+                r.env_var
+            ),
             ("skip", _) if r.wanted => println!(
                 "  [note] {label}: no interpreter found; a library-input run keeps the imported \
                  iRT and the multi-head RT calibration does not run (measured +4.8% peptides on \
@@ -1589,9 +1591,7 @@ fn print_doctor(rep: &DoctorReport) {
                     println!("\x20        {h}");
                 }
             }
-            (status, Some(p))
-                if r.missing.is_empty() && r.warnings.iter().all(|w| w.contains("DeepLC")) =>
-            {
+            (status, Some(p)) if r.missing.is_empty() && r.warnings.is_empty() => {
                 let tag = if status == "ok" { " ok " } else { "note" };
                 let notes: Vec<String> =
                     r.versions.iter().map(|(k, v)| format!("{k} {v}")).collect();
@@ -1604,16 +1604,18 @@ fn print_doctor(rep: &DoctorReport) {
                         format!("\n\x20        {}", notes.join(", "))
                     }
                 );
-                if r.wanted {
+                if r.wanted && im2deep {
+                    println!(
+                        "\x20        (used by a diaPASEF run to predict the library's 1/K0; \
+                         predict_frag.im_predictor = auto)"
+                    );
+                } else if r.wanted {
                     println!(
                         "\x20        (used by a library-input run to re-predict the library iRT; \
                          rt_im_train.library_irt = auto)"
                     );
                 } else if !r.required {
                     println!("\x20        (configured but not needed by this config)");
-                }
-                for w in &r.warnings {
-                    println!("\x20        [warn] {w}");
                 }
             }
             (status, Some(p)) if !r.missing.is_empty() => println!(
@@ -1718,11 +1720,57 @@ fn print_storage(storage: &mumdia::storage::StorageReport) {
     }
 }
 
+/// `<exp>/experiment_manifest.json`, parsed, with its path for messages. Refused without
+/// an `experiment` block, which every reader of it needs.
+fn read_experiment_manifest(exp: &str) -> Result<(String, serde_json::Value)> {
+    let path = format!("{exp}/experiment_manifest.json");
+    let text = std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
+    let m: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("parsing {path}"))?;
+    if m.get("experiment").is_none() {
+        anyhow::bail!("{path} has no `experiment` block");
+    }
+    Ok((path, m))
+}
+
+/// The string list `experiment.<key>` of a manifest from [`read_experiment_manifest`].
+fn manifest_strs(path: &str, m: &serde_json::Value, key: &str) -> Result<Vec<String>> {
+    m["experiment"]
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .ok_or_else(|| anyhow::anyhow!("{path}: experiment.{key} missing"))
+}
+
+/// The band directories of a grouped run (`g00`, `g01`, ...), in band order, which is the
+/// pooled row order: by number, so `g100` follows `g99`, not `g10`.
+fn band_dirs(groups_dir: &str) -> Result<Vec<std::path::PathBuf>> {
+    let mut dirs: Vec<(u32, std::path::PathBuf)> = std::fs::read_dir(groups_dir)
+        .with_context(|| format!("reading {groups_dir}"))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .filter_map(|p| {
+            let digits = p.file_name()?.to_str()?.strip_prefix('g')?;
+            if !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            Some((digits.parse().ok()?, p))
+        })
+        .collect();
+    dirs.sort();
+    Ok(dirs.into_iter().map(|(_, p)| p).collect())
+}
+
 /// Parse a config file without touching the sidecar interpreter fields.
 ///
-/// Only `doctor` wants this. Its whole job is to report what a configuration would
-/// resolve to and why, including when resolution would fail, so it must see the file
-/// as written.
+/// `doctor` wants this: its whole job is to report what a configuration would resolve to
+/// and why, including when resolution would fail, so it must see the file as written. So
+/// do `report` and `sub-library`, which start no sidecar and hash no configuration, and
+/// would otherwise probe every interpreter the configuration names.
 fn load_config_raw(path: &Option<String>) -> Result<Config> {
     match path {
         Some(p) => {
@@ -1785,24 +1833,11 @@ fn localise_experiment_dir(
     cfg: &Config,
     ch: &str,
 ) -> Result<()> {
-    let manifest_path = format!("{exp}/experiment_manifest.json");
-    let text = std::fs::read_to_string(&manifest_path)
-        .with_context(|| format!("reading {manifest_path}"))?;
-    let mut m: serde_json::Value =
-        serde_json::from_str(&text).with_context(|| format!("parsing {manifest_path}"))?;
-    let e = m
-        .get("experiment")
-        .ok_or_else(|| anyhow::anyhow!("{manifest_path} has no `experiment` block"))?;
-    let names: Vec<String> = e
-        .get("runs")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(String::from))
-                .collect()
-        })
-        .ok_or_else(|| anyhow::anyhow!("{manifest_path}: experiment.runs missing"))?;
-    let second_pass = e.get("second_pass").is_some_and(|v| !v.is_null());
+    let (manifest_path, mut m) = read_experiment_manifest(exp)?;
+    let names = manifest_strs(&manifest_path, &m, "runs")?;
+    let second_pass = m["experiment"]
+        .get("second_pass")
+        .is_some_and(|v| !v.is_null());
     let chosen: Vec<usize> = if sources.is_empty() {
         (0..names.len()).collect()
     } else {
@@ -2130,7 +2165,7 @@ fn real_main() -> Result<()> {
             no_pair_link,
             config,
         } => {
-            let _ = load_config(&config)?;
+            let _ = load_config_raw(&config)?;
             let st = stages::sub_library::run(stages::sub_library::SubLibraryParams {
                 precursors: &lib_precursors,
                 fragments: &lib_fragments,
@@ -2167,8 +2202,27 @@ fn real_main() -> Result<()> {
         } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            // The MS1 offset `run` learns from the seed PSMs (`extract.ms1_calibrate`): the seed
+            // table is the one `--mass-cal` is named after (`<seed>.masscal.json`).
+            let seed = mass_cal
+                .as_deref()
+                .and_then(|m| m.strip_suffix(".masscal.json"))
+                .filter(|s| std::path::Path::new(s).is_file());
+            let mut ext_cfg = match (cfg.extract.ms1_calibrate.is_on(), ms1.as_deref(), seed) {
+                (true, Some(ms1), Some(seed)) => {
+                    stages::ms1cal::extract_cfg(&cfg.extract, seed, ms1, cfg.rt_im_train.q_train)?
+                }
+                (true, Some(_), None) => {
+                    tracing::warn!(
+                        "extract: extract.ms1_calibrate is on, but the seed PSMs it learns the \
+                         MS1 offset from are found only as the table --mass-cal is named after \
+                         (<seed>.masscal.json); MS1 is read uncalibrated"
+                    );
+                    cfg.extract.clone()
+                }
+                _ => cfg.extract.clone(),
+            };
             // The ZT Scan keys, from the run's calibration (`--q1-cal`), as `mumdia run` sets them.
-            let mut ext_cfg = cfg.extract.clone();
             stages::q1frag::configure_extract(&cfg, q1_cal.as_deref(), &mut ext_cfg)?;
             stages::extract::run(stages::extract::ExtractParams {
                 precursor_span: None,
@@ -2453,20 +2507,7 @@ fn real_main() -> Result<()> {
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|| ".".to_string())
             });
-            // Band directories in band order: the pooled row order is the bands' order,
-            // and `gNN` sorts lexically into it.
-            let mut dirs: Vec<std::path::PathBuf> = std::fs::read_dir(&groups_dir)
-                .with_context(|| format!("reading {groups_dir}"))?
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| {
-                    p.is_dir()
-                        && p.file_name()
-                            .and_then(|n| n.to_str())
-                            .is_some_and(|n| n.starts_with('g'))
-                })
-                .collect();
-            dirs.sort();
-            let bands: Vec<stages::pool::BandArtifacts> = dirs
+            let bands: Vec<stages::pool::BandArtifacts> = band_dirs(&groups_dir)?
                 .iter()
                 .map(|d| {
                     let f = |n: &str| d.join(n).to_string_lossy().to_string();
@@ -2863,19 +2904,8 @@ fn real_main() -> Result<()> {
                     .map(|c| Some(c.trim().to_string()))
                     .collect()
             };
-            let groups: Option<Vec<usize>> = (!condition.is_empty()).then(|| {
-                let mut seen: Vec<&str> = Vec::new();
-                condition
-                    .iter()
-                    .map(|c| {
-                        let c = c.trim();
-                        seen.iter().position(|s| *s == c).unwrap_or_else(|| {
-                            seen.push(c);
-                            seen.len() - 1
-                        })
-                    })
-                    .collect()
-            });
+            let groups = (!condition.is_empty())
+                .then(|| stages::run_experiment::condition_groups(&conditions));
             let (_, factors) = mumdia::quant_lfq::run_lfq_combine_grouped(
                 &inputs,
                 by_fragment,
@@ -3009,31 +3039,16 @@ fn real_main() -> Result<()> {
             let q = match q {
                 Some(v) => v,
                 None => match &config {
-                    Some(_) => load_config(&config)?.quant.q_threshold,
+                    Some(_) => load_config_raw(&config)?.quant.q_threshold,
                     None => 0.01,
                 },
             };
             if let Some(exp) = experiment_dir {
                 // Everything the report needs is named in the experiment manifest, so the
                 // user points at the directory rather than at four files.
-                let manifest_path = format!("{exp}/experiment_manifest.json");
-                let text = std::fs::read_to_string(&manifest_path)
-                    .map_err(|e| anyhow::anyhow!("reading {manifest_path}: {e}"))?;
-                let m: serde_json::Value = serde_json::from_str(&text)
-                    .map_err(|e| anyhow::anyhow!("parsing {manifest_path}: {e}"))?;
-                let e = m
-                    .get("experiment")
-                    .ok_or_else(|| anyhow::anyhow!("{manifest_path} has no `experiment` block"))?;
-                let strs = |key: &str| -> Result<Vec<String>> {
-                    e.get(key)
-                        .and_then(|v| v.as_array())
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|x| x.as_str().map(String::from))
-                                .collect()
-                        })
-                        .ok_or_else(|| anyhow::anyhow!("{manifest_path}: experiment.{key} missing"))
-                };
+                let (manifest_path, m) = read_experiment_manifest(&exp)?;
+                let e = &m["experiment"];
+                let strs = |key: &str| manifest_strs(&manifest_path, &m, key);
                 let runs = strs("runs")?;
                 let peptide_quants = strs("peptide_quants")?;
                 let scored = e
@@ -3045,15 +3060,7 @@ fn real_main() -> Result<()> {
                     .to_string();
                 let lfq = e.get("lfq").and_then(|v| v.as_str()).map(String::from);
                 // The run's localisation tables, when the `localise` stage ran.
-                let loc_tables: Vec<String> = e
-                    .get("localisation")
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|x| x.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let loc_tables = strs("localisation").unwrap_or_default();
                 // The experiment-level table, when the runs were combined.
                 let loc_experiment = e
                     .get("localisation_experiment")
@@ -3625,5 +3632,40 @@ mod cli_tests {
         assert_eq!(r["unloadable"], serde_json::json!([]));
         assert_ne!(r["status"], "fail", "{r}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A wanted role with an interpreter is one the run uses: DeepLC under the default
+    /// `library_irt = auto` runs `deeplc_finetune.py`, so `doctor` checks that it is there.
+    #[test]
+    fn doctor_checks_the_scripts_of_a_wanted_role_that_resolved() {
+        let dir = std::env::temp_dir().join(format!("mumdia_doctor_wanted_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("deeplc_worker.py"), b"").unwrap();
+        let mut cfg = Config::default();
+        cfg.predict_frag.sidecar_script_dir = dir.display().to_string();
+        cfg.predict_frag.deeplc_python = Some("/definitely/not/here/python".into());
+        let rep = doctor_report(&cfg, None, false, None);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(rep.scripts.status, "fail");
+        assert_eq!(rep.scripts.missing, ["deeplc_finetune.py"]);
+        assert!(!rep.ok);
+    }
+
+    #[test]
+    fn pooled_bands_are_ordered_by_number() {
+        let root = std::env::temp_dir().join(format!("mumdia_band_dirs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for n in ["g00", "g10", "g100", "g11", "g09", "gx", "g", "logs"] {
+            std::fs::create_dir_all(root.join(n)).unwrap();
+        }
+        std::fs::write(root.join("g05"), b"a file, not a band").unwrap();
+        let names: Vec<String> = band_dirs(&root.to_string_lossy())
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(names, ["g00", "g09", "g10", "g11", "g100"]);
     }
 }

@@ -185,10 +185,11 @@ contracts exist:
   `row_id` through the same `align_sidecar_scores` coverage contract, so an
   incomplete or duplicated response hard-errors.
   Both sidecars are run with `PYTHONUTF8=1` and a non-zero exit is a hard error
-  (`run_entrapment_gbm`, `run_pin_sidecar`). The PIN sidecar is spawned behind a
-  `ChildGuard` that kills the worker if the parent unwinds;
-  without it a killed `mumdia` leaves the Python process holding its feature
-  memmap and every later rescore fails on a file it cannot delete.
+  (`run_entrapment_gbm`, `run_pin_sidecar`). A killed `mumdia` runs no destructor,
+  so nothing in the engine can stop its worker: Ctrl-C reaches the worker through the
+  terminal's process group, and the desktop stops a run's whole process tree. An
+  orphaned worker no longer breaks a later rescore, because every invocation names
+  its files apart (`sidecar_paths`).
 
 The work directory is `sidecar_work` under the run's output directory inside `run`
 and `run-experiment`, and `sidecar_work` in the current directory (or `--work-dir`)
