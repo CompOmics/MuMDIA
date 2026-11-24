@@ -544,6 +544,9 @@ jobs:
       # vendored, and pinned to the exact version ci.yml tests the MSI with, so a
       # bundler change arrives as a reviewed version bump.
       - name: Install the Tauri bundler
+        # bash on every runner: under the Windows default (pwsh) $TAURI_CLI_VERSION is an
+        # empty PowerShell variable, not the environment variable.
+        shell: bash
         run: cargo install tauri-cli --version "=$TAURI_CLI_VERSION" --locked
 
       # The Microsoft Visual C++ x64 runtime that PyTorch needs on Windows. A machine
