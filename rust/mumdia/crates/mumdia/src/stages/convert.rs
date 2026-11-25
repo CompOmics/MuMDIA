@@ -1529,6 +1529,10 @@ enum Source {
     Tdf,
 }
 
+/// Spectra read, at most, for the scan filters of a `.raw` whose metadata names no model.
+#[cfg(feature = "thermo")]
+const THERMO_FILTER_PEEK: usize = 64;
+
 /// Open a Thermo `.raw` directly: vendor-centroided spectra, as ThermoRawFileParser writes
 /// them by default, the spectrum count from the file's own index for the truncation check,
 /// and the instrument from its metadata.
@@ -1550,18 +1554,48 @@ fn open_thermo(path: &str) -> Result<(Source, usize, Option<crate::instrument::I
              convert.thermo_native to convert the file with ThermoRawFileParser"
         )
     })?;
+    let mut reader = reader;
     let declared = reader.len();
     let instrument =
-        crate::instrument::from_configurations(reader.instrument_configurations().values());
-    match &instrument {
-        Some(i) => info!(
-            instrument = %i.describe(),
-            astral = i.is_astral(),
-            "convert: instrument from the .raw metadata"
-        ),
-        None => info!("convert: the .raw metadata names no instrument model"),
-    }
-    Ok((Source::Thermo(Box::new(reader)), declared, instrument))
+        match crate::instrument::from_configurations(reader.instrument_configurations().values()) {
+            Some(i) => {
+                info!(
+                    instrument = %i.describe(),
+                    astral = i.is_astral(),
+                    "convert: instrument from the .raw metadata"
+                );
+                i
+            }
+            None => {
+                // The scans up to the first MS2 say which analyzers acquired them.
+                let mut filters = Vec::new();
+                for index in 0..declared.min(THERMO_FILTER_PEEK) {
+                    let Some(spec) = reader.get_spectrum_by_index(index) else {
+                        break;
+                    };
+                    if let Some(p) = spec
+                        .description()
+                        .acquisition
+                        .first_scan()
+                        .and_then(|s| s.get_param_by_name("filter string"))
+                    {
+                        filters.push(p.value.to_string());
+                    }
+                    if spec.ms_level() >= 2 {
+                        break;
+                    }
+                }
+                reader.reset();
+                let i = crate::instrument::from_scan_filters(filters.iter().map(String::as_str));
+                warn!(
+                    astral = i.is_astral(),
+                    "convert: the .raw metadata names no instrument model; recording the \
+                     generic Thermo model, with the Astral analyzer when a scan filter names it"
+                );
+                i
+            }
+        };
+    Ok((Source::Thermo(Box::new(reader)), declared, Some(instrument)))
 }
 
 #[cfg(not(feature = "thermo"))]

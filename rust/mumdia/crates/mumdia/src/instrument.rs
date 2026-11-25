@@ -178,6 +178,25 @@ pub fn from_configurations<'a>(
     inst.astral_analyzer.then_some(inst)
 }
 
+/// PSI-MS accession of "Thermo Fisher Scientific instrument model", the generic term
+/// ThermoRawFileParser writes when a `.raw` names no model.
+pub const THERMO_GENERIC_MODEL: &str = "MS:1000483";
+
+/// The instrument of a Thermo `.raw` whose metadata names no model (Orbitrap Astral files of
+/// 2023 from serial OLEP08), from its scan filters: an `ASTMS` filter is a scan
+/// the Astral analyzer acquired. Recorded as ThermoRawFileParser records the same file in
+/// its mzML (the generic model term, with the Astral analyzer in one configuration), so
+/// both readers resolve `apex_count_window = "auto"` alike.
+pub fn from_scan_filters<'a>(filters: impl IntoIterator<Item = &'a str>) -> Instrument {
+    Instrument {
+        accession: THERMO_GENERIC_MODEL.to_string(),
+        name: "Thermo Fisher Scientific instrument model".to_string(),
+        astral_analyzer: filters
+            .into_iter()
+            .any(|f| f.trim_start().starts_with("ASTMS")),
+    }
+}
+
 /// The head of the mzML at `path` through the end of its `<spectrumList` start tag: the
 /// header [`parse_header`] reads the instrument from, and the spectrum count `convert`
 /// checks completeness against. At most [`HEADER_BYTES`]; `None` when the file cannot be
@@ -521,6 +540,25 @@ mod tests {
         assert_eq!(i.name, "Orbitrap Astral");
         assert!(i.astral_analyzer);
         assert!(i.is_astral());
+    }
+
+    #[test]
+    fn scan_filters_stand_in_for_a_missing_model_as_thermorawfileparser_does() {
+        // ThermoRawFileParser 1.4.5 on 20230324_OLEP08_200ng_30min_E10H50Y40_180K_2Th3p5ms_01.raw,
+        // whose metadata names no model: the generic term, and the Astral analyzer in IC2.
+        let trfp = TRFP_ASTRAL.replace(
+            r#"accession="MS:1003378" value="" name="Orbitrap Astral""#,
+            r#"accession="MS:1000483" value="" name="Thermo Fisher Scientific instrument model""#,
+        );
+        let astral = from_scan_filters([
+            "FTMS + p NSI Full ms [380.0000-980.0000]",
+            "ASTMS + c NSI Full ms2 381.0000@hcd25.00 [150.0000-2000.0000]",
+        ]);
+        assert_eq!(Some(astral.clone()), parse_header(&trfp));
+        assert!(astral.is_astral());
+        let orbitrap = from_scan_filters(["FTMS + p NSI Full ms", "FTMS + c NSI Full ms2"]);
+        assert_eq!(orbitrap.accession, THERMO_GENERIC_MODEL);
+        assert!(!orbitrap.is_astral());
     }
 
     #[test]
