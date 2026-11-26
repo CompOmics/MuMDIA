@@ -4006,6 +4006,17 @@ pub struct MbrConfig {
     /// single cells. Must be in [0, 1). Left out of the canonical configuration when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub second_pass_prefilter_keep_decoys: Option<f64>,
+    /// Under `strategy = second_pass`: the `extract.gate_support_min` of the second-pass
+    /// extraction only (0 = no support gate there). Unset, the second pass uses
+    /// `extract.gate_support_min` like the first. The gate's default (0.845 on spectra that
+    /// carry 1/K0) bounds the first pass's memory on a full library; the second pass searches
+    /// the small empirical library, where it rejected precursors at their first-pass apex. Off
+    /// in the second pass only, on standalone searches of each set's empirical library: 200 pg
+    /// diaPASEF +35% precursors per run, 250 pg +17%, bulk +5.0%, decoy fraction and peak
+    /// memory unchanged (one NN seed; docs/12, "Second pass"). Must be finite and >= 0. Left
+    /// out of the canonical configuration when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub second_pass_gate_support_min: Option<f64>,
     /// Under `strategy = second_pass`, `run-experiment` only: write a Boolean
     /// `first_pass_id` into every run's `peptide_quant` (v3), true where the row's precursor
     /// had a first-pass identification in that run (`run_psm_q <= q_anchor`, target), and a
@@ -4028,6 +4039,7 @@ impl Default for MbrConfig {
             consensus_corr_min: 0.0,
             python: None,
             second_pass_prefilter_keep_decoys: None,
+            second_pass_gate_support_min: None,
             first_pass_flag: false,
         }
     }
@@ -6085,6 +6097,17 @@ impl Config {
                 ));
             }
         }
+        if self
+            .mbr
+            .second_pass_gate_support_min
+            .is_some_and(|v| !v.is_finite() || v < 0.0)
+        {
+            return Err(Invalid(
+                "mbr.second_pass_gate_support_min must be finite and >= 0 (0 disables the \
+                 support gate in the second pass)."
+                    .into(),
+            ));
+        }
         if self.rescore.num_iter == 0 {
             return Err(Invalid(
                 "rescore.num_iter must be >= 1 for iterative model training.".into(),
@@ -6158,6 +6181,15 @@ impl Config {
                 strategy = ?self.mbr.strategy,
                 "mbr.second_pass_prefilter_keep_decoys is set but mbr.strategy is not \
                  second_pass: there is no second-pass rescore, and the setting has no effect"
+            );
+        }
+        if self.mbr.strategy != MbrStrategy::SecondPass
+            && self.mbr.second_pass_gate_support_min.is_some()
+        {
+            tracing::warn!(
+                strategy = ?self.mbr.strategy,
+                "mbr.second_pass_gate_support_min is set but mbr.strategy is not second_pass: \
+                 there is no second-pass extraction, and the setting has no effect"
             );
         }
         if self.mbr.strategy != MbrStrategy::SecondPass && self.mbr.first_pass_flag {
@@ -7146,6 +7178,14 @@ impl Config {
         }
     }
 
+    /// The extraction configuration of the second pass: `extract`, with
+    /// `mbr.second_pass_gate_support_min` as its support gate when that is set.
+    pub fn apply_second_pass_extract(&mut self) {
+        if let Some(v) = self.mbr.second_pass_gate_support_min {
+            self.extract.gate_support_min = Some(v);
+        }
+    }
+
     /// Canonical JSON of the fully-resolved config, for hashing into the
     /// manifest (docs/02_config_and_data_model.md).
     pub fn canonical_json(&self) -> String {
@@ -7912,6 +7952,40 @@ mod tests {
         let parsed: MbrConfig =
             serde_json::from_str(r#"{"second_pass_prefilter_keep_decoys": 0.5}"#).unwrap();
         assert_eq!(parsed.second_pass_prefilter_keep_decoys, Some(0.5));
+    }
+
+    /// `mbr.second_pass_gate_support_min` unset leaves the canonical configuration and the
+    /// second pass's `extract` as they were; set, it replaces only the support gate of the
+    /// second pass, and it is validated like `extract.gate_support_min`.
+    #[test]
+    fn second_pass_gate_support_overrides_only_the_second_pass_and_is_absent_when_unset() {
+        let c = Config::default();
+        assert_eq!(c.mbr.second_pass_gate_support_min, None);
+        assert!(!c.canonical_json().contains("second_pass_gate_support"));
+        let mut c2 = c.clone();
+        c2.apply_second_pass_extract();
+        assert_eq!(c2.extract.gate_support_min, None);
+        assert_eq!(c2.canonical_json(), c.canonical_json());
+
+        let mut off = Config::default();
+        off.mbr.second_pass_gate_support_min = Some(0.0);
+        assert!(off.validate().is_ok());
+        assert!(off
+            .canonical_json()
+            .contains(r#""second_pass_gate_support_min":0.0"#));
+        let mut p2 = off.clone();
+        p2.apply_second_pass_extract();
+        assert_eq!(p2.extract.gate_support_min, Some(0.0));
+        assert_eq!(off.extract.gate_support_min, None);
+
+        for bad in [-0.1, f64::NAN, f64::INFINITY] {
+            let mut c = Config::default();
+            c.mbr.second_pass_gate_support_min = Some(bad);
+            assert!(c.validate().is_err(), "{bad} accepted");
+        }
+        let parsed: MbrConfig =
+            serde_json::from_str(r#"{"second_pass_gate_support_min": 0}"#).unwrap();
+        assert_eq!(parsed.second_pass_gate_support_min, Some(0.0));
     }
 
     /// `mbr.first_pass_flag` is off by default and absent from the canonical configuration

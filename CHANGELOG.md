@@ -252,6 +252,20 @@ than a number. Both are recorded in every run's `manifest.json`.
   targets above the first decoy for one anchor at 1%, and on plates with about half the
   peptides per cell of those that worked most cells had 0 anchors (the rest 100-450), so they
   had no 1/K0 calibration and, below two anchors, no RT window.
+- **`mbr.second_pass_gate_support_min`: the extract support gate of the second pass alone
+  (docs/12 "Second pass", docs/35 section 16).** Unset, the second pass of `run-experiment` uses
+  `extract.gate_support_min` like the first, and every artifact and the config hash are
+  unchanged; 0 turns the support gate off in the second pass only. The gate's default (0.845 on
+  spectra that carry 1/K0) bounds the first pass's memory on a full library, but the second
+  pass searches the small empirical library, and there the gate rejected precursors whose apex
+  sat within 5 s of the first pass's in 97-98% of cases. Measured as standalone `run` searches
+  of each set's empirical library, whose gate-on control reproduced the experiment's second
+  pass, one NN seed, precursors per run at `run_psm_q` 1%, gate on against off in the second
+  pass: 200 pg HeLa 5,405 against 7,309 (+35%), 250 pg HYE 5-min Ultra 8,592 against 10,039
+  (+17%), ProteoBench diaPASEF HYE 91,921 against 96,504 (+5.0%), decoy fraction and peak
+  memory unchanged, other-species share at 200 pg 3.35% against 3.11%. Not yet measured
+  through `run-experiment` itself, with seeds, on an entrapment null or on the single-cell
+  sets, so it is not a default.
 
 ### Changed
 

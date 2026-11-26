@@ -3893,6 +3893,19 @@
       "source_struct": "MbrConfig"
     },
     {
+      "path": "mbr.second_pass_gate_support_min",
+      "name": "second_pass_gate_support_min",
+      "section": "mbr",
+      "rust_type": "Option<f64>",
+      "kind": "float",
+      "optional": true,
+      "default": "null",
+      "default_text": "null",
+      "help": "Under `strategy = second_pass`: the `extract.gate_support_min` of the second-pass extraction only (0 = no support gate there). Unset, the second pass uses `extract.gate_support_min` like the first. The gate's default (0.845 on spectra that carry 1/K0) bounds the first pass's memory on a full library; the second pass searches the small empirical library, where it rejected precursors at their first-pass apex. Off in the second pass only, on standalone searches of each set's empirical library: 200 pg diaPASEF +35% precursors per run, 250 pg +17%, bulk +5.0%, decoy fraction and peak memory unchanged (one NN seed; docs/12, \"Second pass\"). Must be finite and >= 0. Left out of the canonical configuration when unset.",
+      "gates": [],
+      "source_struct": "MbrConfig"
+    },
+    {
       "path": "mbr.first_pass_flag",
       "name": "first_pass_flag",
       "section": "mbr",

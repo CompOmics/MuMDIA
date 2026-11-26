@@ -347,6 +347,8 @@ fn search_second_pass(
     }
     let mut cfg2 = cfg.clone();
     cfg2.prescreen.enabled = false;
+    // `mbr.second_pass_gate_support_min`, when set, is this extraction's support gate.
+    cfg2.apply_second_pass_extract();
     let cfg2 = &cfg2;
     let t_lib = Instant::now();
     let seed_lib = search_seed::SeedLibrary::load(

@@ -825,7 +825,7 @@ requiring entrapment/target-decoy FDR validation before use.
 
 Read by `run-experiment` only. Fields: `strategy` (`second_pass` default), `q_anchor` 0.01,
 `min_anchor_runs` 2, `q_transfer` 0.01, `consensus_corr_min` 0.0, `python` `None`,
-`second_pass_prefilter_keep_decoys`, `first_pass_flag`. `min_anchor_runs`, `q_transfer`,
+`second_pass_prefilter_keep_decoys`, `second_pass_gate_support_min`, `first_pass_flag`. `min_anchor_runs`, `q_transfer`,
 `consensus_corr_min` and `python` configured the rescuable-tier transfer, removed in 0.15.0:
 they still parse, so the configuration hash does not move, and `validate()` warns that they
 do nothing. `rt_window_s`, `decoy_transfer` and `requant_all` were removed in 0.15.0

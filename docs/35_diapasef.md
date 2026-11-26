@@ -1345,6 +1345,20 @@ and 0 is the low-input opt-in. It applies only under
 weights without the 1/K0 terms were fitted on the same diaPASEF runs and were not validated on
 an Orbitrap or Astral acquisition.
 
+The gate's purpose is memory on a full library. The second pass of `run-experiment` (docs/12,
+"Second pass") searches the small empirical library instead, and there the gate removes
+precursors that the first pass already placed: of the second-pass candidates it rejected,
+97-98% sat within 5 s of their first-pass apex. `mbr.second_pass_gate_support_min` sets the
+gate of the second pass alone (unset: `extract.gate_support_min`, as before; 0 turns it off
+there and keeps it in the first pass). Measured as standalone `run` searches of each set's
+empirical library, whose gate-on control reproduced the experiment's own second pass, one NN
+seed, precursors per run at `run_psm_q` 1%, gate on against off: 200 pg HeLa 5,405 against
+7,309 (+35%), 250 pg HYE 5-min Ultra 8,592 against 10,039 (+17%), ProteoBench diaPASEF HYE
+91,921 against 96,504 (+5.0%), at an unchanged decoy fraction and peak memory; the share of
+other-species precursors at 200 pg fell from 3.35% to 3.11%. Not yet measured through
+`run-experiment`'s own second pass, with seeds, on the entrapment run or on the single-cell
+sets, so the key stays unset by default.
+
 ### A prefilter before the classifier
 
 On a large pool the classifier is the rescore's cost, and most of what it scores is never
