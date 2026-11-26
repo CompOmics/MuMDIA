@@ -236,6 +236,20 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Added
+
+- **diaPASEF: `convert.tdf_single_ion = "persistent"` keeps an MS2 single-ion centroid when it
+  recurs in a neighbouring cycle of its window group (experimental, opt-in; docs/35 section 2,
+  "Persistent single ions").** With `tdf_min_points` 2, a single-point cluster is kept when a raw
+  event lies within `tdf_single_ion_tof` (3) TOF indices and `tdf_single_ion_scans` (40) scans
+  of it in one of the `tdf_single_ion_cycles` (2) frames of its window group on either side.
+  Measured on single files, one seed, the support gate off in every arm: precursors at 1% 200 pg
+  HeLa 3,463 (`tdf_min_points` 2) / 6,110 (1) / 5,707 (persistent), 1 ng 10,694 / 16,006 /
+  14,652, from a fifth and two fifths of the MS2 centroids of `tdf_min_points` 1; 50 ng and the
+  E. coli entrapment run unchanged within noise (entrapment FDP 0.39-0.44%). On bulk runs most
+  single ions find a chance partner, so the filter keeps most of them. The default `"drop"`
+  writes the same spectra, reports and configuration hash as before.
+
 ## [0.15.1] - 2026-11-26
 
 ### Changed

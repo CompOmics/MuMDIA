@@ -374,9 +374,11 @@ scanning quadrupole that names its targets alone (SCIEX ZT Scan DIA), and leave 
 every other file. It is omitted from the canonical configuration while unset, and recorded in
 the spectra reports as `params.isolation_half_width` when set. The `config_hash` convert receives is recorded
 for provenance, `config_hash = blake3(cfg.canonical_json() + separators + caps)`, so the
-config's canonical JSON is embedded in the hash. The native diaPASEF reader reads the seven `convert.tdf_*` keys
-(`TdfParams::from_config`): the centroiding tolerance, gap and floor, and the two valley
-splits with their smoothing (docs/35_diapasef.md, section 2). Each is omitted from the
+config's canonical JSON is embedded in the hash. The native diaPASEF reader reads the `convert.tdf_*` keys
+(`TdfParams::from_config`): the centroiding tolerance, gap and floor, the two valley
+splits with their smoothing, the MS1 noise filter, and the opt-in rescue of recurring
+single-ion MS2 clusters (`tdf_single_ion` and its three neighbourhood keys; docs/35_diapasef.md,
+section 2). Each is omitted from the
 canonical configuration at its default, so the config hash of a configuration that
 does not set them is unchanged.
 
