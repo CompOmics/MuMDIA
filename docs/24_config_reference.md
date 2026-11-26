@@ -52,7 +52,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | Section | Struct | Fields | Stage document |
 |---|---|---|---|
 | [(top level)](#top-level) | `Config` | 20 | [docs/02_config_and_data_model.md](02_config_and_data_model.md) |
-| [`convert`](#convert) | `ConvertConfig` | 16 |  |
+| [`convert`](#convert) | `ConvertConfig` | 17 |  |
 | [`prescan`](#prescan) | `PrescanConfig` | 7 | [docs/21_prescan.md](21_prescan.md) |
 | [`prescreen`](#prescreen) | `PrescreenConfig` | 20 |  |
 | [`prescreen.tags`](#prescreentags) | `PrescreenTagsConfig` | 3 |  |
@@ -62,7 +62,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`predict_frag`](#predict_frag) | `PredictFragConfig` | 20 | [docs/06_predict_frag_index_matchers.md](06_predict_frag_index_matchers.md) |
 | [`search_seed`](#search_seed) | `SearchSeedConfig` | 13 | [docs/07_search_seed.md](07_search_seed.md) |
 | [`rt_im_train`](#rt_im_train) | `RtImTrainConfig` | 35 | [docs/08_rt_im_train.md](08_rt_im_train.md) |
-| [`extract`](#extract) | `ExtractConfig` | 48 | [docs/09_extract.md](09_extract.md) |
+| [`extract`](#extract) | `ExtractConfig` | 49 | [docs/09_extract.md](09_extract.md) |
 | [`extract.claim_cues`](#extractclaim_cues) | `ClaimCues` | 7 | [docs/09_extract.md](09_extract.md) |
 | [`features`](#features) | `FeaturesConfig` | 14 | [docs/10_features.md](10_features.md) |
 | [`compete`](#compete) | `CompeteConfig` | 6 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
@@ -121,6 +121,7 @@ Vendor-format conversion, read by every subcommand that takes a spectra path (`r
 | `tdf_mz_ppm` | `f64` | `10.0` |  | Native diaPASEF reader (`stages::convert::tdf`): m/z merge tolerance in ppm between neighbouring TOF points of one centroid (single linkage). Default 10. Read only for a timsTOF `.d` whose frames are diaPASEF, which `convert` reads natively; every other input ignores the `tdf_*` keys. Each `tdf_*` key is omitted from the canonical configuration at its default, so it changes no config hash. |
 | `tdf_im_gap_scans` | `u32` | `30` |  | Native diaPASEF reader: a gap of more than this many TIMS scans without signal splits one m/z trace into separate centroids. Default 30. Provisional: it rests on a peak census of one run and the seed plateau, not on an end-to-end sweep. |
 | `tdf_min_points` | `u32` | `2` |  | Native diaPASEF reader: a centroid built from fewer raw TOF x scan points than this is dropped. Default 2. Provisional, as `tdf_im_gap_scans`. 1 keeps every centroid, including those of a single ion event, which at low load is most of the real fragment signal; with `extract.gate_support_min` 0 it is the low-input opt-in (docs/35_diapasef.md section 11, "Low input"). The two were the default in 0.15.0 and were reverted because 10 of 52 timsTOF diaPASEF benchmark jobs that 0.14.0 ran then failed on memory; which of the two keys caused that is not measured. Measured for the opt-in with the diaPASEF recipe (`extract.gate_min_score` 0.6, `presence_min_coelution` 1, no support gate), three NN seeds, precursors per run at `run_psm_q` 1% against 2: 200 pg HeLa 3,422 -> 7,689, 1 ng 12,542 -> 19,270, 250 pg Ultra 6,912 -> 9,544, 50 ng 5-min Ultra 2 35,710 -> 35,346; E. coli entrapment FDP 0.97% (0.83-1.12%); 0 IDs in three blank runs. The other-species share rose on the 250 pg Ultra set only (1.17% -> 1.40%) and fell elsewhere. The earlier -17% for 1 (docs/35 section 12) was measured under the 0.845 support gate and without the recipe's presence rule. |
+| `tdf_single_ion` | `TdfSingleIon` | `drop` |  | Native diaPASEF reader: what becomes of an MS2 centroid of fewer than `tdf_min_points` raw points (at the default 2, a single ion event). See `TdfSingleIon`. Default `drop`. `flagged` needs `tdf_min_points` of at least 2. Opt-in (docs/35_diapasef.md section 11, "Single-ion peaks at match time"); omitted from the canonical configuration at its default. |
 | `tdf_mz_valley` | `f64` | `0.0` | benchmark-gated | Native diaPASEF reader: split each m/z x mobility cluster at the valleys of its m/z profile. A local minimum of the smoothed profile is a cut when it is below this fraction of the smaller of the two humps beside it, so one ion stays one centroid and two neighbouring ions become two. Must be in [0, 1); 0 (default) is off and leaves the centroids unchanged. Benchmark-gated (docs/35_diapasef.md). |
 | `tdf_mz_smooth_ppm` | `f64` | `8.0` |  | Native diaPASEF reader: half-width in ppm of the triangular smoothing applied to the m/z profile before `tdf_mz_valley` looks for valleys; 0 is no smoothing. Default 8. Unused while `tdf_mz_valley` is 0. |
 | `tdf_im_valley` | `f64` | `0.0` | benchmark-gated | Native diaPASEF reader: split each cluster (after the m/z valley split, when that is on) at the valleys of its mobility profile, the summed intensity per TIMS scan after a triangular smoothing of half-width `tdf_im_smooth_scans`. Separates ions of one m/z whose mobility profiles touch without a `tdf_im_gap_scans` gap. Must be in [0, 1); 0 (default) is off and leaves the centroids unchanged. Benchmark-gated. |
@@ -366,6 +367,7 @@ Database-free tag discovery used by the tag prefilter.
 | `gate_rt_weight` | `f64` | `0.2` |  | Weight of the RT error in `GateMode::WindowMean`: the score is the mean of the summed-window entropy, coverage and cosine minus this times the apex RT error over the candidate's own window half-width on that side (clipped to 1). |
 | `gate_support_min` | `Option<f64>` | `null` |  | A second acceptance threshold under `GateMode::WindowMean`, the diaPASEF gate: a candidate must pass `gate_min_score` and this, without the MS1 rescue. On spectra that carry 1/K0 the score is the window-mean score plus `0.023 ln(1 + apex intensity)` and `0.009 ln(1 + MS1 monoisotopic intensity at the apex)`, minus `1.23` times the apex 1/K0 error against the calibrated prediction, `7.44` times the 1/K0 spread of the matched fragments at the apex (`apex_im_mad`) and `0.18` times the MS1-to-fragment 1/K0 difference: weights fitted on the gate-time quantities of two HYE diaPASEF runs, on targets only. Without 1/K0 it is the window-mean score plus `0.05 ln(1 + apex intensity)` and `0.02 ln(1 + MS1 mono)`. The MS1 term counts only where the apex reads the mono, +1 and +2 isotopes, as the `log_mono_ms1` feature does. 0 is off. Unset (the default) is 0.845 on spectra that carry 1/K0 and off otherwise. It was off in 0.15.0 and was restored because, with `convert.tdf_min_points` 1 as well, 10 of 52 timsTOF diaPASEF benchmark jobs that 0.14.0 ran failed on memory; which of the two keys caused that is not measured. 0, with `convert.tdf_min_points` 1, is the low-input opt-in: on the 2026-11 low-input sets it was +26% precursors per run at 200 pg and +19% at 1 ng with the gate off, +6.1% on 50 ng 5-min Ultra 2 runs, other-species shares unchanged (one NN seed, docs/35_diapasef.md section 16). On the six ProteoBench HYE diaPASEF runs, 0.845 keeps 41% of the candidates the window-mean gate at 0.6 passes, for -1.6% peptides at 1% and -36% wall time (26.8 against 41.6 min); on six 5-min HYE diaPASEF runs -1.75% peptides at -48% wall time; on the E. coli diaPASEF entrapment run -1.6% peptides at an entrapment FDP of 0.32-0.35% against 0.30-0.38% (three NN seeds). A window-mean threshold of 0.75 keeps 45% and loses more identifications. Without 1/K0 the gate is not fitted for a default; 1.215 kept 42% on the same runs (docs/35_diapasef.md section 16). |
 | `im_gate` | `ImGate` | `off` | benchmark-gated | The 1/K0 gate of a run whose spectra carry ion mobility (a diaPASEF `.d` read by the native reader): a fragment peak whose 1/K0 lies outside the candidate's calibrated 1/K0 window (`run_windows.im_lo`/`im_hi`, from `rt-im-train`) is not matched to that candidate, as a peak outside its RT window is not. See `ImGate`. Default `off`. Benchmark-gated (docs/35_diapasef.md). Omitted from the canonical configuration at its default. |
+| `single_ion_im_scale` | `f64` | `1.0` |  | The share of a candidate's 1/K0 window, about its centre, inside which a single-ion centroid (`convert.tdf_single_ion = flagged`) is matched to the candidate. In (0, 1]; default 1, the whole window. Inert without single-ion centroids. Omitted from the canonical configuration at its default. |
 
 ## extract.claim_cues
 
@@ -1111,6 +1113,17 @@ How `run-experiment` names its runs when `--run-names` is absent (`experiment.ru
 | `input` | yes | After the input file's name, sanitised to a portable directory name. |
 | `index` |  | `r0`, `r1`, ... in input order, the layout before 0.10. |
 
+### `TdfSingleIon`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+`convert.tdf_single_ion`: the native diaPASEF reader's MS2 centroids below `tdf_min_points`.
+
+| Value | Default | Description |
+|---|---|---|
+| `drop` | yes | Dropped, as every MS1 and MS2 centroid below `tdf_min_points` is. |
+| `flagged` |  | Kept in separate lists of `spectra_ms2` (v4: `single_ion_mz`, `single_ion_intensity`, `single_ion_im`), which only extract reads. Extract matches such a peak to a candidate only when its 1/K0 lies inside the candidate's calibrated 1/K0 window, whatever `extract.im_gate` is, and never to a candidate without one; the other peaks are matched as before. A fragment of a real precursor shares its 1/K0, while single-ion noise is spread over the slot's whole mobility range. The seed and every other reader of the spectra see what `drop` writes. MS1 centroids are dropped as under `drop`. |
+
 ### `UnknownModPolicy`
 
 (rust/mumdia/crates/mumdia-core/src/config.rs)
@@ -1355,6 +1368,6 @@ instead of looking like an absent field.
 
 ## Coverage
 
-24 structs and 333 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 45 enumerations, 1 named profile(s), 105 environment variables read and 28 set.
+24 structs and 335 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 46 enumerations, 1 named profile(s), 105 environment variables read and 28 set.
 
 30 field(s) carry a gating marker in their doc comment. 53 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.

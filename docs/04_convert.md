@@ -92,6 +92,15 @@ v2 (`SPECTRA_MS2_V2`, native diaPASEF only) adds `window_im_lower` and
 `window_im_upper` (nullable `f32`, before `mz`) and a per-peak `im` list (last). The
 window id then deduplicates on the m/z and the 1/K0 bounds (`IsolationWindow::key`).
 
+v4 (`SPECTRA_MS2_V4`, `artifact::spectra_ms2_si`) is written only by the native diaPASEF
+reader under `convert.tdf_single_ion = flagged`: v2 plus three `LargeList<f32>` columns,
+appended last, `single_ion_mz`, `single_ion_intensity` and `single_ion_im`, holding the MS2
+centroids below `convert.tdf_min_points` (at the default 2, single ion events), m/z ascending.
+`mz`, `intensity` and `im` are what v2 holds, so `load_ms2` (seed, localisation) reads v4 as
+v2; only extract's `load_ms2_with(path, true)` merges the three lists into each scan's peaks
+and marks them (`Ms2Scan::single_ion`). `top_peaks_ms2` does not cap them. docs/35 section 11,
+"Single-ion peaks at match time".
+
 v3 (`SPECTRA_MS2_V3`, `artifact::spectra_ms2_q1`) is written only when
 `convert.isolation_half_width` widened the first MS2 spectrum of the file, that is for a
 scanning-quadrupole acquisition whose spectra name a target and no offsets (section "SCIEX

@@ -869,6 +869,23 @@ gate and the ion-mobility feature family together gave +5.0% on the same run (on
 docs/35 section 11). The diaPASEF recipe (`configs/examples/diapasef.json`) sets
 `im_gate = fragments`.
 
+**Single-ion peaks** (`convert.tdf_single_ion = flagged`, opt-in). When the spectra are
+spectra_ms2 v4, extract decodes them itself (`load_ms2_with(path, true)`; a decode the seed
+lent holds no single-ion lists, so `chain` frees it instead of lending it) and merges the
+single-ion centroids into each scan's peaks, m/z ascending, marked in `Ms2Scan::single_ion`.
+Every guard site reads a peak's 1/K0 through `Guard::peak_im`: a marked peak is
+`PeakIm::SingleIon`, and `RtWindows::admits_single_ion` matches it to a candidate only inside
+its RT window and inside the share `extract.single_ion_im_scale` (default 1, the whole window)
+of its 1/K0 window about the centre, whatever `im_gate` is, and never to a candidate without a
+bounded 1/K0 window. Every other peak is tested as before, so the hits of the multi-point
+centroids are unchanged and the hit store grows only by the single-ion peaks a window admits.
+A run whose windows have no 1/K0 calibration matches none of them and says so. The footprint
+estimate counts the single-ion peaks at the candidate's 1/K0 share of the slot. Under the
+recipe's `im_gate = fragments` every peak is already gated, so there the difference from
+`tdf_min_points` 1 is that the seed does not see them, that candidates without a 1/K0 window
+never take them, and `single_ion_im_scale`. docs/35 section 11, "Single-ion peaks at match
+time".
+
 **Evidence** (psms_extracted v4), computed per accepted row at the row's own apex, so a
 promoted alternative peak carries its own (`im_at`). The apex scan is the one the demix
 resolves (`demix_apex_scan`), which the `rt_scan` lookup map is built for whenever
@@ -1507,6 +1524,7 @@ declutter" commit: `extract.scan_window_mode` (and the `ScanWindowMode` enum),
 | `q1_fragments` | `"auto"` | On for a ZT Scan search, off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). The per-fragment Q1 decision of every accepted row (psms_extracted v6); needs `rt_im_train.q1_calibrate` and spectra_ms2 v3 (section 12) |
 | `q1_deconvolved` | false | Count only the peaks whose Q1 centroid sits where the matched fragment is expected, within the tolerance the Q1 calibration learns; needs `rt_im_train.q1_calibrate` and spectra_ms2 v3 (section 14) |
 | `im_gate` | `off` | The 1/K0 gate on fragment peaks (`off`, `fragments`, `auto`; section 8). Inert on 3D data. Omitted from the canonical configuration at its default |
+| `single_ion_im_scale` | 1.0 | The central share of a candidate's 1/K0 window inside which a single-ion centroid (`convert.tdf_single_ion = flagged`) is matched; in (0, 1] (section 8). Inert without spectra_ms2 v4. Omitted from the canonical configuration at its default |
 
 Note: `extract` itself does not read `emit_candidate_audit`. It gates the separate
 `audit` stage of a single-file `run` (also `mumdia audit`), which writes
@@ -1639,6 +1657,13 @@ tests encode the behavioral invariants that gate tuning must preserve.
   v4 columns, and `extract_writes_the_1k0_evidence_only_for_spectra_with_ion_mobility`
   (`tests/pipeline.rs`) the stage end to end: 3D bytes unchanged under every 1/K0
   setting, v4 evidence values, chromatograms v2/v3/v4, the gate and `auto`.
+- `single_ion_peaks_match_inside_the_candidate_im_window_only`: with the gate off, a
+  single-ion peak reaches only a candidate whose 1/K0 window holds it, never one without a
+  window, and every other hit is unchanged; no flag set is the plain search.
+  `the_windows_builder_scatters_the_im_columns_as_extract_reads_them` covers
+  `admits_single_ion` (window share, RT test, trace pad, no window), and
+  `single_ion_centroids_round_trip_through_their_own_lists` (convert) the v4 lists, which
+  `load_ms2` ignores and `load_ms2_with` merges.
 - `peaks::tests` (`peaks.rs:154`): empty/all-zero profiles yield no peaks; a
   clean triangular peak resolves apex and 1/3-height boundaries; `k=1` keeps only
   the strongest-area peak; a dominant interference peak with `k=1` discards a

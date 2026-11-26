@@ -173,6 +173,23 @@
       "source_struct": "ConvertConfig"
     },
     {
+      "path": "convert.tdf_single_ion",
+      "name": "tdf_single_ion",
+      "section": "convert",
+      "rust_type": "TdfSingleIon",
+      "kind": "enum",
+      "optional": false,
+      "default": "drop",
+      "default_text": "`drop`",
+      "help": "Native diaPASEF reader: what becomes of an MS2 centroid of fewer than `tdf_min_points` raw points (at the default 2, a single ion event). See `TdfSingleIon`. Default `drop`. `flagged` needs `tdf_min_points` of at least 2. Opt-in (docs/35_diapasef.md section 11, \"Single-ion peaks at match time\"); omitted from the canonical configuration at its default.",
+      "gates": [],
+      "source_struct": "ConvertConfig",
+      "choices": [
+        "drop",
+        "flagged"
+      ]
+    },
+    {
       "path": "convert.tdf_mz_valley",
       "name": "tdf_mz_valley",
       "section": "convert",
@@ -2485,6 +2502,19 @@
         "fragments",
         "auto"
       ]
+    },
+    {
+      "path": "extract.single_ion_im_scale",
+      "name": "single_ion_im_scale",
+      "section": "extract",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 1.0,
+      "default_text": "1.0",
+      "help": "The share of a candidate's 1/K0 window, about its centre, inside which a single-ion centroid (`convert.tdf_single_ion = flagged`) is matched to the candidate. In (0, 1]; default 1, the whole window. Inert without single-ion centroids. Omitted from the canonical configuration at its default.",
+      "gates": [],
+      "source_struct": "ExtractConfig"
     },
     {
       "path": "extract.claim_cues.mz_close",
