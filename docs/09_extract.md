@@ -397,7 +397,11 @@ resident  ~ min(batch, budget)                     (waves)
 ```
 
 which is what the footprint estimate now reports for a batch past the budget (`Footprint::of`).
-A batch within the budget is planned exactly as before: one wave, no pieces.
+A batch within the budget is planned exactly as before: one wave, no pieces. The budget is
+compared with estimates, and the estimate reads low on dense spectra, so from the second
+batch on the driver divides it by the most matches collected per estimated match in any batch
+so far (`est_scale`): the bound then holds in matches actually collected, not only in
+estimated ones. The first batch is planned on the estimate alone.
 
 **Byte identity.** The tables follow the flush calls, not only the candidates: each call to
 the flush is one chromatogram chunk, and the parquet writer cuts its pages on the chunks

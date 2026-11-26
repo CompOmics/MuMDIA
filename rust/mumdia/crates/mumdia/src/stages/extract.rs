@@ -6581,6 +6581,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             };
             let step = groups_in_flight(p.cfg, has_im);
             let mut gi = 0usize;
+            let mut est_scale = 1.0f64;
             while gi < groups.len() {
                 let upto = (gi + step).min(groups.len());
                 // Everything below the next batch's first candidate is final: windows are
@@ -6609,16 +6610,23 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                     bound,
                     budget_hits.map(|hits| HitBudget {
                         loads: &load_hits[gi..upto],
-                        hits,
+                        hits: hits / est_scale,
                     }),
                     &mut acc_stream,
                     &mut chunk,
                     &mut flush,
                 );
+                let batch_hits =
+                    local_stats.hits.load(std::sync::atomic::Ordering::Relaxed) - hits_before;
+                // The estimate reads low on dense spectra (0.39 on one diaPASEF run), so the
+                // budget is read against the most matches per estimated match seen so far.
+                let est: f64 = load_hits[gi..upto].iter().sum();
+                if est > 0.0 {
+                    est_scale = est_scale.max(batch_hits as f64 / est);
+                }
                 gi = upto;
                 open_hits_max = open_hits_max.max(acc_stream.n_hits());
-                batch_hits_max = batch_hits_max
-                    .max(local_stats.hits.load(std::sync::atomic::Ordering::Relaxed) - hits_before);
+                batch_hits_max = batch_hits_max.max(batch_hits);
                 // Candidates past the batch's own sub-range grid (a window of this batch
                 // can reach past the last window's range when the windows differ in width)
                 // are final too, and the sub-range loop cannot have reached them.
