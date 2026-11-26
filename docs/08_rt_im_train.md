@@ -1106,6 +1106,25 @@ percentile of 0.054 to 0.081 (0.120 to 0.145 on the three runs with 99 to 196 an
 library on its first run (`rt_library_scope = first_run_only`) the map is applied to the
 adapted iRT, which is already on that run's gradient.
 
+Measured (2026-11-26, one NN seed, 32 threads, `run-experiment` with the second pass) on
+three cells of the 52-cell plate, G1_30 (218 seed anchors, adapts the library), G1_29 (0
+anchors at any rung: the unbounded case) and G1_24 (0 at 1%, 34 at a relaxed rung: the fixed
+120 s window), with the diaPASEF settings of the sweep and `fallback_windows = library`:
+
+| | G1_30 | G1_29 | G1_24 |
+|---|---|---|---|
+| status | loess | fallback_library, 320 s | fallback_fixed + 1/K0 fallback |
+| extract estimate, at once / run (GiB) | 3.4 / 7.4 | 10.6 / 22.4 | 5.1 / 10.8 |
+| precursors at `run_psm_q` 1%, first pass | 3,306 | 145 | 220 |
+| same, second pass (reported) | 3,079 | 169 | 1,437 |
+
+Decoy fraction at `run_psm_q` 1% 0.0-0.97% per run; 26:33 wall, 30.4 GB peak RSS. Before, the
+sweep's engine estimated 163 GiB over the run for a fixed-window cell without 1/K0 and
+290-875 GiB for unbounded ones. With the 0.15.0 reader settings (`tdf_min_points` 1, no
+support gate) the same cells estimated 57 / 146 GiB (G1_29, 420 s half-width) and 26 / 65 GiB
+(G1_24). `tdf_min_points` 2 did not give these cells anchors: 218 / 0 / 0 at 1% against
+219 / 0 / 0 with 1. `fallback_windows = refuse` stopped G1_29 at `rt-im-train` after 2:19.
+
 `fallback_windows = refuse` fails a run with fewer than two RT anchors at `rt-im-train`
 instead, before extract; under `run-experiment` that ends the experiment. Neither applies to
 a grouped run (`groups.window_groups > 1`), whose anchors are read from the seed with no
