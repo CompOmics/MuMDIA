@@ -3173,8 +3173,8 @@ mod tests {
         let m = library_range_map(&irt, &seed_rt, library.fallback_rt_gradient_fraction).unwrap();
         assert_eq!(cal["w_rt"].as_f64(), Some(m.half_width));
         let mut last = f64::NEG_INFINITY;
-        for i in 0..n {
-            if !irt[i].is_finite() {
+        for (i, &x) in irt.iter().enumerate() {
+            if !x.is_finite() {
                 // A row without an iRT keeps the documented whole-gradient sentinel.
                 assert!(kept.rt_cal[i].is_nan() && kept.rt_lo[i] == f64::NEG_INFINITY);
                 continue;
@@ -3182,7 +3182,7 @@ mod tests {
             let c = kept.rt_cal[i];
             assert!(c > last, "row {i}: the map keeps the iRT order");
             last = c;
-            assert_eq!(c, m.slope * irt[i] as f64 + m.intercept);
+            assert_eq!(c, m.slope * x as f64 + m.intercept);
             assert_eq!(
                 (kept.rt_lo[i], kept.rt_hi[i]),
                 (c - m.half_width, c + m.half_width)
@@ -3192,8 +3192,8 @@ mod tests {
         assert_eq!(cal["w_im_sizing"], IM_FALLBACK_SIZING);
         assert_eq!(cal["w_im"].as_f64(), Some(library.fallback_im_window));
         let (lo, hi) = (kept.im_lo.as_ref().unwrap(), kept.im_hi.as_ref().unwrap());
-        for i in 0..n {
-            match pred[i] {
+        for (i, p) in pred.iter().enumerate() {
+            match *p {
                 None => assert!(lo[i] == f32::NEG_INFINITY && hi[i] == f32::INFINITY),
                 Some(p) => {
                     assert!((lo[i] as f64 - (p - 0.07)).abs() < 1e-6, "row {i}");
