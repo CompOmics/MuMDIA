@@ -1147,8 +1147,9 @@ fn fit_anchors(
             let m = library_range_map(lib_irt, &s_rt, cfg.fallback_rt_gradient_fraction);
             if m.is_none() {
                 warn!(
-                    "rt-im-train: fallback_windows = library, but the library iRT or the seed's \
-                     retention times have no spread to map; the RT windows stay unbounded"
+                    "rt-im-train: fallback_windows = library, but there is no library iRT to \
+                     map (a grouped run reads its anchors from the seed), or it or the seed's \
+                     retention times have no spread; the RT windows stay unbounded"
                 );
             }
             m
