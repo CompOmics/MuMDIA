@@ -229,6 +229,15 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Added
+
+- **`extract.gate_keep_decoys`, an experimental decoy-calibrated extraction gate (docs/09
+  section 5a).** Set to a share `f`, extract cuts the window-mean score where the share `f` of
+  the decoy candidates that pass the other gates survives, targets and decoys at the same
+  score, decided per block of 2,048 to 4,095 decoy candidates in m/z order so the rows keep
+  streaming. `gate_min_score` stays a floor; the default support gate is off unless
+  `gate_support_min` is set. Unset by default, and unset nothing changes. Not measured yet.
+
 ### Changed
 
 - **diaPASEF: `convert.tdf_min_points` is 2 and `extract.gate_support_min` 0.845 on spectra

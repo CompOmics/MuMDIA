@@ -62,7 +62,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`predict_frag`](#predict_frag) | `PredictFragConfig` | 20 | [docs/06_predict_frag_index_matchers.md](06_predict_frag_index_matchers.md) |
 | [`search_seed`](#search_seed) | `SearchSeedConfig` | 13 | [docs/07_search_seed.md](07_search_seed.md) |
 | [`rt_im_train`](#rt_im_train) | `RtImTrainConfig` | 35 | [docs/08_rt_im_train.md](08_rt_im_train.md) |
-| [`extract`](#extract) | `ExtractConfig` | 48 | [docs/09_extract.md](09_extract.md) |
+| [`extract`](#extract) | `ExtractConfig` | 49 | [docs/09_extract.md](09_extract.md) |
 | [`extract.claim_cues`](#extractclaim_cues) | `ClaimCues` | 7 | [docs/09_extract.md](09_extract.md) |
 | [`features`](#features) | `FeaturesConfig` | 14 | [docs/10_features.md](10_features.md) |
 | [`compete`](#compete) | `CompeteConfig` | 6 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
@@ -365,6 +365,7 @@ Database-free tag discovery used by the tag prefilter.
 | `gate_coelution_min` | `f64` | `0.5` |  | Second threshold for `GateMode::Combined`: the co-elution score must exceed this while the peak-integrated spectral score exceeds `gate_min_score`. Requiring BOTH is more specific (rejects interferents that pass one axis). |
 | `gate_rt_weight` | `f64` | `0.2` |  | Weight of the RT error in `GateMode::WindowMean`: the score is the mean of the summed-window entropy, coverage and cosine minus this times the apex RT error over the candidate's own window half-width on that side (clipped to 1). |
 | `gate_support_min` | `Option<f64>` | `null` |  | A second acceptance threshold under `GateMode::WindowMean`, the diaPASEF gate: a candidate must pass `gate_min_score` and this, without the MS1 rescue. On spectra that carry 1/K0 the score is the window-mean score plus `0.023 ln(1 + apex intensity)` and `0.009 ln(1 + MS1 monoisotopic intensity at the apex)`, minus `1.23` times the apex 1/K0 error against the calibrated prediction, `7.44` times the 1/K0 spread of the matched fragments at the apex (`apex_im_mad`) and `0.18` times the MS1-to-fragment 1/K0 difference: weights fitted on the gate-time quantities of two HYE diaPASEF runs, on targets only. Without 1/K0 it is the window-mean score plus `0.05 ln(1 + apex intensity)` and `0.02 ln(1 + MS1 mono)`. The MS1 term counts only where the apex reads the mono, +1 and +2 isotopes, as the `log_mono_ms1` feature does. 0 is off. Unset (the default) is 0.845 on spectra that carry 1/K0 and off otherwise. It was off in 0.15.0 and was restored because, with `convert.tdf_min_points` 1 as well, 10 of 52 timsTOF diaPASEF benchmark jobs that 0.14.0 ran failed on memory; which of the two keys caused that is not measured. 0, with `convert.tdf_min_points` 1, is the low-input opt-in: on the 2026-11 low-input sets it was +26% precursors per run at 200 pg and +19% at 1 ng with the gate off, +6.1% on 50 ng 5-min Ultra 2 runs, other-species shares unchanged (one NN seed, docs/35_diapasef.md section 16). On the six ProteoBench HYE diaPASEF runs, 0.845 keeps 41% of the candidates the window-mean gate at 0.6 passes, for -1.6% peptides at 1% and -36% wall time (26.8 against 41.6 min); on six 5-min HYE diaPASEF runs -1.75% peptides at -48% wall time; on the E. coli diaPASEF entrapment run -1.6% peptides at an entrapment FDP of 0.32-0.35% against 0.30-0.38% (three NN seeds). A window-mean threshold of 0.75 keeps 45% and loses more identifications. Without 1/K0 the gate is not fitted for a default; 1.215 kept 42% on the same runs (docs/35_diapasef.md section 16). |
+| `gate_keep_decoys` | `Option<f64>` | `null` | benchmark-gated | Experimental, benchmark-gated: a decoy-calibrated threshold on the window-mean score (`gate_mode = window_mean` only), on top of `gate_min_score`. Set to `f` in (0, 1], the candidates that pass every other gate are cut at the score above which the share `f` of their decoys lies, targets and decoys at the same score; the label is read only to take that quantile from the decoys. `gate_min_score` stays a floor applied first, so `f` is a share of the decoys that pass it (lower the floor to let the share decide), and the MS1 rescue does not apply to this cut. The threshold is chosen per consecutive block of candidates in precursor m/z order holding 2,048 to 4,095 decoys (one block, the whole run, when it has fewer), because extract streams its rows; ties at the threshold are all kept. With it set and `gate_support_min` unset, the support gate is off. Unset (the default) changes nothing (docs/09_extract.md, "Decoy-calibrated gate"). |
 | `im_gate` | `ImGate` | `off` | benchmark-gated | The 1/K0 gate of a run whose spectra carry ion mobility (a diaPASEF `.d` read by the native reader): a fragment peak whose 1/K0 lies outside the candidate's calibrated 1/K0 window (`run_windows.im_lo`/`im_hi`, from `rt-im-train`) is not matched to that candidate, as a peak outside its RT window is not. See `ImGate`. Default `off`. Benchmark-gated (docs/35_diapasef.md). Omitted from the canonical configuration at its default. |
 
 ## extract.claim_cues
@@ -1337,7 +1338,7 @@ instead of looking like an absent field.
 - `peptidoforms.fixed_mods[].name` (`String`)
 - `peptidoforms.fixed_mods[].residue` (`char`)
 
-13 environment read(s) whose name is not a literal. Reads with the same function, access and argument share one entry, which gives their number when there is more than one:
+15 environment read(s) whose name is not a literal. Reads with the same function, access and argument share one entry, which gives their number when there is more than one:
 
 - `rust/mumdia/crates/mumdia-core/src/config.rs::Config::resolve_ztscan_on: env read via closure of `*k``
 - `rust/mumdia/crates/mumdia-core/src/config.rs::Config::resolve_ztscan_on: env read via closure of `self.extract.q1_fragments``
@@ -1345,16 +1346,18 @@ instead of looking like an absent field.
 - `rust/mumdia/crates/mumdia-core/src/config.rs::Config::resolve_ztscan_on: env read via closure of `self.rescore.shadow_q1``
 - `rust/mumdia/crates/mumdia-core/src/config.rs::Config::resolve_ztscan_on: env read via closure of `self.retrace.q1_repick``
 - `rust/mumdia/crates/mumdia-core/src/config.rs::Config::resolve_ztscan_on: env read via closure of `self.rt_im_train.q1_calibrate``
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs::DecoyCut::push: env read via closure of `&mut self``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::PsmRows::push: env read via closure of `&mut self``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::PsmStream::push: env read via closure of `&mut self``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::flush_below: env read via closure of `chunk.slices_mut()``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::flush_below: env read via closure of `runs[r].span_mut(m)``
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs::run_hashed: env read via closure of `d.finish()``
 - `rust/mumdia/crates/mumdia/src/stages/localise/ions.rs::build: env read via closure of `mz_of(base, c, 0.0, z)``
 - `rust/mumdia/crates/mumdia/src/stages/localise/mod.rs::Spectra::valley: env read via closure of `&self``
 - `rust/mumdia/crates/mumdia/src/stages/rescore.rs::check_sidecar_space: env read of `k``
 
 ## Coverage
 
-24 structs and 333 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 45 enumerations, 1 named profile(s), 105 environment variables read and 28 set.
+24 structs and 334 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 45 enumerations, 1 named profile(s), 105 environment variables read and 28 set.
 
-30 field(s) carry a gating marker in their doc comment. 53 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.
+31 field(s) carry a gating marker in their doc comment. 53 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.

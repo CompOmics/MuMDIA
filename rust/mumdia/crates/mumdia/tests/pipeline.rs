@@ -1609,6 +1609,39 @@ fn extract_im(
     (psms, chrom, rp, rc)
 }
 
+/// `extract.gate_keep_decoys` through the streamed extract: the rows it holds back are all
+/// written once the run ends, a run without decoy evidence is not cut (the crafted decoy
+/// matches no peak), the tables are the unset run's byte for byte, and only the reports name
+/// the cut, with its counts.
+#[test]
+fn extract_keep_decoys_writes_every_row_it_keeps() {
+    let (prec, frag) = craft_library();
+    let (ms2, ms1) = (craft_ms2_im(false), craft_ms1_im(false));
+    let win = craft_windows_im(None);
+    let mut cfg = Config::default().extract;
+    cfg.apex_count_window = 1;
+    cfg.presence_min_fragments = 2;
+    cfg.presence_min_matched = 2;
+    cfg.gate_min_score = 0.0;
+    let h = |p: &str| mumdia_io::hash::blake3_file(p).unwrap();
+    let (p0, c0, rp0, _) = extract_im(&prec, &frag, &ms2, &ms1, &win, &cfg, false, "kd_off");
+    assert!(rp0["params"].get("gate_keep_decoys").is_none());
+    assert!(rp0["stats"].get("gate_keep_decoys").is_none());
+    let mut kd = cfg.clone();
+    kd.gate_keep_decoys = Some(0.35);
+    let (p1, c1, rp1, rc1) = extract_im(&prec, &frag, &ms2, &ms1, &win, &kd, false, "kd_on");
+    assert_eq!(h(&p1), h(&p0), "psms_extracted");
+    assert_eq!(h(&c1), h(&c0), "chromatograms");
+    for r in [&rp1, &rc1] {
+        assert_eq!(r["params"]["gate_keep_decoys"], 0.35);
+        let s = &r["stats"]["gate_keep_decoys"];
+        assert_eq!(s["targets_in"], 1, "{s}");
+        assert_eq!(s["targets_kept"], 1, "{s}");
+        assert_eq!(s["decoys_in"], 0, "{s}");
+        assert!(s["threshold_min"].is_null(), "{s}");
+    }
+}
+
 /// Extract on spectra with per-peak 1/K0 writes psms_extracted v4 with the apex 1/K0
 /// evidence and, only while a consumer is on, chromatograms v3/v4 with the per-point 1/K0;
 /// the 1/K0 gate drops exactly the fragment outside the target's window. On the same

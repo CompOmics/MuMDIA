@@ -2467,6 +2467,21 @@
       "source_struct": "ExtractConfig"
     },
     {
+      "path": "extract.gate_keep_decoys",
+      "name": "gate_keep_decoys",
+      "section": "extract",
+      "rust_type": "Option<f64>",
+      "kind": "float",
+      "optional": true,
+      "default": "null",
+      "default_text": "null",
+      "help": "Experimental, benchmark-gated: a decoy-calibrated threshold on the window-mean score (`gate_mode = window_mean` only), on top of `gate_min_score`. Set to `f` in (0, 1], the candidates that pass every other gate are cut at the score above which the share `f` of their decoys lies, targets and decoys at the same score; the label is read only to take that quantile from the decoys. `gate_min_score` stays a floor applied first, so `f` is a share of the decoys that pass it (lower the floor to let the share decide), and the MS1 rescue does not apply to this cut. The threshold is chosen per consecutive block of candidates in precursor m/z order holding 2,048 to 4,095 decoys (one block, the whole run, when it has fewer), because extract streams its rows; ties at the threshold are all kept. With it set and `gate_support_min` unset, the support gate is off. Unset (the default) changes nothing (docs/09_extract.md, \"Decoy-calibrated gate\").",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "ExtractConfig"
+    },
+    {
       "path": "extract.im_gate",
       "name": "im_gate",
       "section": "extract",

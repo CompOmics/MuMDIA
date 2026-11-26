@@ -2532,6 +2532,19 @@ pub struct ExtractConfig {
     /// the same runs (docs/35_diapasef.md section 16).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_support_min: Option<f64>,
+    /// Experimental, benchmark-gated: a decoy-calibrated threshold on the window-mean score
+    /// (`gate_mode = window_mean` only), on top of `gate_min_score`. Set to `f` in (0, 1], the
+    /// candidates that pass every other gate are cut at the score above which the share `f` of
+    /// their decoys lies, targets and decoys at the same score; the label is read only to take
+    /// that quantile from the decoys. `gate_min_score` stays a floor applied first, so `f` is a
+    /// share of the decoys that pass it (lower the floor to let the share decide), and the MS1
+    /// rescue does not apply to this cut. The threshold is chosen per consecutive block of
+    /// candidates in precursor m/z order holding 2,048 to 4,095 decoys (one block, the whole
+    /// run, when it has fewer), because extract streams its rows; ties at the threshold are
+    /// all kept. With it set and `gate_support_min` unset, the support gate is off. Unset (the
+    /// default) changes nothing (docs/09_extract.md, "Decoy-calibrated gate").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_keep_decoys: Option<f64>,
     /// The 1/K0 gate of a run whose spectra carry ion mobility (a diaPASEF `.d` read by the
     /// native reader): a fragment peak whose 1/K0 lies outside the candidate's calibrated
     /// 1/K0 window (`run_windows.im_lo`/`im_hi`, from `rt-im-train`) is not matched to that
@@ -2814,6 +2827,7 @@ impl Default for ExtractConfig {
             gate_coelution_min: 0.5,         // used only by GateMode::Combined
             gate_rt_weight: 0.2,             // used only by GateMode::WindowMean
             gate_support_min: None,          // 0.845 on 1/K0 spectra, off otherwise
+            gate_keep_decoys: None,          // experimental decoy-calibrated cut; off
             im_gate: ImGate::Off,
         }
     }
@@ -5745,6 +5759,20 @@ impl Config {
                  gate)."
                     .into(),
             ));
+        }
+        if let Some(f) = self.extract.gate_keep_decoys {
+            if !(f.is_finite() && f > 0.0 && f <= 1.0) {
+                return Err(Invalid(
+                    "extract.gate_keep_decoys must be in (0, 1]: the share of the decoys kept."
+                        .into(),
+                ));
+            }
+            if self.extract.gate_mode != GateMode::WindowMean {
+                return Err(Invalid(
+                    "extract.gate_keep_decoys cuts on the window-mean score and needs                      extract.gate_mode = window_mean."
+                        .into(),
+                ));
+            }
         }
         if !self.extract.gate_min_score.is_finite()
             || !(0.0..=1.0).contains(&self.extract.gate_min_score)
@@ -10199,6 +10227,17 @@ mod tests {
         assert!(Config::from_json(r#"{"extract":{"gate_min_score":-0.1}}"#).is_err());
         assert!(Config::from_json(r#"{"extract":{"gate_support_min":-0.1}}"#).is_err());
         assert!(Config::from_json(r#"{"extract":{"gate_support_min":1.4}}"#).is_ok());
+        assert!(Config::from_json(r#"{"extract":{"gate_keep_decoys":0.0}}"#).is_err());
+        assert!(Config::from_json(r#"{"extract":{"gate_keep_decoys":1.5}}"#).is_err());
+        assert!(Config::from_json(r#"{"extract":{"gate_keep_decoys":0.35}}"#).is_ok());
+        assert!(Config::from_json(
+            r#"{"extract":{"gate_keep_decoys":0.35,"gate_mode":"apex_pearson"}}"#
+        )
+        .is_err());
+        // Unset, it is left out of the canonical configuration, so no hash moves.
+        assert!(!Config::default()
+            .canonical_json()
+            .contains("gate_keep_decoys"));
         assert!(Config::from_json(r#"{"extract":{"gate_min_score":1.1}}"#).is_err());
     }
 

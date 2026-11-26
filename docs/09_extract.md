@@ -742,6 +742,64 @@ All four diagnostic scores are computed for every accepted candidate only when
 `emit_gate_diagnostics` is set (`extract.rs:2035`); otherwise they are zeroed and
 not written, so the default chain pays no extra cost.
 
+### 5a. Decoy-calibrated gate (`gate_keep_decoys`, experimental)
+
+`extract.gate_keep_decoys` (unset by default; benchmark-gated) replaces a fixed threshold on
+the window-mean score with one calibrated on the run's decoys. Set to `f` in (0, 1], the
+candidates that pass every per-candidate gate are cut at the score above which the share `f` of
+their decoy candidates lies, and targets and decoys are cut at that one score. The motive is
+that an absolute threshold does not transfer across sample loads: the diaPASEF support gate
+(`gate_support_min` 0.845) costs 1.6% of the peptides on bulk HYE and 19-26% of the precursors
+at 200 pg-1 ng, because its intensity terms penalise faint real signal (docs/35 section 16).
+The gate's job is to bound the work downstream; the rescorer does the discrimination. The rule
+is the one `rescore.prefilter_keep_decoys` uses before the classifier, where a cut by a share
+of decoys held up and a cut by a share of rows did not (-0.75% on Astral).
+
+How it works (`DecoyCut`, `keep_decoys_threshold` in `extract.rs`):
+
+- **The score.** The window-mean score of the selected apex (`CandOut::keep_score`), the same
+  on every row of a candidate, so a candidate's promoted peaks go with it. The key needs
+  `gate_mode = window_mean`; any other mode is refused when the configuration loads. A NaN
+  score sorts below every other.
+- **The threshold.** Of the `n` decoy candidates (rank-0 decoy rows) of a block, the
+  `ceil(f n)`-th highest score; a row is kept when its score is at least that. Every tie with
+  the threshold is kept, so slightly more than `f` of the decoys can pass. A block with no
+  decoys is not cut. The label is read only to take the quantile from the decoys; the cut
+  itself is label-blind, so a target and its paired decoy at the same score share a fate.
+- **The blocks.** Extract streams its rows: candidates are flushed in ascending candidate id
+  (precursor m/z) order as the windows that can reach them are done, and their rows and traces
+  are written at once. A run-level quantile would need either every accepted row of the run
+  held until the end, which is the memory the streaming removed, or a second probing pass.
+  The cut therefore holds the accepted rows in candidate order and decides them per
+  consecutive block of 2,048 to 4,095 decoy candidates (`KEEP_DECOYS_BLOCK`): a block closes
+  after its 2,048th decoy once twice as many are waiting, and the remainder is the last block.
+  A run with fewer than 2,048 decoys is one block, the run-level cut. The blocks depend only on
+  the candidate order, never on the thread count, `windows_in_flight` or how the flushes
+  arrive, so the output is deterministic. The run-wide share of decoys kept is `f` (up to the
+  ties and the rounding of each block), and each block's threshold follows the score
+  distribution of its own m/z slice. Not per isolation window: windows overlap, a diaPASEF
+  window is several slots, and an all-ion run has one window, which would hold the whole run.
+  What the cut holds is at most two blocks of accepted rows with their traces.
+- **`gate_min_score`** stays a floor applied first, with its MS1 rescue, as without the key:
+  `f` is a share of the decoys that pass it. To let the share decide, lower the floor (for
+  example 0.3, or 0, which turns the floor off). The MS1 rescue does not apply to the decoy
+  cut.
+- **`gate_support_min`.** With `gate_keep_decoys` set and `gate_support_min` unset, the support
+  gate is off on every spectrum, 1/K0 or not. An explicit `gate_support_min` still applies,
+  before the decoy cut, so `f` is then a share of the decoys that pass both.
+- **Report.** Both extract reports carry `params.gate_keep_decoys` and
+  `stats.gate_keep_decoys`: the share, the number of blocks, the target and decoy candidates
+  in and kept, and the lowest, median and highest block threshold; the same goes to the log
+  line `extract: decoy-calibrated gate`. Unset, no artifact, report, manifest entry or
+  configuration hash changes (the key is left out of the canonical configuration).
+
+Costs and limits. Extract still computes every row down to the floor, chromatograms included,
+so it saves no extract time beyond the floor; what it bounds is the candidate pool that
+features, compete and rescore see. The retrace skeleton row count and the Q1 cycle-trace
+failure count in the reports include candidates the cut later drops. Unmeasured: no count,
+entrapment or wall-time result exists yet, so it is not a default and should be judged like
+any gate change, on two acquisitions with entrapment.
+
 ### 6. Chromatograms and MS1 XICs
 
 Per-fragment observed m/z is an intensity-weighted mean per fragment
@@ -1504,6 +1562,7 @@ declutter" commit: `extract.scan_window_mode` (and the `ScanWindowMode` enum),
 | `emit_gate_diagnostics` | false | Adds the four `gate_*` diagnostic columns |
 | `gate_mode` | `WindowMean` | Which score `gate_min_score` thresholds (`GateMode`) |
 | `gate_coelution_min` | 0.5 | Second threshold for `GateMode::Combined` |
+| `gate_keep_decoys` | unset | Experimental: cut at the window-mean score where this share of the decoys that pass the other gates survives, per block of 2,048-4,095 decoy candidates; turns the default support gate off; `gate_min_score` stays a floor (section 5a) |
 | `q1_fragments` | `"auto"` | On for a ZT Scan search, off for every other (docs/37_ztscan.md, "Automatic for ZT Scan files"). The per-fragment Q1 decision of every accepted row (psms_extracted v6); needs `rt_im_train.q1_calibrate` and spectra_ms2 v3 (section 12) |
 | `q1_deconvolved` | false | Count only the peaks whose Q1 centroid sits where the matched fragment is expected, within the tolerance the Q1 calibration learns; needs `rt_im_train.q1_calibrate` and spectra_ms2 v3 (section 14) |
 | `im_gate` | `off` | The 1/K0 gate on fragment peaks (`off`, `fragments`, `auto`; section 8). Inert on 3D data. Omitted from the canonical configuration at its default |
@@ -1528,6 +1587,7 @@ here for one index.
 | `extract.retain_top_peaks` (`config.rs:635`, default 1) | `<out_psms>.peaks.parquet` sidecar, unscored, written only when K>1 (`extract.rs:2544`); no PSM columns | ID loop not closed (sidecar peaks are unscored); gate pending |
 | `extract.promote_top_peaks` (`config.rs:645`, default 1) | extra `psms_extracted` rows with `peak_rank >= 1` (`extract.rs:2297`); no new columns | **not schema-neutral in rows**: changes the scored population and therefore FDR; on diaPASEF (IM branch, seed 0) K = 2 lost 5.7% and K = 3 5.9%, and `retrace.repick` is the diaPASEF path (docs/35 section 12); gate pending |
 | `extract.emit_candidate_audit` (`config.rs:658`) | none in `extract.rs` (unused there); in `run` it gates the `audit` stage -> `candidate_audit.parquet` (`run.rs:428`) | diagnostic; no ID effect |
+| `extract.gate_keep_decoys` (default unset) | none; drops accepted rows below each block's decoy-share threshold (section 5a) | not measured; gate pending |
 | `extract.emit_gate_diagnostics` (`config.rs:673`) | 4 F32 cols `gate_apex`, `gate_peak_spectral`, `gate_coelution`, `gate_spectral_entropy` (`extract.rs:2511`) | diagnostic; no ID effect |
 | `extract.apex_evidence_rank` (`config.rs:667`) | none; changes the apex-selection score (`extract.rs:1890`) | **the default**, promoted on correctness grounds rather than a count (docs/25 section 2); the legacy score (`false`) was removed in 0.15.0 (HYE: 27.6% more candidates, 1.0% fewer peptides, bench/README.md): it could not distinguish "no signature fragment observed anywhere" from "the earliest qualifying scan is the apex" |
 | `extract.apex_gaussian_sigma_scans` (`config.rs:572`) | none; smooths the apex count profile | not measured; gate pending |
