@@ -743,6 +743,52 @@ fn single_run_span(runs: &[HitRun], bound: u32, max_cands: usize) -> Option<(usi
     Some((r, m))
 }
 
+/// Whether `runs` hold at least `want` distinct candidates below `bound`, counted on cursors
+/// without moving the runs.
+fn has_candidates_below(runs: &[HitRun], bound: u32, want: usize) -> bool {
+    // The candidates of each run, counted by part: exact for one run, and an upper bound
+    // otherwise (a candidate two windows reach counts twice), which settles most calls.
+    let mut upper = 0usize;
+    for r in runs {
+        for (j, p) in r.parts.iter().enumerate().skip(r.pi) {
+            let from = if j == r.pi { r.ci } else { 0 };
+            let m = p.cids[from..].partition_point(|&c| c < bound);
+            upper += m;
+            if from + m < p.cids.len() {
+                break;
+            }
+        }
+    }
+    if upper < want || runs.len() == 1 {
+        return upper >= want;
+    }
+    let mut cur: Vec<(usize, usize)> = runs.iter().map(|r| (r.pi, r.ci)).collect();
+    let peek = |r: &HitRun, (pi, ci): (usize, usize)| r.parts.get(pi).map(|p| p.cids[ci]);
+    let mut n = 0usize;
+    while n < want {
+        let Some(cid) = runs
+            .iter()
+            .zip(&cur)
+            .filter_map(|(r, &c)| peek(r, c))
+            .min()
+            .filter(|&c| c < bound)
+        else {
+            return false;
+        };
+        n += 1;
+        for (r, c) in runs.iter().zip(cur.iter_mut()) {
+            if peek(r, *c) == Some(cid) {
+                c.1 += 1;
+                while c.0 < r.parts.len() && c.1 >= r.parts[c.0].len() {
+                    c.0 += 1;
+                    c.1 = 0;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// A flush of finished candidates: `(cid, hits)` in ascending id, at most `CAND_CHUNK` of
 /// them. Returns false when the consumer went away.
 type FlushFn<'f> = dyn for<'h> FnMut(Vec<(u32, &'h mut [Hit])>) -> bool + Send + 'f;
@@ -755,15 +801,23 @@ type FlushFn<'f> = dyn for<'h> FnMut(Vec<(u32, &'h mut [Hit])>) -> bool + Send +
 /// into `chunk` first. That is the common case by far: a sub-range reached by one window
 /// and holding no leftovers from the batch before. `zero_copy = false` always gathers,
 /// which is the reference the zero-copy batches are tested against.
+///
+/// `full_only` flushes full batches of `max_cands` only and leaves a shorter tail in `runs`:
+/// what a piece of a sub-range flushes under the hit budget, so that the batches, and with
+/// them the chromatogram chunks, are the ones the whole sub-range would have flushed.
 fn flush_below(
     runs: &mut [HitRun],
     bound: u32,
     max_cands: usize,
+    full_only: bool,
     zero_copy: bool,
     chunk: &mut HitStore,
     flush: &mut FlushFn<'_>,
 ) -> bool {
     loop {
+        if full_only && !has_candidates_below(runs, bound, max_cands) {
+            return false;
+        }
         if zero_copy {
             if let Some((r, m)) = single_run_span(runs, bound, max_cands) {
                 let ok = flush(runs[r].span_mut(m));
@@ -797,11 +851,47 @@ impl HitAcc {
 
     /// Free what has been gathered and fold whatever is left into a single run, so the
     /// number of live runs stays bounded however much the windows overlap.
+    ///
+    /// Runs that hold disjoint, ascending candidates, with nothing gathered yet out of any
+    /// but the first, are chained part by part instead of copied: a candidate's hits then
+    /// sit in one run, so the chain reads exactly as the merge would. That is what the hit
+    /// budget's pieces leave (a tail and the next piece's fresh stores), and copying the tail
+    /// at every piece made small pieces quadratic.
     fn compact(&mut self) {
         for r in self.runs.iter_mut() {
             r.release_consumed();
         }
         self.runs.retain(|r| r.peek().is_some());
+        if self.runs.len() > 1 {
+            // Window order is kept for the merge below; the chain reorders only runs that
+            // share no candidate, where the order cannot matter.
+            let mut order: Vec<usize> = (0..self.runs.len()).collect();
+            order.sort_by_key(|&i| self.runs[i].peek());
+            let last_cid = |r: &HitRun| {
+                r.parts
+                    .iter()
+                    .rev()
+                    .find_map(|p| p.cids.last().copied())
+                    .expect("a run with a pending candidate")
+            };
+            let chainable = order.windows(2).all(|w| {
+                let (a, b) = (&self.runs[w[0]], &self.runs[w[1]]);
+                b.ci == 0 && last_cid(a) < b.peek().expect("non-empty")
+            });
+            if chainable {
+                let mut runs: Vec<Option<HitRun>> = std::mem::take(&mut self.runs)
+                    .into_iter()
+                    .map(Some)
+                    .collect();
+                let mut first = runs[order[0]].take().expect("each run once");
+                for &i in &order[1..] {
+                    first
+                        .parts
+                        .extend(runs[i].take().expect("each run once").parts);
+                }
+                self.runs = vec![first];
+            }
+        }
         if self.runs.len() > 1 {
             let mut merged = HitStore::default();
             gather_chunk(&mut self.runs, u32::MAX, usize::MAX, &mut merged);
@@ -2184,22 +2274,51 @@ fn window_loads(
 struct Footprint {
     loads: Vec<WindowLoad>,
     /// Matches held at once: the largest batch of `in_flight` consecutive windows on the
-    /// streamed path, every window's on the paths that accumulate the whole run.
+    /// streamed path (under the hit budget, at most about the budget), every window's on the
+    /// paths that accumulate the whole run.
     resident_hits: f64,
     total_hits: f64,
     streamed: bool,
     in_flight: usize,
     ms2_scans: usize,
+    /// The streamed path's hit budget in matches ([`hit_budget`]), `None` without one.
+    budget_hits: Option<f64>,
 }
 
 impl Footprint {
-    fn of(loads: Vec<WindowLoad>, streamed: bool, in_flight: usize, ms2_scans: usize) -> Self {
+    fn of(
+        loads: Vec<WindowLoad>,
+        streamed: bool,
+        in_flight: usize,
+        ms2_scans: usize,
+        budget_hits: Option<f64>,
+        per_peak_claim: bool,
+    ) -> Self {
         let total_hits: f64 = loads.iter().map(|l| l.hits).sum();
-        // The batches the streamed driver probes: `in_flight` consecutive window groups.
+        // The batches the streamed driver probes: `in_flight` consecutive window groups. A
+        // batch past the budget holds the budget, or its widest task when that cannot be
+        // cut (a whole window under a per-peak claim), plus the short tail of up to
+        // `CAND_CHUNK` candidates a piece leaves for the next (`accumulate_groups`).
         let resident_hits = if streamed {
             loads
                 .chunks(in_flight.max(1))
-                .map(|b| b.iter().map(|l| l.hits).sum::<f64>())
+                .map(|b| {
+                    let sum = b.iter().map(|l| l.hits).sum::<f64>();
+                    match budget_hits {
+                        Some(h) if sum > h => {
+                            let per_cand = |l: &WindowLoad| l.hits / l.candidates.max(1) as f64;
+                            let widest = if per_peak_claim {
+                                b.iter().map(|l| l.hits).fold(0.0, f64::max)
+                            } else {
+                                0.0
+                            };
+                            let tail =
+                                CAND_CHUNK as f64 * b.iter().map(per_cand).fold(0.0, f64::max);
+                            h.max(widest) + tail
+                        }
+                        _ => sum,
+                    }
+                })
                 .fold(0.0, f64::max)
         } else {
             total_hits
@@ -2211,6 +2330,7 @@ impl Footprint {
             streamed,
             in_flight,
             ms2_scans,
+            budget_hits,
         }
     }
 
@@ -2244,6 +2364,38 @@ fn footprint_ceiling(cfg: &ExtractConfig, estimate: f64) -> Option<(f64, String)
     }
 }
 
+/// The share of the machine's memory the `auto` hit budget takes. The estimate reads up to
+/// about two times low on diaPASEF (docs/09_extract.md, "The footprint guard"), and the
+/// library, the spectra and the chromatogram buffers come on top.
+const HIT_BUDGET_AUTO_SHARE: f64 = 0.25;
+
+/// The streamed path's hit budget (`extract.hit_budget_gib`) in matches, this band's share
+/// of `sibling_bands`: `None` when it is off (0), or under `auto` while no batch of
+/// `in_flight` windows is estimated past [`FOOTPRINT_AUTO_FLOOR_GIB`] or the machine's
+/// memory cannot be read.
+fn hit_budget(
+    cfg: &ExtractConfig,
+    sibling_bands: usize,
+    loads: &[WindowLoad],
+    in_flight: usize,
+) -> Option<f64> {
+    let bytes = match cfg.hit_budget_gib {
+        Some(v) if v <= 0.0 => return None,
+        Some(v) => v * GIB,
+        None => {
+            let batch = loads
+                .chunks(in_flight.max(1))
+                .map(|b| b.iter().map(|l| l.hits).sum::<f64>())
+                .fold(0.0, f64::max);
+            if batch * FOOTPRINT_HIT_BYTES < FOOTPRINT_AUTO_FLOOR_GIB * GIB {
+                return None;
+            }
+            crate::memlog::total_memory()? as f64 * HIT_BUDGET_AUTO_SHARE
+        }
+    };
+    Some(bytes / sibling_bands.max(1) as f64 / FOOTPRINT_HIT_BYTES)
+}
+
 /// Log the estimate, and refuse when it passes the ceiling (divided among `sibling_bands`
 /// bands in flight).
 fn check_footprint(fp: &Footprint, cfg: &ExtractConfig, sibling_bands: usize) -> Result<()> {
@@ -2255,6 +2407,10 @@ fn check_footprint(fp: &Footprint, cfg: &ExtractConfig, sibling_bands: usize) ->
         windows = fp.loads.len(),
         streamed = fp.streamed,
         windows_in_flight = fp.in_flight,
+        hit_budget_gib = fp.budget_hits.map_or("off".to_string(), |h| format!(
+            "{:.2}",
+            h * FOOTPRINT_HIT_BYTES / GIB
+        )),
         busiest_window_scans = busiest.map_or(0, |l| l.scans),
         "extract: estimated hit store"
     );
@@ -2305,8 +2461,9 @@ fn check_footprint(fp: &Footprint, cfg: &ExtractConfig, sibling_bands: usize) ->
             )
         }
         _ => format!(
-            "Lower extract.windows_in_flight (now {}), or search the run in isolation-window \
-             groups (groups.window_groups), each of which holds a band of the library.",
+            "Lower extract.hit_budget_gib or extract.windows_in_flight (now {}), or search the \
+             run in isolation-window groups (groups.window_groups), each of which holds a band \
+             of the library.",
             fp.in_flight
         ),
     };
@@ -2566,6 +2723,14 @@ impl LocalIndexStats {
     }
 }
 
+/// The hit budget of one batch (`extract.hit_budget_gib`): the estimated matches of each of
+/// its windows ([`window_loads`]), in batch order, and the matches it may hold at once.
+#[derive(Clone, Copy)]
+struct HitBudget<'a> {
+    loads: &'a [f64],
+    hits: f64,
+}
+
 /// Probe one batch of isolation windows and flush what each candidate sub-range finalises,
 /// in ascending candidate order.
 ///
@@ -2591,6 +2756,12 @@ impl LocalIndexStats {
 /// boundaries can move, because the flush is now cut on sub-ranges rather than on the
 /// batch; no row and no value moves with them.
 ///
+/// Under a hit budget ([`HitBudget`]) a batch estimated past it is cut further: each
+/// sub-range into pieces, the tasks into waves that fit the budget, each wave probed and
+/// flushed before the next starts. A piece that does not close its sub-range flushes full
+/// batches of [`CAND_CHUNK`] only, so the flush calls, and with them every byte of every
+/// table, are those of the uncut batch (docs/09_extract.md, "Bounded hit memory").
+///
 /// Returns true when `flush` asked to stop (the chromatogram writer went away).
 #[allow(clippy::too_many_arguments)]
 fn accumulate_groups(
@@ -2605,6 +2776,7 @@ fn accumulate_groups(
     // First candidate a window of a LATER batch can still add hits to; nothing at or above
     // it may be flushed here.
     bound: u32,
+    budget: Option<HitBudget<'_>>,
     acc: &mut HitAcc,
     chunk: &mut HitStore,
     flush: &mut FlushFn<'_>,
@@ -2633,10 +2805,11 @@ fn accumulate_groups(
     // A per-peak claim compares all of a peak's claimants, so under one each window is one
     // task: cut into sub-ranges, each would take its own winner or normalise its own shares,
     // and the hits would follow the thread count.
-    let width = if matches!(
+    let per_peak_claim = matches!(
         cfg.peak_claim,
         PeakClaim::WinnerPredictedIntensity | PeakClaim::Proportional
-    ) {
+    );
+    let width = if per_peak_claim {
         (g_hi - g_lo).max(1) as u64
     } else {
         mean_span
@@ -2650,19 +2823,85 @@ fn accumulate_groups(
         let s = (g_lo as u64 + k as u64 * width).min(hi);
         ((s) as u32, (s + width).min(hi) as u32)
     };
-    // One task per (sub-range, window) pair that actually intersects, k-major so the pool
-    // starts on the sub-ranges that will be flushed first. `expected[k]` is how many
-    // windows must report before sub-range `k` is final.
-    let mut tasks: Vec<(usize, usize, u32, u32)> = Vec::new();
-    let mut expected: Vec<usize> = vec![0; n_sub];
-    for (k, exp) in expected.iter_mut().enumerate() {
+    // The estimated matches of a window's candidates `lo..hi`: its share of the window's
+    // estimate, read as spread evenly over its candidates.
+    let est = |gi: usize, lo: u32, hi: u32| -> f64 {
+        let (g, load) = (&groups[gi], budget.map_or(0.0, |b| b.loads[gi]));
+        load * (hi - lo) as f64 / (g.hi_cid - g.lo_cid).max(1) as f64
+    };
+    // The hit budget (`extract.hit_budget_gib`) binds only on a batch estimated past it;
+    // every other batch is planned exactly as without one.
+    let over = budget.filter(|b| b.loads.iter().sum::<f64>() > b.hits);
+    // The flush units: the sub-ranges, each cut under the budget into pieces of about
+    // `hits / (2 * threads)` estimated matches, so a wave of the budget still runs about
+    // two tasks a thread. A per-peak claim is never cut (see `width`). `(lo, hi, last)`:
+    // `last` closes its sub-range.
+    let piece_hits = over.map(|b| (b.hits / (2 * threads) as f64).max(1.0));
+    let mut units: Vec<(u32, u32, bool)> = Vec::with_capacity(n_sub);
+    for k in 0..n_sub {
         let (s, e) = sub_bounds(k);
+        let pieces = match piece_hits {
+            Some(ph) if !per_peak_claim => {
+                let sub_est: f64 = (0..groups.len())
+                    .map(|gi| {
+                        let g = &groups[gi];
+                        let (lo, hi) = (g.lo_cid.max(s), g.hi_cid.min(e));
+                        if hi > lo {
+                            est(gi, lo, hi)
+                        } else {
+                            0.0
+                        }
+                    })
+                    .sum();
+                ((sub_est / ph).ceil() as u64).clamp(1, (e - s).max(1) as u64)
+            }
+            _ => 1,
+        };
+        let cut = |p: u64| (s as u64 + (e - s) as u64 * p / pieces) as u32;
+        for p in 0..pieces {
+            units.push((cut(p), cut(p + 1), p + 1 == pieces));
+        }
+    }
+    // One task per (unit, window) pair that actually intersects, unit-major so the pool
+    // starts on the units that will be flushed first. `expected[u]` is how many windows
+    // must report before unit `u` is final.
+    let mut tasks: Vec<(usize, usize, u32, u32)> = Vec::new();
+    let mut task_est: Vec<f64> = Vec::new();
+    let mut expected: Vec<usize> = vec![0; units.len()];
+    for (u, exp) in expected.iter_mut().enumerate() {
+        let (s, e, _) = units[u];
         for (gi, g) in groups.iter().enumerate() {
             let (lo, hi) = (g.lo_cid.max(s), g.hi_cid.min(e));
             if hi > lo {
-                tasks.push((k, gi, lo, hi));
+                tasks.push((u, gi, lo, hi));
+                task_est.push(est(gi, lo, hi));
                 *exp += 1;
             }
+        }
+    }
+    // The waves: consecutive tasks whose estimates fit the budget (at least one task each),
+    // each probed and flushed before the next starts. Without the budget, one wave.
+    let mut waves: Vec<std::ops::Range<usize>> = Vec::new();
+    match over {
+        None => waves.push(0..tasks.len()),
+        Some(b) => {
+            let (mut start, mut sum) = (0usize, 0.0f64);
+            for (i, &t) in task_est.iter().enumerate() {
+                if i > start && sum + t > b.hits {
+                    waves.push(start..i);
+                    (start, sum) = (i, 0.0);
+                }
+                sum += t;
+            }
+            waves.push(start..tasks.len());
+            info!(
+                estimated_hits = task_est.iter().sum::<f64>().round() as u64,
+                budget_hits = b.hits.round() as u64,
+                sub_ranges = n_sub,
+                pieces = units.len(),
+                waves = waves.len(),
+                "extract: batch cut to the hit budget"
+            );
         }
     }
     // Note on the per-peak setup `(peak.mz / mass_off.factor_at(peak.mz), bin_of(q_mz))`:
@@ -2707,7 +2946,6 @@ fn accumulate_groups(
     // (as the removed `groups.calibration = per_group` did) would bake band g00's factor
     // into the peaks band g01 reads. The borrow checker stops it today, because `scans` arrives as
     // a shared slice; do not reach for `&mut` to get around that.
-    let (tx, rx) = std::sync::mpsc::channel::<(usize, usize, HitStore)>();
     {
         let probe_range = |gi: usize, lo: u32, hi: u32| -> HitStore {
             let task = ProbeTask {
@@ -2746,55 +2984,80 @@ fn accumulate_groups(
                 }),
             }
         };
-        let n = tasks.len();
-        // `move`: the receiver is Send but not Sync, so it has to be owned by the scope
-        // closure (the consumer) rather than borrowed into it.
-        rayon::scope(move |sc| {
-            // The workers run under rayon; this thread is the single consumer. `spawn` so
-            // the scope does not block the consumer loop below until every task is done.
-            sc.spawn(move |_| {
-                tasks.par_iter().for_each_with(tx, |tx, &(k, gi, lo, hi)| {
-                    // A closed receiver only happens if the consumer panicked.
-                    let _ = tx.send((k, gi, probe_range(gi, lo, hi)));
-                });
-            });
-            // Stores wait here, keyed by `(sub-range, window)`, until their whole
-            // sub-range has reported. `next_k` is the lowest sub-range not yet flushed, so
-            // the map's first keys are always that sub-range's.
-            let mut pending: std::collections::BTreeMap<(usize, usize), HitStore> =
-                std::collections::BTreeMap::new();
-            let mut arrived: Vec<usize> = vec![0; n_sub];
-            let mut next_k = 0usize;
-            let mut stopped = false;
-            for _ in 0..n {
-                let (k, gi, store) = recv_participating(&rx);
-                arrived[k] += 1;
-                pending.insert((k, gi), store);
-                while next_k < n_sub && arrived[next_k] == expected[next_k] {
-                    let mut runs = std::mem::take(&mut acc.runs);
-                    for _ in 0..expected[next_k] {
-                        let key = *pending.keys().next().expect("the sub-range is complete");
-                        debug_assert_eq!(key.0, next_k);
-                        let store = pending.remove(&key).expect("key came from the map");
-                        // One run per window, appended in window order, after whatever
-                        // earlier windows already left in the accumulator.
-                        runs.push(HitRun::new(vec![store]));
-                    }
-                    // Everything this sub-range owns is final, except what a later batch
-                    // can still reach.
-                    let sub_bound = sub_bounds(next_k).1.min(bound);
-                    if !stopped && flush_below(&mut runs, sub_bound, CAND_CHUNK, true, chunk, flush)
-                    {
-                        stopped = true;
-                    }
-                    acc.runs = runs;
-                    acc.compact();
-                    next_k += 1;
-                }
+        let probe_range = &probe_range;
+        // Stores wait here, keyed by `(unit, window)`, until their whole unit has reported.
+        // `next_u` is the lowest unit not yet flushed, so the map's first keys are always
+        // that unit's.
+        let mut pending: std::collections::BTreeMap<(usize, usize), HitStore> =
+            std::collections::BTreeMap::new();
+        let mut arrived: Vec<usize> = vec![0; units.len()];
+        let mut next_u = 0usize;
+        let mut stopped = false;
+        for wave in waves {
+            if stopped {
+                break;
             }
-            debug_assert!(pending.is_empty() && next_k == n_sub);
-            stopped
-        })
+            let wave_tasks = &tasks[wave];
+            let n = wave_tasks.len();
+            let (tx, rx) = std::sync::mpsc::channel::<(usize, usize, HitStore)>();
+            let (pending, arrived, next_u, stopped) =
+                (&mut pending, &mut arrived, &mut next_u, &mut stopped);
+            let (acc, chunk, flush) = (&mut *acc, &mut *chunk, &mut *flush);
+            let (units, expected) = (&units, &expected);
+            // `move`: the receiver is Send but not Sync, so it has to be owned by the scope
+            // closure (the consumer) rather than borrowed into it.
+            rayon::scope(move |sc| {
+                // The workers run under rayon; this thread is the single consumer. `spawn`
+                // so the scope does not block the consumer loop below until every task of
+                // the wave is done.
+                sc.spawn(move |_| {
+                    wave_tasks
+                        .par_iter()
+                        .for_each_with(tx, |tx, &(u, gi, lo, hi)| {
+                            // A closed receiver only happens if the consumer panicked.
+                            let _ = tx.send((u, gi, probe_range(gi, lo, hi)));
+                        });
+                });
+                for _ in 0..n {
+                    let (u, gi, store) = recv_participating(&rx);
+                    arrived[u] += 1;
+                    pending.insert((u, gi), store);
+                    while *next_u < units.len() && arrived[*next_u] == expected[*next_u] {
+                        let mut runs = std::mem::take(&mut acc.runs);
+                        for _ in 0..expected[*next_u] {
+                            let key = *pending.keys().next().expect("the unit is complete");
+                            debug_assert_eq!(key.0, *next_u);
+                            let store = pending.remove(&key).expect("key came from the map");
+                            // One run per window, appended in window order, after whatever
+                            // earlier windows already left in the accumulator.
+                            runs.push(HitRun::new(vec![store]));
+                        }
+                        // Everything this unit owns is final, except what a later batch can
+                        // still reach. A piece that does not close its sub-range flushes
+                        // full batches only, so the batches are the sub-range's.
+                        let (_, hi, last) = units[*next_u];
+                        if !*stopped
+                            && flush_below(
+                                &mut runs,
+                                hi.min(bound),
+                                CAND_CHUNK,
+                                !last,
+                                true,
+                                chunk,
+                                flush,
+                            )
+                        {
+                            *stopped = true;
+                        }
+                        acc.runs = runs;
+                        acc.compact();
+                        *next_u += 1;
+                    }
+                }
+            });
+        }
+        debug_assert!(stopped || (pending.is_empty() && next_u == units.len()));
+        stopped
     }
 }
 
@@ -4651,17 +4914,31 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     let streamed = !two_pass && stream_bins.is_some();
     // The footprint guard (`extract.max_footprint_gib`): estimate what the hit store will
     // hold at once, and refuse a layout that cannot fit before anything is probed.
-    {
+    // The streamed path's hit budget (`extract.hit_budget_gib`) and the estimate per window it
+    // plans the batches with.
+    let (budget_hits, load_hits) = {
         let groups = wgroups.as_deref().expect("just built");
         let loads = window_loads(groups, scans, &lib, guard, restrict.as_ref(), frag_tol);
+        let in_flight = groups_in_flight(p.cfg, has_im);
+        let budget_hits = streamed
+            .then(|| hit_budget(p.cfg, p.sibling_bands, &loads, in_flight))
+            .flatten();
+        let load_hits: Vec<f64> = loads.iter().map(|l| l.hits).collect();
+        let per_peak_claim = matches!(
+            p.cfg.peak_claim,
+            PeakClaim::WinnerPredictedIntensity | PeakClaim::Proportional
+        );
         let fp = Footprint::of(
             loads,
             streamed,
-            groups_in_flight(p.cfg, has_im),
+            in_flight,
             scans.len(),
+            budget_hits,
+            per_peak_claim,
         );
         check_footprint(&fp, p.cfg, p.sibling_bands)?;
-    }
+        (budget_hits, load_hits)
+    };
     if !streamed && !two_pass {
         wgroups = None;
     }
@@ -6330,6 +6607,10 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                     p.cfg,
                     restrict.as_ref(),
                     bound,
+                    budget_hits.map(|hits| HitBudget {
+                        loads: &load_hits[gi..upto],
+                        hits,
+                    }),
                     &mut acc_stream,
                     &mut chunk,
                     &mut flush,
@@ -6346,6 +6627,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                         &mut acc_stream.runs,
                         bound,
                         CAND_CHUNK,
+                        false,
                         true,
                         &mut chunk,
                         &mut flush,
@@ -7465,8 +7747,8 @@ mod accumulate_tests {
                 // `bound = 0` flushes nothing, so the comparison is over the accumulator.
                 let mut sink = |_: Vec<(u32, &mut [Hit])>| -> bool { true };
                 accumulate_groups(
-                    probe, 1, &groups, sc, guard, &mass_off, &cfg, None, 0, &mut acc, &mut chunk,
-                    &mut sink,
+                    probe, 1, &groups, sc, guard, &mass_off, &cfg, None, 0, None, &mut acc,
+                    &mut chunk, &mut sink,
                 );
             });
             materialize(acc)
@@ -7614,7 +7896,7 @@ mod accumulate_tests {
                 pool.install(|| {
                     let mut sink = |_: Vec<(u32, &mut [Hit])>| -> bool { true };
                     accumulate_groups(
-                        probe, 1, &groups, &sc, guard, &mass_off, &cfg, None, 0, &mut acc,
+                        probe, 1, &groups, &sc, guard, &mass_off, &cfg, None, 0, None, &mut acc,
                         &mut chunk, &mut sink,
                     );
                 });
@@ -7867,7 +8149,7 @@ mod accumulate_tests {
                     };
                     accumulate_groups(
                         // One band in this test, so the probing fan-out is the whole pool.
-                        probe, 1, &groups, &sc, guard, &mass_off, &cfg, None, bound, &mut acc,
+                        probe, 1, &groups, &sc, guard, &mass_off, &cfg, None, bound, None, &mut acc,
                         &mut chunk, &mut sink,
                     );
                 });
@@ -7929,6 +8211,164 @@ mod accumulate_tests {
                 );
             }
         }
+    }
+
+    /// The hit budget (`extract.hit_budget_gib`) moves the schedule and never a flush: at
+    /// every budget, from one that cuts each sub-range into single candidates probed one task
+    /// a wave to one past the batch, the flush calls are the unbudgeted ones, call for call,
+    /// candidate for candidate and hit for hit, and so are the candidates left for a later
+    /// batch. The flush calls are what the chromatogram chunks, and so the file's bytes,
+    /// follow.
+    #[test]
+    fn the_hit_budget_flushes_the_unbudgeted_batches() {
+        let (lib, sc, groups) = four_windows();
+        let n = lib.n_candidates();
+        let win = rt_windows(vec![0.0; n], vec![1e9; n]);
+        let guard = Guard {
+            win: &win,
+            im_gate: false,
+            pad: 0.0,
+        };
+        let mass_off = MassOffset {
+            scalar_ppm: 0.0,
+            grid_mz: Vec::new(),
+            grid_ppm: Vec::new(),
+        };
+        let cfg = ExtractConfig::default();
+        let bins = FragIndex::geometry(&lib, 20.0);
+        let stats = LocalIndexStats::default();
+        let probe = TaskProbe::Local {
+            lib: &lib,
+            bins: &bins,
+            tol_ppm: 20.0,
+            stats: &stats,
+        };
+        // One estimated match per candidate: the batch is 4 * 12,288 = 49,152.
+        let loads: Vec<f64> = groups
+            .iter()
+            .map(|g| (g.hi_cid - g.lo_cid) as f64)
+            .collect();
+        let batch: f64 = loads.iter().sum();
+        type Batches = Vec<Vec<(u32, Vec<Hit>)>>;
+        let run = |threads: usize, bound: u32, budget: Option<f64>| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("thread pool");
+            let mut acc = HitAcc::default();
+            let mut chunk = HitStore::default();
+            let mut batches: Batches = Vec::new();
+            pool.install(|| {
+                let mut sink = |c: Vec<(u32, &mut [Hit])>| -> bool {
+                    batches.push(c.into_iter().map(|(cid, h)| (cid, h.to_vec())).collect());
+                    true
+                };
+                accumulate_groups(
+                    probe,
+                    1,
+                    &groups,
+                    &sc,
+                    guard,
+                    &mass_off,
+                    &cfg,
+                    None,
+                    bound,
+                    budget.map(|hits| HitBudget {
+                        loads: &loads,
+                        hits,
+                    }),
+                    &mut acc,
+                    &mut chunk,
+                    &mut sink,
+                );
+            });
+            (batches, materialize(acc))
+        };
+        // Everything final, and a bound inside the last window that keeps 5,000 of its
+        // candidates for a later batch.
+        let mid = groups[3].lo_cid + 7_000;
+        for threads in [2, 16] {
+            for bound in [u32::MAX, mid] {
+                let (want, left) = run(threads, bound, None);
+                let sizes: Vec<usize> = want.iter().map(|b| b.len()).collect();
+                assert!(want.len() >= 4, "{threads} threads: chunks {sizes:?}");
+                // Two threads probe each window whole: a full batch and a short tail each.
+                assert!(
+                    threads != 2
+                        || (want.iter().any(|b| b.len() == CAND_CHUNK)
+                            && want.iter().any(|b| b.len() < CAND_CHUNK)),
+                    "{threads} threads: full batches and short tails, {sizes:?}"
+                );
+                assert_eq!(left.is_empty(), bound == u32::MAX);
+                // A budget of one match cuts every sub-range into single candidates, one
+                // task a wave (49,152 of them): run it once, it is the slow one.
+                let single = (threads == 2 && bound == mid).then_some(1.0);
+                for budget in single
+                    .into_iter()
+                    .chain([777.0, 5_000.0, batch - 1.0, batch, 1e12])
+                {
+                    let (got, got_left) = run(threads, bound, Some(budget));
+                    assert!(
+                        got == want,
+                        "{threads} threads, bound {bound}, budget {budget}: the flush calls differ"
+                    );
+                    assert!(
+                        got_left == left,
+                        "{threads} threads, bound {bound}, budget {budget}: the open candidates differ"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Footprint under the hit budget: a batch within it holds what it estimates, a batch
+    /// past it the budget plus the tail of `CAND_CHUNK` candidates a piece may leave, or a
+    /// whole window under a per-peak claim when that is wider; the auto budget is off below
+    /// the floor and a set one is split among the bands in flight.
+    #[test]
+    fn the_footprint_holds_the_hit_budget() {
+        let load = |hits: f64| WindowLoad {
+            lower_mz: 400.0,
+            upper_mz: 410.0,
+            scans: 100,
+            candidates: 100_000,
+            hits,
+        };
+        let loads = || vec![load(4e8), load(2e8), load(1e8), load(1e8)];
+        let fp = |budget: Option<f64>, per_peak: bool| {
+            Footprint::of(loads(), true, 2, 400, budget, per_peak).resident_hits
+        };
+        assert_eq!(fp(None, false), 6e8, "the largest batch of two");
+        assert_eq!(fp(Some(1e9), false), 6e8, "within the budget");
+        let tail = CAND_CHUNK as f64 * 4e8 / 1e5;
+        assert_eq!(fp(Some(1e8), false), 1e8 + tail, "the budget plus a tail");
+        assert_eq!(fp(Some(1e8), true), 4e8 + tail, "a window is not cut");
+        let unbudgeted = Footprint::of(loads(), false, 2, 400, Some(1e8), false);
+        assert_eq!(
+            unbudgeted.resident_hits, 8e8,
+            "the whole run off the streamed path"
+        );
+
+        let cfg = |gib: Option<f64>| ExtractConfig {
+            hit_budget_gib: gib,
+            ..ExtractConfig::default()
+        };
+        assert_eq!(
+            hit_budget(&cfg(Some(0.0)), 1, &loads(), 2),
+            None,
+            "0 is off"
+        );
+        assert_eq!(
+            hit_budget(&cfg(Some(10.0)), 4, &loads(), 2),
+            Some(10.0 * GIB / 4.0 / FOOTPRINT_HIT_BYTES),
+            "a band's share"
+        );
+        let small = vec![load(1e6)];
+        assert_eq!(
+            hit_budget(&cfg(None), 1, &small, 2),
+            None,
+            "auto below the floor"
+        );
     }
 
     /// Flush the whole accumulator through the chunked gather the driver uses, and read the
@@ -8144,7 +8584,9 @@ mod accumulate_tests {
                     batches.push(c.into_iter().map(|(cid, h)| (cid, h.to_vec())).collect());
                     true
                 };
-                let stopped = flush_below(&mut runs, bound, cap, zero_copy, &mut chunk, &mut sink);
+                let stopped = flush_below(
+                    &mut runs, bound, cap, false, zero_copy, &mut chunk, &mut sink,
+                );
                 assert!(!stopped);
                 let mut rest = HitStore::default();
                 gather_chunk(&mut runs, u32::MAX, usize::MAX, &mut rest);
@@ -8170,6 +8612,51 @@ mod accumulate_tests {
             n_zero_copy_batches > 50,
             "the zero-copy branch must be exercised ({n_zero_copy_batches} cases)"
         );
+    }
+
+    /// Compaction chains runs that share no candidate and merges the rest in window order:
+    /// either way the accumulator reads as before, candidate for candidate and hit for hit.
+    #[test]
+    fn compaction_keeps_every_candidates_hit_order() {
+        let h = |scan: u32| Hit {
+            scan,
+            frag: 0,
+            inten: 1.0,
+            obs_mz: 300.0,
+            im: 0,
+        };
+        let store = |cids: &[u32], base: u32| {
+            let mut s = HitStore::default();
+            for &c in cids {
+                s.push_segment(c, &[h(base + c), h(base + c + 1000)]);
+            }
+            s
+        };
+        // Disjoint: a partly gathered tail, then a later window's runs out of order.
+        // Overlapping: candidate 5 in both windows, whose order must hold.
+        for (a, b, chained) in [
+            (vec![1u32, 2, 3, 5], vec![7u32, 9], true),
+            (vec![7, 9], vec![1, 2, 3, 5], true),
+            (vec![1, 2, 3, 5], vec![5, 9], false),
+        ] {
+            let build = || {
+                let mut acc = HitAcc {
+                    runs: vec![
+                        HitRun::new(vec![store(&a, 0)]),
+                        HitRun::new(vec![store(&b, 100)]),
+                    ],
+                };
+                let mut first = HitStore::default();
+                gather_chunk(&mut acc.runs, 2, usize::MAX, &mut first);
+                acc
+            };
+            let want = materialize(build());
+            let mut acc = build();
+            acc.compact();
+            assert_eq!(acc.runs.len(), 1, "{a:?} {b:?}");
+            assert_eq!(acc.runs[0].parts.len() > 1, chained, "{a:?} {b:?}");
+            assert_eq!(materialize(acc), want, "{a:?} {b:?}");
+        }
     }
 
     /// The chunk cap is a flush-size limit, not a filter: chunking must not lose or

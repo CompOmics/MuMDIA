@@ -2183,6 +2183,20 @@ pub struct ExtractConfig {
     /// changes whether the stage runs, not what it computes.
     #[serde(skip_serializing)]
     pub max_footprint_gib: Option<f64>,
+    /// Bound the fragment-peak matches the streamed extraction holds at once to about this
+    /// many GiB (docs/09_extract.md, "Bounded hit memory"). When a batch of
+    /// `windows_in_flight` is estimated (as for `max_footprint_gib`) to hold more, its
+    /// candidate sub-ranges are cut into smaller pieces and probed in waves that fit the
+    /// budget, each finished before the next starts. Every table is the same byte for byte at
+    /// any budget: the candidates are written in the same batches, so only the memory and
+    /// the wall clock change. Unset (the default) is `auto`: a quarter of the machine's
+    /// memory (as `max_footprint_gib` reads it), looked up only once a batch is estimated
+    /// past 4 GiB; `0` turns the bound off. Under `groups.parallel` each band in flight gets
+    /// its share. The floor is one candidate per piece, and under a per-peak `peak_claim`
+    /// (`winner_predicted_intensity`, `proportional`) one window, which is not cut. Not part
+    /// of the canonical configuration.
+    #[serde(skip_serializing)]
+    pub hit_budget_gib: Option<f64>,
     /// Scanning-quadrupole spectra: decide for every library fragment of an accepted
     /// candidate whether its signal belongs to the candidate's precursor (`stages::q1frag`,
     /// psms_extracted v6). For each fragment the matched intensity is read in every Q1 step
@@ -2748,6 +2762,7 @@ impl Default for ExtractConfig {
         Self {
             windows_in_flight: None,
             max_footprint_gib: None,
+            hit_budget_gib: None,
             q1_fragments: ZtSwitch::Auto,
             q1_traces: ZtSwitch::Auto,
             q1_model: None,
@@ -6277,6 +6292,10 @@ impl Config {
                 "extract.max_footprint_gib",
                 self.extract.max_footprint_gib.unwrap_or(0.0),
             ),
+            (
+                "extract.hit_budget_gib",
+                self.extract.hit_budget_gib.unwrap_or(0.0),
+            ),
             ("rescore.train_neg_ratio", self.rescore.train_neg_ratio),
             ("rescore.train_subsample", self.rescore.train_subsample),
         ] {
@@ -8671,7 +8690,13 @@ mod tests {
         assert_eq!(fp.extract.max_footprint_gib, Some(64.0));
         assert_eq!(fp.canonical_json(), canon);
         assert!(Config::from_json(r#"{"extract":{"max_footprint_gib":0}}"#).is_ok());
+        // `extract.hit_budget_gib` changes the memory and the wall clock, never a table.
+        let hb = Config::from_json(r#"{"extract":{"hit_budget_gib":8}}"#).unwrap();
+        assert_eq!(hb.extract.hit_budget_gib, Some(8.0));
+        assert_eq!(hb.canonical_json(), canon);
+        assert!(Config::from_json(r#"{"extract":{"hit_budget_gib":0}}"#).is_ok());
         for bad in [
+            r#"{"extract":{"hit_budget_gib":-1}}"#,
             r#"{"convert":{"isolation_half_width":0}}"#,
             r#"{"convert":{"isolation_half_width":-1.9}}"#,
             r#"{"extract":{"max_footprint_gib":-1}}"#,
