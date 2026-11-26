@@ -429,6 +429,27 @@ spectra and the chromatogram buffers. Every run whose largest batch is within it
 as before, so it changes nothing there, not even the schedule. A batch cut to the budget logs
 `extract: batch cut to the hit budget` with the pieces and waves.
 
+**Measured** (2026-11-26, standalone `mumdia extract` at 48 threads on a shared 256-CPU
+host, two repetitions each, one timsTOF Ultra 2 diaPASEF 5-min 50 ng HYE run read with
+`convert.tdf_min_points` 1 and `extract.gate_support_min` 0, on the inputs the run's own
+search wrote: 24 windows, 4 in flight, largest batch 377 million matches against an estimate
+of 151 million):
+
+| build, `hit_budget_gib` | peak RSS (GB) | wall | CPU (s) | tables |
+|---|---|---|---|---|
+| main | 15.10 / 15.34 | 3:20 / 2:49 | 2,411 / 2,308 | reference |
+| this change, unset (`auto`: inert, the estimate is under 4 GiB) | 15.30 / 15.30 | 3:06 / 2:29 | 2,461 / 2,269 | identical |
+| this change, 2 | 12.87 / 12.60 | 3:17 / 6:05 | 2,775 / 2,661 | identical |
+| this change, 0.5 | 9.74 / 9.57 | 3:59 / 4:13 | 4,401 / 4,341 | identical |
+
+"Identical" is the SHA-256 of `psms_extracted.parquet`, its `.peaks.parquet` and
+`chromatograms.parquet` (6.7 GB). The second wall at 2 GiB ran while the host's load rose
+from about 75 to over 200 (728% CPU against 1,400% for the others). About 9 GB of the peak is
+the rest of the stage, so 0.5 GiB took the hit store from about 6 GB to under 1 GB, for about
+1.8 times the CPU: every wave ends at a barrier where the pool spins idle, and 0.5 GiB cut
+the batches into 6 to 17 waves. The CI smoke (`ci/smoke.sh`, where the budget is inert) wrote
+the same 2,330 parquet and TSV files with both builds, three runs each.
+
 ### 1. Matcher and mass recalibration
 
 The fragment tolerance and a systematic ppm offset come from `mass_cal`
