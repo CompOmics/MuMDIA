@@ -7,6 +7,13 @@ All notable changes to MuMDIA are recorded here. The format follows
 `0.1.0` is the first tagged release of the Rust engine. The superseded
 Python implementation remains available at the tag `legacy-python-v1`.
 
+`0.15.1` is a patch release. A timsTOF diaPASEF search read natively from a Bruker `.d` is back
+on the extraction settings of `0.14.0`, because the settings `0.15.0` introduced made some
+searches grow past the memory of the machine; those settings remain available as a low-input
+option. A diaPASEF search therefore finds and quantifies differently from `0.15.0`. A Thermo
+`.raw` whose metadata names no instrument model now reads under native Thermo reading instead of
+stopping at its first scan. Every other search gives the same output as with `0.15.0`.
+
 `0.15.0` is a minor release: it removes options and changes some results. Options that measured
 neutral or worse, or that nothing read, are removed. A configuration, saved desktop setup or
 manifest that sets a removed key at its old default still loads; any other value is now refused
@@ -229,10 +236,12 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-11-26
+
 ### Changed
 
 - **diaPASEF: `convert.tdf_min_points` is 2 and `extract.gate_support_min` 0.845 on spectra
-  that carry 1/K0 again, as in 0.14.0 (docs/35 sections 11 and 16).** 0.15.0 had made them 1
+  that carry 1/K0 again, as in 0.14.0 (#379, docs/35 sections 11 and 16).** 0.15.0 had made them 1
   and off (commit cbc4b159). On the 0.15.0 benchmark sweep 10 of 52 timsTOF diaPASEF jobs that
   0.14.0 ran failed on memory: six single-cell HeLa runs on which the seed found no anchors and
   extract's estimated fragment-peak hit store reached 290-875 GiB over the run, and four bulk
@@ -249,7 +258,7 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
-- **Native Thermo reading of a `.raw` whose metadata names no instrument model (docs/04,
+- **Native Thermo reading of a `.raw` whose metadata names no instrument model (#378, docs/04,
   "Native Thermo reading").** Under `convert.thermo_native` every such file stopped at its first
   scan in mzdata's instrument lookup (seen on all five Orbitrap Astral sets of 2023 in the
   benchmark collection). A `thermo` build now sets `MZDATA_IGNORE_UNKNOWN_INSTRUMENT=silent` at
