@@ -148,7 +148,45 @@ neighbours' events, so the output does not depend on the thread count. At the de
 nothing changes: the key and its three settings are left out of the canonical configuration and
 of the spectra reports, which record all four when it is on.
 
-PERSIST_RESULTS
+**Census** (`tdf_real_single_ion_census`, the recipe's reader with valley splits). On a 200 pg
+HeLa run (timsTOF Pro, 6,259 MS2 frames) the single-point clusters are 15.2 million of 15.5
+million MS2 centroids at `tdf_min_points` 1; on a 50 ng 5-min Ultra 2 run 180 million of 244
+million. At the library fragment m/z of the precursors accepted in a `tdf_min_points` 1 search
+(within 3 s of their apex, inside the slot of their precursor), against the same m/z shifted by
+-7.3, +5.2 and +11.4 Th as a null:
+
+| neighbourhood (cycles, TOF, scans) | 200 pg: single ions kept | fragment / null kept | 50 ng: single ions kept | fragment / null kept |
+|---|---:|---:|---:|---:|
+| 1, 2, 10 | 3.6% | 41% / 3.5% | 19.6% | 52% / 23% |
+| 2, 3, 20 | 11.5% | 66% / 15% | 49.4% | 87% / 55% |
+| 2, 3, 40 (default) | 16.9% | 74% / 22% | 61.7% | 95% / 67% |
+
+At low load the filter separates: three in four single ions at a real fragment recur, one in five
+elsewhere. At 50 ng single ions are dense enough that most have a chance partner, and the filter
+keeps most of them.
+
+**End to end** (single-file `mumdia run`, imported HYE or entrapment library, the diaPASEF recipe
+with `extract.gate_support_min` 0 in every arm, NN seed 0, 10 threads each; precursors at
+`run_psm_q` 1%; MS2 centroids written, and candidates extract accepted):
+
+| file | `tdf_min_points` 2 | `tdf_min_points` 1 | persistent 1, 2, 10 | persistent 2, 3, 40 |
+|---|---:|---:|---:|---:|
+| 200 pg HeLa (Pro) | 3,463 / 0.4 M / 15k | 6,110 / 15.5 M / 609k | 4,675 / 0.9 M / 18k | 5,707 / 2.9 M / 55k |
+| 1 ng HeLa (Pro 2) | 10,694 / 1.3 M / 66k | 16,006 / 25.5 M / 1,325k | 13,067 / 3.7 M / 138k | 14,652 / 10.5 M / 348k |
+| 50 ng 5-min Ultra 2 | 32,400 / 64 M / 6.1 M | 32,006 / 244 M / 7.2 M | 32,317 / 99 M / 6.6 M | 32,011 / 175 M / 7.0 M |
+| E. coli entrapment | 16,597 / 82 M / 1.1 M | 16,607 / 379 M / 1.8 M | 16,690 / 138 M / 1.3 M | 16,519 / 265 M / 1.6 M |
+
+The decoy fraction was 0.94-0.99% in every arm; the entrapment FDP 0.41%, 0.37%, 0.44% and
+0.39%. On the 200 pg file the neighbourhood was tuned on one seed: (1, 2, 10) 4,675, (2, 2, 10)
+5,012, (1, 3, 20) 5,127, (3, 3, 20) 5,268, (3, 4, 40) 5,500, (2, 3, 20) 5,593, (2, 3, 40) 5,707
+and 5,820 on a second host; a third cycle adds noise faster than signal. The default recovers 85%
+of what `tdf_min_points` 1 adds at 200 pg and 74% at 1 ng, from a fifth and two fifths of its MS2
+centroids and a tenth and a quarter of its extract candidates. Single files did not reach the
+memory that stopped the 0.15.0 sweep (process-tree peaks 6.6-7.6 GB at low load, 18-21 GB at 50
+ng, the wall dominated by the multi-head retention-time calibration), so the memory saving is
+measured here only through those volumes. Open: seeds, the single-cell and multi-run
+experiments that ran out of memory, and a rule that stays selective on bulk runs (a partner on
+both sides, or a neighbourhood scaled to the local event density).
 
 ### Artifacts and provenance
 

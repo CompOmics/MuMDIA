@@ -468,7 +468,11 @@ pub struct ConvertConfig {
     /// group before or after it. A fragment of an eluting peptide recurs from one cycle to
     /// the next at about the same TOF index and mobility; a noise event does not. MS1
     /// clusters always follow `tdf_min_points`. Experimental and opt-in (docs/35_diapasef.md
-    /// section 2, "Persistent single ions").
+    /// section 2, "Persistent single ions"). Measured on single files, one seed, with
+    /// `extract.gate_support_min` 0: precursors at `run_psm_q` 1% 200 pg HeLa 3,463 / 6,110 /
+    /// 5,707 for `tdf_min_points` 2 / 1 / 2 with `persistent`, 1 ng 10,694 / 16,006 / 14,652,
+    /// from a fifth and two fifths of the MS2 centroids of `tdf_min_points` 1; bulk 50 ng and
+    /// entrapment runs unchanged within noise.
     #[serde(skip_serializing_if = "TdfSingleIon::is_drop")]
     pub tdf_single_ion: TdfSingleIon,
     /// `tdf_single_ion = persistent`: TOF indices either side in which a partner event
