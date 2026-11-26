@@ -49,6 +49,20 @@ pub struct TdfParams {
     pub im_smooth_scans: f64,
     /// Remove MS1 noise before centroiding (`convert.tdf_ms1_denoise`, `ms1_denoise::Ms1Denoise`).
     pub ms1_denoise: bool,
+    /// Keep an MS2 cluster below `min_points` when it recurs (`convert.tdf_single_ion =
+    /// persistent`); `None` drops it.
+    pub persist: Option<Persist>,
+}
+
+/// The neighbourhood of `convert.tdf_single_ion = persistent`: a cluster below `min_points`
+/// is kept when a raw event lies within `tof` TOF indices and `scans` TIMS scans of one of
+/// its points, inside its slot, in one of the `cycles` frames of its window group on either
+/// side ([`has_partner`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Persist {
+    pub tof: u32,
+    pub scans: u32,
+    pub cycles: u32,
 }
 
 impl TdfParams {
@@ -57,6 +71,11 @@ impl TdfParams {
             mz_ppm: c.tdf_mz_ppm,
             im_gap_scans: c.tdf_im_gap_scans,
             min_points: c.tdf_min_points,
+            persist: (!c.tdf_single_ion.is_drop()).then_some(Persist {
+                tof: c.tdf_single_ion_tof,
+                scans: c.tdf_single_ion_scans,
+                cycles: c.tdf_single_ion_cycles,
+            }),
             mz_valley: c.tdf_mz_valley,
             mz_smooth_ppm: c.tdf_mz_smooth_ppm,
             im_valley: c.tdf_im_valley,
@@ -77,9 +96,15 @@ impl TdfParams {
             "tdf_im_smooth_scans": self.im_smooth_scans,
         });
         // Only when on, so a report at the default is what it was.
-        if self.ms1_denoise {
-            if let Some(o) = v.as_object_mut() {
+        if let Some(o) = v.as_object_mut() {
+            if self.ms1_denoise {
                 o.insert("tdf_ms1_denoise".into(), serde_json::json!(true));
+            }
+            if let Some(ps) = self.persist {
+                o.insert("tdf_single_ion".into(), serde_json::json!("persistent"));
+                o.insert("tdf_single_ion_tof".into(), serde_json::json!(ps.tof));
+                o.insert("tdf_single_ion_scans".into(), serde_json::json!(ps.scans));
+                o.insert("tdf_single_ion_cycles".into(), serde_json::json!(ps.cycles));
             }
         }
         v
@@ -443,7 +468,8 @@ struct Centroids {
 /// neighbour is within `mz_ppm` of the previous one. Each trace is then ordered by scan
 /// and split where two consecutive points are more than `im_gap_scans` scans apart. A
 /// cluster yields its summed intensity and its intensity-weighted m/z and 1/K0, and is
-/// dropped when it holds fewer than `min_points` raw points.
+/// dropped when it holds fewer than `min_points` raw points, unless `keep_small` is given
+/// and accepts it (`convert.tdf_single_ion = persistent`).
 ///
 /// With `mz_valley` > 0, each such cluster is further cut at the valleys of its m/z
 /// profile, and with `im_valley` > 0 each resulting piece at the valleys of its mobility
@@ -457,11 +483,12 @@ fn centroid_2d(
     mz_of: impl Fn(u32) -> f64,
     im_of: impl Fn(f64) -> f64,
     p: &TdfParams,
+    keep_small: Option<&KeepSmall>,
 ) -> Centroids {
     // Total order on the full tuple, so the result does not depend on the input order.
     pts.sort_unstable();
     let emit = |c: &[(u32, u32, u32)], peaks: &mut Vec<(f64, f32, f32)>| {
-        if c.len() < p.min_points as usize {
+        if c.len() < p.min_points as usize && !keep_small.is_some_and(|k| k(c)) {
             return;
         }
         let (mut w, mut wm, mut ws) = (0.0f64, 0.0f64, 0.0f64);
@@ -619,6 +646,51 @@ fn cap(c: Centroids, top: usize) -> Centroids {
     }
 }
 
+/// Decides whether a cluster below `min_points` raw points is kept ([`centroid_2d`]).
+type KeepSmall<'a> = dyn Fn(&[(u32, u32, u32)]) -> bool + 'a;
+
+/// Whether a raw event of `nb`, the neighbouring frames of the same window group, lies within
+/// `p.tof` TOF indices and `p.scans` scans of `(t, s)` inside the slot's scans `slot`
+/// (half-open). Relies on TOF indices ascending within a scan, as TDF stores them (each scan
+/// is delta-coded).
+fn has_partner(nb: &[&Frame], t: u32, s: u32, slot: &std::ops::Range<usize>, p: &Persist) -> bool {
+    let lo = (s.saturating_sub(p.scans) as usize).max(slot.start);
+    let hi = (s.saturating_add(p.scans) as usize + 1).min(slot.end);
+    let (t0, t1) = (t.saturating_sub(p.tof), t.saturating_add(p.tof));
+    nb.iter().any(|f| {
+        let n = f.scan_offsets.len().saturating_sub(1);
+        (lo..hi.min(n)).any(|sc| {
+            let tofs = &f.tof_indices[f.scan_offsets[sc]..f.scan_offsets[sc + 1]];
+            let k = tofs.partition_point(|&x| x < t0);
+            tofs.get(k).is_some_and(|&x| x <= t1)
+        })
+    })
+}
+
+/// For every frame below `n`, the MS2 frames of its window group up to `cycles` occurrences
+/// before and after it, ascending; empty for an MS1 frame. The neighbours of
+/// `convert.tdf_single_ion = persistent`.
+fn window_group_neighbours(reader: &FrameReader, n: usize, cycles: u32) -> Result<Vec<Vec<usize>>> {
+    let mut groups: BTreeMap<u8, Vec<usize>> = BTreeMap::new();
+    for i in 0..n {
+        let f = reader
+            .get_frame_without_coordinates(i)
+            .map_err(|e| anyhow!("frame header {i}: {e}"))?;
+        if matches!(f.ms_level, MSLevel::MS2) {
+            groups.entry(f.window_group).or_default().push(i);
+        }
+    }
+    let k = cycles as usize;
+    let mut out = vec![Vec::new(); n];
+    for frames in groups.values() {
+        for (p, &i) in frames.iter().enumerate() {
+            let near = &frames[p.saturating_sub(k)..(p + k + 1).min(frames.len())];
+            out[i] = near.iter().copied().filter(|&j| j != i).collect();
+        }
+    }
+    Ok(out)
+}
+
 struct Ctx {
     mz: TofMzCalibration,
     im: ScanImCalibration,
@@ -630,6 +702,9 @@ struct Ctx {
     ms1: Option<Ms1Denoise>,
     ms1_points: AtomicU64,
     ms1_kept: AtomicU64,
+    /// MS2 clusters below `min_points` that `tdf_single_ion = persistent` tested and kept.
+    small_seen: AtomicU64,
+    small_kept: AtomicU64,
 }
 
 impl Ctx {
@@ -639,6 +714,7 @@ impl Ctx {
         scans: std::ops::Range<usize>,
         top: usize,
         denoise: Option<&Ms1Denoise>,
+        keep_small: Option<&KeepSmall>,
     ) -> Centroids {
         let n_scans = f.scan_offsets.len().saturating_sub(1);
         let scans = scans.start.min(n_scans)..scans.end.min(n_scans);
@@ -656,11 +732,19 @@ impl Ctx {
         }
         // Raw detector counts: `intensity_correction_factor` (accumulation-time
         // normalisation) is ignored, which is exact while frames share one ramp time.
-        let c = centroid_2d(&mut pts, |t| self.mz.mz_u32(t), |s| self.im.im(s), &self.p);
+        let c = centroid_2d(
+            &mut pts,
+            |t| self.mz.mz_u32(t),
+            |s| self.im.im(s),
+            &self.p,
+            keep_small,
+        );
         cap(c, top)
     }
 
-    fn frame(&self, f: &Frame) -> Vec<Decoded> {
+    /// The spectra of frame `f`. `nb` are the neighbouring frames of its window group, read
+    /// only under `tdf_single_ion = persistent` ([`window_group_neighbours`]).
+    fn frame(&self, f: &Frame, nb: &[&Frame]) -> Vec<Decoded> {
         let rt_s = f.rt_in_seconds;
         if !rt_s.is_finite() {
             return vec![Decoded::BadRt {
@@ -670,7 +754,7 @@ impl Ctx {
         }
         match f.ms_level {
             MSLevel::MS1 => {
-                let c = self.spectrum(f, 0..usize::MAX, self.top_ms1, self.ms1.as_ref());
+                let c = self.spectrum(f, 0..usize::MAX, self.top_ms1, self.ms1.as_ref(), None);
                 vec![Decoded::Ms1 {
                     rt_s,
                     mz: c.mz,
@@ -684,7 +768,16 @@ impl Ctx {
                 (0..q.len())
                     .map(|k| {
                         let (s0, s1) = (q.scan_starts[k], q.scan_ends[k]);
-                        let c = self.spectrum(f, s0..s1, self.top_ms2, None);
+                        let slot = s0..s1;
+                        let keep = |c: &[(u32, u32, u32)]| {
+                            let ps = self.p.persist.as_ref().expect("persist");
+                            let kept = c.iter().any(|&(t, s, _)| has_partner(nb, t, s, &slot, ps));
+                            self.small_seen.fetch_add(1, Ordering::Relaxed);
+                            self.small_kept.fetch_add(kept as u64, Ordering::Relaxed);
+                            kept
+                        };
+                        let keep = self.p.persist.is_some().then_some(&keep as &KeepSmall);
+                        let c = self.spectrum(f, s0..s1, self.top_ms2, None, keep);
                         let (a, b) = (self.im.im(s0 as f64), self.im.im(s1 as f64));
                         let half = q.isolation_width[k] / 2.0;
                         let target = q.isolation_mz[k];
@@ -825,6 +918,71 @@ impl RawTdf {
     }
 }
 
+/// Frames per batch under `tdf_single_ion = persistent`, which holds the raw frames of a
+/// batch and of its neighbours at once.
+const PERSIST_CHUNK: usize = 128;
+
+/// [`drive`]'s frame loop under `tdf_single_ion = persistent`: each batch decodes its frames
+/// and the neighbours they need that are not held yet ([`window_group_neighbours`]), and
+/// drops the held frames no later frame needs. A frame's spectra depend only on its own and
+/// its neighbours' raw events, so the output does not depend on the thread count.
+fn drive_persistent(
+    path: &str,
+    reader: &FrameReader,
+    empty: &BTreeMap<usize, usize>,
+    n: usize,
+    cycles: u32,
+    ctx: &Ctx,
+    sink: &mut impl FnMut(u32, Decoded) -> Result<()>,
+) -> Result<usize> {
+    let nbrs = window_group_neighbours(reader, n, cycles).map_err(|e| anyhow!("{path}: {e}"))?;
+    // first[i]: the lowest frame index any frame at or after i reads.
+    let mut first = vec![n; n + 1];
+    for i in (0..n).rev() {
+        first[i] = first[i + 1]
+            .min(i)
+            .min(nbrs[i].first().copied().unwrap_or(i));
+    }
+    let mut held: BTreeMap<usize, Frame> = BTreeMap::new();
+    let mut emitted = 0usize;
+    for start in (0..n).step_by(PERSIST_CHUNK) {
+        let end = (start + PERSIST_CHUNK).min(n);
+        let mut want: Vec<usize> = (start..end)
+            .chain(nbrs[start..end].iter().flatten().copied())
+            .filter(|j| !held.contains_key(j))
+            .collect();
+        want.sort_unstable();
+        want.dedup();
+        let got: Vec<Result<(usize, Frame)>> = want
+            .into_par_iter()
+            .map(|j| {
+                let f =
+                    read_frame(reader, empty, j).map_err(|e| anyhow!("{path}: frame {j}: {e}"))?;
+                Ok((j, f))
+            })
+            .collect();
+        for r in got {
+            let (j, f) = r?;
+            held.insert(j, f);
+        }
+        let batch: Vec<Vec<Decoded>> = (start..end)
+            .into_par_iter()
+            .map(|i| {
+                let nb: Vec<&Frame> = nbrs[i].iter().map(|j| &held[j]).collect();
+                ctx.frame(&held[&i], &nb)
+            })
+            .collect();
+        for spectra in batch {
+            for d in spectra {
+                sink(emitted as u32, d)?;
+                emitted += 1;
+            }
+        }
+        held = held.split_off(&first[end]);
+    }
+    Ok(emitted)
+}
+
 /// Decode `path` frame by frame and hand every spectrum to `sink` with its scan index
 /// (the emission ordinal). `max_frames > 0` reads only the first frames of the run: on this
 /// path `--max-spectra` counts frames, not spectra. Returns the number of spectra emitted.
@@ -872,29 +1030,50 @@ pub(super) fn drive(
         ms1,
         ms1_points: AtomicU64::new(0),
         ms1_kept: AtomicU64::new(0),
+        small_seen: AtomicU64::new(0),
+        small_kept: AtomicU64::new(0),
     };
     let n = match max_frames {
         0 => reader.len(),
         m => m.min(reader.len()),
     };
     info!(frames = n, params = ?p, mz_calibration = ctx.mz.name(), "convert: decoding timsTOF frames");
-    let mut emitted = 0usize;
-    for start in (0..n).step_by(FRAME_CHUNK) {
-        let batch: Vec<Result<Vec<Decoded>>> = (start..(start + FRAME_CHUNK).min(n))
-            .into_par_iter()
-            .map(|i| {
-                let f = read_frame(&reader, &empty, i)
-                    .map_err(|e| anyhow!("{path}: frame {i}: {e}"))?;
-                Ok(ctx.frame(&f))
-            })
-            .collect();
-        for spectra in batch {
-            for d in spectra? {
-                sink(emitted as u32, d)?;
-                emitted += 1;
-            }
+    let emitted = match p.persist {
+        Some(ps) => {
+            let e = drive_persistent(path, &reader, &empty, n, ps.cycles, &ctx, &mut sink)?;
+            let (seen, kept) = (
+                ctx.small_seen.load(Ordering::Relaxed),
+                ctx.small_kept.load(Ordering::Relaxed),
+            );
+            info!(
+                seen,
+                kept,
+                kept_pct = 100.0 * kept as f64 / seen.max(1) as f64,
+                "convert: MS2 clusters below tdf_min_points kept when they recur                  (convert.tdf_single_ion = persistent)"
+            );
+            e
         }
-    }
+        None => {
+            let mut emitted = 0usize;
+            for start in (0..n).step_by(FRAME_CHUNK) {
+                let batch: Vec<Result<Vec<Decoded>>> = (start..(start + FRAME_CHUNK).min(n))
+                    .into_par_iter()
+                    .map(|i| {
+                        let f = read_frame(&reader, &empty, i)
+                            .map_err(|e| anyhow!("{path}: frame {i}: {e}"))?;
+                        Ok(ctx.frame(&f, &[]))
+                    })
+                    .collect();
+                for spectra in batch {
+                    for d in spectra? {
+                        sink(emitted as u32, d)?;
+                        emitted += 1;
+                    }
+                }
+            }
+            emitted
+        }
+    };
     if let Some(d) = &ctx.ms1 {
         let (points, kept) = (
             ctx.ms1_points.load(Ordering::Relaxed),
@@ -924,6 +1103,7 @@ mod tests {
         im_valley: 0.0,
         im_smooth_scans: 4.0,
         ms1_denoise: false,
+        persist: None,
     };
     const V: TdfParams = TdfParams {
         mz_valley: 0.5,
@@ -933,7 +1113,7 @@ mod tests {
     /// TOF index t sits at m/z 500 + t/1000 (2 ppm per index near 500), scan s at 1/K0 s.
     fn run(pts: &[(u32, u32, u32)], p: &TdfParams) -> Centroids {
         let mut v = pts.to_vec();
-        centroid_2d(&mut v, |t| 500.0 + t as f64 / 1000.0, |s| s, p)
+        centroid_2d(&mut v, |t| 500.0 + t as f64 / 1000.0, |s| s, p, None)
     }
 
     /// The `MzCalibration` model against a published reference row (the test vector of
@@ -1069,6 +1249,58 @@ mod tests {
         assert_eq!(c.inten, vec![2.0, 2.0]);
         let all = run(&[(5000, 10, 9)], &TdfParams { min_points: 1, ..P });
         assert_eq!(all.inten, vec![9.0]);
+    }
+
+    /// A frame of `n_scans` scans holding `(scan, tof)` events, TOF ascending within a scan.
+    fn frame_of(n_scans: usize, ev: &[(usize, u32)]) -> Frame {
+        let mut ev = ev.to_vec();
+        ev.sort_unstable();
+        Frame {
+            scan_offsets: (0..=n_scans)
+                .map(|s| ev.iter().filter(|e| e.0 < s).count())
+                .collect(),
+            tof_indices: ev.iter().map(|e| e.1).collect(),
+            intensities: vec![1; ev.len()],
+            ..Frame::default()
+        }
+    }
+
+    #[test]
+    fn a_partner_is_an_event_in_the_box_and_the_slot() {
+        let ps = Persist {
+            tof: 2,
+            scans: 3,
+            cycles: 1,
+        };
+        let slot = 10..30;
+        let near = frame_of(40, &[(14, 1002)]);
+        let far_tof = frame_of(40, &[(12, 1003)]);
+        let far_scan = frame_of(40, &[(16, 1000)]);
+        let other_slot = frame_of(40, &[(9, 1000)]);
+        assert!(has_partner(&[&near], 1000, 12, &slot, &ps));
+        assert!(!has_partner(&[&far_tof], 1000, 12, &slot, &ps));
+        assert!(!has_partner(&[&far_scan], 1000, 12, &slot, &ps));
+        // Scan 9 is inside the box of scan 10 but outside the slot.
+        assert!(!has_partner(&[&other_slot], 1000, 10, &slot, &ps));
+        assert!(has_partner(&[&far_tof, &near], 1000, 12, &slot, &ps));
+        assert!(!has_partner(&[], 1000, 12, &slot, &ps));
+    }
+
+    #[test]
+    fn keep_small_rescues_only_the_clusters_it_accepts() {
+        // Two single points and one two-point cluster; the predicate accepts TOF 5000 only.
+        let pts = [(1000, 10, 1), (1000, 11, 1), (3000, 10, 4), (5000, 10, 9)];
+        let keep = |c: &[(u32, u32, u32)]| c.iter().any(|q| q.0 == 5000);
+        let mut v = pts.to_vec();
+        let c = centroid_2d(
+            &mut v,
+            |t| 500.0 + t as f64 / 1000.0,
+            |s| s,
+            &P,
+            Some(&keep),
+        );
+        assert_eq!(c.inten, vec![2.0, 9.0]);
+        assert_eq!(run(&pts, &P).inten, vec![2.0]);
     }
 
     #[test]
@@ -1405,5 +1637,216 @@ mod tests {
         .unwrap();
         assert!(ms1 > 0 && ms2 > 0);
         eprintln!("first 60 frames: {ms1} MS1, {ms2} MS2 slot spectra");
+    }
+
+    /// Real-data check that `tdf_single_ion = persistent` does not depend on the thread
+    /// count and keeps at least the centroids of `drop`:
+    /// `MUMDIA_BENCH_TDF=/path/run.d cargo test -- --ignored tdf_real_persistent`.
+    #[test]
+    #[ignore]
+    fn tdf_real_persistent_single_ions_do_not_depend_on_threads() {
+        let Ok(path) = std::env::var("MUMDIA_BENCH_TDF") else {
+            return;
+        };
+        let p = TdfParams {
+            persist: Some(Persist {
+                tof: 2,
+                scans: 10,
+                cycles: 1,
+            }),
+            ..TdfParams::default()
+        };
+        type Ms2 = (Vec<f32>, Vec<f32>, Vec<f32>);
+        let read = |p: &TdfParams, threads: usize| -> Vec<Ms2> {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let mut out = Vec::new();
+            pool.install(|| {
+                drive(&path, 400, p, 0, 0, |_, d| {
+                    if let Decoded::Ms2(r) = d {
+                        out.push((r.mz, r.inten, r.im.unwrap_or_default()));
+                    }
+                    Ok(())
+                })
+            })
+            .unwrap();
+            out
+        };
+        let (one, many) = (read(&p, 1), read(&p, 8));
+        assert!(one == many, "persistent output depends on the thread count");
+        let drop = read(&TdfParams::default(), 8);
+        let (a, b): (usize, usize) = (
+            drop.iter().map(|s| s.0.len()).sum(),
+            one.iter().map(|s| s.0.len()).sum(),
+        );
+        assert!(b >= a, "{b} < {a}");
+        eprintln!("400 frames: {a} MS2 centroids under drop, {b} under persistent");
+    }
+
+    /// Census of the MS2 clusters below `tdf_min_points` for `tdf_single_ion` (docs/35
+    /// section 2, "Persistent single ions"): raw points, centroids of two or more points,
+    /// single-point clusters, and the share of the latter with a partner for a grid of
+    /// neighbourhoods. With `MUMDIA_CENSUS_OUT` the single-point clusters whose frame lies in
+    /// `MUMDIA_CENSUS_RT=lo,hi` seconds are written as little-endian rows of `rt, m/z, 1/K0,
+    /// window lower, window upper` (f32) and the grid's flags (u32, bit g for grid entry g):
+    /// `MUMDIA_BENCH_TDF=<run.d> cargo test --release -- --ignored tdf_real_single_ion_census
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn tdf_real_single_ion_census() {
+        use std::io::Write;
+        let Ok(path) = std::env::var("MUMDIA_BENCH_TDF") else {
+            return;
+        };
+        let (rt_lo, rt_hi) = std::env::var("MUMDIA_CENSUS_RT")
+            .ok()
+            .and_then(|v| {
+                let (a, b) = v.split_once(',')?;
+                Some((a.parse::<f64>().ok()?, b.parse::<f64>().ok()?))
+            })
+            .unwrap_or((0.0, f64::INFINITY));
+        let raw = RawTdf::open(&path).unwrap();
+        let n = raw.reader.len();
+        let mut grid = Vec::new();
+        for cycles in [1u32, 2] {
+            for tof in [1u32, 2, 3] {
+                for scans in [3u32, 6, 10, 20] {
+                    grid.push(Persist { tof, scans, cycles });
+                }
+            }
+        }
+        let g = grid.len();
+        let nb1 = window_group_neighbours(&raw.reader, n, 1).unwrap();
+        let nb2 = window_group_neighbours(&raw.reader, n, 2).unwrap();
+        // The diaPASEF recipe's reader (configs/examples/diapasef.json).
+        let p = TdfParams {
+            mz_valley: 0.5,
+            im_valley: 0.5,
+            ..TdfParams::default()
+        };
+        #[derive(Default)]
+        struct Tally {
+            frames: u64,
+            raw: u64,
+            multi: u64,
+            single: u64,
+            unsorted_scans: u64,
+            kept: Vec<u64>,
+            rows: Vec<u8>,
+        }
+        let per: Vec<Tally> = (0..n)
+            .into_par_iter()
+            .filter(|&i| !nb2[i].is_empty())
+            .map(|i| {
+                let f = raw.frame(i).unwrap();
+                let mut t = Tally {
+                    kept: vec![0; g],
+                    ..Tally::default()
+                };
+                t.frames = 1;
+                let nbf: Vec<Frame> = nb2[i].iter().map(|&j| raw.frame(j).unwrap()).collect();
+                let all: Vec<&Frame> = nbf.iter().collect();
+                let near: Vec<&Frame> = nb2[i]
+                    .iter()
+                    .zip(&nbf)
+                    .filter(|(j, _)| nb1[i].contains(j))
+                    .map(|(_, f)| f)
+                    .collect();
+                let ns = f.scan_offsets.len().saturating_sub(1);
+                for sc in 0..ns {
+                    let s = &f.tof_indices[f.scan_offsets[sc]..f.scan_offsets[sc + 1]];
+                    t.unsorted_scans += (!s.windows(2).all(|w| w[0] <= w[1])) as u64;
+                }
+                let q = &f.quadrupole_settings;
+                let dump = f.rt_in_seconds >= rt_lo && f.rt_in_seconds <= rt_hi;
+                for k in 0..q.len() {
+                    let slot = q.scan_starts[k].min(ns)..q.scan_ends[k].min(ns);
+                    let mut pts = Vec::new();
+                    for sc in slot.clone() {
+                        for e in f.scan_offsets[sc]..f.scan_offsets[sc + 1] {
+                            pts.push((f.tof_indices[e], sc as u32, f.intensities[e]));
+                        }
+                    }
+                    t.raw += pts.len() as u64;
+                    let small = std::cell::RefCell::new(Vec::new());
+                    let rec = |c: &[(u32, u32, u32)]| {
+                        small.borrow_mut().push((c[0].0, c[0].1));
+                        false
+                    };
+                    let c = centroid_2d(
+                        &mut pts,
+                        |x| raw.mz_of(x as f64),
+                        |s| raw.im_of_scan(s),
+                        &p,
+                        Some(&rec),
+                    );
+                    t.multi += c.mz.len() as u64;
+                    let half = q.isolation_width[k] / 2.0;
+                    for (tof, sc) in small.into_inner() {
+                        t.single += 1;
+                        let mut flags = 0u32;
+                        for (gi, ps) in grid.iter().enumerate() {
+                            let nb = if ps.cycles == 1 { &near } else { &all };
+                            if has_partner(nb, tof, sc, &slot, ps) {
+                                flags |= 1 << gi;
+                                t.kept[gi] += 1;
+                            }
+                        }
+                        if dump {
+                            for v in [
+                                f.rt_in_seconds as f32,
+                                raw.mz_of(tof as f64) as f32,
+                                raw.im_of_scan(sc as f64) as f32,
+                                (q.isolation_mz[k] - half) as f32,
+                                (q.isolation_mz[k] + half) as f32,
+                            ] {
+                                t.rows.extend_from_slice(&v.to_le_bytes());
+                            }
+                            t.rows.extend_from_slice(&flags.to_le_bytes());
+                        }
+                    }
+                }
+                t
+            })
+            .collect();
+        let mut tot = Tally {
+            kept: vec![0; g],
+            ..Tally::default()
+        };
+        let mut out = std::env::var("MUMDIA_CENSUS_OUT")
+            .ok()
+            .map(|o| std::io::BufWriter::new(std::fs::File::create(o).unwrap()));
+        for t in per {
+            tot.frames += t.frames;
+            tot.raw += t.raw;
+            tot.multi += t.multi;
+            tot.single += t.single;
+            tot.unsorted_scans += t.unsorted_scans;
+            for (a, b) in tot.kept.iter_mut().zip(&t.kept) {
+                *a += b;
+            }
+            if let Some(o) = out.as_mut() {
+                o.write_all(&t.rows).unwrap();
+            }
+        }
+        eprintln!(
+            "census {path}: MS2 frames {} raw points {} centroids>=2 {} single {} \
+             unsorted scans {}",
+            tot.frames, tot.raw, tot.multi, tot.single, tot.unsorted_scans
+        );
+        for (gi, ps) in grid.iter().enumerate() {
+            let k = tot.kept[gi];
+            eprintln!(
+                "grid {gi} cycles {} tof {} scans {}: kept {k} ({:.1}% of single), \
+                 centroids {:.3}x of min_points 1",
+                ps.cycles,
+                ps.tof,
+                ps.scans,
+                100.0 * k as f64 / tot.single.max(1) as f64,
+                (tot.multi + k) as f64 / (tot.multi + tot.single).max(1) as f64
+            );
+        }
     }
 }

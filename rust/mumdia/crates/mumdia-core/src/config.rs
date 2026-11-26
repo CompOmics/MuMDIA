@@ -460,6 +460,29 @@ pub struct ConvertConfig {
     /// rule.
     #[serde(skip_serializing_if = "is_default_tdf_min_points")]
     pub tdf_min_points: u32,
+    /// Native diaPASEF reader: what becomes of an MS2 cluster below `tdf_min_points` raw
+    /// points (with the default 2, a single ion event). `drop` (default) drops it.
+    /// `persistent` keeps it when one of its points recurs: a raw event within
+    /// `tdf_single_ion_tof` TOF indices and `tdf_single_ion_scans` TIMS scans of it, inside
+    /// its diaPASEF slot, in one of the `tdf_single_ion_cycles` frames of the same window
+    /// group before or after it. A fragment of an eluting peptide recurs from one cycle to
+    /// the next at about the same TOF index and mobility; a noise event does not. MS1
+    /// clusters always follow `tdf_min_points`. Experimental and opt-in (docs/35_diapasef.md
+    /// section 2, "Persistent single ions").
+    #[serde(skip_serializing_if = "TdfSingleIon::is_drop")]
+    pub tdf_single_ion: TdfSingleIon,
+    /// `tdf_single_ion = persistent`: TOF indices either side in which a partner event
+    /// counts. Default 2.
+    #[serde(skip_serializing_if = "is_default_tdf_single_ion_tof")]
+    pub tdf_single_ion_tof: u32,
+    /// `tdf_single_ion = persistent`: TIMS scans either side in which a partner event
+    /// counts. Default 10.
+    #[serde(skip_serializing_if = "is_default_tdf_single_ion_scans")]
+    pub tdf_single_ion_scans: u32,
+    /// `tdf_single_ion = persistent`: frames of the same window group searched on each side
+    /// (diaPASEF cycles). Default 1; must be >= 1.
+    #[serde(skip_serializing_if = "is_default_tdf_single_ion_cycles")]
+    pub tdf_single_ion_cycles: u32,
     /// Native diaPASEF reader: split each m/z x mobility cluster at the valleys of its
     /// m/z profile. A local minimum of the smoothed profile is a cut when it is below this
     /// fraction of the smaller of the two humps beside it, so one ion stays one centroid and
@@ -539,6 +562,10 @@ impl Default for ConvertConfig {
             tdf_mz_ppm: 10.0,
             tdf_im_gap_scans: 30,
             tdf_min_points: 2,
+            tdf_single_ion: TdfSingleIon::Drop,
+            tdf_single_ion_tof: 2,
+            tdf_single_ion_scans: 10,
+            tdf_single_ion_cycles: 1,
             tdf_mz_valley: 0.0,
             tdf_mz_smooth_ppm: 8.0,
             tdf_im_valley: 0.0,
@@ -626,6 +653,35 @@ fn is_default_tdf_im_gap_scans(v: &u32) -> bool {
 fn is_default_tdf_min_points(v: &u32) -> bool {
     *v == ConvertConfig::default().tdf_min_points
 }
+fn is_default_tdf_single_ion_tof(v: &u32) -> bool {
+    *v == ConvertConfig::default().tdf_single_ion_tof
+}
+fn is_default_tdf_single_ion_scans(v: &u32) -> bool {
+    *v == ConvertConfig::default().tdf_single_ion_scans
+}
+fn is_default_tdf_single_ion_cycles(v: &u32) -> bool {
+    *v == ConvertConfig::default().tdf_single_ion_cycles
+}
+
+/// `convert.tdf_single_ion`: what the native diaPASEF reader does with an MS2 cluster below
+/// `convert.tdf_min_points` raw points.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TdfSingleIon {
+    /// Drop it, as every reader version before the key.
+    #[default]
+    Drop,
+    /// Keep it when one of its points recurs in a neighbouring cycle of its window group.
+    Persistent,
+}
+
+impl TdfSingleIon {
+    /// Whether this is the default, which the canonical configuration omits.
+    pub fn is_drop(&self) -> bool {
+        matches!(self, TdfSingleIon::Drop)
+    }
+}
+
 fn is_default_tdf_mz_valley(v: &f64) -> bool {
     *v == ConvertConfig::default().tdf_mz_valley
 }
@@ -6388,6 +6444,13 @@ impl Config {
         if !(cv.tdf_mz_ppm.is_finite() && cv.tdf_mz_ppm > 0.0) || cv.tdf_min_points == 0 {
             return Err(Invalid(
                 "convert.tdf_mz_ppm must be finite and > 0, and convert.tdf_min_points >= 1".into(),
+            ));
+        }
+        if cv.tdf_single_ion_cycles == 0 {
+            return Err(Invalid(
+                "convert.tdf_single_ion_cycles must be >= 1 (frames of the same window group \
+                 searched on each side)"
+                    .into(),
             ));
         }
         // What each key of the ZT Scan analysis reads (`validate_ztscan`), checked again
