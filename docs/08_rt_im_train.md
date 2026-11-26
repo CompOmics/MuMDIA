@@ -1109,7 +1109,8 @@ adapted iRT, which is already on that run's gradient.
 Measured (2026-11-26, one NN seed, 32 threads, `run-experiment` with the second pass) on
 three cells of the 52-cell plate, G1_30 (218 seed anchors, adapts the library), G1_29 (0
 anchors at any rung: the unbounded case) and G1_24 (0 at 1%, 34 at a relaxed rung: the fixed
-120 s window), with the diaPASEF settings of the sweep and `fallback_windows = library`:
+120 s window), with the sweep's diaPASEF configuration at the current reader defaults
+(`tdf_min_points` 2, support gate 0.845) and `fallback_windows = library`:
 
 | | G1_30 | G1_29 | G1_24 |
 |---|---|---|---|
@@ -1122,7 +1123,9 @@ Decoy fraction at `run_psm_q` 1% 0.0-0.97% per run; 26:33 wall, 30.4 GB peak RSS
 sweep's engine estimated 163 GiB over the run for a fixed-window cell without 1/K0 and
 290-875 GiB for unbounded ones. With the 0.15.0 reader settings (`tdf_min_points` 1, no
 support gate) the same cells estimated 57 / 146 GiB (G1_29, 420 s half-width) and 26 / 65 GiB
-(G1_24). `tdf_min_points` 2 did not give these cells anchors: 218 / 0 / 0 at 1% against
+(G1_24), and the experiment finished (2:27:36, 124 GB peak RSS) with no identification at all:
+the pooled rescore of 14.7M PSMs had no training signal, and so had the adapting cell's own
+bootstrap rescore, so the fallback bounds the memory there but cannot rescue the search. `tdf_min_points` 2 did not give these cells anchors: 218 / 0 / 0 at 1% against
 219 / 0 / 0 with 1. `fallback_windows = refuse` stopped G1_29 at `rt-im-train` after 2:19.
 
 `fallback_windows = refuse` fails a run with fewer than two RT anchors at `rt-im-train`
