@@ -229,6 +229,24 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Changed
+
+- **diaPASEF: `convert.tdf_min_points` is 2 and `extract.gate_support_min` 0.845 on spectra
+  that carry 1/K0 again, as in 0.14.0 (docs/35 sections 11 and 16).** 0.15.0 had made them 1
+  and off (commit cbc4b159). On the 0.15.0 benchmark sweep 10 of 52 timsTOF diaPASEF jobs that
+  0.14.0 ran failed on memory: six single-cell HeLa runs on which the seed found no anchors and
+  extract's estimated fragment-peak hit store reached 290-875 GiB over the run, and four bulk
+  runs (60-min a549 and k562 runs at a 378 GB process-tree peak, a 5-min 50 ng Ultra 2 run at
+  271 GB, an MCF7 single-cell-spike run, and an HLA Ultra run whose extract footprint guard
+  estimated 362 GiB at once and 2.7 TB over the run on a 264 GiB node). Against 0.14.0 the
+  intermediates on diaPASEF were 0.7-3.7x as large and the wall about 3.2x as long (1.1-6x).
+  Which of the two keys causes the growth is not measured yet. `convert.tdf_min_points: 1` with
+  `extract.gate_support_min: 0` is the low-input opt-in, with the measurements 0.15.0 recorded
+  for it (200 pg HeLa 3,422 -> 7,689 precursors per run, 1 ng 12,542 -> 19,270, three NN
+  seeds). The diaPASEF recipe keeps `extract.presence_min_coelution` 1, and the rescore
+  prefilter's best-column fallback stays. A diaPASEF search read natively from a Bruker `.d`
+  finds and quantifies differently from 0.15.0; a search without 1/K0 is unaffected.
+
 ### Fixed
 
 - **Native Thermo reading of a `.raw` whose metadata names no instrument model (docs/04,
@@ -241,6 +259,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   both readers. Builds without the `thermo` feature, and files that name their model, are
   unchanged.
 
+||||||| d84de316
 ## [0.15.0] - 2026-11-23
 
 ### Changed

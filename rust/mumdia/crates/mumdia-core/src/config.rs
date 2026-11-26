@@ -443,17 +443,21 @@ pub struct ConvertConfig {
     #[serde(skip_serializing_if = "is_default_tdf_im_gap_scans")]
     pub tdf_im_gap_scans: u32,
     /// Native diaPASEF reader: a centroid built from fewer raw TOF x scan points than this
-    /// is dropped. Default 1 (every centroid is kept) since 2026-11-19, previously 2.
+    /// is dropped. Default 2. Provisional, as `tdf_im_gap_scans`.
     ///
-    /// At low load most real fragment signal is a single ion event, which 2 dropped; extract
-    /// then rejected the faint precursors at presence. Measured with the diaPASEF recipe
-    /// (`extract.gate_min_score` 0.6, `presence_min_coelution` 1, no support gate), three NN
-    /// seeds, precursors per run at `run_psm_q` 1% against 2: 200 pg HeLa 3,422 -> 7,689, 1 ng
-    /// 12,542 -> 19,270, 250 pg Ultra 6,912 -> 9,544, 50 ng 5-min Ultra 2 35,710 -> 35,346; E.
-    /// coli entrapment FDP 0.97% (0.83-1.12%); 0 IDs in three blank runs. The other-species
-    /// share rose on the 250 pg Ultra set only (1.17% -> 1.40%) and fell elsewhere
-    /// (docs/35_diapasef.md section 11, "Low input"). The earlier -17% for 1 (docs/35 section 12) was
-    /// measured under the 0.845 support gate and without the recipe's presence rule.
+    /// 1 keeps every centroid, including those of a single ion event, which at low load is
+    /// most of the real fragment signal; with `extract.gate_support_min` 0 it is the low-input
+    /// opt-in (docs/35_diapasef.md section 11, "Low input"). The two were the default in
+    /// 0.15.0 and were reverted because 10 of 52 timsTOF diaPASEF benchmark jobs that 0.14.0
+    /// ran then failed on memory; which of the two keys caused that is not measured. Measured
+    /// for the opt-in with the diaPASEF recipe (`extract.gate_min_score` 0.6,
+    /// `presence_min_coelution` 1, no support gate), three NN seeds, precursors per run at
+    /// `run_psm_q` 1% against 2: 200 pg HeLa 3,422 -> 7,689, 1 ng 12,542 -> 19,270, 250 pg
+    /// Ultra 6,912 -> 9,544, 50 ng 5-min Ultra 2 35,710 -> 35,346; E. coli entrapment FDP 0.97%
+    /// (0.83-1.12%); 0 IDs in three blank runs. The other-species share rose on the 250 pg
+    /// Ultra set only (1.17% -> 1.40%) and fell elsewhere. The earlier -17% for 1 (docs/35
+    /// section 12) was measured under the 0.845 support gate and without the recipe's presence
+    /// rule.
     #[serde(skip_serializing_if = "is_default_tdf_min_points")]
     pub tdf_min_points: u32,
     /// Native diaPASEF reader: split each m/z x mobility cluster at the valleys of its
@@ -534,7 +538,7 @@ impl Default for ConvertConfig {
             parallel_conversions: 4,
             tdf_mz_ppm: 10.0,
             tdf_im_gap_scans: 30,
-            tdf_min_points: 1, // single-ion centroids kept (since 2026-11-19; was 2)
+            tdf_min_points: 2,
             tdf_mz_valley: 0.0,
             tdf_mz_smooth_ppm: 8.0,
             tdf_im_valley: 0.0,
@@ -2512,11 +2516,13 @@ pub struct ExtractConfig {
     /// intensity)` and `0.02 ln(1 + MS1 mono)`. The MS1 term counts only where the apex reads
     /// the mono, +1 and +2 isotopes, as the `log_mono_ms1` feature does. 0 is off.
     ///
-    /// Unset (the default) is off. It was 0.845 on spectra that carry 1/K0 from 2026-10-18 to
-    /// 2026-11-19, a speed default; it is off because on the 2026-11 low-input campaign it cost
-    /// identifications at every load: +26% precursors per run at 200 pg and +19% at 1 ng with
-    /// it off, +6.1% on 50 ng 5-min Ultra 2 runs, other-species shares unchanged (one NN seed,
-    /// docs/35_diapasef.md section 16). The measurements of the old default: on the six
+    /// Unset (the default) is 0.845 on spectra that carry 1/K0 and off otherwise. It was off in
+    /// 0.15.0 and was restored because, with `convert.tdf_min_points` 1 as well, 10 of 52
+    /// timsTOF diaPASEF benchmark jobs that 0.14.0 ran failed on memory; which of the two keys
+    /// caused that is not measured. 0, with `convert.tdf_min_points` 1, is the low-input
+    /// opt-in: on the 2026-11 low-input sets it was +26% precursors per run at 200 pg and +19%
+    /// at 1 ng with the gate off, +6.1% on 50 ng 5-min Ultra 2 runs, other-species shares
+    /// unchanged (one NN seed, docs/35_diapasef.md section 16). On the six
     /// ProteoBench HYE diaPASEF runs, 0.845 keeps 41% of the candidates the window-mean gate
     /// at 0.6 passes, for -1.6% peptides at 1% and -36% wall time (26.8 against 41.6 min);
     /// on six 5-min HYE diaPASEF runs -1.75% peptides at -48% wall time; on the E. coli
@@ -2807,7 +2813,7 @@ impl Default for ExtractConfig {
             gate_mode: GateMode::WindowMean, // window-summed agreement minus RT term (since 2026-10-08)
             gate_coelution_min: 0.5,         // used only by GateMode::Combined
             gate_rt_weight: 0.2,             // used only by GateMode::WindowMean
-            gate_support_min: None,          // off (0.845 on 1/K0 spectra until 2026-11-19)
+            gate_support_min: None,          // 0.845 on 1/K0 spectra, off otherwise
             im_gate: ImGate::Off,
         }
     }
@@ -8381,7 +8387,7 @@ mod tests {
         let canon = d.canonical_json();
         assert!(!canon.contains("tdf_"), "{canon}");
         let explicit = Config::from_json(
-            r#"{"convert":{"tdf_mz_ppm":10.0,"tdf_im_gap_scans":30,"tdf_min_points":1,
+            r#"{"convert":{"tdf_mz_ppm":10.0,"tdf_im_gap_scans":30,"tdf_min_points":2,
                 "tdf_mz_valley":0.0,"tdf_mz_smooth_ppm":8.0,"tdf_im_valley":0.0,
                 "tdf_im_smooth_scans":8.0}}"#,
         )
