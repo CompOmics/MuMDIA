@@ -2828,17 +2828,161 @@ const MIN_CANDIDATES_PER_TASK: usize = 4096;
 const DEFAULT_GATE_SUPPORT_MIN_IM: f64 = 0.845;
 
 /// `extract.gate_support_min`, or its default: [`DEFAULT_GATE_SUPPORT_MIN_IM`] on spectra that
-/// carry 1/K0, off (0) otherwise. The gate is defined on the window-mean score, so under any
-/// other `gate_mode` it is off whatever the setting, and the report does not name it.
+/// carry 1/K0, off (0) otherwise, and off under `extract.gate_keep_decoys`, whose decoy share
+/// replaces it. The gate is defined on the window-mean score, so under any other `gate_mode`
+/// it is off whatever the setting, and the report does not name it.
 fn support_gate_min(cfg: &ExtractConfig, has_im: bool) -> f64 {
     if !matches!(cfg.gate_mode, GateMode::WindowMean) {
         return 0.0;
     }
-    cfg.gate_support_min.unwrap_or(if has_im {
-        DEFAULT_GATE_SUPPORT_MIN_IM
-    } else {
-        0.0
-    })
+    cfg.gate_support_min
+        .unwrap_or(if has_im && cfg.gate_keep_decoys.is_none() {
+            DEFAULT_GATE_SUPPORT_MIN_IM
+        } else {
+            0.0
+        })
+}
+
+/// Decoy candidates per block of `extract.gate_keep_decoys`: a block closes after this many
+/// once twice as many are waiting, so every block holds this many to twice as many (the last
+/// block the rest, the only block of a run with fewer than this many all of them).
+const KEEP_DECOYS_BLOCK: usize = 2048;
+
+/// The score at which the share `keep` of `decoys` (window-mean scores) is kept: the
+/// `ceil(keep * n)`-th highest, so a cut at `>=` keeps at least that many and every tie with
+/// it. `None` without decoys: there is nothing to calibrate on, and nothing is cut.
+fn keep_decoys_threshold(mut decoys: Vec<f64>, keep: f64) -> Option<f64> {
+    if decoys.is_empty() {
+        return None;
+    }
+    decoys.sort_unstable_by(|a, b| b.total_cmp(a));
+    let n = decoys.len();
+    // The epsilon keeps `0.35 * 100` from rounding up to 36.
+    let k = ((keep * n as f64 - 1e-9).ceil() as usize).clamp(1, n);
+    Some(decoys[k - 1])
+}
+
+/// `extract.gate_keep_decoys`: holds the accepted rows, in their candidate order, until a
+/// block of [`KEEP_DECOYS_BLOCK`] decoy candidates is complete, then cuts the block at
+/// [`keep_decoys_threshold`] of its decoys' scores (`CandOut::keep_score`) and releases what
+/// passes, in the same order. Blocks depend only on that order, never on how the rows arrive,
+/// so the cut does not depend on the thread count or `windows_in_flight`.
+struct DecoyCut {
+    keep: f64,
+    pending: Vec<CandOut>,
+    /// Decoy candidates (rank-0 decoy rows) in `pending`.
+    decoys: usize,
+    /// One threshold per block that had decoys.
+    thresholds: Vec<f64>,
+    blocks: usize,
+    /// Candidates (rank-0 rows) into and out of the cut: targets, then decoys.
+    seen: [u64; 2],
+    kept: [u64; 2],
+}
+
+impl DecoyCut {
+    fn new(keep: f64) -> DecoyCut {
+        DecoyCut {
+            keep,
+            pending: Vec::new(),
+            decoys: 0,
+            thresholds: Vec::new(),
+            blocks: 0,
+            seen: [0; 2],
+            kept: [0; 2],
+        }
+    }
+
+    fn is_decoy_cand(r: &CandOut) -> bool {
+        r.peak_rank == 0 && r.label == "decoy"
+    }
+
+    /// Take a candidate-ordered run of rows; return the rows of every block it completed.
+    fn push(&mut self, rows: Vec<CandOut>) -> Vec<CandOut> {
+        self.decoys += rows.iter().filter(|r| Self::is_decoy_cand(r)).count();
+        self.pending.extend(rows);
+        let mut out = Vec::new();
+        while self.decoys >= 2 * KEEP_DECOYS_BLOCK {
+            // The block ends after the rows of its KEEP_DECOYS_BLOCK-th decoy candidate (its
+            // promoted peaks follow its rank-0 row).
+            let mut seen = 0usize;
+            let mut end = 0usize;
+            for (i, r) in self.pending.iter().enumerate() {
+                if Self::is_decoy_cand(r) {
+                    seen += 1;
+                    if seen == KEEP_DECOYS_BLOCK {
+                        end = i + 1;
+                        break;
+                    }
+                }
+            }
+            let cid = self.pending[end - 1].cid;
+            while end < self.pending.len()
+                && self.pending[end].peak_rank != 0
+                && self.pending[end].cid == cid
+            {
+                end += 1;
+            }
+            let block: Vec<CandOut> = self.pending.drain(..end).collect();
+            self.decoys -= KEEP_DECOYS_BLOCK;
+            out.extend(self.cut(block));
+        }
+        out
+    }
+
+    /// The last block: every row still held.
+    fn finish(&mut self) -> Vec<CandOut> {
+        let block = std::mem::take(&mut self.pending);
+        self.decoys = 0;
+        self.cut(block)
+    }
+
+    fn cut(&mut self, block: Vec<CandOut>) -> Vec<CandOut> {
+        if block.is_empty() {
+            return block;
+        }
+        self.blocks += 1;
+        let t = keep_decoys_threshold(
+            block
+                .iter()
+                .filter(|r| Self::is_decoy_cand(r))
+                .map(|r| r.keep_score)
+                .collect(),
+            self.keep,
+        );
+        self.thresholds.extend(t);
+        let mut out = Vec::with_capacity(block.len());
+        for r in block {
+            let d = (r.label == "decoy") as usize;
+            let pass = t.is_none_or(|t| r.keep_score >= t);
+            if r.peak_rank == 0 {
+                self.seen[d] += 1;
+                self.kept[d] += pass as u64;
+            }
+            if pass {
+                out.push(r);
+            }
+        }
+        out
+    }
+
+    /// The report's account of the cut: the share, the blocks, the candidates in and out, and
+    /// the thresholds' range.
+    fn summary(&self) -> serde_json::Value {
+        let mut t = self.thresholds.clone();
+        t.sort_unstable_by(|a, b| a.total_cmp(b));
+        json!({
+            "keep_decoys": self.keep,
+            "blocks": self.blocks,
+            "targets_in": self.seen[0],
+            "targets_kept": self.kept[0],
+            "decoys_in": self.seen[1],
+            "decoys_kept": self.kept[1],
+            "threshold_min": t.first(),
+            "threshold_median": t.get(t.len() / 2),
+            "threshold_max": t.last(),
+        })
+    }
 }
 
 /// `extract.windows_in_flight`, or its default: the rayon thread count capped at 16, and
@@ -3702,6 +3846,9 @@ struct CandOut {
     /// The window-mean score (`GateMode::WindowMean`) of the candidate, whatever the gate
     /// mode, for the offline design of a gate (`emit_gate_diagnostics` only).
     gate_window_mean: f32,
+    /// The window-mean score `extract.gate_keep_decoys` cuts on ([`DecoyCut`]), the same on
+    /// every row of a candidate; 0 when the key is unset.
+    keep_score: f64,
     /// Spectrum-centric demix features (D2), all 0 unless `emit_demix_features`:
     /// residual-explained fraction, active-set survival flag, and this candidate's
     /// fraction of the total demixed abundance at its apex.
@@ -5572,6 +5719,14 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         } else {
             0.0
         };
+        // A NaN would sort above every score; it is no evidence, so it sorts below.
+        let keep_score = if p.cfg.gate_keep_decoys.is_some() {
+            Some(window_mean())
+                .filter(|v| !v.is_nan())
+                .unwrap_or(f64::NEG_INFINITY)
+        } else {
+            0.0
+        };
 
         // Soft competition features from the co-elution arbitration (all 0 when the
         // two-pass path did not run). contested_frac: fraction of contested INTENSITY
@@ -5970,6 +6125,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             gate_coelution: gate_coelution as f32,
             gate_spectral_entropy: gate_spectral_entropy as f32,
             gate_window_mean: gate_window_mean as f32,
+            keep_score,
             deconv_explained: deconv_explained as f32,
             deconv_active: deconv_active as f32,
             deconv_share: deconv_share as f32,
@@ -6066,6 +6222,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 gate_coelution: gate_coelution as f32,
                 gate_spectral_entropy: gate_spectral_entropy as f32,
                 gate_window_mean: gate_window_mean as f32,
+                keep_score,
                 // Demix is a rank-0 apex feature; alternate peaks carry 0.
                 deconv_explained: 0.0,
                 deconv_active: 0.0,
@@ -6118,6 +6275,8 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     // the stage means the serial encoder bounds extract; a small one means it does not.
     let mut chrom_send_blocked = std::time::Duration::ZERO;
     let mut chrom_chunks_sent = 0u64;
+    // `extract.gate_keep_decoys`: the decoy-calibrated cut the accepted rows pass through.
+    let mut decoy_cut = p.cfg.gate_keep_decoys.map(DecoyCut::new);
     let (chrom_w, q1t_w) = std::thread::scope(|sc| -> Result<_> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<Col>>(2);
         // `extract.q1_traces`: the cycle-trace table's writer, on a thread of its own.
@@ -6148,138 +6307,157 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         // window batch on the streamed path and once on the eager paths, so the code
         // that produces a row is the same either way. Returns false when the writer has
         // gone away; its error surfaces at the join below.
+        // Append accepted rows: their PSM rows to the table, their chromatogram rows to the
+        // writer thread. Returns false when a write failed or the writer has gone away.
+        let mut emit_rows = |rows: Vec<CandOut>| -> bool {
+            if psms_err.is_some() {
+                return false;
+            }
+            let mut ch = ChromChunk::default();
+            let mut chq = ChromChunk::default();
+            for mut r in rows {
+                n_accepted += 1;
+                let rcid = r.cid;
+                for (rank, apex, start, end, ev, area) in &r.peaks {
+                    pk_cid.push(rcid);
+                    pk_rank.push(*rank as i32);
+                    pk_apex.push(*apex);
+                    pk_start.push(*start);
+                    pk_end.push(*end);
+                    pk_ev.push(*ev);
+                    pk_area.push(*area);
+                }
+                if let Some(q) = &r.q1f {
+                    for &c in &q.class {
+                        if let Some(n) = q1f_classes.get_mut(c as usize) {
+                            *n += 1;
+                        }
+                    }
+                    if q.moved_s != 0.0 {
+                        q1f_moved += 1;
+                    }
+                }
+                let chrom = std::mem::take(&mut r.chrom);
+                let chrom_q1 = std::mem::take(&mut r.chrom_q1);
+                let chrom_q1_class = std::mem::take(&mut r.chrom_q1_class);
+                if let Err(e) = psms.push(r, p.cfg) {
+                    psms_err = Some(e);
+                    return false;
+                }
+                // The cycle rows, in the sidecar's layout.
+                let qrows = &mut chq.rows;
+                for ((cc, nm, fmz, omz, pint, rt, it, _), cl) in
+                    chrom_q1.into_iter().zip(chrom_q1_class)
+                {
+                    qrows.cid.push(cc);
+                    qrows.name.push(nm);
+                    qrows.frag_mz.push(fmz);
+                    qrows.frag_obs_mz.push(omz);
+                    qrows.predicted_intensity.push(pint);
+                    qrows.q1_class.push(cl);
+                    if chrom_layout == crate::chromatograms::Layout::V2 {
+                        match q1t_encoder.encode(cc, rt, it) {
+                            Ok(e) => {
+                                qrows.rt.push(e.rt);
+                                qrows.intensity.push(e.intensity);
+                                qrows.trace_offset.push(e.trace_offset);
+                                qrows.trace_len.push(e.trace_len);
+                            }
+                            Err(e) => {
+                                psms_err = Some(e);
+                                return false;
+                            }
+                        }
+                    } else {
+                        qrows.rt.push(rt);
+                        qrows.intensity.push(it);
+                    }
+                }
+                let rows = &mut ch.rows;
+                for (cc, nm, fmz, omz, pint, rt, it, im) in chrom {
+                    rows.cid.push(cc);
+                    rows.name.push(nm);
+                    rows.frag_mz.push(fmz);
+                    rows.frag_obs_mz.push(omz);
+                    rows.predicted_intensity.push(pint);
+                    if chrom_layout == crate::chromatograms::Layout::V2 {
+                        // The band-local id: the offset is added to every row alike,
+                        // so it cannot change which rows share a candidate. With the
+                        // per-point 1/K0 it is cut to the run its trace keeps;
+                        // `encode_im(.., None)` is `encode`.
+                        let im = chrom_im.then_some(im);
+                        match chrom_encoder.encode_im(cc, rt, it, im) {
+                            Ok(e) => {
+                                rows.rt.push(e.rt);
+                                rows.intensity.push(e.intensity);
+                                rows.trace_offset.push(e.trace_offset);
+                                rows.trace_len.push(e.trace_len);
+                                if chrom_im {
+                                    rows.im.push(e.im);
+                                }
+                            }
+                            // A row the encoder refuses stops the loop like a failed
+                            // psms write, and the table is abandoned the same way.
+                            Err(e) => {
+                                psms_err = Some(e);
+                                return false;
+                            }
+                        }
+                    } else {
+                        rows.rt.push(rt);
+                        rows.intensity.push(it);
+                        if chrom_im {
+                            rows.im.push(im);
+                        }
+                    }
+                }
+            }
+            let r = &ch.rows;
+            let chunk_bytes = r.trace_bytes()
+                + crate::memlog::bytes_of(&r.cid)
+                + crate::memlog::bytes_of(&r.frag_mz)
+                + crate::memlog::bytes_of(&r.frag_obs_mz)
+                + crate::memlog::bytes_of(&r.predicted_intensity)
+                + crate::memlog::bytes_of(&r.trace_offset)
+                + crate::memlog::bytes_of(&r.trace_len)
+                + r.name.iter().map(|s| s.len()).sum::<usize>();
+            chrom_bytes_total += chunk_bytes;
+            chrom_bytes_max_chunk = chrom_bytes_max_chunk.max(chunk_bytes);
+            // Hand the chunk's chromatogram rows to the writer thread. A send error means
+            // the writer failed; its error surfaces at the join below. The columns are
+            // built before the clock starts, so the timer holds only the wait for a
+            // free channel slot.
+            if q1t {
+                let qcols = chq.cols(chrom_offset, chrom_layout, false, true);
+                if qtx.send(qcols).is_err() {
+                    return false;
+                }
+            }
+            let cols = ch.cols(chrom_offset, chrom_layout, chrom_im, false);
+            let t_send = Instant::now();
+            let sent = tx.send(cols);
+            chrom_send_blocked += t_send.elapsed();
+            chrom_chunks_sent += 1;
+            if sent.is_err() {
+                return false;
+            }
+            true
+        };
         let mut emit_batch = |mut cand_hits: Vec<(u32, &mut [Hit])>| -> bool {
             for chunk in cand_hits.chunks_mut(CAND_CHUNK) {
-                let outs: Vec<Vec<CandOut>> = chunk
+                let outs: Vec<CandOut> = chunk
                     .par_iter_mut()
                     .map(|(cid, hits)| per_candidate(*cid, hits))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .flatten()
                     .collect();
-                let mut ch = ChromChunk::default();
-                let mut chq = ChromChunk::default();
-                for mut r in outs.into_iter().flatten() {
-                    n_accepted += 1;
-                    let rcid = r.cid;
-                    for (rank, apex, start, end, ev, area) in &r.peaks {
-                        pk_cid.push(rcid);
-                        pk_rank.push(*rank as i32);
-                        pk_apex.push(*apex);
-                        pk_start.push(*start);
-                        pk_end.push(*end);
-                        pk_ev.push(*ev);
-                        pk_area.push(*area);
-                    }
-                    if let Some(q) = &r.q1f {
-                        for &c in &q.class {
-                            if let Some(n) = q1f_classes.get_mut(c as usize) {
-                                *n += 1;
-                            }
-                        }
-                        if q.moved_s != 0.0 {
-                            q1f_moved += 1;
-                        }
-                    }
-                    let chrom = std::mem::take(&mut r.chrom);
-                    let chrom_q1 = std::mem::take(&mut r.chrom_q1);
-                    let chrom_q1_class = std::mem::take(&mut r.chrom_q1_class);
-                    if let Err(e) = psms.push(r, p.cfg) {
-                        psms_err = Some(e);
-                        return false;
-                    }
-                    // The cycle rows, in the sidecar's layout.
-                    let qrows = &mut chq.rows;
-                    for ((cc, nm, fmz, omz, pint, rt, it, _), cl) in
-                        chrom_q1.into_iter().zip(chrom_q1_class)
-                    {
-                        qrows.cid.push(cc);
-                        qrows.name.push(nm);
-                        qrows.frag_mz.push(fmz);
-                        qrows.frag_obs_mz.push(omz);
-                        qrows.predicted_intensity.push(pint);
-                        qrows.q1_class.push(cl);
-                        if chrom_layout == crate::chromatograms::Layout::V2 {
-                            match q1t_encoder.encode(cc, rt, it) {
-                                Ok(e) => {
-                                    qrows.rt.push(e.rt);
-                                    qrows.intensity.push(e.intensity);
-                                    qrows.trace_offset.push(e.trace_offset);
-                                    qrows.trace_len.push(e.trace_len);
-                                }
-                                Err(e) => {
-                                    psms_err = Some(e);
-                                    return false;
-                                }
-                            }
-                        } else {
-                            qrows.rt.push(rt);
-                            qrows.intensity.push(it);
-                        }
-                    }
-                    let rows = &mut ch.rows;
-                    for (cc, nm, fmz, omz, pint, rt, it, im) in chrom {
-                        rows.cid.push(cc);
-                        rows.name.push(nm);
-                        rows.frag_mz.push(fmz);
-                        rows.frag_obs_mz.push(omz);
-                        rows.predicted_intensity.push(pint);
-                        if chrom_layout == crate::chromatograms::Layout::V2 {
-                            // The band-local id: the offset is added to every row alike,
-                            // so it cannot change which rows share a candidate. With the
-                            // per-point 1/K0 it is cut to the run its trace keeps;
-                            // `encode_im(.., None)` is `encode`.
-                            let im = chrom_im.then_some(im);
-                            match chrom_encoder.encode_im(cc, rt, it, im) {
-                                Ok(e) => {
-                                    rows.rt.push(e.rt);
-                                    rows.intensity.push(e.intensity);
-                                    rows.trace_offset.push(e.trace_offset);
-                                    rows.trace_len.push(e.trace_len);
-                                    if chrom_im {
-                                        rows.im.push(e.im);
-                                    }
-                                }
-                                // A row the encoder refuses stops the loop like a failed
-                                // psms write, and the table is abandoned the same way.
-                                Err(e) => {
-                                    psms_err = Some(e);
-                                    return false;
-                                }
-                            }
-                        } else {
-                            rows.rt.push(rt);
-                            rows.intensity.push(it);
-                            if chrom_im {
-                                rows.im.push(im);
-                            }
-                        }
-                    }
-                }
-                let r = &ch.rows;
-                let chunk_bytes = r.trace_bytes()
-                    + crate::memlog::bytes_of(&r.cid)
-                    + crate::memlog::bytes_of(&r.frag_mz)
-                    + crate::memlog::bytes_of(&r.frag_obs_mz)
-                    + crate::memlog::bytes_of(&r.predicted_intensity)
-                    + crate::memlog::bytes_of(&r.trace_offset)
-                    + crate::memlog::bytes_of(&r.trace_len)
-                    + r.name.iter().map(|s| s.len()).sum::<usize>();
-                chrom_bytes_total += chunk_bytes;
-                chrom_bytes_max_chunk = chrom_bytes_max_chunk.max(chunk_bytes);
-                // Hand the chunk's chromatogram rows to the writer thread. A send error means
-                // the writer failed; its error surfaces at the join below. The columns are
-                // built before the clock starts, so the timer holds only the wait for a
-                // free channel slot.
-                if q1t {
-                    let qcols = chq.cols(chrom_offset, chrom_layout, false, true);
-                    if qtx.send(qcols).is_err() {
-                        return false;
-                    }
-                }
-                let cols = ch.cols(chrom_offset, chrom_layout, chrom_im, false);
-                let t_send = Instant::now();
-                let sent = tx.send(cols);
-                chrom_send_blocked += t_send.elapsed();
-                chrom_chunks_sent += 1;
-                if sent.is_err() {
+                // Under `extract.gate_keep_decoys` the rows wait for their block's cut.
+                let rows = match decoy_cut.as_mut() {
+                    Some(d) => d.push(outs),
+                    None => outs,
+                };
+                if !emit_rows(rows) {
                     return false;
                 }
             }
@@ -6402,6 +6580,10 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                     break;
                 }
             }
+        }
+        // The rows the decoy-calibrated cut still holds: its last block.
+        if let Some(d) = decoy_cut.as_mut() {
+            emit_rows(d.finish());
         }
         // A final empty chunk fixes the schema when no candidate was accepted at all. Not
         // after a failed psms_extracted write, whose table is abandoned below.
@@ -6557,6 +6739,12 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     let mut stats = std::collections::BTreeMap::new();
     stats.insert("accepted".to_string(), json!(n_accepted));
     stats.insert("scan_window".to_string(), json!(scan_window));
+    // Only under `extract.gate_keep_decoys`, so a report without it is unchanged.
+    if let Some(d) = &decoy_cut {
+        let summary = d.summary();
+        info!(cut = %summary, "extract: decoy-calibrated gate");
+        stats.insert("gate_keep_decoys".to_string(), summary);
+    }
     if q1f_ctx.is_some() {
         stats.insert(
             "q1_fragments".to_string(),
@@ -6683,6 +6871,11 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                         "evidence_cycles": 2 * crate::stages::q1dec::EVIDENCE_CYCLES + 1,
                     }),
                 );
+            }
+        }
+        if let Some(f) = p.cfg.gate_keep_decoys {
+            if let Some(obj) = params.as_object_mut() {
+                obj.insert("gate_keep_decoys".into(), json!(f));
             }
         }
         // The support gate, only when it is on, so a report without it is unchanged.
@@ -8206,6 +8399,140 @@ mod accumulate_tests {
 }
 
 #[cfg(test)]
+mod keep_decoys_tests {
+    use super::psms_stream_tests::row;
+    use super::*;
+
+    /// A candidate's row: rank 0 unless `rank` says otherwise.
+    fn cand(cid: u32, decoy: bool, score: f64, rank: u8) -> CandOut {
+        CandOut {
+            cid,
+            peak_rank: rank,
+            label: if decoy { "decoy" } else { "target" }.to_string(),
+            keep_score: score,
+            ..row(0)
+        }
+    }
+
+    #[test]
+    fn the_threshold_keeps_the_share_of_decoys_and_every_tie() {
+        let d: Vec<f64> = (0..100).map(|i| i as f64 / 100.0).collect();
+        // 35 of 100 kept: the 35th highest is 0.65.
+        assert_eq!(keep_decoys_threshold(d.clone(), 0.35), Some(0.65));
+        // Everything kept at 1: the lowest score.
+        assert_eq!(keep_decoys_threshold(d.clone(), 1.0), Some(0.0));
+        // At least one decoy is kept, however small the share.
+        assert_eq!(keep_decoys_threshold(d, 1e-6), Some(0.99));
+        // Ties: the threshold is the tied score, and a `>=` cut keeps all of them.
+        let tied = vec![0.9, 0.5, 0.5, 0.5, 0.1];
+        assert_eq!(keep_decoys_threshold(tied, 0.4), Some(0.5));
+        // No decoys: nothing to calibrate on.
+        assert_eq!(keep_decoys_threshold(Vec::new(), 0.35), None);
+        // The input order does not matter.
+        let a = vec![0.3, 0.1, 0.7, 0.5];
+        let b = vec![0.5, 0.7, 0.1, 0.3];
+        assert_eq!(keep_decoys_threshold(a, 0.5), keep_decoys_threshold(b, 0.5));
+    }
+
+    /// Targets and decoys are cut at one score; a block without decoys is not cut; an
+    /// all-decoy block keeps its share.
+    #[test]
+    fn the_cut_treats_targets_and_decoys_alike() {
+        let mut c = DecoyCut::new(0.5);
+        let mut rows = Vec::new();
+        for i in 0..10u32 {
+            // Targets and decoys with the same scores.
+            rows.push(cand(2 * i, false, i as f64, 0));
+            rows.push(cand(2 * i + 1, true, i as f64, 0));
+        }
+        assert!(
+            c.push(rows).is_empty(),
+            "a short run is one block, held to the end"
+        );
+        let out = c.finish();
+        let kept: Vec<(u32, bool)> = out.iter().map(|r| (r.cid, r.label == "decoy")).collect();
+        // Half the decoys (scores 5..9) and the targets at the same scores.
+        assert_eq!(out.len(), 10);
+        assert!(out.iter().all(|r| r.keep_score >= 5.0), "{kept:?}");
+        assert_eq!((c.seen, c.kept), ([10, 10], [5, 5]));
+        assert_eq!(c.thresholds, vec![5.0]);
+
+        let mut t = DecoyCut::new(0.1);
+        let targets: Vec<CandOut> = (0..5).map(|i| cand(i, false, -1.0, 0)).collect();
+        t.push(targets);
+        assert_eq!(t.finish().len(), 5, "no decoys: nothing is cut");
+        assert!(t.thresholds.is_empty());
+
+        let mut a = DecoyCut::new(0.25);
+        a.push((0..8).map(|i| cand(i, true, i as f64, 0)).collect());
+        assert_eq!(a.finish().len(), 2, "all decoys: the share of them");
+    }
+
+    /// The blocks, and so the rows kept, depend on the rows' order alone: pushed in one
+    /// piece or one row at a time, the output is the same, and a candidate's promoted
+    /// peaks stay with its rank-0 row.
+    #[test]
+    fn the_cut_does_not_depend_on_how_the_rows_arrive() {
+        let n = 5 * KEEP_DECOYS_BLOCK as u32 + 77;
+        let mut rows = Vec::new();
+        for i in 0..n {
+            // A score that varies along m/z, so the blocks' thresholds differ.
+            let s = ((i * 7919) % 1000) as f64 / 1000.0 + (i / 3000) as f64 * 0.1;
+            rows.push(cand(i, i % 3 != 0, s, 0));
+            if i % 5 == 0 {
+                rows.push(cand(i, i % 3 != 0, s, 1));
+            }
+        }
+        let run = |pieces: usize| -> (Vec<(u32, u8)>, Vec<f64>) {
+            let mut c = DecoyCut::new(0.35);
+            let mut out = Vec::new();
+            let mut it = rows
+                .iter()
+                .map(|r| cand(r.cid, r.label == "decoy", r.keep_score, r.peak_rank));
+            loop {
+                let piece: Vec<CandOut> = it.by_ref().take(pieces).collect();
+                if piece.is_empty() {
+                    break;
+                }
+                out.extend(c.push(piece));
+            }
+            out.extend(c.finish());
+            (
+                out.iter().map(|r| (r.cid, r.peak_rank)).collect(),
+                c.thresholds,
+            )
+        };
+        let (whole, tw) = run(usize::MAX);
+        let (single, ts) = run(1);
+        let (odd, to) = run(8191);
+        assert_eq!(whole, single);
+        assert_eq!(whole, odd);
+        assert_eq!(tw, ts);
+        assert_eq!(tw, to);
+        // Blocks of 2048 to 4095 decoys: 2/3 of n are decoys.
+        let decoys = (0..n).filter(|i| i % 3 != 0).count();
+        assert_eq!(tw.len(), decoys / KEEP_DECOYS_BLOCK);
+        // Ascending candidate order is kept, and every promoted row follows its rank 0.
+        assert!(whole.windows(2).all(|w| w[0] < w[1]));
+        assert!(whole
+            .iter()
+            .filter(|r| r.1 == 1)
+            .all(|r| whole.contains(&(r.0, 0))));
+    }
+
+    /// Unset, the support gate keeps its default; set, it is off unless asked for.
+    #[test]
+    fn keep_decoys_turns_the_default_support_gate_off() {
+        let mut cfg = ExtractConfig::default();
+        assert_eq!(support_gate_min(&cfg, true), DEFAULT_GATE_SUPPORT_MIN_IM);
+        cfg.gate_keep_decoys = Some(0.35);
+        assert_eq!(support_gate_min(&cfg, true), 0.0);
+        cfg.gate_support_min = Some(0.8);
+        assert_eq!(support_gate_min(&cfg, true), 0.8);
+    }
+}
+
+#[cfg(test)]
 mod psms_stream_tests {
     use super::*;
 
@@ -8217,7 +8544,7 @@ mod psms_stream_tests {
     }
 
     /// One accepted row whose every column varies with `i`, with nulls in the MS1 columns.
-    fn row(i: usize) -> CandOut {
+    pub(super) fn row(i: usize) -> CandOut {
         let f = i as f64;
         CandOut {
             cid: i as u32,
@@ -8258,6 +8585,7 @@ mod psms_stream_tests {
             gate_coelution: -0.25,
             gate_spectral_entropy: (i % 9) as f32,
             gate_window_mean: 0.0,
+            keep_score: 0.0,
             deconv_explained: 0.0,
             deconv_active: 1.0,
             deconv_share: 0.5,

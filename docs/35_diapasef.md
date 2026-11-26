@@ -1303,6 +1303,12 @@ seed, other-species shares unchanged. It was restored because 10 of the 52 diaPA
 weights without the 1/K0 terms were fitted on the same diaPASEF runs and were not validated on
 an Orbitrap or Astral acquisition.
 
+`extract.gate_keep_decoys` (experimental, unset by default, unmeasured) is the candidate for a
+gate that follows the load instead: it cuts the window-mean score where a fixed share of the
+decoys survives, per block of candidates in m/z order, the rule of the rescore prefilter below.
+Set, it turns the default support gate off unless `gate_support_min` is given, and
+`gate_min_score` stays a floor. docs/09_extract.md section 5a has the design.
+
 ### A prefilter before the classifier
 
 On a large pool the classifier is the rescore's cost, and most of what it scores is never
