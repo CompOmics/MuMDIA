@@ -246,6 +246,17 @@ than a number. Both are recorded in every run's `manifest.json`.
   seeds). The diaPASEF recipe keeps `extract.presence_min_coelution` 1, and the rescore
   prefilter's best-column fallback stays. A diaPASEF search read natively from a Bruker `.d`
   finds and quantifies differently from 0.15.0; a search without 1/K0 is unaffected.
+- **extract holds at most about `extract.hit_budget_gib` of fragment-peak matches at once
+  (docs/09, "Bounded hit memory").** The streamed extraction probed a batch of
+  `windows_in_flight` windows as one set of tasks, and the stores of the later candidate
+  sub-ranges waited for the earlier ones, so it held about the whole batch: memory grew with
+  the windows in flight times their candidates times the peaks inside each candidate's RT
+  window, which is what single-ion centroids and seeds without anchors multiplied on
+  diaPASEF. A batch estimated past the budget is now cut into pieces of its sub-ranges and
+  probed in waves that fit it. A piece flushes full batches of candidates only, so every
+  table is the same file at any budget; only the memory and the wall clock change. Unset is
+  `auto`, a quarter of the machine's memory, which leaves every batch within it planned as
+  before; `0` is off. The footprint estimate reports the bounded store.
 
 ### Fixed
 
