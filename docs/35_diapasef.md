@@ -932,6 +932,18 @@ long (1.1-6x). Both keys are back at their 0.14.0 defaults. Which of the two, or
 combination, causes the growth is not measured yet; until it is, use the opt-in on low-input
 runs and on a machine with memory to spare.
 
+The six single-cell failures were experiments of 25 to 71 cells, and what made their extract
+explode was the seed, not the reader alone. The seed's `(decoys + 1) / targets` needs 100
+targets above the first decoy for one anchor at 1%; on those plates, which a reference search
+of the same library put at about half the precursors per cell of the plates that worked, the
+seed's anchors at 1% were 0 on most cells and 100 to 450 on the others. With fewer than
+`min_seed_for_calibration` anchors at the seed's cut there is no 1/K0 calibration, so a cell
+left on the fixed 120 s RT window had no 1/K0 window either (one such cell: 163 GiB of hits
+estimated), and a cell with fewer than two anchors had neither. `rt_im_train.fallback_windows
+= "library"` (opt-in, docs/08 section 4i) gives those cells the library's iRT range mapped onto
+the gradient and the library's 1/K0 plus or minus 0.07; `"refuse"` stops a cell without RT
+anchors at `rt-im-train`.
+
 ## 12. Closed levers
 
 Measured and not kept. Commits are on the IM branch; seeds are `nn_torch` seeds on the E. coli

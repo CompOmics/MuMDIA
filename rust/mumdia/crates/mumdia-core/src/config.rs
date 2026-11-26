@@ -592,6 +592,35 @@ fn is_default_im_window_sizing(v: &ImWindowSizing) -> bool {
 fn is_default_im_window_sizing_q(v: &f64) -> bool {
     *v == RtImTrainConfig::default().im_window_sizing_q
 }
+fn is_default_fallback_rt_gradient_fraction(v: &f64) -> bool {
+    *v == RtImTrainConfig::default().fallback_rt_gradient_fraction
+}
+fn is_default_fallback_im_window(v: &f64) -> bool {
+    *v == RtImTrainConfig::default().fallback_im_window
+}
+
+/// What `rt-im-train` gives a run the seed left without a calibration
+/// (`rt_im_train.fallback_windows`, docs/08_rt_im_train.md section 4i).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FallbackWindows {
+    /// Fewer than two RT anchors: every candidate is searched over the whole gradient; no
+    /// 1/K0 calibration: no 1/K0 window. The behaviour before the key existed.
+    #[default]
+    Unbounded,
+    /// Bounded windows from the library: its iRT mapped onto the run's gradient, and on a
+    /// run with 1/K0 its predicted 1/K0, each with a fixed half-width.
+    Library,
+    /// Fail the run at `rt-im-train` instead of searching it over the whole gradient.
+    Refuse,
+}
+
+impl FallbackWindows {
+    /// The default, omitted from the canonical configuration.
+    pub fn is_unbounded(&self) -> bool {
+        matches!(self, FallbackWindows::Unbounded)
+    }
+}
 
 /// How `rt-im-train` sizes the ion-mobility half-window `w_im`
 /// (`rt_im_train.im_window_sizing`, docs/08_rt_im_train.md "Ion-mobility calibration").
@@ -1697,6 +1726,37 @@ pub struct RtImTrainConfig {
     pub composition_correction: bool,
     /// Fallback fixed RT window in seconds when calibration cannot be fit.
     pub fallback_rt_window_s: f64,
+    /// What a run gets when its seed leaves it without a calibration
+    /// (docs/08_rt_im_train.md section 4i). `unbounded` (the default): fewer than two RT
+    /// anchors search every candidate over the whole gradient, and a run with 1/K0 but no
+    /// ion-mobility calibration has no 1/K0 window, as before the key existed. `library`:
+    /// such a run is searched in bounded windows from the library instead. The RT window is
+    /// the library's `predicted_irt`, its 1st to 99th percentile mapped linearly onto the 1st
+    /// to 99th percentile of the seed's observed retention times, with a half-width of
+    /// `fallback_rt_gradient_fraction` of that span (`calibration_status`
+    /// `fallback_library`); the 1/K0 window, on a run with 1/K0 whose ion mobility could not
+    /// be calibrated (too few anchors at the seed's cut), is the library's `predicted_im`
+    /// plus or minus `fallback_im_window`. Both are recorded in `cal.json`. `refuse`: a run
+    /// with fewer than two RT anchors fails at `rt-im-train` rather than being searched over
+    /// the whole gradient. Neither applies to a grouped run (`groups.window_groups > 1`),
+    /// whose unbounded windows `groups.allow_unbounded_rt` governs. Off by default because
+    /// a default that changes outputs needs entrapment and two acquisitions. Measured on 18
+    /// calibrated single-cell diaPASEF runs: the confident anchors' residual to the map had
+    /// a 99th percentile of 0.10-0.26 of the span, and their uncalibrated 1/K0 residual one
+    /// of 0.054-0.081 (up to 0.145 on runs with 99-196 anchors). Omitted from the
+    /// canonical configuration at its default.
+    #[serde(skip_serializing_if = "FallbackWindows::is_unbounded")]
+    pub fallback_windows: FallbackWindows,
+    /// Under `fallback_windows = library`: the RT half-width as a fraction of the seed's
+    /// observed retention-time span (1st to 99th percentile). Default 0.25; in (0, 1].
+    /// Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_default_fallback_rt_gradient_fraction")]
+    pub fallback_rt_gradient_fraction: f64,
+    /// Under `fallback_windows = library`: the 1/K0 half-width around the library's
+    /// `predicted_im`, in V s cm^-2. Default 0.07; > 0. Omitted from the canonical
+    /// configuration at its default.
+    #[serde(skip_serializing_if = "is_default_fallback_im_window")]
+    pub fallback_im_window: f64,
     /// Fine-tune the DeepLC multitask model on this run's confident seed PSMs
     /// and rewrite the library's `predicted_irt` before RT calibration. Requires
     /// `predict_frag.deeplc_python` (the DeepLC interpreter). Off by default; the
@@ -2110,6 +2170,9 @@ impl Default for RtImTrainConfig {
             anchor_x_filter: false,
             composition_correction: true,
             fallback_rt_window_s: 120.0,
+            fallback_windows: FallbackWindows::Unbounded,
+            fallback_rt_gradient_fraction: 0.25,
+            fallback_im_window: 0.07,
             finetune_deeplc: false,
             multihead_calibration: None,
             multihead_anchors: MultiheadAnchors::Auto,
@@ -6156,6 +6219,21 @@ impl Config {
                 self.rt_im_train.im_window_min
             )));
         }
+        let f = self.rt_im_train.fallback_rt_gradient_fraction;
+        if !(f.is_finite() && f > 0.0 && f <= 1.0) {
+            return Err(Invalid(format!(
+                "rt_im_train.fallback_rt_gradient_fraction must be finite and in (0, 1] (got \
+                 {f}): it is the half-width of the fallback RT window as a fraction of the run's \
+                 gradient"
+            )));
+        }
+        let w = self.rt_im_train.fallback_im_window;
+        if !(w.is_finite() && w > 0.0) {
+            return Err(Invalid(format!(
+                "rt_im_train.fallback_im_window must be finite and > 0 (got {w}): it is the \
+                 half-width of the fallback 1/K0 window, in V s cm^-2"
+            )));
+        }
         if !(self.rt_im_train.im_window_sizing_q > 0.0
             && self.rt_im_train.im_window_sizing_q <= 0.5)
         {
@@ -10128,6 +10206,45 @@ mod tests {
         assert!(back.groups.allow_unbounded_rt);
         assert_eq!(back.canonical_json(), c);
         assert!(Config::from_json(r#"{"groups":{"allow_unbounded_rt":"yes"}}"#).is_err());
+    }
+
+    /// `rt_im_train.fallback_windows` and its two widths are omitted from the canonical
+    /// configuration at their defaults, so the config hash of every configuration that does not
+    /// set them is unchanged; a set value is part of the identity, and bad widths are refused.
+    #[test]
+    fn fallback_windows_default_off_and_leave_the_default_config_hash_alone() {
+        let d = Config::default();
+        assert_eq!(d.rt_im_train.fallback_windows, FallbackWindows::Unbounded);
+        let canon = d.canonical_json();
+        assert!(!canon.contains("fallback_windows"), "{canon}");
+        assert!(!canon.contains("fallback_rt_gradient_fraction"), "{canon}");
+        assert!(!canon.contains("fallback_im_window"), "{canon}");
+        let explicit = Config::from_json(
+            r#"{"rt_im_train":{"fallback_windows":"unbounded",
+                "fallback_rt_gradient_fraction":0.25,"fallback_im_window":0.07}}"#,
+        )
+        .unwrap();
+        assert_eq!(explicit.canonical_json(), canon);
+        let on = Config::from_json(
+            r#"{"rt_im_train":{"fallback_windows":"library","fallback_im_window":0.1}}"#,
+        )
+        .unwrap();
+        assert_eq!(on.rt_im_train.fallback_windows, FallbackWindows::Library);
+        let c = on.canonical_json();
+        assert!(c.contains(r#""fallback_windows":"library""#), "{c}");
+        assert!(c.contains(r#""fallback_im_window":0.1"#), "{c}");
+        assert_eq!(Config::from_json(&c).unwrap().canonical_json(), c);
+        let refuse = Config::from_json(r#"{"rt_im_train":{"fallback_windows":"refuse"}}"#).unwrap();
+        assert_eq!(refuse.rt_im_train.fallback_windows, FallbackWindows::Refuse);
+        for bad in [
+            r#"{"rt_im_train":{"fallback_windows":"wide"}}"#,
+            r#"{"rt_im_train":{"fallback_rt_gradient_fraction":0}}"#,
+            r#"{"rt_im_train":{"fallback_rt_gradient_fraction":1.5}}"#,
+            r#"{"rt_im_train":{"fallback_im_window":0}}"#,
+            r#"{"rt_im_train":{"fallback_im_window":-0.1}}"#,
+        ] {
+            assert!(Config::from_json(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

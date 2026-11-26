@@ -452,6 +452,25 @@ run the second pass of `run-experiment` searches again on the consensus retentio
 the others. A stop would end those experiments. A grouped search, where unbounded windows
 multiply the memory by the number of bands, stops (next section).
 
+**Cause: a seed at the edge of its FDR floor (low-input diaPASEF).** The seed's q is
+`(decoys + 1) / targets`, so a confident target at 1% needs 100 targets ranked above the
+first decoy. A single cell whose seed ranks only a few hundred real peptides lands on one
+side or the other of that line: on three single-cell diaPASEF plates of the v0.15.0 sweep the
+anchor counts at 1% were 0 on most runs and 100 to 450 on the rest, never between, and a
+reference search of the same runs found about half the precursors per cell of the plates
+that worked. The relaxed `anchor_q_ladder` then gives a few runs 2 to 49 anchors (the fixed
+120 s window), but the ion-mobility calibration needs `min_seed_for_calibration` anchors at
+the seed's own cut, so on diaPASEF such a run has no 1/K0 window either, and extract
+estimated 160 to 875 GiB of hits for single runs, past the memory watchdog and the footprint
+guard (`extract.max_footprint_gib`).
+
+**Fix for that case.** `rt_im_train.fallback_windows = "library"` (opt-in, docs/08 section
+4i) bounds both windows from the library: the library iRT range mapped onto the run's
+gradient with a half-width of `fallback_rt_gradient_fraction` (0.25) of it, status
+`fallback_library`, and on a run with 1/K0 and no ion-mobility calibration the library's
+1/K0 plus or minus `fallback_im_window` (0.07). `fallback_windows = "refuse"` fails a run
+without anchors at `rt-im-train` instead of extracting it over the whole gradient.
+
 ## Grouped search: unbounded retention-time windows
 
 **Symptom.** A grouped run (`groups.window_groups > 1`) stops with an error that begins

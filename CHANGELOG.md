@@ -229,6 +229,22 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Added
+
+- **`rt_im_train.fallback_windows`: bounded windows for a run whose seed found no anchors
+  (opt-in; docs/08 section 4i, docs/17 "Seed: no confident targets").** The default
+  `unbounded` keeps every artifact byte for byte. `library` gives a run with fewer than two RT
+  anchors the library's iRT range (1st-99th percentile) mapped linearly onto the seed's
+  observed RT range, with a half-width of `fallback_rt_gradient_fraction` (0.25) of that span
+  (`calibration_status` `fallback_library`, `cal.json` `rt_fallback`), and a run with 1/K0 but
+  no ion-mobility calibration the library's `predicted_im` plus or minus `fallback_im_window`
+  (0.07; `im_method` `library_uncalibrated`). `refuse` fails a run with fewer than two RT
+  anchors at `rt-im-train` instead of extracting it over the whole gradient. The cause on the
+  0.15.0 sweep's single-cell diaPASEF failures: the seed's `(decoys + 1) / targets` needs 100
+  targets above the first decoy for one anchor at 1%, and on plates with about half the
+  peptides per cell of those that worked most cells had 0 anchors (the rest 100-450), so they
+  had no 1/K0 calibration and, below two anchors, no RT window.
+
 ### Changed
 
 - **diaPASEF: `convert.tdf_min_points` is 2 and `extract.gate_support_min` 0.845 on spectra

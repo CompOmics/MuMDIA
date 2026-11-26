@@ -1484,6 +1484,50 @@
       "source_struct": "RtImTrainConfig"
     },
     {
+      "path": "rt_im_train.fallback_windows",
+      "name": "fallback_windows",
+      "section": "rt_im_train",
+      "rust_type": "FallbackWindows",
+      "kind": "enum",
+      "optional": false,
+      "default": "unbounded",
+      "default_text": "`unbounded`",
+      "help": "What a run gets when its seed leaves it without a calibration (docs/08_rt_im_train.md section 4i). `unbounded` (the default): fewer than two RT anchors search every candidate over the whole gradient, and a run with 1/K0 but no ion-mobility calibration has no 1/K0 window, as before the key existed. `library`: such a run is searched in bounded windows from the library instead. The RT window is the library's `predicted_irt`, its 1st to 99th percentile mapped linearly onto the 1st to 99th percentile of the seed's observed retention times, with a half-width of `fallback_rt_gradient_fraction` of that span (`calibration_status` `fallback_library`); the 1/K0 window, on a run with 1/K0 whose ion mobility could not be calibrated (too few anchors at the seed's cut), is the library's `predicted_im` plus or minus `fallback_im_window`. Both are recorded in `cal.json`. `refuse`: a run with fewer than two RT anchors fails at `rt-im-train` rather than being searched over the whole gradient. Neither applies to a grouped run (`groups.window_groups > 1`), whose unbounded windows `groups.allow_unbounded_rt` governs. Off by default because a default that changes outputs needs entrapment and two acquisitions. Measured on 18 calibrated single-cell diaPASEF runs: the confident anchors' residual to the map had a 99th percentile of 0.10-0.26 of the span, and their uncalibrated 1/K0 residual one of 0.054-0.081 (up to 0.145 on runs with 99-196 anchors). Omitted from the canonical configuration at its default.",
+      "gates": [],
+      "source_struct": "RtImTrainConfig",
+      "choices": [
+        "unbounded",
+        "library",
+        "refuse"
+      ]
+    },
+    {
+      "path": "rt_im_train.fallback_rt_gradient_fraction",
+      "name": "fallback_rt_gradient_fraction",
+      "section": "rt_im_train",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.25,
+      "default_text": "0.25",
+      "help": "Under `fallback_windows = library`: the RT half-width as a fraction of the seed's observed retention-time span (1st to 99th percentile). Default 0.25; in (0, 1]. Omitted from the canonical configuration at its default.",
+      "gates": [],
+      "source_struct": "RtImTrainConfig"
+    },
+    {
+      "path": "rt_im_train.fallback_im_window",
+      "name": "fallback_im_window",
+      "section": "rt_im_train",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.07,
+      "default_text": "0.07",
+      "help": "Under `fallback_windows = library`: the 1/K0 half-width around the library's `predicted_im`, in V s cm^-2. Default 0.07; > 0. Omitted from the canonical configuration at its default.",
+      "gates": [],
+      "source_struct": "RtImTrainConfig"
+    },
+    {
       "path": "rt_im_train.finetune_deeplc",
       "name": "finetune_deeplc",
       "section": "rt_im_train",
