@@ -52,7 +52,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | Section | Struct | Fields | Stage document |
 |---|---|---|---|
 | [(top level)](#top-level) | `Config` | 20 | [docs/02_config_and_data_model.md](02_config_and_data_model.md) |
-| [`convert`](#convert) | `ConvertConfig` | 16 |  |
+| [`convert`](#convert) | `ConvertConfig` | 20 |  |
 | [`prescan`](#prescan) | `PrescanConfig` | 7 | [docs/21_prescan.md](21_prescan.md) |
 | [`prescreen`](#prescreen) | `PrescreenConfig` | 20 |  |
 | [`prescreen.tags`](#prescreentags) | `PrescreenTagsConfig` | 3 |  |
@@ -121,6 +121,10 @@ Vendor-format conversion, read by every subcommand that takes a spectra path (`r
 | `tdf_mz_ppm` | `f64` | `10.0` |  | Native diaPASEF reader (`stages::convert::tdf`): m/z merge tolerance in ppm between neighbouring TOF points of one centroid (single linkage). Default 10. Read only for a timsTOF `.d` whose frames are diaPASEF, which `convert` reads natively; every other input ignores the `tdf_*` keys. Each `tdf_*` key is omitted from the canonical configuration at its default, so it changes no config hash. |
 | `tdf_im_gap_scans` | `u32` | `30` |  | Native diaPASEF reader: a gap of more than this many TIMS scans without signal splits one m/z trace into separate centroids. Default 30. Provisional: it rests on a peak census of one run and the seed plateau, not on an end-to-end sweep. |
 | `tdf_min_points` | `u32` | `2` |  | Native diaPASEF reader: a centroid built from fewer raw TOF x scan points than this is dropped. Default 2. Provisional, as `tdf_im_gap_scans`. 1 keeps every centroid, including those of a single ion event, which at low load is most of the real fragment signal; with `extract.gate_support_min` 0 it is the low-input opt-in (docs/35_diapasef.md section 11, "Low input"). The two were the default in 0.15.0 and were reverted because 10 of 52 timsTOF diaPASEF benchmark jobs that 0.14.0 ran then failed on memory; which of the two keys caused that is not measured. Measured for the opt-in with the diaPASEF recipe (`extract.gate_min_score` 0.6, `presence_min_coelution` 1, no support gate), three NN seeds, precursors per run at `run_psm_q` 1% against 2: 200 pg HeLa 3,422 -> 7,689, 1 ng 12,542 -> 19,270, 250 pg Ultra 6,912 -> 9,544, 50 ng 5-min Ultra 2 35,710 -> 35,346; E. coli entrapment FDP 0.97% (0.83-1.12%); 0 IDs in three blank runs. The other-species share rose on the 250 pg Ultra set only (1.17% -> 1.40%) and fell elsewhere. The earlier -17% for 1 (docs/35 section 12) was measured under the 0.845 support gate and without the recipe's presence rule. |
+| `tdf_single_ion` | `TdfSingleIon` | `drop` |  | Native diaPASEF reader: what becomes of an MS2 cluster below `tdf_min_points` raw points (with the default 2, a single ion event). `drop` (default) drops it. `persistent` keeps it when one of its points recurs: a raw event within `tdf_single_ion_tof` TOF indices and `tdf_single_ion_scans` TIMS scans of it, inside its diaPASEF slot, in one of the `tdf_single_ion_cycles` frames of the same window group before or after it. A fragment of an eluting peptide recurs from one cycle to the next at about the same TOF index and mobility; a noise event does not. MS1 clusters always follow `tdf_min_points`. Experimental and opt-in (docs/35_diapasef.md section 2, "Persistent single ions"). |
+| `tdf_single_ion_tof` | `u32` | `3` |  | `tdf_single_ion = persistent`: TOF indices either side in which a partner event counts. Default 3. |
+| `tdf_single_ion_scans` | `u32` | `40` |  | `tdf_single_ion = persistent`: TIMS scans either side in which a partner event counts. Default 40. |
+| `tdf_single_ion_cycles` | `u32` | `2` |  | `tdf_single_ion = persistent`: frames of the same window group searched on each side (diaPASEF cycles). Default 2; must be >= 1. |
 | `tdf_mz_valley` | `f64` | `0.0` | benchmark-gated | Native diaPASEF reader: split each m/z x mobility cluster at the valleys of its m/z profile. A local minimum of the smoothed profile is a cut when it is below this fraction of the smaller of the two humps beside it, so one ion stays one centroid and two neighbouring ions become two. Must be in [0, 1); 0 (default) is off and leaves the centroids unchanged. Benchmark-gated (docs/35_diapasef.md). |
 | `tdf_mz_smooth_ppm` | `f64` | `8.0` |  | Native diaPASEF reader: half-width in ppm of the triangular smoothing applied to the m/z profile before `tdf_mz_valley` looks for valleys; 0 is no smoothing. Default 8. Unused while `tdf_mz_valley` is 0. |
 | `tdf_im_valley` | `f64` | `0.0` | benchmark-gated | Native diaPASEF reader: split each cluster (after the m/z valley split, when that is on) at the valleys of its mobility profile, the summed intensity per TIMS scan after a triangular smoothing of half-width `tdf_im_smooth_scans`. Separates ions of one m/z whose mobility profiles touch without a `tdf_im_gap_scans` gap. Must be in [0, 1); 0 (default) is off and leaves the centroids unchanged. Benchmark-gated. |
@@ -1111,6 +1115,17 @@ How `run-experiment` names its runs when `--run-names` is absent (`experiment.ru
 | `input` | yes | After the input file's name, sanitised to a portable directory name. |
 | `index` |  | `r0`, `r1`, ... in input order, the layout before 0.10. |
 
+### `TdfSingleIon`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+`convert.tdf_single_ion`: what the native diaPASEF reader does with an MS2 cluster below `convert.tdf_min_points` raw points.
+
+| Value | Default | Description |
+|---|---|---|
+| `drop` | yes | Drop it, as every reader version before the key. |
+| `persistent` |  | Keep it when one of its points recurs in a neighbouring cycle of its window group. |
+
 ### `UnknownModPolicy`
 
 (rust/mumdia/crates/mumdia-core/src/config.rs)
@@ -1355,6 +1370,6 @@ instead of looking like an absent field.
 
 ## Coverage
 
-24 structs and 333 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 45 enumerations, 1 named profile(s), 105 environment variables read and 28 set.
+24 structs and 337 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 46 enumerations, 1 named profile(s), 105 environment variables read and 28 set.
 
 30 field(s) carry a gating marker in their doc comment. 53 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.

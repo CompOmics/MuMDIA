@@ -236,6 +236,13 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Added
+
+- **diaPASEF: `convert.tdf_single_ion = "persistent"` keeps an MS2 single-ion centroid when it
+  recurs in a neighbouring cycle of its window group (experimental, opt-in; docs/35 section 2,
+  "Persistent single ions").** CHANGELOG_RESULTS The default `"drop"` writes the same spectra, reports
+  and configuration hash as before.
+
 ## [0.15.1] - 2026-11-26
 
 ### Changed

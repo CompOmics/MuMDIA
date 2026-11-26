@@ -472,15 +472,15 @@ pub struct ConvertConfig {
     #[serde(skip_serializing_if = "TdfSingleIon::is_drop")]
     pub tdf_single_ion: TdfSingleIon,
     /// `tdf_single_ion = persistent`: TOF indices either side in which a partner event
-    /// counts. Default 2.
+    /// counts. Default 3.
     #[serde(skip_serializing_if = "is_default_tdf_single_ion_tof")]
     pub tdf_single_ion_tof: u32,
     /// `tdf_single_ion = persistent`: TIMS scans either side in which a partner event
-    /// counts. Default 10.
+    /// counts. Default 40.
     #[serde(skip_serializing_if = "is_default_tdf_single_ion_scans")]
     pub tdf_single_ion_scans: u32,
     /// `tdf_single_ion = persistent`: frames of the same window group searched on each side
-    /// (diaPASEF cycles). Default 1; must be >= 1.
+    /// (diaPASEF cycles). Default 2; must be >= 1.
     #[serde(skip_serializing_if = "is_default_tdf_single_ion_cycles")]
     pub tdf_single_ion_cycles: u32,
     /// Native diaPASEF reader: split each m/z x mobility cluster at the valleys of its
@@ -563,9 +563,9 @@ impl Default for ConvertConfig {
             tdf_im_gap_scans: 30,
             tdf_min_points: 2,
             tdf_single_ion: TdfSingleIon::Drop,
-            tdf_single_ion_tof: 2,
-            tdf_single_ion_scans: 10,
-            tdf_single_ion_cycles: 1,
+            tdf_single_ion_tof: 3,
+            tdf_single_ion_scans: 40,
+            tdf_single_ion_cycles: 2,
             tdf_mz_valley: 0.0,
             tdf_mz_smooth_ppm: 8.0,
             tdf_im_valley: 0.0,

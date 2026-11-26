@@ -173,6 +173,62 @@
       "source_struct": "ConvertConfig"
     },
     {
+      "path": "convert.tdf_single_ion",
+      "name": "tdf_single_ion",
+      "section": "convert",
+      "rust_type": "TdfSingleIon",
+      "kind": "enum",
+      "optional": false,
+      "default": "drop",
+      "default_text": "`drop`",
+      "help": "Native diaPASEF reader: what becomes of an MS2 cluster below `tdf_min_points` raw points (with the default 2, a single ion event). `drop` (default) drops it. `persistent` keeps it when one of its points recurs: a raw event within `tdf_single_ion_tof` TOF indices and `tdf_single_ion_scans` TIMS scans of it, inside its diaPASEF slot, in one of the `tdf_single_ion_cycles` frames of the same window group before or after it. A fragment of an eluting peptide recurs from one cycle to the next at about the same TOF index and mobility; a noise event does not. MS1 clusters always follow `tdf_min_points`. Experimental and opt-in (docs/35_diapasef.md section 2, \"Persistent single ions\").",
+      "gates": [],
+      "source_struct": "ConvertConfig",
+      "choices": [
+        "drop",
+        "persistent"
+      ]
+    },
+    {
+      "path": "convert.tdf_single_ion_tof",
+      "name": "tdf_single_ion_tof",
+      "section": "convert",
+      "rust_type": "u32",
+      "kind": "integer",
+      "optional": false,
+      "default": 3,
+      "default_text": "3",
+      "help": "`tdf_single_ion = persistent`: TOF indices either side in which a partner event counts. Default 3.",
+      "gates": [],
+      "source_struct": "ConvertConfig"
+    },
+    {
+      "path": "convert.tdf_single_ion_scans",
+      "name": "tdf_single_ion_scans",
+      "section": "convert",
+      "rust_type": "u32",
+      "kind": "integer",
+      "optional": false,
+      "default": 40,
+      "default_text": "40",
+      "help": "`tdf_single_ion = persistent`: TIMS scans either side in which a partner event counts. Default 40.",
+      "gates": [],
+      "source_struct": "ConvertConfig"
+    },
+    {
+      "path": "convert.tdf_single_ion_cycles",
+      "name": "tdf_single_ion_cycles",
+      "section": "convert",
+      "rust_type": "u32",
+      "kind": "integer",
+      "optional": false,
+      "default": 2,
+      "default_text": "2",
+      "help": "`tdf_single_ion = persistent`: frames of the same window group searched on each side (diaPASEF cycles). Default 2; must be >= 1.",
+      "gates": [],
+      "source_struct": "ConvertConfig"
+    },
+    {
       "path": "convert.tdf_mz_valley",
       "name": "tdf_mz_valley",
       "section": "convert",

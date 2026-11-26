@@ -1049,7 +1049,8 @@ pub(super) fn drive(
                 seen,
                 kept,
                 kept_pct = 100.0 * kept as f64 / seen.max(1) as f64,
-                "convert: MS2 clusters below tdf_min_points kept when they recur                  (convert.tdf_single_ion = persistent)"
+                "convert: MS2 clusters below tdf_min_points kept when they recur \
+                 (convert.tdf_single_ion = persistent)"
             );
             e
         }
@@ -1648,14 +1649,10 @@ mod tests {
         let Ok(path) = std::env::var("MUMDIA_BENCH_TDF") else {
             return;
         };
-        let p = TdfParams {
-            persist: Some(Persist {
-                tof: 2,
-                scans: 10,
-                cycles: 1,
-            }),
-            ..TdfParams::default()
-        };
+        let p = TdfParams::from_config(&ConvertConfig {
+            tdf_single_ion: mumdia_core::config::TdfSingleIon::Persistent,
+            ..ConvertConfig::default()
+        });
         type Ms2 = (Vec<f32>, Vec<f32>, Vec<f32>);
         let read = |p: &TdfParams, threads: usize| -> Vec<Ms2> {
             let pool = rayon::ThreadPoolBuilder::new()
@@ -1712,7 +1709,7 @@ mod tests {
         let mut grid = Vec::new();
         for cycles in [1u32, 2] {
             for tof in [1u32, 2, 3] {
-                for scans in [3u32, 6, 10, 20] {
+                for scans in [3u32, 6, 10, 20, 40] {
                     grid.push(Persist { tof, scans, cycles });
                 }
             }

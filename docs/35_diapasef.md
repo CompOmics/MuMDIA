@@ -134,6 +134,22 @@ Reader scope: timsrust 0.4.2 classifies frames by `MsMsType` only. Synchro-PASEF
 slice-PASEF, and older TDF compression, are untested. Only Ultra 2 E. coli and HYE runs have been
 searched end to end; a timsTOF Pro run has only been converted.
 
+### Persistent single ions
+
+`convert.tdf_single_ion = "persistent"` (experimental, opt-in; default `"drop"`) keeps an MS2
+cluster below `tdf_min_points` raw points when it recurs: when a raw event lies within
+`tdf_single_ion_tof` TOF indices (2) and `tdf_single_ion_scans` TIMS scans (10) of one of its
+points, inside its diaPASEF slot, in one of the `tdf_single_ion_cycles` frames (1) of the same
+window group before or after its frame. A fragment of an eluting peptide is acquired in every
+cycle of its elution at about the same TOF index and mobility; a noise event is not. MS1
+clusters always follow `tdf_min_points`. The reader holds the raw frames of a batch of 128
+frames and of their neighbours, and a frame's spectra depend only on its own and its
+neighbours' events, so the output does not depend on the thread count. At the default `"drop"`
+nothing changes: the key and its three settings are left out of the canonical configuration and
+of the spectra reports, which record all four when it is on.
+
+PERSIST_RESULTS
+
 ### Artifacts and provenance
 
 The spectra and isolation-window artifacts of a diaPASEF run are v2 (`artifact::spectra_ms1`,
@@ -147,7 +163,7 @@ exact bytes.
 | `isolation_windows` | `im_lower`, `im_upper`: one row per slot, so slots that share an m/z range are separate rows. Provenance only; no stage reads them. |
 
 The spectra reports of a diaPASEF run add `params.reader = "timsrust"` and the seven
-`convert.tdf_*` settings; `params.instrument` is the `GlobalMetadata.InstrumentName` of
+`convert.tdf_*` settings (with `tdf_ms1_denoise` and the four `tdf_single_ion*` keys when on); `params.instrument` is the `GlobalMetadata.InstrumentName` of
 `analysis.tdf`, with no PSI-MS accession. An mzML report has no `reader` field, and an absent
 field reads as mzML. `run` records the version each artifact was written with, and a later pass
 over existing spectra reads it back from the reports.
