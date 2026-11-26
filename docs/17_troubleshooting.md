@@ -464,12 +464,14 @@ the seed's own cut, so on diaPASEF such a run has no 1/K0 window either, and ext
 estimated 160 to 875 GiB of hits for single runs, past the memory watchdog and the footprint
 guard (`extract.max_footprint_gib`).
 
-**Fix for that case.** `rt_im_train.fallback_windows = "library"` (opt-in, docs/08 section
-4i) bounds both windows from the library: the library iRT range mapped onto the run's
+**Fix for that case.** `rt_im_train.fallback_windows = "library"` (docs/08 section 4i), which
+the default `auto` is on spectra with 1/K0, bounds both windows from the library: the library iRT range mapped onto the run's
 gradient with a half-width of `fallback_rt_gradient_fraction` (0.25) of it, status
 `fallback_library`, and on a run with 1/K0 and no ion-mobility calibration the library's
 1/K0 plus or minus `fallback_im_window` (0.07). `fallback_windows = "refuse"` fails a run
-without anchors at `rt-im-train` instead of extracting it over the whole gradient.
+without anchors at `rt-im-train` instead of extracting it over the whole gradient. A run whose
+`cal.json` has `calibration_status` `fallback_library` was searched in that window; on a run
+without 1/K0, `auto` leaves the windows unbounded, so set `library` there explicitly.
 
 ## Grouped search: unbounded retention-time windows
 

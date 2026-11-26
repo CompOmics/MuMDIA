@@ -1130,12 +1130,16 @@ fn fit_anchors(
     };
     let n_train = train_irt.len();
     info!(n_train, "rt-im-train: training points");
+    // A seed with `observed_im` is a run whose spectra carry 1/K0.
+    let im_reported = seed.has_column("observed_im");
     // `fallback_windows`: a run that cannot define a mapping is refused, or mapped by the
     // library's iRT range onto its gradient. Without the library (anchors read from the seed)
-    // there is nothing to map, and the windows stay unbounded.
-    let rt_fallback = match cfg.fallback_windows {
+    // there is nothing to map, and the windows stay unbounded. `auto` is `library` on a run
+    // with 1/K0 and `unbounded` otherwise, so a 3D run is unchanged.
+    let fallback = cfg.fallback_windows.resolve(im_reported);
+    let rt_fallback = match fallback {
         _ if !windows_unbounded(n_train) => None,
-        FallbackWindows::Unbounded => None,
+        FallbackWindows::Unbounded | FallbackWindows::Auto => None,
         FallbackWindows::Refuse => anyhow::bail!(
             "rt-im-train: {seed_psms} gives {n_train} target anchor(s), fewer than the two a \
              retention-time calibration needs, and rt_im_train.fallback_windows = refuse, so \
@@ -1156,7 +1160,6 @@ fn fit_anchors(
         }
     };
     // The ion-mobility calibration, on a seed with 1/K0 only.
-    let im_reported = seed.has_column("observed_im");
     let im = if im_reported {
         im_from_seed(
             &seed,
@@ -1175,10 +1178,7 @@ fn fit_anchors(
     // `fallback_windows = library` on a run with 1/K0 that could not be calibrated: the
     // library's 1/K0 with a fixed half-width rather than no 1/K0 window at all.
     let im = match im {
-        None if im_reported
-            && lib_im.is_some()
-            && cfg.fallback_windows == FallbackWindows::Library =>
-        {
+        None if im_reported && lib_im.is_some() && fallback == FallbackWindows::Library => {
             warn!(
                 w_im = cfg.fallback_im_window,
                 "rt-im-train: no ion-mobility calibration; the 1/K0 window is the library's \
@@ -1316,8 +1316,10 @@ fn fit_anchors(
                     half_width_s = m.half_width,
                     rt_p01_s = m.rt.0,
                     rt_p99_s = m.rt.1,
+                    fallback_windows = cfg.fallback_windows.as_str(),
                     "rt-im-train: fewer than two target anchors; using the library's iRT \
-                     range mapped onto the gradient (rt_im_train.fallback_windows = library)"
+                     range mapped onto the gradient (rt_im_train.fallback_windows resolved to \
+                     library)"
                 );
                 (Some(m.half_width), FALLBACK_LIBRARY_STATUS.to_string())
             }
@@ -1727,6 +1729,7 @@ fn write_windows(
     if let Some(m) = &fit.rt_fallback {
         cal_json["rt_fallback"] = json!({
             "mode": "library",
+            "fallback_windows": p.cfg.fallback_windows.as_str(),
             "irt_p01": m.irt.0,
             "irt_p99": m.irt.1,
             "rt_p01_s": m.rt.0,
@@ -3063,12 +3066,13 @@ mod tests {
         assert!(library_range_map(&irt, &[], 0.25).is_none());
     }
 
-    /// A 4D run whose seed has no confident target: by default the windows stay unbounded in
-    /// RT and absent in 1/K0, byte for byte as before; under `fallback_windows = library` the
-    /// RT window is the library-range map with its half-width and the 1/K0 window the
-    /// library's 1/K0 plus or minus `fallback_im_window` (null where the library has none),
-    /// recorded in `cal.json`; under `refuse` the stage fails. On a calibrated 3D run the key
-    /// changes nothing.
+    /// A 4D run whose seed has no confident target: under `fallback_windows = unbounded` the
+    /// windows stay unbounded in RT and absent in 1/K0, byte for byte as before the key; under
+    /// `library`, and under the default `auto` on a run with 1/K0, the RT window is the
+    /// library-range map with its half-width and the 1/K0 window the library's 1/K0 plus or
+    /// minus `fallback_im_window` (null where the library has none), recorded in `cal.json`;
+    /// under `refuse` the stage fails. On a 3D run `auto` is `unbounded`, and on a calibrated
+    /// 3D run the key changes nothing.
     #[test]
     fn fallback_windows_bound_a_run_without_anchors() {
         let n = 400usize;
@@ -3149,14 +3153,18 @@ mod tests {
             })
         };
         let default = RtImTrainConfig::default();
+        let unbounded = RtImTrainConfig {
+            fallback_windows: FallbackWindows::Unbounded,
+            ..RtImTrainConfig::default()
+        };
         let library = RtImTrainConfig {
             fallback_windows: FallbackWindows::Library,
             ..RtImTrainConfig::default()
         };
         let empty_4d = seed("empty_4d", false, true);
 
-        // Default: unbounded RT, no 1/K0 window, no fallback keys.
-        let (kept, cal, _) = run_with("default", &empty_4d, &default).unwrap();
+        // Unbounded: unbounded RT, no 1/K0 window, no fallback keys.
+        let (kept, cal, _) = run_with("unbounded", &empty_4d, &unbounded).unwrap();
         assert_eq!(cal["calibration_status"], INSUFFICIENT_ANCHORS_STATUS);
         assert_eq!(cal["method"], "unavailable");
         assert_eq!(cal["im_method"], "unavailable");
@@ -3169,6 +3177,7 @@ mod tests {
         assert_eq!(cal["calibration_status"], FALLBACK_LIBRARY_STATUS);
         assert_eq!(cal["method"], "library_range");
         assert_eq!(cal["rt_fallback"]["mode"], "library");
+        assert_eq!(cal["rt_fallback"]["fallback_windows"], "library");
         let seed_rt: Vec<f64> = (0..n).map(|i| 300.0 + 3.0 * i as f64).collect();
         let m = library_range_map(&irt, &seed_rt, library.fallback_rt_gradient_fraction).unwrap();
         assert_eq!(cal["w_rt"].as_f64(), Some(m.half_width));
@@ -3201,6 +3210,24 @@ mod tests {
                 }
             }
         }
+
+        // Default `auto` on a run with 1/K0: the library windows, byte for byte, with the
+        // setting that resolved to them recorded.
+        let (_, cal_lib, bytes_lib) = run_with("library_again", &empty_4d, &library).unwrap();
+        let (_, mut cal_auto, bytes_auto) = run_with("auto_4d", &empty_4d, &default).unwrap();
+        assert_eq!(bytes_auto, bytes_lib);
+        assert_eq!(cal_auto["rt_fallback"]["fallback_windows"], "auto");
+        cal_auto["rt_fallback"]["fallback_windows"] = "library".into();
+        assert_eq!(cal_auto, cal_lib);
+
+        // Default `auto` on a run without 1/K0: unbounded, byte for byte.
+        let empty_3d = seed("empty_3d", false, false);
+        let (kept, cal_auto, bytes_auto) = run_with("auto_3d", &empty_3d, &default).unwrap();
+        let (_, cal_unb, bytes_unb) = run_with("unbounded_3d", &empty_3d, &unbounded).unwrap();
+        assert_eq!(cal_auto["calibration_status"], INSUFFICIENT_ANCHORS_STATUS);
+        assert!(cal_auto.get("rt_fallback").is_none());
+        assert!(kept.rt_lo.iter().all(|v| *v == f64::NEG_INFINITY));
+        assert_eq!((bytes_auto, cal_auto), (bytes_unb, cal_unb));
 
         // Refuse: the stage fails and names the key.
         let refuse = RtImTrainConfig {

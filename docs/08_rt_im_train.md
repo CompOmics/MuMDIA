@@ -291,9 +291,10 @@ variants (rt_im_train.rs:30-40):
   stage warns, sets `w_rt = None`, and uses status
   `"insufficient_anchors_unbounded"` (rt_im_train.rs:160-167). Every candidate then
   gets the unbounded window `(NaN, -inf, +inf)` so extraction scans the full
-  isolation-window RT range. Under `fallback_windows = library` the run gets the
-  library-range window of section 4i instead (status `"fallback_library"`), and under
-  `fallback_windows = refuse` the stage fails.
+  isolation-window RT range. Under `fallback_windows = library`, which the default
+  `auto` is on spectra with 1/K0, the run gets the library-range window of section 4i
+  instead (status `"fallback_library"`), and under `fallback_windows = refuse` the stage
+  fails.
 - **`Fixed(fallback_rt_window_s)`** (`2 <= n_train < min_anchors`): a linear map
   exists but there are too few anchors to estimate its residual distribution. The
   stage warns and retains the configured broad fixed half-window with status
@@ -1056,11 +1057,11 @@ model: they do, to a median of 0.003 steps and a MAD of 0.16 steps after the cal
 and 0.11 steps early before it. Nothing applies the calibration yet; the per-fragment Q1
 decisions it is for are a later change.
 
-### 4i. Runs without anchors: `fallback_windows` (opt-in, 2026-11-26)
+### 4i. Runs without anchors: `fallback_windows` (default on diaPASEF, 2026-11-26)
 
 A run whose seed search leaves fewer than two target anchors, even at the last rung of
-`anchor_q_ladder`, has no iRT to RT mapping, and by default every candidate is extracted over
-the whole gradient. On a run with 1/K0 the ion-mobility calibration needs
+`anchor_q_ladder`, has no iRT to RT mapping, and under `fallback_windows = unbounded` every
+candidate is extracted over the whole gradient. On a run with 1/K0 the ion-mobility calibration needs
 `min_seed_for_calibration` anchors at the seed's own cut, so a run short of anchors also has
 no 1/K0 window, whether its RT window is unbounded, the fixed fallback or even calibrated on
 relaxed anchors. Both together are what made extract estimate 290 to 875 GiB of hits on
@@ -1109,7 +1110,7 @@ adapted iRT, which is already on that run's gradient.
 Measured (2026-11-26, one NN seed, 32 threads, `run-experiment` with the second pass) on
 three cells of the 52-cell plate, G1_30 (218 seed anchors, adapts the library), G1_29 (0
 anchors at any rung: the unbounded case) and G1_24 (0 at 1%, 34 at a relaxed rung: the fixed
-120 s window), with the sweep's diaPASEF configuration at the current reader defaults
+120 s window), with the sweep's diaPASEF configuration at the 0.15.1 reader defaults
 (`tdf_min_points` 2, support gate 0.845) and `fallback_windows = library`:
 
 | | G1_30 | G1_29 | G1_24 |
@@ -1133,11 +1134,27 @@ instead, before extract; under `run-experiment` that ends the experiment. Neithe
 a grouped run (`groups.window_groups > 1`), whose anchors are read from the seed with no
 library row: its unbounded windows are governed by `groups.allow_unbounded_rt`.
 
-Opt-in. The default `unbounded` writes every artifact byte for byte as before; the key and
-its widths are omitted from the canonical configuration at their defaults. `library` only
-changes runs that have no RT calibration or no 1/K0 calibration, which today either exceed
-the memory of the machine or are searched in windows no score was measured on; making it
-the default still needs entrapment and a second acquisition.
+The default is `auto`: `library` on a run whose spectra carry per-peak 1/K0 (its seed
+records `observed_im`), `unbounded` otherwise. A run without 1/K0 therefore writes every
+artifact byte for byte as before, and the key and its widths are omitted from the canonical
+configuration at their defaults. The explicit `unbounded`, `library` and `refuse` behave as
+they did when the key was opt-in. `cal.json` `rt_fallback.fallback_windows` records the
+setting (`auto` or `library`) that resolved to the library window. `library` only changes runs
+that have no RT calibration or no 1/K0 calibration.
+
+The diaPASEF default rests on whole plates of single-cell HeLa diaPASEF runs (2026-11-26, the
+0.15.1 defaults otherwise, one NN seed, precursors per run at `run_psm_q` 1%, process-tree
+peak):
+
+| plate | `unbounded` | `library` |
+|---|---|---|
+| 52 cells | 1,282 / 193 GB / 203 min | 1,352 / 48 GB / 74 min |
+| 71 cells | 1,454 / 182 GB / 234 min | 1,453 / 44 GB / 88 min |
+| 13 cells | 3,194 / 10 GB | 3,219 / 10 GB |
+
+It holds the identifications and takes the memory of the plates whose cells had no anchors
+to a quarter. Open: one seed, and no low-input entrapment set exists, so the FDP of the
+library-window cells is not measured.
 
 ### 5. Optional adaptive per-region window (default off)
 
@@ -1520,7 +1537,7 @@ though the enum variant still exists.
 | `min_seed_for_calibration` | `50` | Minimum anchors to (a) use LOESS instead of linear (rt_im_train.rs:135) and (b) trust the residual window instead of the fixed fallback (via `min_anchors = max(this, 2)`, rt_im_train.rs:157). |
 | `loess_span` | `0.3` | LOESS local-fit fraction; passed as `span` to `Loess::fit` (rt_im_train.rs:137). Fraction of anchors in each local window. |
 | `fallback_rt_window_s` | `120.0` | Fixed half-window (seconds) when anchors are too few (`WindowPlan::Fixed`, rt_im_train.rs:168-175); also the upper clamp for adaptive bin widths (rt_im_train.rs:211). |
-| `fallback_windows` | `unbounded` | What a run without a calibration gets (section 4i). `unbounded`: fewer than two RT anchors search the whole gradient and a 4D run without an IM calibration has no 1/K0 window, as before. `library`: the library-range RT window (`calibration_status` `fallback_library`) and the library's 1/K0 plus or minus `fallback_im_window`. `refuse`: fewer than two RT anchors fail the run at `rt-im-train`. Not applied to grouped runs. Opt-in. Omitted from the canonical configuration at the default. |
+| `fallback_windows` | `auto` | What a run without a calibration gets (section 4i). `auto`: `library` on spectra with 1/K0, `unbounded` otherwise. `unbounded`: fewer than two RT anchors search the whole gradient and a 4D run without an IM calibration has no 1/K0 window, as before. `library`: the library-range RT window (`calibration_status` `fallback_library`) and the library's 1/K0 plus or minus `fallback_im_window`. `refuse`: fewer than two RT anchors fail the run at `rt-im-train`. Not applied to grouped runs. Omitted from the canonical configuration at the default. |
 | `fallback_rt_gradient_fraction` | `0.25` | Under `fallback_windows = library`: the RT half-width as a fraction of the seed's observed RT span (1st to 99th percentile). In (0, 1]. Omitted from the canonical configuration at the default. |
 | `fallback_im_window` | `0.07` | Under `fallback_windows = library`: the 1/K0 half-width around the library's `predicted_im`, V s cm^-2. Omitted from the canonical configuration at the default. |
 | `finetune_deeplc` | `false` | Enable the DeepLC multitask fine-tune pre-step in `run` (run.rs:265). Requires `predict_frag.deeplc_python` (preflight, run.rs:62-67). On one measured run it was not needed per file once the library iRT had been fine-tuned once: the per-run LOESS reached the same residuals for much less wall clock (see the fine-tune section for the scope of that measurement). |

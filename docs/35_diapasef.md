@@ -96,7 +96,7 @@ native reader.
   m/z x mobility: points join one m/z trace while each neighbour is within `convert.tdf_mz_ppm`
   (10) of the previous one; a trace splits where two consecutive points are more than
   `convert.tdf_im_gap_scans` (30) scans apart; a cluster of fewer than `convert.tdf_min_points`
-  (2) raw points is dropped. A peak is the cluster's summed intensity at its intensity-weighted
+  (1) raw points is dropped, so by default every cluster is kept. A peak is the cluster's summed intensity at its intensity-weighted
   m/z and 1/K0. The result does not depend on the input order.
 - **Valley splits.** With `convert.tdf_mz_valley` above 0 a cluster is also cut at the valleys
   of its m/z profile, and with `convert.tdf_im_valley` above 0 each piece at the valleys of its
@@ -120,10 +120,11 @@ native reader.
 - **`--max-spectra` counts frames**, not spectra, on this path: N frames yield N spectra for MS1
   frames and one spectrum per slot for MS2 frames.
 
-The reader settings are provisional. `tdf_im_gap_scans` 30 and `tdf_min_points` 2 rest on a peak
-census of one run and the seed plateau. `tdf_min_points` 1 keeps every centroid, including those
-of a single ion event, which at low load is most of the real fragment signal; with
-`extract.gate_support_min` 0 it is the low-input opt-in (section 11, "Low input"). The valley
+The reader settings are provisional. `tdf_im_gap_scans` 30 rests on a peak census of one run and
+the seed plateau. `tdf_min_points` 1 (2 in 0.14.0 and 0.15.1) keeps every centroid, including
+those of a single ion event, which at low load is most of the real fragment signal; it is the
+default with the support gate kept, and with `extract.gate_support_min` 0 as well it is the
+low-input opt-in (section 11, "Low input"). The valley
 fractions stay at 0 until they are measured
 as one package with the seed's count-once matching on the six-run HYE set with three `nn_torch`
 seeds: on its own, the mobility split cut the seed anchors from 5,200 to 3,331. The smoothing
@@ -884,15 +885,18 @@ whose fragments are single ion events never assembled a peak group, because the 
 dropped every centroid of fewer than `convert.tdf_min_points` (2) points. Three changes made
 the default together in 0.15.0: `tdf_min_points` 1, the support gate off (`gate_support_min`
 unset), and in `configs/examples/diapasef.json` `extract.presence_min_coelution` 1 (default
-2), keeping `gate_min_score` 0.6. The first two are reverted to their 0.14.0 defaults for
-memory (below) and are the low-input opt-in, set on top of the recipe:
+2), keeping `gate_min_score` 0.6. 0.15.1 reverted the first two to their 0.14.0 defaults for
+memory (below). The default since then is `tdf_min_points` 1 with the support gate kept
+(0.845 on spectra with 1/K0), and the gate off as well is the low-input opt-in, set on top of
+the recipe:
 
 ```json
-{"convert": {"tdf_min_points": 1}, "extract": {"gate_support_min": 0}}
+{"extract": {"gate_support_min": 0}}
 ```
 
-The recipe keeps `presence_min_coelution` 1. The "new" column below is the opt-in; the restored
-defaults with the recipe's presence rule were not measured on these sets.
+The recipe keeps `presence_min_coelution` 1. The "new" column below is the opt-in, measured
+before the reader default changed; the current default is compared with both at the end of this
+section.
 
 | set | main | new (seed range) | new vs main | % of DIA-NN, main -> new | wall, main -> new |
 |---|---:|---:|---:|---|---|
@@ -928,9 +932,29 @@ over the run, and four bulk runs (60-min a549 and k562 runs at a 378 GB process-
 5-min 50 ng Ultra 2 run at 271 GB, an MCF7 single-cell-spike run, and an HLA Ultra run whose
 extract footprint guard estimated 362 GiB at once and 2.7 TB over the run on a 264 GiB node).
 Against 0.14.0 the intermediates on diaPASEF were 0.7-3.7x as large and the wall about 3.2x as
-long (1.1-6x). Both keys are back at their 0.14.0 defaults. Which of the two, or their
-combination, causes the growth is not measured yet; until it is, use the opt-in on low-input
-runs and on a machine with memory to spare.
+long (1.1-6x). 0.15.1 put both keys back at their 0.14.0 defaults.
+
+Which key carries the memory was then measured on the fleet (0.15.1 engine with configuration
+patches; precursors per run at `run_psm_q` 1%, mean of three NN seeds, seed spread at most 1% on
+every set; process-tree peak). B0 is 0.15.1 (`tdf_min_points` 2, support gate 0.845), B2 is
+`tdf_min_points` 1 with the gate kept, the current default, and B1 is 0.15.0 (`tdf_min_points` 1,
+gate off), the low-input opt-in:
+
+| set | B0 | B2 | B1 | peak GB, B0 / B2 / B1 |
+|---|---:|---:|---:|---|
+| 200 pg HeLa, timsTOF Pro (6 runs) | 1,847 | 5,418 | 7,744 | 11 / 10 / 10 |
+| 250 pg HYE, Ultra 5-min (18 runs) | 4,775 | 8,828 | 10,146 | 12 / 19 / 87 |
+| 1 ng HeLa/E. coli, Pro 2 (27 runs) | 7,154 | 16,279 | 21,128 | 12 / 18 / 70 |
+| ProteoBench HYE (6 runs) | 90,702 | 91,826 | 96,966 | 36 / 66 / 107 |
+| E. coli Ultra 2 entrapment, real precursors | 16,139 | 16,333 | 16,553 | 38 / 38 / 38 |
+
+The entrapment FDP was 0.41-0.42% (B0), 0.43-0.47% (B2) and 0.42-0.44% (B1). B2 ran within about
+1.0-1.3x the wall of B0 on the low-input sets (17-31 min). The reader brings most of the
+low-input gain at a modest peak; turning the gate off adds the rest at four to five times the
+peak, so the gate, not the reader, carries the memory growth of 0.15.0. B0 and B1 gave 0
+identifications on the three blank runs of the 200 pg set. Open: the entrapment set is bulk, so
+no low-input set has an empirical null for B2; B2 on the single-cell plates, the 50 ng Ultra 2
+set and the blanks is being measured.
 
 The six single-cell failures were experiments of 25 to 71 cells, and what made their extract
 explode was the seed, not the reader alone. The seed's `(decoys + 1) / targets` needs 100
@@ -939,10 +963,14 @@ of the same library put at about half the precursors per cell of the plates that
 seed's anchors at 1% were 0 on most cells and 100 to 450 on the others. With fewer than
 `min_seed_for_calibration` anchors at the seed's cut there is no 1/K0 calibration, so a cell
 left on the fixed 120 s RT window had no 1/K0 window either (one such cell: 163 GiB of hits
-estimated), and a cell with fewer than two anchors had neither. `rt_im_train.fallback_windows
-= "library"` (opt-in, docs/08 section 4i) gives those cells the library's iRT range mapped onto
-the gradient and the library's 1/K0 plus or minus 0.07; `"refuse"` stops a cell without RT
-anchors at `rt-im-train`.
+estimated), and a cell with fewer than two anchors had neither. `rt_im_train.fallback_windows`
+(docs/08 section 4i) defaults to `auto`, which on spectra with 1/K0 is `library`: those cells
+get the library's iRT range mapped onto the gradient and the library's 1/K0 plus or minus 0.07.
+On whole single-cell plates on the 0.15.1 defaults (one NN seed) it held the precursors per run
+(52 cells 1,282 -> 1,352, 71 cells 1,454 -> 1,453, 13 cells 3,194 -> 3,219) and cut the
+process-tree peak from 193 to 48 GB and from 182 to 44 GB, and the wall from 203 to 74 and from
+234 to 88 minutes, on the two plates whose cells had no anchors. `"unbounded"` restores the
+whole-gradient search; `"refuse"` stops a cell without RT anchors at `rt-im-train`.
 
 ## 12. Closed levers
 
@@ -964,7 +992,7 @@ run unless marked.
 | `rt_im_train.rt_window_multiplier` 1.5 or 2.0 with retrace on | -1.8% (13,429), -2.9% (13,282), decoy fraction 0.99%; at 1.5 about 100 precursors came back inside the window and 373 more lost to a wrong peak inside it | `1c5b9a1` |
 | 1/K0 window narrowed to `apex_im` +/- delta | delta 0.008 -8.0%, 0.012 -1.4%, 0.020 +1.4% (seed 0); not recommended | `31cba11` |
 | `convert.tdf_mz_ppm 5` | +3.6%, but the seed fell to 615 anchors; superseded by the valley split | `31cba11` |
-| `tdf_min_points 1` | -17% (P1); for MS1 only +0.25% / -0.2%. Reopened on 2026-11-19: with the recipe's presence rule and no support gate it is +54% to +125% at low load, the low-input opt-in; the default in 0.15.0 only, reverted for memory (section 11, "Low input") | `76d57b6`, `31cba11` |
+| `tdf_min_points 1` | -17% (P1); for MS1 only +0.25% / -0.2%. Reopened on 2026-11-19: with the recipe's presence rule and no support gate it is +54% to +125% at low load, the default in 0.15.0, reverted for memory in 0.15.1, and the default again with the support gate kept (section 11, "Low input") | `76d57b6`, `31cba11` |
 | valley fraction and smoothing | m/z 0.3 -6.1%; smoothing 12 ppm -4.4%; m/z 0.7 +1.6%, nothing once the mobility split and count-once are on | `31cba11` |
 | refit widths as fitted, and fragment mass recalibration on identifications | -4.0%; 7.99 ppm -2.7%, 10.11 ppm -0.3% | `31cba11` |
 | `peak_claim = coelution_shadow`, contested-evidence features | -8.7%, -0.4% (seed 0) | `31cba11` |
@@ -1309,8 +1337,10 @@ previous behaviour, or to 0.82 for a smaller loss at less of the speed. It was o
 because the low-input sets of section 11 ("Low input") lost far more than these bulk sets: +26%
 precursors per run at 200 pg and +19% at 1 ng with it off, +6.1% at 50 ng on Ultra 2, one NN
 seed, other-species shares unchanged. It was restored because 10 of the 52 diaPASEF jobs of the
-0.15.0 benchmark sweep failed on memory with it off and `convert.tdf_min_points` 1 (section 11,
-"Low input"); 0 with `tdf_min_points` 1 is the low-input opt-in. It applies only under
+0.15.0 benchmark sweep failed on memory with it off and `convert.tdf_min_points` 1; with
+`tdf_min_points` 1 kept, turning it off took the process-tree peak from 18-19 GB to 70-87 GB
+on the 250 pg and 1 ng sets (section 11, "Low input"), so it stays on with the default reader,
+and 0 is the low-input opt-in. It applies only under
 `extract.gate_mode = window_mean` (the default), and on spectra without 1/K0 it stays off: the
 weights without the 1/K0 terms were fitted on the same diaPASEF runs and were not validated on
 an Orbitrap or Astral acquisition.

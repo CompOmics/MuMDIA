@@ -443,14 +443,19 @@ pub struct ConvertConfig {
     #[serde(skip_serializing_if = "is_default_tdf_im_gap_scans")]
     pub tdf_im_gap_scans: u32,
     /// Native diaPASEF reader: a centroid built from fewer raw TOF x scan points than this
-    /// is dropped. Default 2. Provisional, as `tdf_im_gap_scans`.
+    /// is dropped. Default 1 (2 in 0.14.0 and 0.15.1): every centroid, including those of a
+    /// single ion event, which at low load is most of the real fragment signal.
     ///
-    /// 1 keeps every centroid, including those of a single ion event, which at low load is
-    /// most of the real fragment signal; with `extract.gate_support_min` 0 it is the low-input
-    /// opt-in (docs/35_diapasef.md section 11, "Low input"). The two were the default in
-    /// 0.15.0 and were reverted because 10 of 52 timsTOF diaPASEF benchmark jobs that 0.14.0
-    /// ran then failed on memory; which of the two keys caused that is not measured. Measured
-    /// for the opt-in with the diaPASEF recipe (`extract.gate_min_score` 0.6,
+    /// The default keeps the support gate (`extract.gate_support_min` 0.845 on 1/K0 spectra).
+    /// Measured against 2 with the gate kept, three NN seeds, precursors per run at
+    /// `run_psm_q` 1%: 200 pg HeLa 1,847 -> 5,418, 250 pg 5-min Ultra 4,775 -> 8,828, 1 ng
+    /// 7,154 -> 16,279, ProteoBench HYE 90,702 -> 91,826; E. coli entrapment 16,139 -> 16,333
+    /// real precursors at an FDP of 0.43-0.47% against 0.41-0.42%; process-tree peaks within
+    /// 19 GB on the low-input sets and 66 GB against 36 on ProteoBench HYE (docs/35_diapasef.md
+    /// section 11, "Low input"). 1 with `extract.gate_support_min` 0, as in 0.15.0, is the
+    /// low-input opt-in: more precursors again, but 10 of 52 timsTOF diaPASEF benchmark jobs
+    /// that 0.14.0 ran failed on memory under it. 2 restores 0.15.1. Measured
+    /// for that opt-in with the diaPASEF recipe (`extract.gate_min_score` 0.6,
     /// `presence_min_coelution` 1, no support gate), three NN seeds, precursors per run at
     /// `run_psm_q` 1% against 2: 200 pg HeLa 3,422 -> 7,689, 1 ng 12,542 -> 19,270, 250 pg
     /// Ultra 6,912 -> 9,544, 50 ng 5-min Ultra 2 35,710 -> 35,346; E. coli entrapment FDP 0.97%
@@ -538,7 +543,7 @@ impl Default for ConvertConfig {
             parallel_conversions: 4,
             tdf_mz_ppm: 10.0,
             tdf_im_gap_scans: 30,
-            tdf_min_points: 2,
+            tdf_min_points: 1,
             tdf_mz_valley: 0.0,
             tdf_mz_smooth_ppm: 8.0,
             tdf_im_valley: 0.0,
@@ -604,9 +609,12 @@ fn is_default_fallback_im_window(v: &f64) -> bool {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FallbackWindows {
+    /// `library` on a run whose spectra carry per-peak 1/K0 (its seed records `observed_im`),
+    /// `unbounded` otherwise, so a run without 1/K0 is unchanged. The default.
+    #[default]
+    Auto,
     /// Fewer than two RT anchors: every candidate is searched over the whole gradient; no
     /// 1/K0 calibration: no 1/K0 window. The behaviour before the key existed.
-    #[default]
     Unbounded,
     /// Bounded windows from the library: its iRT mapped onto the run's gradient, and on a
     /// run with 1/K0 its predicted 1/K0, each with a fixed half-width.
@@ -617,8 +625,27 @@ pub enum FallbackWindows {
 
 impl FallbackWindows {
     /// The default, omitted from the canonical configuration.
-    pub fn is_unbounded(&self) -> bool {
-        matches!(self, FallbackWindows::Unbounded)
+    pub fn is_auto(&self) -> bool {
+        matches!(self, FallbackWindows::Auto)
+    }
+
+    /// The value a run uses: `auto` is `library` on spectra with 1/K0, `unbounded` without.
+    pub fn resolve(self, has_im: bool) -> FallbackWindows {
+        match self {
+            FallbackWindows::Auto if has_im => FallbackWindows::Library,
+            FallbackWindows::Auto => FallbackWindows::Unbounded,
+            v => v,
+        }
+    }
+
+    /// The name the configuration spells it with.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FallbackWindows::Auto => "auto",
+            FallbackWindows::Unbounded => "unbounded",
+            FallbackWindows::Library => "library",
+            FallbackWindows::Refuse => "refuse",
+        }
     }
 }
 
@@ -1727,7 +1754,8 @@ pub struct RtImTrainConfig {
     /// Fallback fixed RT window in seconds when calibration cannot be fit.
     pub fallback_rt_window_s: f64,
     /// What a run gets when its seed leaves it without a calibration
-    /// (docs/08_rt_im_train.md section 4i). `unbounded` (the default): fewer than two RT
+    /// (docs/08_rt_im_train.md section 4i). `auto` (the default) is `library` on a run whose
+    /// spectra carry per-peak 1/K0 and `unbounded` otherwise. `unbounded`: fewer than two RT
     /// anchors search every candidate over the whole gradient, and a run with 1/K0 but no
     /// ion-mobility calibration has no 1/K0 window, as before the key existed. `library`:
     /// such a run is searched in bounded windows from the library instead. The RT window is
@@ -1739,13 +1767,16 @@ pub struct RtImTrainConfig {
     /// plus or minus `fallback_im_window`. Both are recorded in `cal.json`. `refuse`: a run
     /// with fewer than two RT anchors fails at `rt-im-train` rather than being searched over
     /// the whole gradient. Neither applies to a grouped run (`groups.window_groups > 1`),
-    /// whose unbounded windows `groups.allow_unbounded_rt` governs. Off by default because
-    /// a default that changes outputs needs entrapment and two acquisitions. Measured on 18
+    /// whose unbounded windows `groups.allow_unbounded_rt` governs. On by default on diaPASEF
+    /// only (after 0.15.1): on single-cell HeLa diaPASEF plates whose seed left most cells
+    /// without anchors it held precursors per run (1,282 -> 1,352 and 1,454 -> 1,453) and
+    /// took the process-tree peak from 193 to 48 GB and 182 to 44 GB, one NN seed; no
+    /// low-input entrapment set exists yet. Measured on 18
     /// calibrated single-cell diaPASEF runs: the confident anchors' residual to the map had
     /// a 99th percentile of 0.10-0.26 of the span, and their uncalibrated 1/K0 residual one
     /// of 0.054-0.081 (up to 0.145 on runs with 99-196 anchors). Omitted from the
     /// canonical configuration at its default.
-    #[serde(skip_serializing_if = "FallbackWindows::is_unbounded")]
+    #[serde(skip_serializing_if = "FallbackWindows::is_auto")]
     pub fallback_windows: FallbackWindows,
     /// Under `fallback_windows = library`: the RT half-width as a fraction of the seed's
     /// observed retention-time span (1st to 99th percentile). Default 0.25; in (0, 1].
@@ -2170,7 +2201,7 @@ impl Default for RtImTrainConfig {
             anchor_x_filter: false,
             composition_correction: true,
             fallback_rt_window_s: 120.0,
-            fallback_windows: FallbackWindows::Unbounded,
+            fallback_windows: FallbackWindows::Auto,
             fallback_rt_gradient_fraction: 0.25,
             fallback_im_window: 0.07,
             finetune_deeplc: false,
@@ -2581,9 +2612,11 @@ pub struct ExtractConfig {
     ///
     /// Unset (the default) is 0.845 on spectra that carry 1/K0 and off otherwise. It was off in
     /// 0.15.0 and was restored because, with `convert.tdf_min_points` 1 as well, 10 of 52
-    /// timsTOF diaPASEF benchmark jobs that 0.14.0 ran failed on memory; which of the two keys
-    /// caused that is not measured. 0, with `convert.tdf_min_points` 1, is the low-input
-    /// opt-in: on the 2026-11 low-input sets it was +26% precursors per run at 200 pg and +19%
+    /// timsTOF diaPASEF benchmark jobs that 0.14.0 ran failed on memory. With
+    /// `convert.tdf_min_points` 1 (the default after 0.15.1) the gate kept the process-tree
+    /// peak at 18-19 GB on the 250 pg and 1 ng sets, where turning it off took it to 70-87 GB,
+    /// so the gate, not the reader, carries the memory. 0 is the low-input opt-in: on the
+    /// 2026-11 low-input sets it was +26% precursors per run at 200 pg and +19%
     /// at 1 ng with the gate off, +6.1% on 50 ng 5-min Ultra 2 runs, other-species shares
     /// unchanged (one NN seed, docs/35_diapasef.md section 16). On the six
     /// ProteoBench HYE diaPASEF runs, 0.845 keeps 41% of the candidates the window-mean gate
@@ -8465,7 +8498,7 @@ mod tests {
         let canon = d.canonical_json();
         assert!(!canon.contains("tdf_"), "{canon}");
         let explicit = Config::from_json(
-            r#"{"convert":{"tdf_mz_ppm":10.0,"tdf_im_gap_scans":30,"tdf_min_points":2,
+            r#"{"convert":{"tdf_mz_ppm":10.0,"tdf_im_gap_scans":30,"tdf_min_points":1,
                 "tdf_mz_valley":0.0,"tdf_mz_smooth_ppm":8.0,"tdf_im_valley":0.0,
                 "tdf_im_smooth_scans":8.0}}"#,
         )
@@ -8478,8 +8511,8 @@ mod tests {
                 r#""tdf_im_gap_scans":20"#,
             ),
             (
-                r#"{"convert":{"tdf_min_points":3}}"#,
-                r#""tdf_min_points":3"#,
+                r#"{"convert":{"tdf_min_points":2}}"#,
+                r#""tdf_min_points":2"#,
             ),
             (
                 r#"{"convert":{"tdf_mz_valley":0.7}}"#,
@@ -10211,20 +10244,43 @@ mod tests {
     /// `rt_im_train.fallback_windows` and its two widths are omitted from the canonical
     /// configuration at their defaults, so the config hash of every configuration that does not
     /// set them is unchanged; a set value is part of the identity, and bad widths are refused.
+    /// The default `auto` is `library` on spectra with 1/K0 and `unbounded` without, so a 3D
+    /// run keeps the behaviour (and the canonical configuration) it had before the key.
     #[test]
-    fn fallback_windows_default_off_and_leave_the_default_config_hash_alone() {
+    fn fallback_windows_default_auto_and_leave_the_default_config_hash_alone() {
         let d = Config::default();
-        assert_eq!(d.rt_im_train.fallback_windows, FallbackWindows::Unbounded);
+        assert_eq!(d.rt_im_train.fallback_windows, FallbackWindows::Auto);
+        assert_eq!(
+            d.rt_im_train.fallback_windows.resolve(true),
+            FallbackWindows::Library
+        );
+        assert_eq!(
+            d.rt_im_train.fallback_windows.resolve(false),
+            FallbackWindows::Unbounded
+        );
+        for v in [
+            FallbackWindows::Unbounded,
+            FallbackWindows::Library,
+            FallbackWindows::Refuse,
+        ] {
+            assert_eq!(v.resolve(true), v);
+            assert_eq!(v.resolve(false), v);
+        }
         let canon = d.canonical_json();
         assert!(!canon.contains("fallback_windows"), "{canon}");
         assert!(!canon.contains("fallback_rt_gradient_fraction"), "{canon}");
         assert!(!canon.contains("fallback_im_window"), "{canon}");
         let explicit = Config::from_json(
-            r#"{"rt_im_train":{"fallback_windows":"unbounded",
+            r#"{"rt_im_train":{"fallback_windows":"auto",
                 "fallback_rt_gradient_fraction":0.25,"fallback_im_window":0.07}}"#,
         )
         .unwrap();
         assert_eq!(explicit.canonical_json(), canon);
+        let unbounded =
+            Config::from_json(r#"{"rt_im_train":{"fallback_windows":"unbounded"}}"#).unwrap();
+        let c = unbounded.canonical_json();
+        assert!(c.contains(r#""fallback_windows":"unbounded""#), "{c}");
+        assert_eq!(Config::from_json(&c).unwrap().canonical_json(), c);
         let on = Config::from_json(
             r#"{"rt_im_train":{"fallback_windows":"library","fallback_im_window":0.1}}"#,
         )

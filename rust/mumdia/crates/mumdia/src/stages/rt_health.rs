@@ -232,7 +232,7 @@ fn status_phrase(gap: &RtCalibrationGap) -> &'static str {
         "no retention-time calibration: every candidate is extracted over the whole gradient"
     } else if gap.calibration_status == FALLBACK_LIBRARY_STATUS {
         "no retention-time calibration: candidates are extracted in the library-range fallback \
-         window (rt_im_train.fallback_windows = library)"
+         window (rt_im_train.fallback_windows = library, which auto is on spectra with 1/K0)"
     } else {
         "too few anchors for a calibrated window: candidates are extracted in the broad \
          fallback window (rt_im_train.fallback_rt_window_s)"

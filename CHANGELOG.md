@@ -239,8 +239,9 @@ than a number. Both are recorded in every run's `manifest.json`.
 ### Added
 
 - **`rt_im_train.fallback_windows`: bounded windows for a run whose seed found no anchors
-  (opt-in; docs/08 section 4i, docs/17 "Seed: no confident targets").** The default
-  `unbounded` keeps every artifact byte for byte. `library` gives a run with fewer than two RT
+  (docs/08 section 4i, docs/17 "Seed: no confident targets").** `unbounded` keeps every
+  artifact byte for byte as before the key; the default is `auto` (see "Changed"). `library`
+  gives a run with fewer than two RT
   anchors the library's iRT range (1st-99th percentile) mapped linearly onto the seed's
   observed RT range, with a half-width of `fallback_rt_gradient_fraction` (0.25) of that span
   (`calibration_status` `fallback_library`, `cal.json` `rt_fallback`), and a run with 1/K0 but
@@ -251,6 +252,33 @@ than a number. Both are recorded in every run's `manifest.json`.
   targets above the first decoy for one anchor at 1%, and on plates with about half the
   peptides per cell of those that worked most cells had 0 anchors (the rest 100-450), so they
   had no 1/K0 calibration and, below two anchors, no RT window.
+
+### Changed
+
+- **diaPASEF: `convert.tdf_min_points` defaults to 1, with `extract.gate_support_min` kept at
+  0.845 on spectra that carry 1/K0 (docs/35 sections 2, 11 "Low input" and 16).** The native
+  Bruker reader keeps single-ion centroids again; the support gate stays on. Fleet, 0.15.1
+  engine with configuration patches, precursors per run at `run_psm_q` 1%, mean of three NN
+  seeds (spread at most 1%), process-tree peak, 0.15.1 against this default against 0.15.0
+  (gate off as well): 200 pg HeLa on a timsTOF Pro 1,847 / 5,418 / 7,744 (11 / 10 / 10 GB),
+  250 pg HYE 5-min Ultra 4,775 / 8,828 / 10,146 (12 / 19 / 87 GB), 1 ng HeLa/E. coli Pro 2
+  7,154 / 16,279 / 21,128 (12 / 18 / 70 GB), ProteoBench diaPASEF HYE 90,702 / 91,826 / 96,966
+  (36 / 66 / 107 GB); E. coli Ultra 2 entrapment 16,139 / 16,333 / 16,553 real precursors at
+  an FDP of 0.41-0.42% / 0.43-0.47% / 0.42-0.44% (38 GB each). Wall within about 1.0-1.3x of
+  0.15.1 on the low-input sets. The gate, not the reader, carried the memory growth of 0.15.0;
+  `extract.gate_support_min: 0` remains the low-input opt-in and `convert.tdf_min_points: 2`
+  restores 0.15.1. No low-input set has an entrapment null yet. A search without 1/K0 is
+  unaffected, and the config hash of a configuration that does not set the key is unchanged.
+- **`rt_im_train.fallback_windows` defaults to `auto`: `library` on spectra that carry per-peak
+  1/K0, `unbounded` otherwise (docs/08 section 4i).** A diaPASEF run whose seed leaves it
+  without an RT or 1/K0 calibration is searched in the library's windows instead of over the
+  whole gradient. Whole single-cell HeLa diaPASEF plates on the 0.15.1 defaults, one NN seed,
+  precursors per run at `run_psm_q` 1% / process-tree peak / wall, `unbounded` against
+  `library`: 52 cells 1,282 / 193 GB / 203 min against 1,352 / 48 GB / 74 min, 71 cells 1,454 /
+  182 GB / 234 min against 1,453 / 44 GB / 88 min, 13 cells 3,194 / 10 GB against 3,219 / 10
+  GB. `cal.json` `rt_fallback.fallback_windows` records the setting that resolved to the
+  library window. A run without 1/K0 is byte-identical, and the key stays out of the canonical
+  configuration at `auto`; the explicit `unbounded`, `library` and `refuse` behave as before.
 
 ## [0.15.1] - 2026-11-26
 
