@@ -49,6 +49,9 @@ pub struct TdfParams {
     pub im_smooth_scans: f64,
     /// Remove MS1 noise before centroiding (`convert.tdf_ms1_denoise`, `ms1_denoise::Ms1Denoise`).
     pub ms1_denoise: bool,
+    /// Keep the MS2 centroids below `min_points` apart instead of dropping them
+    /// (`convert.tdf_single_ion = flagged`, spectra_ms2 v4).
+    pub single_ion: bool,
 }
 
 impl TdfParams {
@@ -62,6 +65,7 @@ impl TdfParams {
             im_valley: c.tdf_im_valley,
             im_smooth_scans: c.tdf_im_smooth_scans,
             ms1_denoise: c.tdf_ms1_denoise,
+            single_ion: !c.tdf_single_ion.is_drop(),
         }
     }
 
@@ -77,9 +81,12 @@ impl TdfParams {
             "tdf_im_smooth_scans": self.im_smooth_scans,
         });
         // Only when on, so a report at the default is what it was.
-        if self.ms1_denoise {
-            if let Some(o) = v.as_object_mut() {
+        if let Some(o) = v.as_object_mut() {
+            if self.ms1_denoise {
                 o.insert("tdf_ms1_denoise".into(), serde_json::json!(true));
+            }
+            if self.single_ion {
+                o.insert("tdf_single_ion".into(), serde_json::json!("flagged"));
             }
         }
         v
@@ -429,12 +436,15 @@ impl TofMzCalibration {
     }
 }
 
-/// One centroided spectrum: m/z-sorted peaks with a per-peak 1/K0.
+/// One centroided spectrum: m/z-sorted peaks with a per-peak 1/K0, and under
+/// `TdfParams::single_ion` the clusters below `min_points` apart, in the same form.
 #[derive(Debug, Default, PartialEq)]
 struct Centroids {
     mz: Vec<f32>,
     inten: Vec<f32>,
     im: Vec<f32>,
+    /// `[mz, intensity, im]` of the clusters below `min_points`; empty unless kept.
+    single: [Vec<f32>; 3],
 }
 
 /// Centroid raw `(tof_index, scan, intensity)` points in m/z x mobility.
@@ -443,7 +453,8 @@ struct Centroids {
 /// neighbour is within `mz_ppm` of the previous one. Each trace is then ordered by scan
 /// and split where two consecutive points are more than `im_gap_scans` scans apart. A
 /// cluster yields its summed intensity and its intensity-weighted m/z and 1/K0, and is
-/// dropped when it holds fewer than `min_points` raw points.
+/// dropped when it holds fewer than `min_points` raw points, or under `single_ion` kept in
+/// [`Centroids::single`].
 ///
 /// With `mz_valley` > 0, each such cluster is further cut at the valleys of its m/z
 /// profile, and with `im_valley` > 0 each resulting piece at the valleys of its mobility
@@ -460,8 +471,9 @@ fn centroid_2d(
 ) -> Centroids {
     // Total order on the full tuple, so the result does not depend on the input order.
     pts.sort_unstable();
-    let emit = |c: &[(u32, u32, u32)], peaks: &mut Vec<(f64, f32, f32)>| {
-        if c.len() < p.min_points as usize {
+    let emit = |c: &[(u32, u32, u32)], peaks: &mut Vec<(f64, f32, f32, bool)>| {
+        let below = c.len() < p.min_points as usize;
+        if below && !p.single_ion {
             return;
         }
         let (mut w, mut wm, mut ws) = (0.0f64, 0.0f64, 0.0f64);
@@ -472,11 +484,11 @@ fn centroid_2d(
             ws += x * s as f64;
         }
         if w > 0.0 {
-            peaks.push((wm / w, w as f32, im_of(ws / w) as f32));
+            peaks.push((wm / w, w as f32, im_of(ws / w) as f32, below));
         }
     };
     // Mobility valley split of one piece, then emit.
-    let im_split = |c: &mut [(u32, u32, u32)], peaks: &mut Vec<(f64, f32, f32)>| {
+    let im_split = |c: &mut [(u32, u32, u32)], peaks: &mut Vec<(f64, f32, f32, bool)>| {
         if p.im_valley <= 0.0 {
             return emit(c, peaks);
         }
@@ -488,7 +500,7 @@ fn centroid_2d(
             a = b;
         }
     };
-    let mut peaks: Vec<(f64, f32, f32)> = Vec::new();
+    let mut peaks: Vec<(f64, f32, f32, bool)> = Vec::new();
     let mut i = 0;
     while i < pts.len() {
         let mut j = i + 1;
@@ -532,10 +544,20 @@ fn centroid_2d(
         i = j;
     }
     peaks.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.2.total_cmp(&b.2)));
+    let (single, kept): (Vec<_>, Vec<_>) = peaks.into_iter().partition(|p| p.3);
+    let cols = |v: &[(f64, f32, f32, bool)]| -> [Vec<f32>; 3] {
+        [
+            v.iter().map(|p| p.0 as f32).collect(),
+            v.iter().map(|p| p.1).collect(),
+            v.iter().map(|p| p.2).collect(),
+        ]
+    };
+    let [mz, inten, im] = cols(&kept);
     Centroids {
-        mz: peaks.iter().map(|p| p.0 as f32).collect(),
-        inten: peaks.iter().map(|p| p.1).collect(),
-        im: peaks.iter().map(|p| p.2).collect(),
+        mz,
+        inten,
+        im,
+        single: cols(&single),
     }
 }
 
@@ -605,7 +627,8 @@ fn valley_cuts(
 ///
 /// The selection is the one the mzML path uses ([`top_n_by_intensity`]: intensity
 /// descending, the lower index on ties). The kept peaks then return to index order, which
-/// is m/z order here because [`centroid_2d`] emits them sorted.
+/// is m/z order here because [`centroid_2d`] emits them sorted. [`Centroids::single`] is not
+/// capped.
 fn cap(c: Centroids, top: usize) -> Centroids {
     if top == 0 || c.mz.len() <= top {
         return c;
@@ -616,6 +639,7 @@ fn cap(c: Centroids, top: usize) -> Centroids {
         mz: idx.iter().map(|&k| c.mz[k]).collect(),
         inten: idx.iter().map(|&k| c.inten[k]).collect(),
         im: idx.iter().map(|&k| c.im[k]).collect(),
+        single: c.single,
     }
 }
 
@@ -639,6 +663,7 @@ impl Ctx {
         scans: std::ops::Range<usize>,
         top: usize,
         denoise: Option<&Ms1Denoise>,
+        single_ion: bool,
     ) -> Centroids {
         let n_scans = f.scan_offsets.len().saturating_sub(1);
         let scans = scans.start.min(n_scans)..scans.end.min(n_scans);
@@ -656,7 +681,11 @@ impl Ctx {
         }
         // Raw detector counts: `intensity_correction_factor` (accumulation-time
         // normalisation) is ignored, which is exact while frames share one ramp time.
-        let c = centroid_2d(&mut pts, |t| self.mz.mz_u32(t), |s| self.im.im(s), &self.p);
+        let p = TdfParams {
+            single_ion,
+            ..self.p
+        };
+        let c = centroid_2d(&mut pts, |t| self.mz.mz_u32(t), |s| self.im.im(s), &p);
         cap(c, top)
     }
 
@@ -670,7 +699,7 @@ impl Ctx {
         }
         match f.ms_level {
             MSLevel::MS1 => {
-                let c = self.spectrum(f, 0..usize::MAX, self.top_ms1, self.ms1.as_ref());
+                let c = self.spectrum(f, 0..usize::MAX, self.top_ms1, self.ms1.as_ref(), false);
                 vec![Decoded::Ms1 {
                     rt_s,
                     mz: c.mz,
@@ -684,7 +713,7 @@ impl Ctx {
                 (0..q.len())
                     .map(|k| {
                         let (s0, s1) = (q.scan_starts[k], q.scan_ends[k]);
-                        let c = self.spectrum(f, s0..s1, self.top_ms2, None);
+                        let c = self.spectrum(f, s0..s1, self.top_ms2, None, self.p.single_ion);
                         let (a, b) = (self.im.im(s0 as f64), self.im.im(s1 as f64));
                         let half = q.isolation_width[k] / 2.0;
                         let target = q.isolation_mz[k];
@@ -700,6 +729,7 @@ impl Ctx {
                             pmz: Some(target),
                             pz: None,
                             im: Some(c.im),
+                            single: self.p.single_ion.then_some(c.single),
                             im_lo: Some(a.min(b) as f32),
                             im_hi: Some(a.max(b) as f32),
                             target_only: None,
@@ -924,6 +954,7 @@ mod tests {
         im_valley: 0.0,
         im_smooth_scans: 4.0,
         ms1_denoise: false,
+        single_ion: false,
     };
     const V: TdfParams = TdfParams {
         mz_valley: 0.5,
@@ -1033,6 +1064,8 @@ mod tests {
         assert_eq!((d.mz_ppm, d.im_gap_scans, d.min_points), (10.0, 30, 2));
         assert_eq!((d.mz_valley, d.im_valley), (0.0, 0.0));
         assert_eq!((d.mz_smooth_ppm, d.im_smooth_scans), (8.0, 8.0));
+        assert!(!d.single_ion, "single-ion centroids are dropped by default");
+        assert!(d.report_params().get("tdf_single_ion").is_none());
     }
 
     #[test]
@@ -1069,6 +1102,41 @@ mod tests {
         assert_eq!(c.inten, vec![2.0, 2.0]);
         let all = run(&[(5000, 10, 9)], &TdfParams { min_points: 1, ..P });
         assert_eq!(all.inten, vec![9.0]);
+        assert!(
+            c.single.iter().all(|v| v.is_empty()),
+            "dropped, not kept apart"
+        );
+    }
+
+    /// `convert.tdf_single_ion = flagged`: the peaks of at least `min_points` points are the
+    /// ones `drop` writes, and each cluster below the floor is kept apart with its own m/z,
+    /// intensity and 1/K0, in m/z order.
+    #[test]
+    fn flagged_keeps_the_clusters_below_the_floor_apart() {
+        let pts = [
+            (1000, 10, 1),
+            (1000, 11, 1),
+            (1100, 10, 1),
+            (1101, 10, 1),
+            (5000, 40, 9),
+            (3000, 20, 4),
+        ];
+        let drop = run(&pts, &P);
+        let flagged = run(
+            &pts,
+            &TdfParams {
+                single_ion: true,
+                ..P
+            },
+        );
+        assert_eq!(
+            (&flagged.mz, &flagged.inten, &flagged.im),
+            (&drop.mz, &drop.inten, &drop.im)
+        );
+        let [mz, inten, im] = &flagged.single;
+        assert_eq!(mz, &vec![503.0f32, 505.0]);
+        assert_eq!(inten, &vec![4.0, 9.0]);
+        assert_eq!(im, &vec![20.0, 40.0]);
     }
 
     #[test]
@@ -1217,6 +1285,7 @@ mod tests {
             mz: vec![1.0, 2.0, 3.0],
             inten: vec![5.0, 1.0, 9.0],
             im: vec![0.7, 0.8, 0.9],
+            single: Default::default(),
         };
         let k = cap(c, 2);
         assert_eq!(k.mz, vec![1.0, 3.0]);
@@ -1226,6 +1295,7 @@ mod tests {
             mz: vec![1.0, 2.0, 3.0],
             inten: vec![4.0, 4.0, 4.0],
             im: vec![0.7, 0.8, 0.9],
+            single: Default::default(),
         };
         assert_eq!(cap(t, 2).mz, vec![1.0, 2.0]);
     }

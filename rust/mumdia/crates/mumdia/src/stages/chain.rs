@@ -448,6 +448,9 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
         chrom.clone()
     };
     info!(stage = %"extract", "run: stage start");
+    // Extract decodes a spectra_ms2 v4 itself, with the single-ion centroids the seed's
+    // decode leaves out, so the seed's copy is freed rather than held beside it.
+    let lent_ms2 = lent_ms2.filter(|_| !crate::spectra::has_single_ion(&co.ms2));
     let mut ext_cfg =
         crate::stages::ms1cal::extract_cfg(&cfg.extract, seed, &co.ms1, cfg.rt_im_train.q_train)?;
     // The ZT Scan keys: the per-fragment Q1 decision and the Q1-deconvolved evidence read the

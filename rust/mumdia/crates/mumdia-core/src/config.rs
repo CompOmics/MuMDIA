@@ -460,6 +460,13 @@ pub struct ConvertConfig {
     /// rule.
     #[serde(skip_serializing_if = "is_default_tdf_min_points")]
     pub tdf_min_points: u32,
+    /// Native diaPASEF reader: what becomes of an MS2 centroid of fewer than `tdf_min_points`
+    /// raw points (at the default 2, a single ion event). See [`TdfSingleIon`]. Default
+    /// `drop`. `flagged` needs `tdf_min_points` of at least 2. Opt-in (docs/35_diapasef.md
+    /// section 11, "Single-ion peaks at match time"); omitted from the canonical configuration
+    /// at its default.
+    #[serde(skip_serializing_if = "TdfSingleIon::is_drop")]
+    pub tdf_single_ion: TdfSingleIon,
     /// Native diaPASEF reader: split each m/z x mobility cluster at the valleys of its
     /// m/z profile. A local minimum of the smoothed profile is a cut when it is below this
     /// fraction of the smaller of the two humps beside it, so one ion stays one centroid and
@@ -539,6 +546,7 @@ impl Default for ConvertConfig {
             tdf_mz_ppm: 10.0,
             tdf_im_gap_scans: 30,
             tdf_min_points: 2,
+            tdf_single_ion: TdfSingleIon::Drop,
             tdf_mz_valley: 0.0,
             tdf_mz_smooth_ppm: 8.0,
             tdf_im_valley: 0.0,
@@ -614,6 +622,31 @@ pub enum ImWindowSizing {
     /// The default since 2026-10-22; without 1/K0 in the spectra it does nothing.
     #[default]
     SeedDecoyCorrected,
+}
+
+/// `convert.tdf_single_ion`: the native diaPASEF reader's MS2 centroids below
+/// `tdf_min_points`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TdfSingleIon {
+    /// Dropped, as every MS1 and MS2 centroid below `tdf_min_points` is.
+    #[default]
+    Drop,
+    /// Kept in separate lists of `spectra_ms2` (v4: `single_ion_mz`, `single_ion_intensity`,
+    /// `single_ion_im`), which only extract reads. Extract matches such a peak to a candidate
+    /// only when its 1/K0 lies inside the candidate's calibrated 1/K0 window, whatever
+    /// `extract.im_gate` is, and never to a candidate without one; the other peaks are matched
+    /// as before. A fragment of a real precursor shares its 1/K0, while single-ion noise is
+    /// spread over the slot's whole mobility range. The seed and every other reader of the
+    /// spectra see what `drop` writes. MS1 centroids are dropped as under `drop`.
+    Flagged,
+}
+
+impl TdfSingleIon {
+    /// Whether this is the default, which the canonical configuration omits.
+    pub fn is_drop(&self) -> bool {
+        matches!(self, TdfSingleIon::Drop)
+    }
 }
 
 // The `convert.tdf_*` keys at their defaults, which the canonical configuration omits.
@@ -1473,6 +1506,11 @@ fn is_false(v: &bool) -> bool {
 /// A `true` flag, which the canonical configuration omits for a key whose default is on.
 fn is_true(v: &bool) -> bool {
     *v
+}
+
+/// A factor left at 1, which the canonical configuration omits.
+fn is_one(v: &f64) -> bool {
+    *v == 1.0
 }
 
 /// A number left at 0 ("off"), which the canonical configuration omits for keys added
@@ -2540,6 +2578,12 @@ pub struct ExtractConfig {
     /// default.
     #[serde(skip_serializing_if = "ImGate::is_off")]
     pub im_gate: ImGate,
+    /// The share of a candidate's 1/K0 window, about its centre, inside which a single-ion
+    /// centroid (`convert.tdf_single_ion = flagged`) is matched to the candidate. In (0, 1];
+    /// default 1, the whole window. Inert without single-ion centroids. Omitted from the
+    /// canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_one")]
+    pub single_ion_im_scale: f64,
 }
 
 /// `extract.im_gate`: whether fragment peaks are matched only inside a candidate's 1/K0
@@ -2815,6 +2859,7 @@ impl Default for ExtractConfig {
             gate_rt_weight: 0.2,             // used only by GateMode::WindowMean
             gate_support_min: None,          // 0.845 on 1/K0 spectra, off otherwise
             im_gate: ImGate::Off,
+            single_ion_im_scale: 1.0,
         }
     }
 }
@@ -6390,6 +6435,19 @@ impl Config {
                 "convert.tdf_mz_ppm must be finite and > 0, and convert.tdf_min_points >= 1".into(),
             ));
         }
+        let si = self.extract.single_ion_im_scale;
+        if !(si > 0.0 && si <= 1.0) {
+            return Err(Invalid(format!(
+                "extract.single_ion_im_scale must be in (0, 1] (got {si})"
+            )));
+        }
+        if !cv.tdf_single_ion.is_drop() && cv.tdf_min_points < 2 {
+            return Err(Invalid(
+                "convert.tdf_single_ion = flagged keeps the centroids below \
+                 convert.tdf_min_points apart, and at 1 there are none; set tdf_min_points to 2"
+                    .into(),
+            ));
+        }
         // What each key of the ZT Scan analysis reads (`validate_ztscan`), checked again
         // once `"auto"` is resolved.
         self.validate_ztscan()?;
@@ -8388,7 +8446,7 @@ mod tests {
         assert!(!canon.contains("tdf_"), "{canon}");
         let explicit = Config::from_json(
             r#"{"convert":{"tdf_mz_ppm":10.0,"tdf_im_gap_scans":30,"tdf_min_points":2,
-                "tdf_mz_valley":0.0,"tdf_mz_smooth_ppm":8.0,"tdf_im_valley":0.0,
+                "tdf_single_ion":"drop","tdf_mz_valley":0.0,"tdf_mz_smooth_ppm":8.0,"tdf_im_valley":0.0,
                 "tdf_im_smooth_scans":8.0}}"#,
         )
         .unwrap();
@@ -8402,6 +8460,14 @@ mod tests {
             (
                 r#"{"convert":{"tdf_min_points":3}}"#,
                 r#""tdf_min_points":3"#,
+            ),
+            (
+                r#"{"convert":{"tdf_single_ion":"flagged"}}"#,
+                r#""tdf_single_ion":"flagged""#,
+            ),
+            (
+                r#"{"extract":{"single_ion_im_scale":0.5}}"#,
+                r#""single_ion_im_scale":0.5"#,
             ),
             (
                 r#"{"convert":{"tdf_mz_valley":0.7}}"#,
@@ -8429,6 +8495,9 @@ mod tests {
             r#"{"convert":{"tdf_mz_smooth_ppm":-1.0}}"#,
             r#"{"convert":{"tdf_mz_ppm":0.0}}"#,
             r#"{"convert":{"tdf_min_points":0}}"#,
+            r#"{"convert":{"tdf_min_points":1,"tdf_single_ion":"flagged"}}"#,
+            r#"{"extract":{"single_ion_im_scale":0.0}}"#,
+            r#"{"extract":{"single_ion_im_scale":1.5}}"#,
         ] {
             assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
         }

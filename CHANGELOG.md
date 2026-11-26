@@ -256,6 +256,24 @@ than a number. Both are recorded in every run's `manifest.json`.
   prefilter's best-column fallback stays. A diaPASEF search read natively from a Bruker `.d`
   finds and quantifies differently from 0.15.0; a search without 1/K0 is unaffected.
 
+### Added
+
+- **diaPASEF: single-ion centroids kept apart and matched inside the 1/K0 window
+  (`convert.tdf_single_ion = flagged`, `extract.single_ion_im_scale`; opt-in, docs/35 section 11,
+  "Single-ion peaks at match time").** The native reader writes the MS2 centroids below
+  `tdf_min_points` to three lists of their own (spectra_ms2 v4: `single_ion_mz`,
+  `single_ion_intensity`, `single_ion_im`); only extract reads them, and matches such a peak to a
+  candidate only inside the candidate's calibrated 1/K0 window (or its central share
+  `single_ion_im_scale`), whatever `extract.im_gate` is, and never to a candidate without one. The
+  seed and every other reader see the default spectra. One NN seed, with `gate_support_min` 0: 200
+  pg HeLa 7,611 precursors per run against 7,713 for `tdf_min_points` 1 and 1,854 for the default,
+  at the same 0.98% decoy fraction; a 5-min 50 ng Ultra 2 run 32,236 against 32,029 and 30,873.
+  It does not reduce memory under the diaPASEF recipe, which already gates every peak by 1/K0
+  (`im_gate = fragments`): the compete pool and the process-tree peak are those of
+  `tdf_min_points` 1, and on the bulk run the support gate, not the single-ion peaks, doubles the
+  pool. Both keys are omitted from the canonical configuration at their defaults, so every other
+  search, 3D or diaPASEF, is byte-identical.
+
 ### Fixed
 
 - **Native Thermo reading of a `.raw` whose metadata names no instrument model (#378, docs/04,

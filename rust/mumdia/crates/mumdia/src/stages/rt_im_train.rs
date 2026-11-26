@@ -530,6 +530,42 @@ impl RtWindows {
         self.im_lo.is_some()
     }
 
+    /// Whether candidate `c` has a bounded 1/K0 window, which a single-ion centroid needs
+    /// to be matched (`convert.tdf_single_ion`).
+    #[inline]
+    pub(crate) fn has_im_window(&self, c: usize) -> bool {
+        match (&self.im_lo, &self.im_hi) {
+            (Some(lo), Some(hi)) => lo[c].is_finite() && hi[c].is_finite(),
+            _ => false,
+        }
+    }
+
+    /// Whether candidate `c` may take a single-ion centroid (`convert.tdf_single_ion`) at
+    /// retention time `rt` and 1/K0 `im`: the RT window widened by `pad`, and a 1/K0 inside
+    /// the share `scale` of the candidate's 1/K0 window about its centre (1 is the window).
+    /// Never for a candidate without a bounded 1/K0 window, whatever `extract.im_gate` is.
+    #[inline]
+    pub(crate) fn admits_single_ion(
+        &self,
+        c: usize,
+        rt: f64,
+        im: f32,
+        pad: f64,
+        scale: f32,
+    ) -> bool {
+        if rt < self.rt_lo[c] - pad || rt > self.rt_hi[c] + pad || !self.has_im_window(c) {
+            return false;
+        }
+        let (Some(lo), Some(hi)) = (&self.im_lo, &self.im_hi) else {
+            return false;
+        };
+        let (l, h) = (lo[c], hi[c]);
+        if scale >= 1.0 {
+            return !(im < l || im > h);
+        }
+        (im - (l + h) / 2.0).abs() <= (h - l) / 2.0 * scale
+    }
+
     /// Why these windows are NOT the ones `extract` would read from `run_windows` for the
     /// `ncand`-candidate library at `library_precursors`, or `None` when they are: the same
     /// precursor table and the same `run_windows` path as the fit, and the same candidate
@@ -2814,6 +2850,21 @@ mod tests {
             "the RT test still applies"
         );
         assert!(kept.admits(2, 10.0, Some(5.0)), "unbounded in 1/K0");
+        // A single-ion centroid: the window, or its central share, and never a candidate
+        // without one or no 1/K0 window at all.
+        assert!(kept.admits_single_ion(0, 10.0, 0.915, 0.0, 1.0));
+        assert!(!kept.admits_single_ion(0, 10.0, 0.915, 0.0, 0.5));
+        assert!(kept.admits_single_ion(0, 10.0, 0.905, 0.0, 0.5));
+        assert!(!kept.admits_single_ion(0, 10.0, 0.95, 0.0, 1.0));
+        assert!(!kept.admits_single_ion(0, 20.0, 0.9, 0.0, 1.0));
+        assert!(
+            kept.admits_single_ion(0, 20.0, 0.9, 5.0, 1.0),
+            "the trace pad"
+        );
+        assert!(
+            !kept.admits_single_ion(2, 10.0, 0.9, 0.0, 1.0),
+            "no window, no match"
+        );
 
         // All null: no 1/K0 window in memory or read back.
         let nulls: Vec<Row> = vec![(0, None, None, None), (1, None, None, None)];
@@ -2824,6 +2875,7 @@ mod tests {
         assert_eq!(im_bits(&read), None);
         assert!(!read.has_im());
         assert!(read.admits(0, 10.0, Some(9.0)), "no window, no gate");
+        assert!(!read.admits_single_ion(0, 10.0, 0.9, 0.0, 1.0));
 
         // A NaN bound.
         let bad: Vec<Row> = vec![(1, Some(1.0), Some(f64::NAN), Some(1.1))];

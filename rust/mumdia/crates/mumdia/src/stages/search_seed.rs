@@ -1343,6 +1343,7 @@ mod peak_selection_tests {
                 })
                 .collect(),
             im: None,
+            single_ion: None,
         }
     }
 
@@ -1490,6 +1491,7 @@ mod chunk_tests {
                 window: window(in_a),
                 peaks,
                 im: None,
+                single_ion: None,
             });
         }
         let cfg = SearchSeedConfig {
@@ -1580,6 +1582,7 @@ mod widen_tests {
                     window,
                     peaks,
                     im: None,
+                    single_ion: None,
                 }
             })
             .collect();

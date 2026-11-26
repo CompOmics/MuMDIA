@@ -98,6 +98,14 @@ native reader.
   `convert.tdf_im_gap_scans` (30) scans apart; a cluster of fewer than `convert.tdf_min_points`
   (2) raw points is dropped. A peak is the cluster's summed intensity at its intensity-weighted
   m/z and 1/K0. The result does not depend on the input order.
+- **Single-ion centroids (opt-in).** Under `convert.tdf_single_ion = flagged` the MS2 clusters
+  below `tdf_min_points` (at the default 2, a single ion event) are not dropped but written to
+  three lists of their own in spectra_ms2 v4 (`single_ion_mz`, `single_ion_intensity`,
+  `single_ion_im`). `mz`, `intensity` and `im` stay what the default writes, so the seed and every
+  other reader see the default spectra; only extract merges the single-ion lists into its peaks,
+  and matches such a peak to a candidate only when its 1/K0 lies inside the candidate's
+  calibrated 1/K0 window (section 11, "Single-ion peaks at match time"). MS1 centroids are not
+  kept. Needs `tdf_min_points` of at least 2.
 - **Valley splits.** With `convert.tdf_mz_valley` above 0 a cluster is also cut at the valleys
   of its m/z profile, and with `convert.tdf_im_valley` above 0 each piece at the valleys of its
   mobility profile. One function (`valley_cuts`) serves both axes: the profile is smoothed with a
@@ -144,6 +152,7 @@ exact bytes.
 |---|---|
 | `spectra_ms1` | `im`: per-peak 1/K0 list, parallel to `mz` |
 | `spectra_ms2` | `window_im_lower`, `window_im_upper` (nullable f32, the slot's 1/K0 bounds); `im` per-peak list |
+| `spectra_ms2` v4 (`convert.tdf_single_ion = flagged` only) | v2 plus `single_ion_mz`, `single_ion_intensity`, `single_ion_im`: the centroids below `tdf_min_points`, m/z ascending |
 | `isolation_windows` | `im_lower`, `im_upper`: one row per slot, so slots that share an m/z range are separate rows. Provenance only; no stage reads them. |
 
 The spectra reports of a diaPASEF run add `params.reader = "timsrust"` and the seven
@@ -932,6 +941,55 @@ long (1.1-6x). Both keys are back at their 0.14.0 defaults. Which of the two, or
 combination, causes the growth is not measured yet; until it is, use the opt-in on low-input
 runs and on a machine with memory to spare.
 
+### Single-ion peaks at match time (2026-11, opt-in)
+
+`convert.tdf_single_ion = flagged` keeps the MS2 centroids below `tdf_min_points` in lists of
+their own (spectra_ms2 v4, section 2), and extract matches such a peak to a candidate only when
+its 1/K0 lies inside the candidate's calibrated 1/K0 window (`RtWindows::admits_single_ion`),
+whatever `extract.im_gate` is, and never to a candidate without a window. The idea: a fragment of
+a real precursor shares its 1/K0, while single-ion noise is spread over the slot's mobility range.
+`extract.single_ion_im_scale` (default 1) narrows that window for these peaks only, to its central
+share. Every other reader sees the default spectra, so the seed, its anchors and the calibrations
+are those of `tdf_min_points` 2.
+
+What it is not: a cure for the memory growth. The diaPASEF recipe sets `im_gate = fragments`, so
+under `tdf_min_points` 1 every single-ion peak was already matched inside the 1/K0 window; flagged
+mode changes the seed's input and the candidates without a window, not the matching. Measured with
+the sweep configuration (`admin/env/configs/tims_main.json`, the recipe without the library keys,
+imported PeptDeep/DeepLC/IM2Deep HYE library), one NN seed, engine 90cc1a9, on a shared host whose
+load stood at 2-2.5x its cores for most of the runs, so the wall times say little. Precursors per
+run at `run_psm_q` 1%, the decoy fraction of the accepted precursors, the summed compete pool of
+both passes and the process-tree peak:
+
+| arm | 200 pg HeLa, 6 runs: prec/run | decoys | pool | peak GB | 5-min 50 ng Ultra 2, 1 run: prec | decoys | pool | peak GB |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| A: default (`tdf_min_points` 2, support gate 0.845) | 1,854 | 0.15% | 30.0k | 11.1 | 30,873 | 0.99% | 5.84M | 10.9 |
+| A0: A with `gate_support_min` 0 | 2,347 | 0.18% | 59.3k | 9.6 | 32,106 | 1.00% | 12.28M | 18.5 |
+| B: `tdf_min_points` 1, `gate_support_min` 0 (0.15.0) | 7,713 | 0.98% | 2.85M | 10.2 | 32,029 | 1.00% | 14.41M | 20.9 |
+| C: `tdf_single_ion` flagged, `gate_support_min` 0 | 7,611 | 0.98% | 2.57M | 10.0 | 32,236 | 1.00% | 14.46M | 21.0 |
+| D: C with `single_ion_im_scale` 0.5 | 7,417 | 0.98% | 1.05M | 9.7 | 32,531 | 1.00% | 13.84M | 20.2 |
+| B2: `tdf_min_points` 1, support gate on | 5,351 | 0.97% | 218k | 10.2 | 30,200 | 1.00% | 7.59M | 15.4 |
+| E: `tdf_single_ion` flagged, support gate on | 5,202 | 0.89% | 186k | 9.6 | 30,355 | 0.99% | 7.67M | 15.5 |
+
+Read with one seed in mind:
+
+- At 200 pg flagged mode keeps the gain of `tdf_min_points` 1 (C 7,611 against B 7,713, -1.3%,
+  at the same decoy fraction), although its seed has the default's 462 confident peptides where B's
+  has 707. 98% of the MS2 centroids there are single ions (0.35M against 15M per run).
+- On the bulk run single-ion evidence adds nothing (C +0.4% and B -0.2% against A0); what moves the
+  count and the pool is the support gate (A0: +4.0% precursors at 2.1x the pool). The 5-min run
+  holds 180M single-ion centroids, and with the gate on they cost 1.7-2.2% (B2, E).
+- The pool, and with it the pooled rescore that ran the 0.15.0 sweep out of memory (128M PSMs for
+  18 such runs), grows mostly with the support gate: on the bulk run 2.1x from the gate (A0), a
+  further 1.18x from the single-ion peaks (C). At 200 pg the single-ion peaks dominate (A0 to C:
+  43x), but the pool is small there.
+- `single_ion_im_scale` 0.5 holds 41% of C's pool at 200 pg for -2.5% precursors (D); on the bulk
+  run it is +0.9% at 96% of C's pool, which one seed does not separate from C.
+- Flagged mode holds the merged scans in extract instead of the lent seed decode: on the bulk run
+  its largest process was 18.6 GB against B's 15.5 GB at the same tree peak.
+
+Not measured: entrapment, a second seed, the 1 ng and single-cell sets, a pooled bulk experiment.
+
 ## 12. Closed levers
 
 Measured and not kept. Commits are on the IM branch; seeds are `nn_torch` seeds on the E. coli
@@ -1096,6 +1154,11 @@ Measured on hippogriff (128 cores, 755 GB) on the six ProteoBench HYE diaPASEF r
 gradient, timsTOF SCP) at 120 threads, NN seed 0, with `MUMDIA_CACHE_DIR=off`, so both DeepLC
 calibrations of the first run start cold. Peaks are GNU `time` maximum RSS of the engine
 process unless named otherwise.
+
+Single-ion centroids (`tdf_min_points` 1 or `tdf_single_ion = flagged`) and the support gate set
+the size of the compete pool, which the pooled rescore pays for: on a 5-min 50 ng Ultra 2 run the
+gate off doubled it and the single-ion peaks added 18% on top (section 11, "Single-ion peaks at
+match time").
 
 ### Where it goes
 

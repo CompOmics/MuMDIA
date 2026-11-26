@@ -270,15 +270,16 @@ impl ConvertSchemas {
     /// The schemas a conversion writes: the v2 spectra and isolation windows when the
     /// source carries ion mobility, the v1 artifacts otherwise.
     pub fn for_source(has_im: bool) -> ConvertSchemas {
-        Self::for_conversion(has_im, false)
+        Self::for_conversion(has_im, false, false)
     }
 
     /// [`ConvertSchemas::for_source`], with spectra_ms2 v3 when the conversion recorded the
-    /// Q1 sweep of a scanning quadrupole (`q1`).
-    pub fn for_conversion(has_im: bool, q1: bool) -> ConvertSchemas {
+    /// Q1 sweep of a scanning quadrupole (`q1`), and v4 when the native diaPASEF reader kept
+    /// the single-ion centroids apart (`si`).
+    pub fn for_conversion(has_im: bool, q1: bool, si: bool) -> ConvertSchemas {
         ConvertSchemas {
             ms1: artifact::spectra_ms1(has_im),
-            ms2: artifact::spectra_ms2_q1(has_im, q1),
+            ms2: artifact::spectra_ms2_si(has_im, q1, si),
             isolation_windows: artifact::isolation_windows(has_im),
             ms2_to_ms1: artifact::MS2_TO_MS1,
         }
@@ -342,13 +343,18 @@ struct Ms2Chunk {
     /// The Q1 sweep of v3 ([`Q1Sweep`]), filled only while it is recorded.
     q1_cycle: Vec<u32>,
     q1_step: Vec<u32>,
+    /// `single_ion_mz`, `single_ion_intensity`, `single_ion_im` of v4, filled only under
+    /// `convert.tdf_single_ion = flagged`.
+    single: [Vec<Vec<f32>>; 3],
 }
 
 impl Ms2Chunk {
     /// The v1 columns, and for a source with ion mobility (`has_im`, fixed per run) the
     /// window 1/K0 bounds and the per-peak `im` list of v2, or under a recorded Q1 sweep
-    /// (`q1`, fixed per run) `q1_cycle` and `q1_step`, appended last (v3).
-    fn cols(&mut self, has_im: bool, q1: bool) -> Vec<Col> {
+    /// (`q1`, fixed per run) `q1_cycle` and `q1_step`, appended last (v3), or with the
+    /// single-ion centroids kept apart (`si`, fixed per run) their three lists, appended
+    /// last (v4).
+    fn cols(&mut self, has_im: bool, q1: bool, si: bool) -> Vec<Col> {
         let mut c = vec![
             Col::U32("scan_index".into(), std::mem::take(&mut self.idx)),
             Col::Str("id".into(), std::mem::take(&mut self.id)),
@@ -387,6 +393,11 @@ impl Ms2Chunk {
                 "q1_step".into(),
                 std::mem::take(&mut self.q1_step),
             ));
+        }
+        if si {
+            for (name, v) in crate::spectra::SINGLE_ION_COLS.iter().zip(&mut self.single) {
+                c.push(Col::LargeListF32((*name).into(), std::mem::take(v)));
+            }
         }
         c
     }
@@ -516,6 +527,9 @@ struct Ms2Row {
     pz: Option<i32>,
     /// Per-peak 1/K0 and the window's 1/K0 bounds; `None` for a 3D source.
     im: Option<Vec<f32>>,
+    /// `[mz, intensity, im]` of the centroids below `convert.tdf_min_points`, under
+    /// `convert.tdf_single_ion = flagged` only.
+    single: Option<[Vec<f32>; 3]>,
     im_lo: Option<f32>,
     im_hi: Option<f32>,
     /// The isolation window target of a spectrum that named one and no offsets, read
@@ -636,6 +650,7 @@ fn decode_one<S: SpectrumLike>(
                 pmz,
                 pz,
                 im: None,
+                single: None,
                 im_lo: None,
                 im_hi: None,
                 target_only,
@@ -974,6 +989,9 @@ struct Fold {
     /// The Q1 sweep of spectra_ms2 v3, recorded when the first MS2 spectrum was widened by
     /// `convert.isolation_half_width`.
     q1: Q1Sweep,
+    /// The single-ion lists of spectra_ms2 v4 are written (`convert.tdf_single_ion =
+    /// flagged` on a source with ion mobility); fixes the column set like `has_im`.
+    single_ion: bool,
 }
 
 impl Fold {
@@ -1001,7 +1019,14 @@ impl Fold {
             target_only: TargetOnly::default(),
             source: String::new(),
             q1: Q1Sweep::default(),
+            single_ion: false,
         }
+    }
+
+    /// Write the single-ion lists of spectra_ms2 v4; only a source with ion mobility has them.
+    fn with_single_ion(mut self, on: bool) -> Self {
+        self.single_ion = on && self.has_im;
+        self
     }
 
     /// The input path the refusal of a target-only file names.
@@ -1051,6 +1076,7 @@ impl Fold {
                     pmz,
                     pz,
                     im,
+                    single,
                     im_lo,
                     im_hi,
                     target_only,
@@ -1102,6 +1128,11 @@ impl Fold {
                     self.ms2.im_hi.push(im_hi);
                     self.ms2.im.push(im.unwrap_or_default());
                 }
+                if self.single_ion {
+                    for (col, v) in self.ms2.single.iter_mut().zip(single.unwrap_or_default()) {
+                        col.push(v);
+                    }
+                }
                 // The Q1 sweep (v3), on a source without 1/K0 whose first MS2 spectrum the
                 // half-width widened.
                 if !self.has_im && self.q1.decide(widened) {
@@ -1113,8 +1144,11 @@ impl Fold {
                 self.map_ms1
                     .push(self.last_ms1_index.map(|x| x as i32).unwrap_or(-1));
                 if self.ms2.idx.len() >= SPECTRA_CHUNK {
-                    self.ms2_w
-                        .write_cols(self.ms2.cols(self.has_im, self.q1.on()))?;
+                    self.ms2_w.write_cols(self.ms2.cols(
+                        self.has_im,
+                        self.q1.on(),
+                        self.single_ion,
+                    ))?;
                 }
             }
             Decoded::Other => {}
@@ -1759,7 +1793,9 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
     // not a reason to refuse a run, and a spectrum with no retention time cannot be placed
     // in a chromatogram. The "no MS2 spectra" bail below is the backstop for a file whose
     // retention times are ALL unusable.
-    let mut fold = Fold::new(&ms1_path, &ms2_path, native_tdf).with_source(p.mzml);
+    let mut fold = Fold::new(&ms1_path, &ms2_path, native_tdf)
+        .with_source(p.mzml)
+        .with_single_ion(p.tdf.single_ion);
 
     let read = match source {
         Source::Mzml(reader) => drive_mzml(*reader, declared, &p, force_threads, &mut fold)?,
@@ -1792,6 +1828,7 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
         first_bad_rt,
         target_only,
         q1,
+        single_ion,
         ..
     } = fold;
     // Target-only spectra (`Isolation::TargetOnly`) in a file shorter than the sample, or
@@ -1813,7 +1850,7 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
         );
     }
     ms1_w.write_cols(ms1.cols(native_tdf))?;
-    ms2_w.write_cols(ms2.cols(native_tdf, q1.on()))?;
+    ms2_w.write_cols(ms2.cols(native_tdf, q1.on(), single_ion))?;
 
     // A short read means the file ended before the index said it would. `--max-spectra`
     // truncates deliberately, so it is excluded.
@@ -1906,7 +1943,7 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
 
     let elapsed = t0.elapsed().as_millis();
     let n_iw = iw_written.rows;
-    let schemas = ConvertSchemas::for_conversion(native_tdf, q1.on());
+    let schemas = ConvertSchemas::for_conversion(native_tdf, q1.on(), single_ion);
     let mut params = json!({
         "mzml": p.mzml,
         "max_spectra": p.max_spectra,
@@ -2840,6 +2877,7 @@ mod tests {
                 pmz: Some(512.5),
                 pz: None,
                 im: Some(vec![lo, hi]),
+                single: None,
                 im_lo: Some(lo),
                 im_hi: Some(hi),
                 target_only: None,
@@ -2861,7 +2899,7 @@ mod tests {
             ..
         } = fold;
         ms1_w.write_cols(ms1.cols(true)).unwrap();
-        ms2_w.write_cols(ms2.cols(true, false)).unwrap();
+        ms2_w.write_cols(ms2.cols(true, false, false)).unwrap();
         ms1_w.close().unwrap();
         ms2_w.close().unwrap();
         let cols = mumdia_io::table::column_names(m2).unwrap();
@@ -2883,6 +2921,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// spectra_ms2 v4 (`convert.tdf_single_ion = flagged`): the single-ion centroids go to
+    /// their own three lists, which `load_ms2` does not read (it returns the v2 spectra) and
+    /// extract's `load_ms2_with` merges into the peaks in m/z order with a flag. A 3D source
+    /// never writes them.
+    #[test]
+    fn single_ion_centroids_round_trip_through_their_own_lists() {
+        let d = tmpdir("single_ion");
+        let (m1, m2) = (d.join("ms1.parquet"), d.join("ms2.parquet"));
+        let (m1, m2) = (m1.to_str().unwrap(), m2.to_str().unwrap());
+        let mut fold = Fold::new(m1, m2, true).with_single_ion(true);
+        assert!(!Fold::new(m1, m2, false).with_single_ion(true).single_ion);
+        let row = |single: Option<[Vec<f32>; 3]>| Ms2Row {
+            rt_s: 10.0,
+            id: "frame=2 slot=0".into(),
+            mz: vec![300.0, 400.0],
+            inten: vec![1.0, 2.0],
+            nonfinite_peaks: 0,
+            wt: 512.5,
+            wl: 500.0,
+            wu: 525.0,
+            pmz: Some(512.5),
+            pz: None,
+            im: Some(vec![0.7, 0.8]),
+            single,
+            im_lo: Some(0.6),
+            im_hi: Some(1.0),
+            target_only: None,
+            widened: false,
+        };
+        let single = [
+            vec![250.0, 350.0, 450.0],
+            vec![5.0, 6.0, 7.0],
+            vec![0.9, 0.95, 0.65],
+        ];
+        fold.absorb(0, Decoded::Ms2(Box::new(row(Some(single)))))
+            .unwrap();
+        fold.absorb(1, Decoded::Ms2(Box::new(row(None)))).unwrap();
+        let Fold {
+            mut ms1_w,
+            mut ms2_w,
+            mut ms1,
+            mut ms2,
+            ..
+        } = fold;
+        ms1_w.write_cols(ms1.cols(true)).unwrap();
+        ms2_w.write_cols(ms2.cols(true, false, true)).unwrap();
+        ms1_w.close().unwrap();
+        ms2_w.close().unwrap();
+        assert_eq!(
+            ConvertSchemas::for_conversion(true, false, true).ms2,
+            ("spectra_ms2", 4)
+        );
+        assert!(crate::spectra::has_single_ion(m2));
+        let plain = crate::spectra::load_ms2(m2).unwrap();
+        assert!(plain
+            .iter()
+            .all(|s| s.peaks.len() == 2 && s.single_ion.is_none()));
+        let merged = crate::spectra::load_ms2_with(m2, true).unwrap();
+        let s = &merged[0];
+        let mz: Vec<f32> = s.peaks.iter().map(|p| p.mz).collect();
+        assert_eq!(mz, vec![250.0, 300.0, 350.0, 400.0, 450.0]);
+        assert_eq!(s.im.as_deref(), Some(&[0.9, 0.7, 0.95, 0.8, 0.65][..]));
+        assert_eq!(
+            s.single_ion.as_deref(),
+            Some(&[true, false, true, false, true][..])
+        );
+        assert_eq!(s.peaks[4].intensity, 7.0);
+        // A spectrum without single-ion centroids is its v2 self, flagged nowhere.
+        assert_eq!(merged[1].peaks.len(), 2);
+        assert_eq!(merged[1].single_ion.as_deref(), Some(&[false, false][..]));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// A non-finite 1/K0 window bound cannot key a window, so it is refused.
     #[test]
     fn a_non_finite_window_mobility_is_refused() {
@@ -2901,6 +3012,7 @@ mod tests {
             pmz: None,
             pz: None,
             im: Some(vec![0.7]),
+            single: None,
             im_lo: Some(f32::NAN),
             im_hi: Some(1.0),
             target_only: None,

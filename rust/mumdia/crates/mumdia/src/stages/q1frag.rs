@@ -1833,6 +1833,7 @@ mod tests {
                         intensity: (c * 100 + s) as f32,
                     }],
                     im: None,
+                    single_ion: None,
                 });
                 cols.scan_index.push(idx);
                 cols.cycle.push(c);

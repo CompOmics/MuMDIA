@@ -340,6 +340,7 @@ mod tests {
                 intensity: 100.0,
             }],
             im: Some(vec![at]),
+            single_ion: None,
         };
         // slot A (0.80-0.90) holds the precursor's 1/K0 0.85; slot B (1.00-1.10) another ion
         let scans: Vec<Ms2Scan> = (0..10u32)

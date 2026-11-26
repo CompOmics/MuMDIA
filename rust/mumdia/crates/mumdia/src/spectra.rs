@@ -79,7 +79,26 @@ pub(crate) fn list_col<'a>(b: &'a RecordBatch, name: &str) -> Result<ListF32<'a>
     ListF32::of(col, name)
 }
 
-/// Load MS2 scans (spectra_ms2.parquet) into memory, RT-sorted.
+/// The three lists of spectra_ms2 v4 (`convert.tdf_single_ion = flagged`): the m/z,
+/// intensity and 1/K0 of the MS2 centroids below `convert.tdf_min_points`, m/z ascending.
+pub const SINGLE_ION_COLS: [&str; 3] = ["single_ion_mz", "single_ion_intensity", "single_ion_im"];
+
+/// Whether the spectra_ms2 artifact at `path` keeps single-ion centroids apart (v4). Read
+/// from the parquet footer; `false` for a file that cannot be read.
+pub fn has_single_ion(path: &str) -> bool {
+    mumdia_io::table::column_names(path).is_ok_and(|c| c.iter().any(|n| n == SINGLE_ION_COLS[0]))
+}
+
+/// Load MS2 scans (spectra_ms2.parquet) into memory, RT-sorted. The single-ion lists of a
+/// v4 artifact are not read ([`load_ms2_with`]).
+pub fn load_ms2(path: &str) -> Result<Vec<Ms2Scan>> {
+    load_ms2_with(path, false)
+}
+
+/// [`load_ms2`], and with `single_ion` the single-ion lists of a v4 artifact merged into
+/// each scan's peaks in m/z order (a tie keeps the `mz` peak first), with
+/// [`Ms2Scan::single_ion`] marking them. Extract's decode only; on an artifact without the
+/// lists it is [`load_ms2`].
 ///
 /// Decoded in parallel: the table is cut into row-contiguous parts
 /// ([`TableFile::row_parts`]; `convert` writes an offset index, so even its one row group
@@ -87,11 +106,15 @@ pub(crate) fn list_col<'a>(b: &'a RecordBatch, name: &str) -> Result<ListF32<'a>
 /// concatenated in order before the (stable) retention-time sort. Row order before the
 /// sort is therefore file order, as in a serial decode, and the result is the same `Vec`
 /// bit for bit at any thread count (`the_parallel_decode_returns_the_written_scans`).
-pub fn load_ms2(path: &str) -> Result<Vec<Ms2Scan>> {
+pub fn load_ms2_with(path: &str, single_ion: bool) -> Result<Vec<Ms2Scan>> {
     let t0 = std::time::Instant::now();
     let t = TableFile::open(path).with_context(|| format!("loading ms2 {path}"))?;
+    let single_ion = single_ion && t.has_column(SINGLE_ION_COLS[0]);
     let parts = t.row_parts(rayon::current_num_threads().min(DECODE_PARTS_MAX))?;
-    let decoded: Vec<Result<Vec<Ms2Scan>>> = parts.par_iter().map(decode_ms2).collect();
+    let decoded: Vec<Result<Vec<Ms2Scan>>> = parts
+        .par_iter()
+        .map(|p| decode_ms2(p, single_ion))
+        .collect();
     let mut out = Vec::with_capacity(t.nrows);
     // The first error in part order is the one the serial decode would have hit first.
     for d in decoded {
@@ -113,6 +136,21 @@ pub fn load_ms2(path: &str) -> Result<Vec<Ms2Scan>> {
     ];
     if im_bytes > 0 {
         parts_mem.push(("peak_im", im_bytes));
+    }
+    let single: usize = out
+        .iter()
+        .filter_map(|s| s.single_ion.as_deref())
+        .map(|f| f.iter().filter(|&&b| b).count())
+        .sum();
+    if single_ion {
+        parts_mem.push((
+            "peak_single_ion_flag",
+            peak_bytes / std::mem::size_of::<Peak>(),
+        ));
+        tracing::info!(
+            single_ion_peaks = single,
+            "spectra: single-ion MS2 centroids merged"
+        );
     }
     crate::memlog::report("ms2 scans", &parts_mem);
     // The decode's own wall time. The stage logs bracket it together with the library load
@@ -154,8 +192,9 @@ pub fn load_q1_sweep(path: &str) -> Result<Option<Q1SweepCols>> {
     }))
 }
 
-/// The MS2 scans of one part, in file order.
-fn decode_ms2(t: &TableFile) -> Result<Vec<Ms2Scan>> {
+/// The MS2 scans of one part, in file order; with `single_ion` (the artifact has the v4
+/// lists) each scan's single-ion centroids merged in ([`load_ms2_with`]).
+fn decode_ms2(t: &TableFile, single_ion: bool) -> Result<Vec<Ms2Scan>> {
     let scan_index = t.u32("scan_index")?;
     let rt = t.f64("rt_seconds")?;
     let wlo = t.f64("window_lower")?;
@@ -187,16 +226,29 @@ fn decode_ms2(t: &TableFile) -> Result<Vec<Ms2Scan>> {
     // getters used, so it stays aligned.
     let mut out = Vec::with_capacity(t.nrows);
     let mut i = 0usize;
-    let lists: &[&str] = if has_im {
-        &["mz", "intensity", "im"]
+    let single_ion = single_ion && has_im;
+    let mut lists: Vec<&str> = if has_im {
+        vec!["mz", "intensity", "im"]
     } else {
-        &["mz", "intensity"]
+        vec!["mz", "intensity"]
     };
-    t.for_each_batch(Some(lists), SCAN_BATCH_ROWS, |b| {
+    if single_ion {
+        lists.extend(SINGLE_ION_COLS);
+    }
+    t.for_each_batch(Some(&lists), SCAN_BATCH_ROWS, |b| {
         let mza = list_col(b, "mz")?;
         let ina = list_col(b, "intensity")?;
         let ima = if has_im {
             Some(list_col(b, "im")?)
+        } else {
+            None
+        };
+        let sia = if single_ion {
+            Some([
+                list_col(b, SINGLE_ION_COLS[0])?,
+                list_col(b, SINGLE_ION_COLS[1])?,
+                list_col(b, SINGLE_ION_COLS[2])?,
+            ])
         } else {
             None
         };
@@ -223,6 +275,19 @@ fn decode_ms2(t: &TableFile) -> Result<Vec<Ms2Scan>> {
                 }
                 None => None,
             };
+            let (peaks, im, single_ion) = match (&sia, im) {
+                (Some([sm, si, sim]), Some(im)) => {
+                    let (sm, si, sim) = (
+                        sm.row_slice(k, SINGLE_ION_COLS[0])?,
+                        si.row_slice(k, SINGLE_ION_COLS[1])?,
+                        sim.row_slice(k, SINGLE_ION_COLS[2])?,
+                    );
+                    let m = sm.len().min(si.len()).min(sim.len());
+                    let (p, im, f) = merge_single_ion(peaks, im, &sm[..m], &si[..m], &sim[..m]);
+                    (p, Some(im), Some(f))
+                }
+                (_, im) => (peaks, im, None),
+            };
             out.push(Ms2Scan {
                 scan_index: scan_index[i],
                 rt_seconds: rt[i],
@@ -235,12 +300,55 @@ fn decode_ms2(t: &TableFile) -> Result<Vec<Ms2Scan>> {
                 },
                 peaks,
                 im,
+                single_ion,
             });
             i += 1;
         }
         Ok(())
     })?;
     Ok(out)
+}
+
+/// One scan's peaks and 1/K0 (m/z ascending) with its single-ion centroids (m/z ascending)
+/// merged in by m/z, a tie keeping the first list's peak first, and the per-peak flag that
+/// marks the merged ones.
+fn merge_single_ion(
+    peaks: Vec<Peak>,
+    im: Vec<f32>,
+    mz: &[f32],
+    inten: &[f32],
+    sim: &[f32],
+) -> (Vec<Peak>, Vec<f32>, Vec<bool>) {
+    let n = peaks.len() + mz.len();
+    let (mut p, mut m, mut f) = (
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+    );
+    let mut j = 0;
+    for (pk, x) in peaks.into_iter().zip(im) {
+        while j < mz.len() && mz[j] < pk.mz {
+            p.push(Peak {
+                mz: mz[j],
+                intensity: inten[j],
+            });
+            m.push(sim[j]);
+            f.push(true);
+            j += 1;
+        }
+        p.push(pk);
+        m.push(x);
+        f.push(false);
+    }
+    for k in j..mz.len() {
+        p.push(Peak {
+            mz: mz[k],
+            intensity: inten[k],
+        });
+        m.push(sim[k]);
+        f.push(true);
+    }
+    (p, m, f)
 }
 
 /// Index of the peak of `peaks` (m/z ascending) nearest `target` within `tol_ppm`, or `None`
