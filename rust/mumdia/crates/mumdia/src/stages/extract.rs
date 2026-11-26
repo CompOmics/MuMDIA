@@ -2823,16 +2823,22 @@ const DEFAULT_MAX_WINDOWS_IN_FLIGHT_IM: usize = 4;
 /// entry per fragment bin) costs more than the posting-list work it divides.
 const MIN_CANDIDATES_PER_TASK: usize = 4096;
 
-/// `extract.gate_support_min`, or 0 (off) when it is unset. The gate is defined on the
-/// window-mean score, so under any other `gate_mode` it is off whatever the setting, and the
-/// report does not name it. It was the default on 1/K0 spectra at 0.845 from 2026-10-18 to
-/// 2026-11-19 and was turned off because it cost identifications at every load measured,
-/// from 200 pg to 50 ng (docs/35_diapasef.md section 16).
-fn support_gate_min(cfg: &ExtractConfig) -> f64 {
-    match cfg.gate_mode {
-        GateMode::WindowMean => cfg.gate_support_min.unwrap_or(0.0),
-        _ => 0.0,
+/// The diaPASEF gate's default threshold on spectra that carry 1/K0
+/// (`extract.gate_support_min` unset; docs/35_diapasef.md section 16).
+const DEFAULT_GATE_SUPPORT_MIN_IM: f64 = 0.845;
+
+/// `extract.gate_support_min`, or its default: [`DEFAULT_GATE_SUPPORT_MIN_IM`] on spectra that
+/// carry 1/K0, off (0) otherwise. The gate is defined on the window-mean score, so under any
+/// other `gate_mode` it is off whatever the setting, and the report does not name it.
+fn support_gate_min(cfg: &ExtractConfig, has_im: bool) -> f64 {
+    if !matches!(cfg.gate_mode, GateMode::WindowMean) {
+        return 0.0;
     }
+    cfg.gate_support_min.unwrap_or(if has_im {
+        DEFAULT_GATE_SUPPORT_MIN_IM
+    } else {
+        0.0
+    })
 }
 
 /// `extract.windows_in_flight`, or its default: the rayon thread count capped at 16, and
@@ -4326,7 +4332,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     // for themselves. Every 1/K0 path below is keyed on it or on the resolved gate, so a 3D
     // run takes main's path unchanged.
     let has_im = scans.iter().any(|s| s.im.is_some());
-    let support_min = support_gate_min(p.cfg);
+    let support_min = support_gate_min(p.cfg, has_im);
     // `extract.im_gate`: `auto` takes the gate when both the spectra and the windows carry
     // 1/K0. An explicit `fragments` without either runs ungated and says so.
     let mut im_gate = p.cfg.im_gate.resolve(has_im, win.has_im());
@@ -8463,17 +8469,20 @@ mod ms1_near_tests {
         assert_eq!(ms1_near(&scans, 0, 1, 600.0, 5.0), 300.0);
         assert_eq!(ms1_near(&scans, 2, 5, 600.0, 5.0), 700.0);
     }
-    /// The support gate is off unless it is set, an explicit setting applies to 3D and 1/K0
-    /// spectra alike, and it never applies outside the window-mean gate.
+    /// The diaPASEF gate is on by default on 1/K0 spectra only, an explicit setting wins
+    /// (0 turns it off), and it never applies outside the window-mean gate.
     #[test]
-    fn the_support_gate_is_off_unless_set() {
-        use super::{support_gate_min, ExtractConfig, GateMode};
+    fn the_support_gate_defaults_on_for_ion_mobility_spectra_only() {
+        use super::{support_gate_min, ExtractConfig, GateMode, DEFAULT_GATE_SUPPORT_MIN_IM};
         let mut cfg = ExtractConfig::default();
-        assert_eq!(support_gate_min(&cfg), 0.0);
+        assert_eq!(support_gate_min(&cfg, true), DEFAULT_GATE_SUPPORT_MIN_IM);
+        assert_eq!(support_gate_min(&cfg, false), 0.0);
+        cfg.gate_support_min = Some(0.0);
+        assert_eq!(support_gate_min(&cfg, true), 0.0);
         cfg.gate_support_min = Some(1.215);
-        assert_eq!(support_gate_min(&cfg), 1.215);
+        assert_eq!(support_gate_min(&cfg, false), 1.215);
         cfg.gate_mode = GateMode::ApexPearson;
-        assert_eq!(support_gate_min(&cfg), 0.0);
+        assert_eq!(support_gate_min(&cfg, true), 0.0);
     }
 }
 

@@ -391,9 +391,10 @@ docs/35_diapasef.md is the full record; these are the decisions that set its sha
   the ions a slot separates.
 - **Mobility gap of 30 scans.** The native centroiding splits a trace where two consecutive
   points are more than `convert.tdf_im_gap_scans` 30 scans apart, with
-  `tdf_min_points` 1 since 2026-11-19 (single-ion centroids kept; docs/35 section 11,
-  "Low input"). The earlier value was 2, chosen when 1 cost 17% of peptides. The gap rests on a peak census of one run and the seed
-  plateau, so it is provisional (docs/35 section 2).
+  `tdf_min_points` 2 (1 cost 17% of peptides). Both rest on a peak census of one run and the
+  seed plateau, so they are provisional (docs/35 section 2). `tdf_min_points` 1 with the
+  support gate off is the low-input opt-in; it was the default in 0.15.0 and was reverted
+  for memory (docs/35 section 11, "Low input").
 - **The 1/K0 width and peak-shape features (P7) are closed.** -0.9% over three seeds, -0.1%
   on a re-test; not ported (docs/35 section 12).
 - **Fragment-model fine-tuning is open, not adopted.** +3.4% per run on HYE diaPASEF without
