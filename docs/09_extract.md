@@ -447,7 +447,10 @@ of 151 million):
 from about 75 to over 200 (728% CPU against 1,400% for the others). About 9 GB of the peak is
 the rest of the stage, so 0.5 GiB took the hit store from about 6 GB to under 1 GB, for about
 1.8 times the CPU: every wave ends at a barrier where the pool spins idle, and 0.5 GiB cut
-the batches into 6 to 17 waves. The CI smoke (`ci/smoke.sh`, where the budget is inert) wrote
+the batches into 6 to 17 waves. End to end, the same run through `mumdia run` (NN seed 0) at
+`hit_budget_gib` 1 wrote the same `psms_extracted`, `features`, `psms_competed`,
+`psms_scored`, quant tables and TSV reports as main (32,510 peptides, 35,590 precursors), at a
+process peak of 11.9 GB against 16.9 GB. The CI smoke (`ci/smoke.sh`, where the budget is inert) wrote
 the same 2,330 parquet and TSV files with both builds, three runs each.
 
 ### 1. Matcher and mass recalibration
