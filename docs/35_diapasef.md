@@ -872,8 +872,8 @@ them one at a time; a shortfall is bisected with them before any IM mechanism is
 
 ### Low input (2026-11)
 
-Five low-input diaPASEF sets, each searched with a DIA-NN 2.7 library of the same species and
-against DIA-NN 2.7 on the same library and runs: 200 pg HeLa and 200 pg yeast on a timsTOF Pro
+Five low-input diaPASEF sets, each searched with a predicted spectral library of the same species
+and compared with a reference search engine on the same library and runs: 200 pg HeLa and 200 pg yeast on a timsTOF Pro
 (six runs each, the other species of the HYE mix as a foreign-species check), 1 ng HeLa with E.
 coli entrapment on a timsTOF Pro 2 (six runs), 250 pg HYE human on an Ultra (three runs) and 13
 HeLa single cells on a Pro; with 50 ng 5-min HYE on an Ultra 2 (three runs), the E. coli
@@ -898,7 +898,7 @@ The recipe keeps `presence_min_coelution` 1. The "new" column below is the opt-i
 before the reader default changed; the current default is compared with both at the end of this
 section.
 
-| set | main | new (seed range) | new vs main | % of DIA-NN, main -> new | wall, main -> new |
+| set | main | new (seed range) | new vs main | % of reference engine, main -> new | wall, main -> new |
 |---|---:|---:|---:|---|---|
 | 200 pg HeLa | 1,884 | 7,689 (7,656-7,711) | +308% | 22% -> 88% | 8:09 -> 12:14 |
 | 200 pg yeast | 1,704 | 5,004 | +194% | 28% -> 83% | 8:07 -> 11:30 |
