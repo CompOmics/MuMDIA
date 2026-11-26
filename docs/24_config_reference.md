@@ -1271,6 +1271,7 @@ moves to another function.
 | `MUMDIA_XGB_JOBS` | sidecar | `"0"` | `scripts/mokapot_worker.py::make_model` |
 | `MUMDIA_XGB_LR` | sidecar | `"0.1"` | `scripts/mokapot_worker.py::make_model` |
 | `MUMDIA_XGB_TREES` | sidecar | `"200"` | `scripts/mokapot_worker.py::make_model` |
+| `MZDATA_IGNORE_UNKNOWN_INSTRUMENT` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/main.rs::main` |
 | `OMP_NUM_THREADS` | both | `16` | `rust/mumdia/crates/mumdia/src/main.rs::apply_threads`, `scripts/nn_rescore_worker.py::main` |
 | `OneDrive` | engine | computed: set by the OneDrive client on Windows; a results, cache or temporary directory under it gets a location warning, never a refusal (`storage.rs` `location_notes`) | `rust/mumdia/crates/mumdia/src/storage.rs::onedrive_roots` |
 | `OneDriveCommercial` | engine | computed: set by the OneDrive client for a work or school account; as `OneDrive` (`storage.rs` `location_notes`) | `rust/mumdia/crates/mumdia/src/storage.rs::onedrive_roots` |
@@ -1281,7 +1282,7 @@ moves to another function.
 | `VIRTUAL_ENV` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
 | `XDG_CACHE_HOME` | engine | computed: set by the desktop environment, often unset; an absolute value puts the engine's caches in `$XDG_CACHE_HOME/mumdia` on Linux when MUMDIA_CACHE_DIR is unset (`cache.rs` `root`) | `rust/mumdia/crates/mumdia/src/cache.rs::root` |
 
-104 variables are read: 44 engine-side, 67 sidecar-side, 7 on both sides.
+105 variables are read: 45 engine-side, 67 sidecar-side, 7 on both sides.
 
 ### Variables the code sets
 
@@ -1311,6 +1312,7 @@ one exception noted in its own help text: it sets `MUMDIA_NN_THREADS` and
 | `MUMDIA_NN_WARM_EPOCHS` | engine | `p.cfg.train_warm_epochs.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_pin_sidecar` |
 | `MUMDIA_NN_WARM_START` | engine | `if p.cfg.train_warm_epochs > 0 { "1" } else { "0" }` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_pin_sidecar` |
 | `MUMDIA_TEMP_DIR` | engine | `t` | `rust/mumdia/crates/mumdia/src/storage.rs::apply` |
+| `MZDATA_IGNORE_UNKNOWN_INSTRUMENT` | engine | `"silent"` | `rust/mumdia/crates/mumdia/src/main.rs::main` |
 | `NUMEXPR_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py::<module>` |
 | `OMP_NUM_THREADS` | both | `"1"` in deeplc_finetune.py; `n.to_string()` in main.rs | `rust/mumdia/crates/mumdia/src/main.rs::apply_threads`, `scripts/deeplc_finetune.py::<module>` |
 | `OPENBLAS_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py::<module>` |
@@ -1353,6 +1355,6 @@ instead of looking like an absent field.
 
 ## Coverage
 
-24 structs and 333 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 45 enumerations, 1 named profile(s), 104 environment variables read and 27 set.
+24 structs and 333 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 45 enumerations, 1 named profile(s), 105 environment variables read and 28 set.
 
 30 field(s) carry a gating marker in their doc comment. 53 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.

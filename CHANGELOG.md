@@ -247,6 +247,19 @@ than a number. Both are recorded in every run's `manifest.json`.
   prefilter's best-column fallback stays. A diaPASEF search read natively from a Bruker `.d`
   finds and quantifies differently from 0.15.0; a search without 1/K0 is unaffected.
 
+### Fixed
+
+- **Native Thermo reading of a `.raw` whose metadata names no instrument model (docs/04,
+  "Native Thermo reading").** Under `convert.thermo_native` every such file stopped at its first
+  scan in mzdata's instrument lookup (seen on all five Orbitrap Astral sets of 2023 in the
+  benchmark collection). A `thermo` build now sets `MZDATA_IGNORE_UNKNOWN_INSTRUMENT=silent` at
+  startup unless it is set, and `convert` records the instrument from the scan filters as
+  ThermoRawFileParser does (the generic Thermo model, with the Astral analyzer when a filter
+  starts with `ASTMS`), so `extract.apex_count_window = "auto"` resolves the same through
+  both readers. Builds without the `thermo` feature, and files that name their model, are
+  unchanged.
+
+||||||| d84de316
 ## [0.15.0] - 2026-11-23
 
 ### Changed

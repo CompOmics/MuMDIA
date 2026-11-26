@@ -678,6 +678,16 @@ instrument-configuration parameter that is neither the serial number nor the ins
 method text, which mzdata stores as `customization`), and the spectra reports record
 `params.reader = "thermorawfilereader"` and `params.centroiding = "vendor"`.
 
+Some files name no model: the Orbitrap Astral files of 2023 from serial OLEP08 in the
+benchmark collection do not, and ThermoRawFileParser writes the generic "Thermo Fisher
+Scientific instrument model" (`MS:1000483`) for them. mzdata then builds no instrument
+configuration and panics on the first scan unless `MZDATA_IGNORE_UNKNOWN_INSTRUMENT` is set,
+so a `thermo` build sets it to `silent` at startup (a value already in the environment is
+kept). `convert` then reads the scans up to the first MS2 and records the generic model with
+the Astral analyzer when a scan filter starts with `ASTMS`, which is what
+ThermoRawFileParser records for the same file, so `extract.apex_count_window = "auto"`
+resolves to 1 through either reader.
+
 Measured against ThermoRawFileParser 1.4.5 (`-f 2 -m 2`, peak picking on, the arguments
 `raw.rs` uses) on PXD071205 Astral files, 2026-10-19:
 

@@ -1902,6 +1902,14 @@ fn localise_experiment_dir(
 fn main() -> Result<()> {
     // The reference point for the orchestrators' pre-stage timer, before anything else.
     mumdia::prestage::mark_process_start();
+    // mzdata panics on every scan of a `.raw` whose metadata names no model (the scan's
+    // analyzer maps to no instrument configuration) unless this is set. Set here, before
+    // any other thread exists; the instrument is recorded from the scan filters instead
+    // (`convert::open_thermo`). A value the user set is kept.
+    #[cfg(feature = "thermo")]
+    if std::env::var_os("MZDATA_IGNORE_UNKNOWN_INSTRUMENT").is_none() {
+        std::env::set_var("MZDATA_IGNORE_UNKNOWN_INSTRUMENT", "silent");
+    }
     // The dispatch in `real_main` is one large function whose arms keep their locals in
     // a single frame, and without optimisation that frame exceeds the 1 MiB main-thread
     // stack Windows reserves: the debug binary overflowed on `--version` before printing
