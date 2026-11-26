@@ -120,10 +120,11 @@ native reader.
 - **`--max-spectra` counts frames**, not spectra, on this path: N frames yield N spectra for MS1
   frames and one spectrum per slot for MS2 frames.
 
-The reader settings are provisional. `tdf_im_gap_scans` 30 rests on a peak census of one run
-and the seed plateau. `tdf_min_points` is 1 since 2026-11-19 (it was 2): every centroid is
-kept, including those of a single ion event, which at low load is most of the real fragment
-signal (section 11, "Low input"). The valley fractions stay at 0 until they are measured
+The reader settings are provisional. `tdf_im_gap_scans` 30 and `tdf_min_points` 2 rest on a peak
+census of one run and the seed plateau. `tdf_min_points` 1 keeps every centroid, including those
+of a single ion event, which at low load is most of the real fragment signal; with
+`extract.gate_support_min` 0 it is the low-input opt-in (section 11, "Low input"). The valley
+fractions stay at 0 until they are measured
 as one package with the seed's count-once matching on the six-run HYE set with three `nn_torch`
 seeds: on its own, the mobility split cut the seed anchors from 5,200 to 3,331. The smoothing
 half-width of 8 replaced 4, the value measured to over-split on both axes; it is inert while
@@ -881,9 +882,17 @@ mean of three NN seeds where a range is given, one seed otherwise.
 The loss breakdown on main put most of the gap in extract's presence rule: faint precursors
 whose fragments are single ion events never assembled a peak group, because the reader
 dropped every centroid of fewer than `convert.tdf_min_points` (2) points. Three changes made
-the default together: `tdf_min_points` 1, the support gate off (`gate_support_min` unset), and
-in `configs/examples/diapasef.json` `extract.presence_min_coelution` 1 (default 2), keeping
-`gate_min_score` 0.6.
+the default together in 0.15.0: `tdf_min_points` 1, the support gate off (`gate_support_min`
+unset), and in `configs/examples/diapasef.json` `extract.presence_min_coelution` 1 (default
+2), keeping `gate_min_score` 0.6. The first two are reverted to their 0.14.0 defaults for
+memory (below) and are the low-input opt-in, set on top of the recipe:
+
+```json
+{"convert": {"tdf_min_points": 1}, "extract": {"gate_support_min": 0}}
+```
+
+The recipe keeps `presence_min_coelution` 1. The "new" column below is the opt-in; the restored
+defaults with the recipe's presence rule were not measured on these sets.
 
 | set | main | new (seed range) | new vs main | % of DIA-NN, main -> new | wall, main -> new |
 |---|---:|---:|---:|---|---|
@@ -912,6 +921,17 @@ smaller and the blanks take under 3 minutes. Co-elution 2 or a gate of 0.45 kept
 gain at more of the cost. The prefilter still stands aside on noise-heavy pools when no fold
 has 10 targets even at q 0.1.
 
+Memory. The 0.15.0 benchmark sweep ran 52 timsTOF diaPASEF jobs with `tdf_min_points` 1 and the
+support gate off, and 10 that 0.14.0 ran failed on memory: six single-cell HeLa runs on which
+the seed found no anchors and extract's estimated fragment-peak hit store reached 290-875 GiB
+over the run, and four bulk runs (60-min a549 and k562 runs at a 378 GB process-tree peak, a
+5-min 50 ng Ultra 2 run at 271 GB, an MCF7 single-cell-spike run, and an HLA Ultra run whose
+extract footprint guard estimated 362 GiB at once and 2.7 TB over the run on a 264 GiB node).
+Against 0.14.0 the intermediates on diaPASEF were 0.7-3.7x as large and the wall about 3.2x as
+long (1.1-6x). Both keys are back at their 0.14.0 defaults. Which of the two, or their
+combination, causes the growth is not measured yet; until it is, use the opt-in on low-input
+runs and on a machine with memory to spare.
+
 ## 12. Closed levers
 
 Measured and not kept. Commits are on the IM branch; seeds are `nn_torch` seeds on the E. coli
@@ -932,7 +952,7 @@ run unless marked.
 | `rt_im_train.rt_window_multiplier` 1.5 or 2.0 with retrace on | -1.8% (13,429), -2.9% (13,282), decoy fraction 0.99%; at 1.5 about 100 precursors came back inside the window and 373 more lost to a wrong peak inside it | `1c5b9a1` |
 | 1/K0 window narrowed to `apex_im` +/- delta | delta 0.008 -8.0%, 0.012 -1.4%, 0.020 +1.4% (seed 0); not recommended | `31cba11` |
 | `convert.tdf_mz_ppm 5` | +3.6%, but the seed fell to 615 anchors; superseded by the valley split | `31cba11` |
-| `tdf_min_points 1` | -17% (P1); for MS1 only +0.25% / -0.2%. Reopened and made the default on 2026-11-19: with the recipe's presence rule and no support gate it is +54% to +125% at low load (section 11, "Low input") | `76d57b6`, `31cba11` |
+| `tdf_min_points 1` | -17% (P1); for MS1 only +0.25% / -0.2%. Reopened on 2026-11-19: with the recipe's presence rule and no support gate it is +54% to +125% at low load, the low-input opt-in; the default in 0.15.0 only, reverted for memory (section 11, "Low input") | `76d57b6`, `31cba11` |
 | valley fraction and smoothing | m/z 0.3 -6.1%; smoothing 12 ppm -4.4%; m/z 0.7 +1.6%, nothing once the mobility split and count-once are on | `31cba11` |
 | refit widths as fitted, and fragment mass recalibration on identifications | -4.0%; 7.99 ppm -2.7%, 10.11 ppm -0.3% | `31cba11` |
 | `peak_claim = coelution_shadow`, contested-evidence features | -8.7%, -0.4% (seed 0) | `31cba11` |
@@ -1230,8 +1250,8 @@ spectra of a diaPASEF frame are summed over the candidate's 1/K0 band, so nearly
 candidate matches its fragments and the agreement scores sit high for most. A higher
 threshold buys time with identifications.
 
-`extract.gate_support_min` (off by default since 2026-11-19; it was 0.845 on spectra that carry
-1/K0 from 2026-10-18, see the end of this subsection) is a second threshold on the window-mean score plus the
+`extract.gate_support_min` (default 0.845 on spectra that carry 1/K0 since 2026-10-18, off
+otherwise; 0 turns it off) is a second threshold on the window-mean score plus the
 apex intensity and the MS1 monoisotopic intensity and, on spectra that carry 1/K0, three 1/K0
 terms: the apex 1/K0 error against the calibrated prediction, the 1/K0 spread of the matched
 fragments at the apex and the MS1-to-fragment 1/K0 difference. The weights come from a
@@ -1270,13 +1290,15 @@ took 29 min for 38,406 peptides, and on the E. coli run (three seeds) it gave 14
 14,008 peptides at an entrapment FDP of 0.37, 0.37 and 0.32%, a smaller loss (-0.8%) for less
 of the speed.
 
-The gate was the default on spectra that carry 1/K0 from 2026-10-18 to 2026-11-19, at 0.845. It is
-off because the low-input sets of section 11 ("Low input") lost far more than these bulk sets:
-+26% precursors per run at 200 pg and +19% at 1 ng with it off, +6.1% at 50 ng on Ultra 2, one
-NN seed, other-species shares unchanged. On the bulk sets above it traded about
+The gate is the default on spectra that carry 1/K0 since 2026-10-18, at 0.845: it trades about
 1.6% of the peptides for a third to a half of the wall time, at an unchanged entrapment FDP and
 an unchanged or slightly better quantification. Set `extract.gate_support_min` to 0 for the
-previous behaviour, or to 0.82 for a smaller loss at less of the speed. It applies only under
+previous behaviour, or to 0.82 for a smaller loss at less of the speed. It was off in 0.15.0,
+because the low-input sets of section 11 ("Low input") lost far more than these bulk sets: +26%
+precursors per run at 200 pg and +19% at 1 ng with it off, +6.1% at 50 ng on Ultra 2, one NN
+seed, other-species shares unchanged. It was restored because 10 of the 52 diaPASEF jobs of the
+0.15.0 benchmark sweep failed on memory with it off and `convert.tdf_min_points` 1 (section 11,
+"Low input"); 0 with `tdf_min_points` 1 is the low-input opt-in. It applies only under
 `extract.gate_mode = window_mean` (the default), and on spectra without 1/K0 it stays off: the
 weights without the 1/K0 terms were fitted on the same diaPASEF runs and were not validated on
 an Orbitrap or Astral acquisition.

@@ -344,10 +344,16 @@ changed to 0.6 to match the default classifier. `native_tda` has since risen to
 describes this configuration and the default is back to 0.2. Re-derive the optimum
 rather than inheriting it if you change the library, the apex mode or the folds.
 
-On diaPASEF a second gate, `extract.gate_support_min` (the window-mean score plus intensity,
-MS1 and three 1/K0 terms, fitted on targets only), was on by default at 0.845 from 2026-10-18
-to 2026-11-19. It is off: it bought 36-48% of the wall on bulk HYE for -1.6% peptides, but cost
-26% of the precursors at 200 pg and 19% at 1 ng (docs/35 section 16).
+On diaPASEF (spectra that carry 1/K0) a second gate is on by default since 2026-10-18:
+`extract.gate_support_min` unset is 0.845, the window-mean score plus intensity, MS1 and three
+1/K0 terms, fitted on targets only. The window-mean gate at 0.6 passes 33% of the library
+there (about 5% on Astral and Orbitrap), and the second gate keeps 41% of that: -1.6% peptides
+for -36% wall on six 60-min HYE runs, -1.75% for -48% on six 5-min runs, the E. coli
+entrapment FDP unchanged (0.32-0.35% against 0.30-0.38%). It is a speed default that costs
+identifications; 0 restores the previous behaviour. It stays off without 1/K0 (docs/35
+section 16). It was off in 0.15.0 (+26% precursors at 200 pg and +19% at 1 ng with it off) and
+is restored for memory, with `convert.tdf_min_points` 2; see the low-input bullet under
+"diaPASEF (timsTOF)".
 
 DeepLC 4.5.0 or newer is required wherever DeepLC runs (`predict-frag` in FASTA mode, the
 optional fine-tune, the multi-head calibration; 4.5.0 since 2026-09-28, for the default
@@ -451,14 +457,19 @@ fine-tuning also is not guaranteed deterministic.
   `extract.im_gate`, `features.im_features`, `retrace.*`, `rt_im_train.anchor_x_filter`,
   `rescore.shadow_im_tolerance` and the cross-run quant selectors. Promote one only in its
   own change, with entrapment and a second acquisition (docs/35 section 14).
-- The native reader keeps single-ion centroids (`convert.tdf_min_points` 1 since 2026-11-19,
-  was 2). With the recipe's `presence_min_coelution` 1, gate 0.6 and no support gate, three NN
-  seeds: 200 pg HeLa 3,422 -> 7,689 precursors per run (88% of DIA-NN 2.7), 1 ng 12,542 ->
+- Low input is an opt-in, not the default: `convert.tdf_min_points` 1 (keep single-ion
+  centroids; default 2) with `extract.gate_support_min` 0. Both were the default in 0.15.0 and
+  are reverted: on the 0.15.0 benchmark sweep 10 of 52 diaPASEF jobs that 0.14.0 ran failed on
+  memory (six single-cell runs without seed anchors whose extract hit store reached 290-875 GiB,
+  bulk runs at peaks of 271-378 GB, an HLA run whose footprint guard estimated 2.7 TB
+  over the run), intermediates 0.7-3.7x and wall about 3.2x against 0.14.0. Which of the two
+  keys causes it is not measured. With the recipe's `presence_min_coelution` 1, gate 0.6 and no
+  support gate, three NN seeds: 200 pg HeLa 3,422 -> 7,689 precursors per run, 1 ng 12,542 ->
   19,270, 250 pg Ultra 6,912 -> 9,544, 50 ng -1.0%, E. coli entrapment FDP 0.97%, 0 IDs in
   blanks. Open: the 250 pg Ultra foreign-species share rose 1.17% -> 1.40% (docs/35 section
   11, "Low input"). Keep `gate_min_score` 0.6 with it: at 0.3 the pool grew up to 14x for the
   same counts.
-- The 1/K0 window sizing is one of the exceptions, on by
+- The 1/K0 window sizing is one of the exceptions (with the support gate above), on by
   default since 2026-10-22 and inert without 1/K0: `rt_im_train.im_window_sizing =
   seed_decoy_corrected` widens the anchors' `w_im` to 1.3x the decoy-corrected p95 of every
   seed PSM up to seed q 0.1, and `im_window_multiplier` is 1.3 (was 1.0) for both windows.

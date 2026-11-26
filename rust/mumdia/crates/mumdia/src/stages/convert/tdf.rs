@@ -1030,7 +1030,7 @@ mod tests {
     #[test]
     fn the_shipped_defaults_are_the_measured_settings() {
         let d = TdfParams::default();
-        assert_eq!((d.mz_ppm, d.im_gap_scans, d.min_points), (10.0, 30, 1));
+        assert_eq!((d.mz_ppm, d.im_gap_scans, d.min_points), (10.0, 30, 2));
         assert_eq!((d.mz_valley, d.im_valley), (0.0, 0.0));
         assert_eq!((d.mz_smooth_ppm, d.im_smooth_scans), (8.0, 8.0));
     }
