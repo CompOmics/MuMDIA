@@ -268,7 +268,6 @@ than a number. Both are recorded in every run's `manifest.json`.
   both readers. Builds without the `thermo` feature, and files that name their model, are
   unchanged.
 
-||||||| d84de316
 ## [0.15.0] - 2026-11-23
 
 ### Changed
