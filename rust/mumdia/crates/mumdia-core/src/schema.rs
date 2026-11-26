@@ -29,6 +29,12 @@ pub mod artifact {
     /// source writes v1 or v2, byte for byte. Readers select columns by name, so every
     /// version loads everywhere.
     pub const SPECTRA_MS2_V3: (&str, u32) = ("spectra_ms2", 3);
+    /// v4, written only by the native diaPASEF reader under `convert.tdf_single_ion =
+    /// flagged`: v2 plus the MS2 centroids below `convert.tdf_min_points` in three lists of
+    /// their own, `single_ion_mz`, `single_ion_intensity` and `single_ion_im` (m/z ascending),
+    /// appended last. `mz`, `intensity` and `im` are what v2 holds, so every reader that does
+    /// not ask for the new lists reads the v2 spectra.
+    pub const SPECTRA_MS2_V4: (&str, u32) = ("spectra_ms2", 4);
     pub const ISOLATION_WINDOWS: (&str, u32) = ("isolation_windows", 1);
     /// v2, written only for a source with ion mobility: each window's 1/K0 bounds
     /// `im_lower` and `im_upper`, so slots sharing an m/z range are separate rows. A 3D
@@ -257,6 +263,16 @@ pub mod artifact {
         }
     }
 
+    /// [`spectra_ms2_q1`], or [`SPECTRA_MS2_V4`] when the native diaPASEF reader kept the
+    /// single-ion centroids apart (`si`), which only a source with ion mobility does.
+    pub fn spectra_ms2_si(has_im: bool, q1: bool, si: bool) -> (&'static str, u32) {
+        if si && has_im {
+            SPECTRA_MS2_V4
+        } else {
+            spectra_ms2_q1(has_im, q1)
+        }
+    }
+
     /// The `isolation_windows` schema a conversion writes: [`ISOLATION_WINDOWS_V2`] when
     /// the source carries ion mobility, else [`ISOLATION_WINDOWS`].
     pub fn isolation_windows(has_im: bool) -> (&'static str, u32) {
@@ -455,6 +471,10 @@ mod tests {
         assert_eq!(spectra_ms2_q1(false, true), ("spectra_ms2", 3));
         assert_eq!(spectra_ms2_q1(true, false), ("spectra_ms2", 2));
         assert_eq!(spectra_ms2_q1(true, true), ("spectra_ms2", 2));
+        assert_eq!(spectra_ms2_si(true, false, true), ("spectra_ms2", 4));
+        assert_eq!(spectra_ms2_si(false, false, true), ("spectra_ms2", 1));
+        assert_eq!(spectra_ms2_si(false, true, true), ("spectra_ms2", 3));
+        assert_eq!(spectra_ms2_si(true, false, false), ("spectra_ms2", 2));
     }
 
     /// Extraction keeps main's 3D versions; 1/K0 moves psms_extracted to v4 and each

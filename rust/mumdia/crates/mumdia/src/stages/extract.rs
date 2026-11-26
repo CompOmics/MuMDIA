@@ -37,7 +37,7 @@ use crate::matchers::binning::LogBins;
 #[cfg(test)]
 use crate::matchers::fragindex::NarrowedProbe;
 use crate::matchers::fragindex::{BinnedProbe, FragIndex, LocalIndex, WindowNarrow};
-use crate::spectra::{load_ms1, load_ms2, Ms1Scan};
+use crate::spectra::{load_ms1, load_ms2_with, Ms1Scan};
 use crate::stages::q1frag;
 use crate::stages::q1trace;
 use crate::stages::rt_im_train::RtWindows;
@@ -331,15 +331,31 @@ fn peak_hit_im(sim: Option<&[f32]>, j: usize) -> u16 {
     sim.map_or(0, |v| hit_im(v[j]))
 }
 
+/// What the window test reads of one peak's 1/K0 ([`Guard::peak_im`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PeakIm {
+    /// No 1/K0 test: the gate is off or the scan carries no 1/K0.
+    Free,
+    /// The 1/K0 gate (`extract.im_gate`) tests this 1/K0.
+    Gated(f32),
+    /// A single-ion centroid (`convert.tdf_single_ion = flagged`): matched only inside a
+    /// candidate's 1/K0 window, whatever the gate is, and never to a candidate without one.
+    SingleIon(f32),
+}
+
 /// The window test of every probe: the candidates' windows and whether the 1/K0 gate
 /// (`extract.im_gate`, resolved for this run) applies. Every guard site asks
-/// [`RtWindows::admits`] through it, with the peak's 1/K0 when the gate reads one.
+/// [`RtWindows::admits`] through it, with the peak's 1/K0 when the gate reads one
+/// ([`Guard::peak_im`]).
 #[derive(Clone, Copy)]
 struct Guard<'a> {
     win: &'a RtWindows,
     im_gate: bool,
     /// The trace pad in seconds (`ExtractParams::trace_pad`), 0 without one.
     pad: f64,
+    /// The share of a candidate's 1/K0 window a single-ion centroid must lie in
+    /// (`extract.single_ion_im_scale`).
+    si_scale: f32,
 }
 
 impl<'a> Guard<'a> {
@@ -354,18 +370,45 @@ impl<'a> Guard<'a> {
         }
     }
 
+    /// What the window test reads of peak `j` of `scan`: a single-ion centroid's 1/K0 always,
+    /// any other peak's only under the gate ([`Guard::scan_im`]).
+    #[inline]
+    fn peak_im(&self, scan: &Ms2Scan, j: usize) -> PeakIm {
+        if let (Some(f), Some(im)) = (scan.single_ion.as_deref(), scan.im.as_deref()) {
+            if f[j] {
+                return PeakIm::SingleIon(im[j]);
+            }
+        }
+        match self.scan_im(scan) {
+            Some(v) => PeakIm::Gated(v[j]),
+            None => PeakIm::Free,
+        }
+    }
+
     /// [`RtWindows::admits`] for candidate `c` at retention time `rt` and peak 1/K0 `pim`.
     #[inline]
-    fn admits(&self, c: usize, rt: f64, pim: Option<f32>) -> bool {
-        self.win.admits(c, rt, pim)
+    fn admits(&self, c: usize, rt: f64, pim: PeakIm) -> bool {
+        match pim {
+            PeakIm::Free => self.win.admits(c, rt, None),
+            PeakIm::Gated(x) => self.win.admits(c, rt, Some(x)),
+            PeakIm::SingleIon(x) => self.win.admits_single_ion(c, rt, x, 0.0, self.si_scale),
+        }
     }
 
     /// A peak the window does not admit but the trace pad does: it goes into the candidate's
     /// traces with its full intensity and takes no part in a peak claim, so the in-window
     /// hits of every candidate are what they are without the pad. Always false without one.
     #[inline]
-    fn pads(&self, c: usize, rt: f64, pim: Option<f32>) -> bool {
-        self.pad > 0.0 && self.win.admits_padded(c, rt, pim, self.pad)
+    fn pads(&self, c: usize, rt: f64, pim: PeakIm) -> bool {
+        self.pad > 0.0
+            && match pim {
+                PeakIm::Free => self.win.admits_padded(c, rt, None, self.pad),
+                PeakIm::Gated(x) => self.win.admits_padded(c, rt, Some(x), self.pad),
+                PeakIm::SingleIon(x) => {
+                    self.win
+                        .admits_single_ion(c, rt, x, self.pad, self.si_scale)
+                }
+            }
     }
 
     /// Whether candidate `c` claims peak `j` of `scan` on the two-pass paths: the window
@@ -373,7 +416,7 @@ impl<'a> Guard<'a> {
     #[inline]
     fn claims(&self, restrict: Option<&CandMask>, c: u32, scan: &Ms2Scan, j: usize) -> bool {
         let cu = c as usize;
-        self.admits(cu, scan.rt_seconds, self.scan_im(scan).map(|v| v[j]))
+        self.admits(cu, scan.rt_seconds, self.peak_im(scan, j))
             && restrict.is_none_or(|s| s.contains(c))
     }
 }
@@ -1456,9 +1499,8 @@ fn demix_solve_scan(
     let mut col_of: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
     let mut rows: Vec<(f64, Vec<(u32, f32)>)> = Vec::new();
     let mut claimants: Vec<(u32, u16, f32)> = Vec::new();
-    let gim = guard.scan_im(scan);
     for (j, peak) in scan.peaks.iter().enumerate() {
-        let pim = gim.map(|v| v[j]);
+        let pim = guard.peak_im(scan, j);
         // Peaks are stored at the artifact's f32 width; widen once per peak. Exact, so
         // `mz` is the value the peak used to carry in an f64 field.
         let mz = peak.mz as f64;
@@ -2087,7 +2129,9 @@ struct WindowLoad {
 /// That chance is counted on the peaks of a sample of [`FOOTPRINT_SAMPLE_SCANS`] scans and
 /// the fragments of a sample of [`FOOTPRINT_FRAG_CANDIDATES`] candidates
 /// ([`sampled_collision_rate`]). Under the 1/K0 gate only the share of the slot's
-/// 1/K0 range the candidate's window overlaps counts. An allowlist drops the candidates it
+/// 1/K0 range the candidate's window overlaps counts, and for the single-ion centroids of
+/// `convert.tdf_single_ion` always (none for a candidate without a 1/K0 window). An
+/// allowlist drops the candidates it
 /// excludes. The fragments of the peptides present match their own peaks more often than
 /// chance, so this still reads low on a dense run, which is the side a guard for 100-fold
 /// excesses can afford.
@@ -2104,20 +2148,31 @@ fn window_loads(
         .par_iter()
         .map(|g| {
             let w = &scans[g.scans[0]].window;
-            // The window's scans on the RT axis, with the peaks before each.
-            let mut by_rt: Vec<(f64, usize)> = g
+            // The window's scans on the RT axis, with the peaks before each, the single-ion
+            // centroids apart.
+            let mut by_rt: Vec<(f64, usize, usize)> = g
                 .scans
                 .iter()
-                .map(|&si| (scans[si].rt_seconds, scans[si].peaks.len()))
+                .map(|&si| {
+                    let s = &scans[si];
+                    let single = s
+                        .single_ion
+                        .as_deref()
+                        .map_or(0, |f| f.iter().filter(|&&b| b).count());
+                    (s.rt_seconds, s.peaks.len() - single, single)
+                })
                 .collect();
             if !by_rt.windows(2).all(|p| p[0].0 <= p[1].0) {
                 by_rt.sort_by(|a, b| a.0.total_cmp(&b.0));
             }
             let rts: Vec<f64> = by_rt.iter().map(|x| x.0).collect();
             let mut cum: Vec<u64> = Vec::with_capacity(by_rt.len() + 1);
+            let mut cum_single: Vec<u64> = Vec::with_capacity(by_rt.len() + 1);
             cum.push(0);
-            for &(_, n) in &by_rt {
+            cum_single.push(0);
+            for &(_, n, ns) in &by_rt {
                 cum.push(cum.last().copied().unwrap_or(0) + n as u64);
+                cum_single.push(cum_single.last().copied().unwrap_or(0) + ns as u64);
             }
             // The chance that a peak meets a fragment, counted on samples of both.
             let step = (g.scans.len() / FOOTPRINT_SAMPLE_SCANS).max(1);
@@ -2138,12 +2193,11 @@ fn window_loads(
             } else {
                 0.0
             };
-            let slot_im = match (w.im_lower, w.im_upper, &win.im_lo, &win.im_hi) {
-                (Some(a), Some(b), Some(lo), Some(hi)) if guard.im_gate && b > a => {
-                    Some((a, b, lo, hi))
-                }
+            let slot_bounds = match (w.im_lower, w.im_upper, &win.im_lo, &win.im_hi) {
+                (Some(a), Some(b), Some(lo), Some(hi)) if b > a => Some((a, b, lo, hi)),
                 _ => None,
             };
+            let slot_im = slot_bounds.filter(|_| guard.im_gate);
             let n = (g.hi_cid - g.lo_cid) as usize;
             let stride = n.div_ceil(FOOTPRINT_CANDIDATES).max(1);
             let mut hits = 0.0f64;
@@ -2167,6 +2221,18 @@ fn window_loads(
                 };
                 let peaks = (cum[b] - cum[a]) as f64;
                 hits += lib.frag_range(c).len() as f64 * peaks * rate * im_share;
+                let single = (cum_single[b] - cum_single[a]) as f64;
+                if single > 0.0 {
+                    // Matched only inside the candidate's own 1/K0 window (`Guard::admits`).
+                    let share = match slot_bounds {
+                        Some((s0, s1, lo, hi)) if win.has_im_window(ci) => {
+                            let o = hi[ci].min(s1) - lo[ci].max(s0);
+                            (o.max(0.0) / (s1 - s0)) as f64 * guard.si_scale as f64
+                        }
+                        _ => 0.0,
+                    };
+                    hits += lib.frag_range(c).len() as f64 * single * rate * share;
+                }
             }
             WindowLoad {
                 lower_mz: w.lower_mz,
@@ -2440,9 +2506,8 @@ impl ProbeTask<'_> {
         let mut setup: Vec<(f64, u32)> = Vec::new();
         for &si in ids {
             let scan = &scans[si];
-            // The 1/K0 the window test reads (`None` with the gate off or on a 3D scan), and
-            // the 1/K0 each hit carries.
-            let (gim, sim) = (guard.scan_im(scan), scan.im.as_deref());
+            // The 1/K0 each hit carries; the window test reads `guard.peak_im`.
+            let sim = scan.im.as_deref();
             let rt = scan.rt_seconds;
             let hs = si as u32;
             setup.clear();
@@ -2452,7 +2517,7 @@ impl ProbeTask<'_> {
                 (q, bins.bin(q) as u32)
             }));
             for (j, (peak, &(q_mz, bin))) in scan.peaks.iter().zip(&setup).enumerate() {
-                let pim = gim.map(|v| v[j]);
+                let pim = guard.peak_im(scan, j);
                 let him = peak_hit_im(sim, j);
                 let inten = peak.intensity;
                 let obs_mz = peak.mz;
@@ -3360,11 +3425,13 @@ fn extract_twopass_windows(
 /// warning.
 #[allow(clippy::type_complexity)]
 fn decode_unlent(p: &ExtractParams) -> Result<(Option<Vec<Ms2Scan>>, Option<Vec<Ms1Scan>>)> {
+    // A lent decode holds no single-ion centroids, which only extract reads (spectra_ms2 v4).
+    let single_ion = crate::spectra::has_single_ion(p.ms2);
     match p.scans {
         Some(shared) => {
-            let ms2 = if shared.ms2.is_empty() {
-                let owned = load_ms2(p.ms2)?;
-                if !owned.is_empty() {
+            let ms2 = if shared.ms2.is_empty() || single_ion {
+                let owned = load_ms2_with(p.ms2, true)?;
+                if !owned.is_empty() && !single_ion {
                     warn!(
                         ms2 = p.ms2,
                         scans = owned.len(),
@@ -3397,7 +3464,7 @@ fn decode_unlent(p: &ExtractParams) -> Result<(Option<Vec<Ms2Scan>>, Option<Vec<
         None => {
             // The two artifacts are independent; the MS2 error, if any, is reported first.
             let (ms2, ms1) = rayon::join(
-                || load_ms2(p.ms2),
+                || load_ms2_with(p.ms2, true),
                 || match p.ms1 {
                     Some(path) => load_ms1(path),
                     None => Ok(Vec::new()),
@@ -3628,7 +3695,6 @@ fn apex_im_stats(
         .and_then(|si| {
             let scan = &scans[si];
             let im = scan.im.as_deref()?;
-            let gim = guard.scan_im(scan);
             let mut pts: Vec<(f64, f64)> = Vec::new();
             for &f in lib.cand_frag_mz(cid) {
                 let f = f as f64;
@@ -3636,7 +3702,7 @@ fn apex_im_stats(
                 let Some(j) = crate::spectra::nearest_peak(&scan.peaks, target, frag_tol) else {
                     continue;
                 };
-                if !guard.admits(c, apex_rt, gim.map(|v| v[j])) {
+                if !guard.admits(c, apex_rt, guard.peak_im(scan, j)) {
                     continue;
                 }
                 pts.push((im[j] as f64, scan.peaks[j].intensity as f64));
@@ -4353,6 +4419,23 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             .map_or(0, |lo| lo.iter().filter(|v| v.is_finite()).count());
         info!(gated_candidates = gated, "extract: 1/K0 gate on");
     }
+    // `convert.tdf_single_ion = flagged`: those peaks are matched inside 1/K0 windows only.
+    if scans.iter().any(|s| s.single_ion.is_some()) {
+        let windowed = (0..ncand).filter(|&c| win.has_im_window(c)).count();
+        if windowed == 0 {
+            warn!(
+                run_windows = p.run_windows,
+                "extract: the spectra keep single-ion centroids (convert.tdf_single_ion), but \
+                 no candidate has a 1/K0 window (no ion-mobility calibration); none of them \
+                 is matched"
+            );
+        } else {
+            info!(
+                windowed_candidates = windowed,
+                "extract: single-ion centroids matched inside each candidate's 1/K0 window"
+            );
+        }
+    }
     // `ExtractParams::trace_pad` in seconds at this run's cycle time. The two-pass claims
     // build their elution profiles from the guarded hits, so they take no pad.
     let trace_pad_s = match p.trace_pad {
@@ -4483,6 +4566,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         win: &win,
         im_gate,
         pad: trace_pad_s,
+        si_scale: p.cfg.single_ion_im_scale as f32,
     };
     // The per-point 1/K0 of the traces is written only on 4D data with a consumer on.
     let chrom_im = has_im && p.chrom_im;
@@ -4705,11 +4789,11 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 if hi <= lo {
                     continue;
                 }
-                let (gim, sim) = (guard.scan_im(scan), scan.im.as_deref());
+                let sim = scan.im.as_deref();
                 let rt = scan.rt_seconds;
                 let hs = si as u32;
                 for (j, peak) in scan.peaks.iter().enumerate() {
-                    let pim = gim.map(|v| v[j]);
+                    let pim = guard.peak_im(scan, j);
                     let him = peak_hit_im(sim, j);
                     let inten = peak.intensity;
                     let obs_mz = peak.mz;
@@ -7395,6 +7479,7 @@ mod accumulate_tests {
                     })
                     .collect(),
                 im: None,
+                single_ion: None,
             })
             .collect()
     }
@@ -7460,6 +7545,7 @@ mod accumulate_tests {
                 win: &win,
                 im_gate,
                 pad: 0.0,
+                si_scale: 1.0,
             };
             pool.install(|| {
                 // `bound = 0` flushes nothing, so the comparison is over the accumulator.
@@ -7500,6 +7586,112 @@ mod accumulate_tests {
                 "{what}: 3D scans are not gated"
             );
         }
+    }
+
+    /// `convert.tdf_single_ion = flagged`: with the 1/K0 gate off, a flagged peak is matched
+    /// only to a candidate whose 1/K0 window holds its 1/K0, never to one without a window,
+    /// and every unflagged peak is matched as before. All flags off is the unflagged search.
+    #[test]
+    fn single_ion_peaks_match_inside_the_candidate_im_window_only() {
+        use std::collections::BTreeSet;
+        let n = 50;
+        let lib = lib(n);
+        let bins = FragIndex::geometry(&lib, 20.0);
+        let stats = LocalIndexStats::default();
+        let probe = TaskProbe::Local {
+            lib: &lib,
+            bins: &bins,
+            tol_ppm: 20.0,
+            stats: &stats,
+        };
+        let w = IsolationWindow {
+            target_mz: 400.0,
+            lower_mz: 400.0 - 1e-9,
+            upper_mz: 400.0 + (n - 1) as f64 * 1e-3 + 1e-9,
+            im_lower: None,
+            im_upper: None,
+        };
+        let mut mob = scans(3, w, 0);
+        for s in &mut mob {
+            s.im = Some(vec![1.0; s.peaks.len()]);
+        }
+        let mut unflagged = mob.clone();
+        // Odd peaks are single-ion centroids.
+        let single_mz: BTreeSet<u32> = mob[0]
+            .peaks
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| k % 2 == 1)
+            .map(|(_, p)| p.mz.to_bits())
+            .collect();
+        for s in &mut mob {
+            s.single_ion = Some((0..s.peaks.len()).map(|k| k % 2 == 1).collect());
+        }
+        for s in &mut unflagged {
+            s.single_ion = Some(vec![false; s.peaks.len()]);
+        }
+        let groups = vec![WinGroup {
+            lo_cid: 0,
+            hi_cid: n as u32,
+            scans: vec![0, 1, 2],
+        }];
+        // Candidate 0's 1/K0 window excludes 1.0, candidate 1's holds it, the rest have none.
+        let mut win = rt_windows(vec![0.0; n], vec![1e9; n]);
+        let mut im_lo = vec![f32::NEG_INFINITY; n];
+        let mut im_hi = vec![f32::INFINITY; n];
+        (im_lo[0], im_hi[0]) = (0.5, 0.9);
+        (im_lo[1], im_hi[1]) = (0.9, 1.1);
+        win.im_lo = Some(im_lo);
+        win.im_hi = Some(im_hi);
+        win.im_cal = Some(vec![None; n]);
+        let mass_off = MassOffset {
+            scalar_ppm: 0.0,
+            grid_mz: Vec::new(),
+            grid_ppm: Vec::new(),
+        };
+        let cfg = ExtractConfig::default();
+        // (candidate, scan, fragment, peak m/z) of every hit.
+        let run = |sc: &[Ms2Scan]| -> BTreeSet<(u32, u32, u16, u32)> {
+            let mut acc = HitAcc::default();
+            let mut chunk = HitStore::default();
+            let guard = Guard {
+                win: &win,
+                im_gate: false,
+                pad: 0.0,
+                si_scale: 1.0,
+            };
+            let mut sink = |_: Vec<(u32, &mut [Hit])>| -> bool { true };
+            accumulate_groups(
+                probe, 1, &groups, sc, guard, &mass_off, &cfg, None, 0, &mut acc, &mut chunk,
+                &mut sink,
+            );
+            materialize(acc)
+                .into_iter()
+                .flat_map(|(c, hs)| {
+                    hs.into_iter()
+                        .map(move |h| (c, h.scan, h.frag, h.obs_mz.to_bits()))
+                })
+                .collect()
+        };
+        let all = run(&unflagged);
+        assert_eq!(all, run(&scans(3, w, 0)), "no flag set is the plain search");
+        let got = run(&mob);
+        let want: BTreeSet<_> = all
+            .iter()
+            .copied()
+            .filter(|&(c, _, _, mz)| c == 1 || !single_mz.contains(&mz))
+            .collect();
+        assert_eq!(got, want);
+        assert!(
+            got.iter()
+                .any(|&(c, _, _, mz)| c == 1 && single_mz.contains(&mz)),
+            "a single-ion peak inside the window is matched"
+        );
+        assert!(
+            all.iter()
+                .any(|&(c, _, _, mz)| c == 0 && single_mz.contains(&mz)),
+            "candidate 0 had single-ion hits to lose"
+        );
     }
 
     /// The peak's 1/K0 rides in the padding: `Hit` stays 16 bytes, since the hit
@@ -7583,6 +7775,7 @@ mod accumulate_tests {
             win: &win,
             im_gate: false,
             pad: 0.0,
+            si_scale: 1.0,
         };
         let mass_off = MassOffset {
             scalar_ppm: 0.0,
@@ -7698,6 +7891,7 @@ mod accumulate_tests {
                     })
                     .collect(),
                 im: None,
+                single_ion: None,
             })
             .collect();
         let idx = FragIndex::build(&lib, 20.0);
@@ -7706,6 +7900,7 @@ mod accumulate_tests {
             win: &win,
             im_gate: false,
             pad: 0.0,
+            si_scale: 1.0,
         };
         let mass_off = MassOffset {
             scalar_ppm: 0.0,
@@ -7790,6 +7985,7 @@ mod accumulate_tests {
             win: &win,
             im_gate: false,
             pad: 0.0,
+            si_scale: 1.0,
         };
         let mass_off = MassOffset {
             scalar_ppm: 0.0,
@@ -8592,6 +8788,7 @@ mod q1_tests {
                         intensity: 1.0,
                     }],
                     im: None,
+                    single_ion: None,
                 });
             }
         }

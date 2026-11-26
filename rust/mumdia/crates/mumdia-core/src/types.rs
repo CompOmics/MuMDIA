@@ -107,6 +107,10 @@ pub struct Ms2Scan {
     /// (spectra v2, the native diaPASEF reader). `None` on 3D spectra, where nothing is
     /// decoded or allocated for it.
     pub im: Option<Vec<f32>>,
+    /// Per-peak flag, parallel to `peaks`: the peak is a centroid below
+    /// `convert.tdf_min_points` (spectra_ms2 v4), which extract matches only inside a
+    /// candidate's 1/K0 window. `None` everywhere but extract's decode of a v4 artifact.
+    pub single_ion: Option<Vec<bool>>,
 }
 
 #[cfg(test)]
