@@ -386,9 +386,12 @@ than a number. Both are recorded in every run's `manifest.json`.
   sample, and fits the same 32-column model; on the eight cells every fold fitted and the cut
   kept 35.1% of the PSMs. The second-pass rescore (`mbr.second_pass_prefilter_keep_decoys`)
   takes the same path. A fold whose sample fits keeps exactly the model it had: a six-run
-  Astral pool (4.99 M PSMs, 43.8% kept) gave a byte-identical scored table. The whole-plate measurement is pending.
-  Caveat: the classifier's counts on a plate the prefilter now cuts are measured on one seed of
-  one plate; seeds, a second plate and the species-entrapment null are owed.
+  Astral pool (4.99 M PSMs, 43.8% kept) gave a byte-identical scored table. Whole 52-cell
+  plate, first-pass rescore on the same competed tables, `nn_torch`, one seed: 35.1% of 52.38 M
+  PSMs kept, 750 against 794 target precursors per run at `run_psm_q` 1% (-5.5%; peptides at
+  `peptide_q_value` 1% 3,303 against 3,328), rescore 24.5 against 93 min, process-tree peak 60
+  against 151 GB proportional set size. Caveat: one seed of one plate, so the -5.5% is not yet
+  separated from seed noise; seeds, a second plate and the species-entrapment null are owed.
 
 ## [0.15.1] - 2026-11-26
 
