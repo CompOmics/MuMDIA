@@ -255,6 +255,15 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **Extract probes half its default windows in flight on a run whose RT windows are the
+  library fallback (docs/09 "The footprint guard", docs/08 section 4i).** A run without
+  anchors under `rt_im_train.fallback_windows = library` has RT windows of half the gradient,
+  so every isolation window group in flight holds many times the fragment-peak matches of a
+  calibrated run; unset, `extract.windows_in_flight` is now halved there (4 to 2 on diaPASEF).
+  The batch only bounds memory: `psms_extracted`, the chromatograms and every later table
+  are the same bytes, and a calibrated run, an explicit `windows_in_flight` and a standalone
+  `mumdia extract` (which reads `run_windows.parquet` and does not see the flag) are
+  unchanged. MEASUREMENT_PLACEHOLDER
 - **diaPASEF: `convert.tdf_min_points` defaults to 1, with `extract.gate_support_min` kept at
   0.845 on spectra that carry 1/K0 (docs/35 sections 2, 11 "Low input" and 16).** The native
   Bruker reader keeps single-ion centroids again; the support gate stays on. Fleet, 0.15.1

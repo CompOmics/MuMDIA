@@ -1129,6 +1129,11 @@ the pooled rescore of 14.7M PSMs had no training signal, and so had the adapting
 bootstrap rescore, so the fallback bounds the memory there but cannot rescue the search. `tdf_min_points` 2 did not give these cells anchors: 218 / 0 / 0 at 1% against
 219 / 0 / 0 with 1. `fallback_windows = refuse` stopped G1_29 at `rt-im-train` after 2:19.
 
+On a run whose RT windows are this fallback, extract probes half its default
+`windows_in_flight` at a time (2 instead of 4 on diaPASEF), because a window of half the
+gradient holds many times the matches of a calibrated one; the output is the same bytes
+(docs/09_extract.md, "The footprint guard").
+
 `fallback_windows = refuse` fails a run with fewer than two RT anchors at `rt-im-train`
 instead, before extract; under `run-experiment` that ends the experiment. Neither applies to
 a grouped run (`groups.window_groups > 1`), whose anchors are read from the seed with no

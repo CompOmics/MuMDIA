@@ -2237,7 +2237,9 @@ impl Default for RtImTrainConfig {
 pub struct ExtractConfig {
     /// Isolation windows probed per batch before the candidates no later window can touch
     /// are scored and written. `None` (the default) uses the rayon thread count capped at
-    /// 16, and at 4 on spectra that carry 1/K0 (diaPASEF). The hit accumulator holds the
+    /// 16, and at 4 on spectra that carry 1/K0 (diaPASEF), and half that on a run whose RT
+    /// windows are the library fallback of `rt_im_train.fallback_windows` (a run without
+    /// anchors, docs/08_rt_im_train.md section 4i), never below 1. The hit accumulator holds the
     /// windows in flight, so this sets the stage's peak almost linearly: on the HYE benchmark
     /// at 32 threads, 32 in flight is 24.65 GiB, 16 is 16.57 GiB and 8 is 12.31 GiB, with
     /// identical output (docs/27 section 3.10). A diaPASEF run has few, dense window groups,

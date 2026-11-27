@@ -304,6 +304,14 @@ task keeps beside each until it groups them: 20 bytes a match):
   path, every window on the paths that accumulate the whole run (a two-pass peak claim, the
   contested features, the bucketed matcher).
 
+Unset, `windows_in_flight` is halved on a run whose RT windows are the library fallback of
+`rt_im_train.fallback_windows` (a run without anchors, docs/08_rt_im_train.md section 4i):
+4 becomes 2 on diaPASEF. The flag travels with the windows `rt-im-train` hands to extract in
+memory (`RtWindows::library_fallback`), so a standalone `mumdia extract`, which reads
+`run_windows.parquet`, keeps the full default; set the key there by hand. The batch size
+changes no byte of `psms_extracted` or the chromatograms
+(`windows_in_flight_leave_the_extract_bytes_alone`), and a calibrated run is not touched.
+
 The ceiling is `extract.max_footprint_gib`: unset (`auto`), the machine's physical memory
 (the tightest cgroup limit on the process's path when smaller: a container's, or a SLURM or
 systemd job's, read by `memlog::total_memory`),
