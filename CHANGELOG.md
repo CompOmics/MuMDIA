@@ -280,6 +280,26 @@ than a number. Both are recorded in every run's `manifest.json`.
   library window. A run without 1/K0 is byte-identical, and the key stays out of the canonical
   configuration at `auto`; the explicit `unbounded`, `library` and `refuse` behave as before.
 
+### Fixed
+
+- **The rescore prefilter no longer stands aside on a whole single-cell diaPASEF plate (docs/35
+  section 16, "A prefilter before the classifier").** Each fold's model is fitted on a
+  400,000-row stride sample of the other folds, from the targets `prelim_score` passes at q
+  0.01 to 0.1. Under `convert.tdf_min_points` 1 a 52-cell plate pools about 52 M PSMs, the sample
+  is 1 row in 88, and q's (decoys + 1) / targets needs 10 targets above the first decoy, so the
+  sample held none; moreover neither `prelim_score` nor any prefilter column ranks confident
+  targets above the decoys there (eight cells, 7.56 M PSMs: `prelim_score` 21 targets at q 0.1
+  and none at 0.01 over the whole pool), while the seed score `log_seed_hyperscore` passed 234 at
+  0.01. The prefilter then stood aside, and the classifier received the whole pool. A fold whose
+  sample cannot be fitted now starts from whichever of `prelim_score` and `log_seed_hyperscore`
+  passes more targets at q 0.1 over all the rows outside the fold, adds those targets to its
+  sample, and fits the same 32-column model; on the eight cells every fold fitted and the cut
+  kept 35.1% of the PSMs. The second-pass rescore (`mbr.second_pass_prefilter_keep_decoys`)
+  takes the same path. A fold whose sample fits keeps exactly the model it had: a six-run
+  Astral pool (4.99 M PSMs, 43.8% kept) gave a byte-identical scored table. The whole-plate measurement is pending.
+  Caveat: the classifier's counts on a plate the prefilter now cuts are measured on one seed of
+  one plate; seeds, a second plate and the species-entrapment null are owed.
+
 ## [0.15.1] - 2026-11-26
 
 ### Changed
