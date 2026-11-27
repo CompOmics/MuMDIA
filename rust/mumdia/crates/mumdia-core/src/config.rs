@@ -4061,8 +4061,9 @@ pub struct RescoreConfig {
     /// the decoys (default 0.35); 0 keeps every PSM. The model is fitted per experiment on
     /// `prefilter_features` (a default list when unset): for each fold a logistic regression
     /// of the targets at `train_fdr` against the decoys of a 400,000-row sample of the other
-    /// folds (when that sample holds too few confident targets, with every target the
-    /// `prelim_score` passes at q 0.1 over the other folds added), refitted three times, and
+    /// folds (when that sample holds too few confident targets, the fold starts from
+    /// `prelim_score` or the seed score `log_seed_hyperscore`, whichever passes more targets at
+    /// q 0.1 over all the other folds, and those targets join the sample), refitted three times, and
     /// every PSM is scored by the model of the fold it is held out of, on the rescore's own
     /// fold keys. Targets and decoys above the cut are all
     /// kept, so the share of rows kept follows the pool: 36% on a six-run diaPASEF pool, 49%
