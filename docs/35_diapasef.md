@@ -1402,7 +1402,13 @@ all the rows outside the fold, those targets join the sample, and the model is f
 32 columns as before. A fold whose sample fits keeps exactly the model it had, so every pool
 that the prefilter cut before is cut the same way. On the eight cells every fold started from
 the seed score (265-403 targets at q 0.1 outside the fold) and the cut kept 35.1% of the PSMs.
-<!-- MEASUREMENT: 52-cell first pass, filled below -->
+On the whole 52-cell plate (52.38 M PSMs, first-pass rescore, `nn_torch`, one seed, the same
+competed tables) every fold started from the seed score (1,412-2,322 targets at q 0.1 outside
+the fold) and the cut kept 35.1% of the PSMs: 750 against 794 target precursors per run at
+`run_psm_q` 1% (-5.5%; 3,303 against 3,328 peptides at `peptide_q_value` 1%), in 24.5 instead
+of 93 minutes, at a process-tree peak of 60 instead of 151 GB proportional set size (150 instead
+of 401 GB resident, which counts the workers' shared mapping of the feature matrix once per
+process). Whether the per-run loss is seed noise is not measured yet.
 The prefilter still stands aside when neither score passes 10 targets at q 0.1 outside a fold,
 as on the single-cell search of `rt_bootstrap/`, where the classifier found no training signal
 either.
