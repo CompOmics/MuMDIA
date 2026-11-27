@@ -922,8 +922,9 @@ ng and entrapment against that arm). `tdf_min_points` 1 with the gate at 0.3 fou
 counts within seed noise but at 2.3x the wall: the candidate pool grew up to 14x, a blank took
 50 min, and the pooled single-cell rescore handoff reached 103 GB. At 0.6 the pool is 4-22x
 smaller and the blanks take under 3 minutes. Co-elution 2 or a gate of 0.45 kept less of the
-gain at more of the cost. The prefilter still stands aside on noise-heavy pools when no fold
-has 10 targets even at q 0.1.
+gain at more of the cost. The prefilter still stands aside on noise-heavy pools when neither
+`prelim_score` nor the seed score passes 10 targets at q 0.1 outside a fold (section 16, "A
+prefilter before the classifier").
 
 Memory. The 0.15.0 benchmark sweep ran 52 timsTOF diaPASEF jobs with `tdf_min_points` 1 and the
 support gate off, and 10 that 0.14.0 ran failed on memory: six single-cell HeLa runs on which
@@ -1413,6 +1414,25 @@ against 168,249 precursors per run with 379 against 374 carbamidomethylated targ
 seeds, 2:59 instead of 5:06 at 7.1 instead of 15.6 GB; per file, 161,055 against 161,371 with
 144 against 147. On three of the 24 single-cell files a fold had fewer than 10 confident targets
 to fit on, and the prefilter stood aside with a warning.
+
+A fold whose sample cannot be fitted is now started again before the prefilter stands aside.
+Two things left a whole single-cell diaPASEF plate under `convert.tdf_min_points` 1 without a
+model. The (decoys + 1) / targets of q needs 10 targets above the first decoy for 10 targets at
+q 0.1, and the 400,000-row sample of a 52-cell pool is 1 row in 88, so a sample holds a tenth
+of the confident targets the whole pool has. And none of the 32 columns, nor `prelim_score`,
+ranks confident targets above the decoys there: on eight cells of the plate (7.56 M PSMs)
+`prelim_score` passed 21 targets at q 0.1 and none at 0.01 over the whole pool, and none at
+any level in the sample. The seed score `log_seed_hyperscore`, which is not a prefilter column,
+passed 234 targets at 0.01 over the whole pool and none in the sample. Such a fold now starts
+from whichever of `prelim_score` and `log_seed_hyperscore` passes more targets at q 0.1 over
+all the rows outside the fold, those targets join the sample, and the model is fitted on the
+32 columns as before. A fold whose sample fits keeps exactly the model it had, so every pool
+that the prefilter cut before is cut the same way. On the eight cells every fold started from
+the seed score (265-403 targets at q 0.1 outside the fold) and the cut kept 35.1% of the PSMs.
+<!-- MEASUREMENT: 52-cell first pass, filled below -->
+The prefilter still stands aside when neither score passes 10 targets at q 0.1 outside a fold,
+as on the single-cell search of `rt_bootstrap/`, where the classifier found no training signal
+either.
 
 Every number above used `nn_torch`. Under `native_tda` the prefilter is also a sensitivity
 gain, because the linear model fits the boundary far better without the weak bulk: one HYE
