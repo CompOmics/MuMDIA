@@ -4239,6 +4239,21 @@ function searchProblems() {
         `Set Bands to Automatic or Off for these files: ${diapasef.map(baseName).join(", ")}.`
     );
   }
+  // The "ztscan" preset sets the ZT Scan keys explicitly, and the engine refuses them unless
+  // every input is a ZT Scan run by its census; vendor files are not probed here, and a
+  // .wiff2 that msconvert converted carries no quadrupole positions, so they are refused too.
+  if (/ztscan\.json$/.test($("preset").value)) {
+    const notZt = state.picks.mzml.filter((f) => !state.ztscan.probes[f]?.scanning_quadrupole);
+    if (notZt.length) {
+      out.push(
+        "The \"ztscan\" preset is only for SCIEX ZT Scan DIA mzML files, and these files are " +
+          `not recognised as such: ${notZt.map(baseName).join(", ")}. Choose another preset ` +
+          "(for example \"diann-library\"): MuMDIA runs the ZT Scan analysis by itself for ZT " +
+          "Scan files under any preset. A ZT Scan file must be converted with the SCIEX MS " +
+          "Data Converter, which writes the quadrupole positions."
+      );
+    }
+  }
   const zt = ztscanFiles();
   if (zt.length && !(parseFloat($("ztscan-hw").value) > 0)) {
     out.push(
