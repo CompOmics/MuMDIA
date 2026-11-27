@@ -630,71 +630,33 @@ pub fn prefilter_scores(inp: PrefilterInput) -> Option<Vec<f64>> {
     assert_eq!(inp.is_decoy.len(), n, "prefilter_scores: decoy labels");
     assert_eq!(inp.init_score.len(), n, "prefilter_scores: initial scores");
     let folds = inp.folds.max(2);
-    let d = inp.features.n_features();
     let fold_of = fold_assignment(inp.fold_key, folds);
     let mut out = vec![f64::NEG_INFINITY; n];
     for test_fold in 0..folds as u32 {
-        let outside = fold_of.iter().filter(|&&f| f != test_fold).count();
-        if outside == 0 {
-            continue;
-        }
-        let stride = outside.div_ceil(inp.max_train_rows.max(1)).max(1);
-        let train_idx: Vec<u32> = fold_of
+        let outside: Vec<u32> = fold_of
             .iter()
             .enumerate()
             .filter(|(_, &f)| f != test_fold)
             .map(|(i, _)| i as u32)
-            .step_by(stride)
             .collect();
-        let (mean, std) = fit_standardizer(inp.features, &train_idx);
-        let mut xtr: Vec<f32> = vec![0.0; train_idx.len().saturating_mul(d)];
-        xtr.par_chunks_mut(d.max(1))
-            .zip(train_idx.par_iter())
-            .for_each(|(o, &i)| std_row_into(inp.features.row(i as usize), &mean, &std, o));
-        let xrow = |k: usize| -> &[f32] { &xtr[k * d..(k + 1) * d] };
-        let decoy: Vec<bool> = train_idx
-            .iter()
-            .map(|&i| inp.is_decoy[i as usize])
-            .collect();
-        let mut scores: Vec<f64> = train_idx
-            .iter()
-            .map(|&i| inp.init_score[i as usize])
-            .collect();
-        // A pool that is mostly noise (diaPASEF under the relaxed extract rules) can leave the
-        // initial score without 10 targets at `train_fdr`. Percolator's start then: the one
-        // column, in either direction, that passes the most targets.
-        if confident_targets(&scores, &decoy, inp.train_fdr) < 10 {
-            if let Some(s) = best_single_column(d, &xrow, &decoy, inp.train_fdr) {
-                scores = s;
-            }
+        if outside.is_empty() {
+            continue;
         }
-        let mut w = vec![0.0; d + 1];
-        for _ in 0..inp.num_iter.max(1) {
-            let q = target_decoy_q_split(&scores, &decoy);
-            // A pool whose top is mostly decoys can leave no column with 10 targets at
-            // `train_fdr`; the positives are then the targets at the first looser level that has.
-            let passing = |f: f64| count_targets_at_q(&q, &decoy, f);
-            let fdr = [inp.train_fdr, 0.05, 0.1]
-                .into_iter()
-                .filter(|&f| f >= inp.train_fdr)
-                .find(|&f| passing(f) >= 10)?;
-            let mut rows: Vec<&[f32]> = Vec::new();
-            let mut ys: Vec<f64> = Vec::new();
-            for (k, &is_d) in decoy.iter().enumerate() {
-                if is_d {
-                    rows.push(xrow(k));
-                    ys.push(0.0);
-                } else if q[k] <= fdr {
-                    rows.push(xrow(k));
-                    ys.push(1.0);
-                }
+        let stride = outside.len().div_ceil(inp.max_train_rows.max(1)).max(1);
+        let train_idx: Vec<u32> = outside.iter().copied().step_by(stride).collect();
+        // A pool whose confident targets are rare (a single-cell plate) can leave the stride
+        // sample with fewer than 10 targets at any level, because q's +1 needs 10 targets
+        // above the first decoy. The sample then also keeps every target the initial score
+        // passes at the loosest level over all the rows outside the fold; a pool whose stride
+        // sample fits keeps exactly the model it had.
+        let (w, mean, std) = match fit_prefilter_fold(&inp, &train_idx) {
+            Some(f) => f,
+            None if stride > 1 => {
+                let enriched = with_confident_targets(&inp, &outside, train_idx, stride);
+                fit_prefilter_fold(&inp, &enriched)?
             }
-            w = logreg_fit(&rows, &ys, 1e-3, 100, 0.5);
-            scores = (0..train_idx.len())
-                .into_par_iter()
-                .map(|k| score_row(&w, xrow(k)))
-                .collect();
-        }
+            None => return None,
+        };
         let test_idx: Vec<u32> = fold_of
             .iter()
             .enumerate()
@@ -710,6 +672,101 @@ pub fn prefilter_scores(inp: PrefilterInput) -> Option<Vec<f64>> {
         }
     }
     Some(out)
+}
+
+/// The loosest level at which [`prefilter_scores`] still takes its positive set.
+const PREFILTER_LOOSEST_FDR: f64 = 0.1;
+
+/// One fold's prefilter model, fitted on the rows `train_idx`: the weights and the
+/// standardiser they apply to. `None` when the rows hold fewer than 10 targets at every level
+/// up to [`PREFILTER_LOOSEST_FDR`].
+type PrefilterFold = (Vec<f64>, Vec<f64>, Vec<f64>);
+fn fit_prefilter_fold(inp: &PrefilterInput, train_idx: &[u32]) -> Option<PrefilterFold> {
+    let d = inp.features.n_features();
+    let (mean, std) = fit_standardizer(inp.features, train_idx);
+    let mut xtr: Vec<f32> = vec![0.0; train_idx.len().saturating_mul(d)];
+    xtr.par_chunks_mut(d.max(1))
+        .zip(train_idx.par_iter())
+        .for_each(|(o, &i)| std_row_into(inp.features.row(i as usize), &mean, &std, o));
+    let xrow = |k: usize| -> &[f32] { &xtr[k * d..(k + 1) * d] };
+    let decoy: Vec<bool> = train_idx
+        .iter()
+        .map(|&i| inp.is_decoy[i as usize])
+        .collect();
+    let mut scores: Vec<f64> = train_idx
+        .iter()
+        .map(|&i| inp.init_score[i as usize])
+        .collect();
+    // A pool that is mostly noise (diaPASEF under the relaxed extract rules) can leave the
+    // initial score without 10 targets at `train_fdr`. Percolator's start then: the one
+    // column, in either direction, that passes the most targets.
+    if confident_targets(&scores, &decoy, inp.train_fdr) < 10 {
+        if let Some(s) = best_single_column(d, &xrow, &decoy, inp.train_fdr) {
+            scores = s;
+        }
+    }
+    let mut w = vec![0.0; d + 1];
+    for _ in 0..inp.num_iter.max(1) {
+        let q = target_decoy_q_split(&scores, &decoy);
+        // A pool whose top is mostly decoys can leave no column with 10 targets at
+        // `train_fdr`; the positives are then the targets at the first looser level that has.
+        let passing = |f: f64| count_targets_at_q(&q, &decoy, f);
+        let fdr = [inp.train_fdr, 0.05, PREFILTER_LOOSEST_FDR]
+            .into_iter()
+            .filter(|&f| f >= inp.train_fdr)
+            .find(|&f| passing(f) >= 10)?;
+        let mut rows: Vec<&[f32]> = Vec::new();
+        let mut ys: Vec<f64> = Vec::new();
+        for (k, &is_d) in decoy.iter().enumerate() {
+            if is_d {
+                rows.push(xrow(k));
+                ys.push(0.0);
+            } else if q[k] <= fdr {
+                rows.push(xrow(k));
+                ys.push(1.0);
+            }
+        }
+        w = logreg_fit(&rows, &ys, 1e-3, 100, 0.5);
+        scores = (0..train_idx.len())
+            .into_par_iter()
+            .map(|k| score_row(&w, xrow(k)))
+            .collect();
+    }
+    Some((w, mean, std))
+}
+
+/// The stride sample `train_idx` of the rows `outside` a fold, with every target of `outside`
+/// that the initial score passes at [`PREFILTER_LOOSEST_FDR`] added, in row order. The q is
+/// taken over all of `outside`, where the +1 of the q estimate weighs `stride` times less
+/// than in the sample.
+fn with_confident_targets(
+    inp: &PrefilterInput,
+    outside: &[u32],
+    mut train_idx: Vec<u32>,
+    stride: usize,
+) -> Vec<u32> {
+    let decoy: Vec<bool> = outside.iter().map(|&i| inp.is_decoy[i as usize]).collect();
+    let init: Vec<f64> = outside
+        .iter()
+        .map(|&i| inp.init_score[i as usize])
+        .collect();
+    let q = target_decoy_q_split(&init, &decoy);
+    let before = train_idx.len();
+    train_idx.extend(
+        outside
+            .iter()
+            .enumerate()
+            .filter(|&(k, _)| !decoy[k] && q[k] <= PREFILTER_LOOSEST_FDR && k % stride != 0)
+            .map(|(_, &i)| i),
+    );
+    let added = train_idx.len() - before;
+    train_idx.sort_unstable();
+    tracing::info!(
+        sampled = before,
+        added_targets = added,
+        "rescore: prefilter stride sample had too few confident targets; every target the          initial score passes at q 0.1 outside the fold is added"
+    );
+    train_idx
 }
 
 /// How many targets pass `fdr` under `scores`.
@@ -951,6 +1008,63 @@ mod tests {
             train_fdr: 0.01,
         })
         .expect("the targets pass at a looser level");
+        let keep = prefilter_decoy_cut_mask(&s, &is_decoy, 0.3);
+        let kept_real = (0..n).filter(|&i| real[i] && keep[i]).count();
+        let n_real = real.iter().filter(|&&r| r).count();
+        assert!(
+            kept_real as f64 > 0.99 * n_real as f64,
+            "{kept_real} of {n_real}"
+        );
+    }
+
+    /// Confident targets so rare that the stride sample of a fold holds fewer than 10 of them
+    /// (a single-cell plate: 1 row in 88 sampled) no longer make the prefilter stand aside:
+    /// the sample gains every target the initial score passes outside the fold.
+    #[test]
+    fn the_prefilter_fits_when_the_stride_sample_holds_too_few_confident_targets() {
+        let n = 100_000usize;
+        let mut m = FeatureMatrix::with_capacity(n, 2);
+        let mut is_decoy = Vec::with_capacity(n);
+        let mut real = Vec::with_capacity(n);
+        let mut x = 9001u64;
+        let mut rnd = || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((x >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        for i in 0..n {
+            let d = i % 2 == 1;
+            let r = !d && i % 500 == 0;
+            let shift = if r { 4.0 } else { 0.0 };
+            m.push(rnd() + shift);
+            m.push(rnd() + shift * 0.5);
+            is_decoy.push(d);
+            real.push(r);
+        }
+        let m = m.finish().unwrap();
+        let fold_key: Vec<u32> = (0..n as u32).map(|i| i / 2).collect();
+        let init: Vec<f64> = (0..n).map(|i| m.row(i)[0] as f64).collect();
+        let inp = PrefilterInput {
+            features: &m,
+            is_decoy: &is_decoy,
+            fold_key: &fold_key,
+            init_score: &init,
+            folds: 3,
+            max_train_rows: 1_000,
+            num_iter: 3,
+            train_fdr: 0.01,
+        };
+        // The case itself: a plain stride sample of a fold has no model to fit.
+        let fold_of = fold_assignment(&fold_key, 3);
+        let outside: Vec<u32> = (0..n as u32)
+            .filter(|&i| fold_of[i as usize] != 0)
+            .collect();
+        let stride = outside.len().div_ceil(1_000);
+        let sample: Vec<u32> = outside.iter().copied().step_by(stride).collect();
+        assert!(fit_prefilter_fold(&inp, &sample).is_none());
+        let s = prefilter_scores(inp).expect("the confident targets outside the fold are added");
+        assert!(s.iter().all(|v| v.is_finite()));
         let keep = prefilter_decoy_cut_mask(&s, &is_decoy, 0.3);
         let kept_real = (0..n).filter(|&i| real[i] && keep[i]).count();
         let n_real = real.iter().filter(|&&r| r).count();
