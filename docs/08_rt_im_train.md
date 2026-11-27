@@ -1130,9 +1130,13 @@ bootstrap rescore, so the fallback bounds the memory there but cannot rescue the
 219 / 0 / 0 with 1. `fallback_windows = refuse` stopped G1_29 at `rt-im-train` after 2:19.
 
 On a run whose RT windows are this fallback, extract probes half its default
-`windows_in_flight` at a time (2 instead of 4 on diaPASEF), because a window of half the
-gradient holds many times the matches of a calibrated one; the output is the same bytes
-(docs/09_extract.md, "The footprint guard").
+`windows_in_flight` at a time (2 instead of 4 on diaPASEF): it holds a whole batch's
+fragment-peak matches at once, and a window of half the gradient collects many of them. On
+four cells of the 52-cell plate (`tdf_min_points` 1, 48 threads) the two fallback cells
+matched 15.6-15.8 billion peaks against 5.8-5.9 billion for the two on the fixed 120 s
+window, and the experiment's peak RSS, which sat in those two extracts (their largest batch,
+6.6-6.7 billion matches at 20 bytes), fell from 126.0 to 74.4 GiB at 2 in flight, with the
+same extract wall and every output byte the same (docs/09_extract.md, "The footprint guard").
 
 `fallback_windows = refuse` fails a run with fewer than two RT anchors at `rt-im-train`
 instead, before extract; under `run-experiment` that ends the experiment. Neither applies to

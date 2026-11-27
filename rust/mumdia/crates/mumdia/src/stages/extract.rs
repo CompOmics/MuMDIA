@@ -2844,9 +2844,10 @@ fn support_gate_min(cfg: &ExtractConfig, has_im: bool) -> f64 {
 /// `extract.windows_in_flight`, or its default: the rayon thread count capped at 16, and
 /// at [`DEFAULT_MAX_WINDOWS_IN_FLIGHT_IM`] on spectra that carry 1/K0, halved when the RT
 /// windows are the library-range fallback of a run without anchors (`library_fallback`,
-/// `RtWindows::library_fallback`). Those windows span half the gradient, so each window
-/// group in flight holds many times the matches of a calibrated one; the batch only
-/// bounds memory, so the output is the same at any setting. An explicit value is kept.
+/// `RtWindows::library_fallback`). Those windows span half the gradient, and the matches
+/// of a whole batch are held at once (126 against 74 GiB at 4 and 2 on single-cell
+/// diaPASEF, docs/08 section 4i); the batch only bounds memory, so the output is the same
+/// at any setting. An explicit value is kept.
 fn groups_in_flight(cfg: &ExtractConfig, has_im: bool, library_fallback: bool) -> usize {
     let cap = if has_im {
         DEFAULT_MAX_WINDOWS_IN_FLIGHT_IM

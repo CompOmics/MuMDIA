@@ -258,12 +258,20 @@ than a number. Both are recorded in every run's `manifest.json`.
 - **Extract probes half its default windows in flight on a run whose RT windows are the
   library fallback (docs/09 "The footprint guard", docs/08 section 4i).** A run without
   anchors under `rt_im_train.fallback_windows = library` has RT windows of half the gradient,
-  so every isolation window group in flight holds many times the fragment-peak matches of a
-  calibrated run; unset, `extract.windows_in_flight` is now halved there (4 to 2 on diaPASEF).
-  The batch only bounds memory: `psms_extracted`, the chromatograms and every later table
-  are the same bytes, and a calibrated run, an explicit `windows_in_flight` and a standalone
+  and extract holds the fragment-peak matches of a whole batch of isolation window groups at
+  once; unset, `extract.windows_in_flight` is now halved there (4 to 2 on diaPASEF). The
+  batch only bounds memory: `psms_extracted`, the chromatograms and every later table are
+  the same bytes, and a calibrated run, an explicit `windows_in_flight` and a standalone
   `mumdia extract` (which reads `run_windows.parquet` and does not see the flag) are
-  unchanged. MEASUREMENT_PLACEHOLDER
+  unchanged. Measured on four cells of a single-cell HeLa diaPASEF plate (two on the library
+  fallback, two on the fixed 120 s window; `run-experiment`, 48 threads, one host): the
+  fallback cells' extract matched 15.6-15.8 billion fragment peaks against 5.8-5.9 billion,
+  their largest batch 6.6-6.7 billion at 4 in flight and 3.4 billion at 2, and the
+  experiment's peak (one process, which is also the process-tree peak) fell from 126.0 to
+  74.4 GiB, with those extracts at 161-162 s against 162-172 s and the experiment at 24:43
+  against 24:12. All 75 output tables and 59 recorded content hashes are identical. These
+  cells found no identification (no training signal), so the second pass did not run; a
+  whole plate is still to be measured.
 - **diaPASEF: `convert.tdf_min_points` defaults to 1, with `extract.gate_support_min` kept at
   0.845 on spectra that carry 1/K0 (docs/35 sections 2, 11 "Low input" and 16).** The native
   Bruker reader keeps single-ion centroids again; the support gate stays on. Fleet, 0.15.1
