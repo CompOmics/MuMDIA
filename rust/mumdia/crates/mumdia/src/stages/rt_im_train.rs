@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use anyhow::Result;
-use mumdia_core::config::{CalibrationMethod, RtImTrainConfig};
+use mumdia_core::config::{CalibrationMethod, FallbackWindows, RtImTrainConfig};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
 use mumdia_io::table::{write_table_chunked_hashed, Col, TableFile};
@@ -65,6 +65,60 @@ pub(crate) const INSUFFICIENT_ANCHORS_STATUS: &str = "insufficient_anchors_unbou
 /// `calibration_status` of a run with too few anchors for a residual-sized window: the
 /// broad `fallback_rt_window_s` around a fit on those few anchors.
 pub(crate) const FALLBACK_FIXED_STATUS: &str = "fallback_fixed";
+/// `calibration_status` of a run with fewer than two target anchors under
+/// `fallback_windows = library`: the library's iRT range mapped onto the run's gradient
+/// ([`library_range_map`]).
+pub(crate) const FALLBACK_LIBRARY_STATUS: &str = "fallback_library";
+/// `w_im_sizing` of the 1/K0 window of `fallback_windows = library` on a run without an
+/// ion-mobility calibration: the library's `predicted_im` plus or minus `fallback_im_window`.
+const IM_FALLBACK_SIZING: &str = "fallback_library";
+
+/// The RT window of `fallback_windows = library` (docs/08_rt_im_train.md section 4i).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LibraryRangeMap {
+    /// The library's `predicted_irt`, 1st and 99th percentile.
+    irt: (f64, f64),
+    /// The seed's `observed_rt` (every row, targets and decoys), 1st and 99th percentile.
+    rt: (f64, f64),
+    slope: f64,
+    intercept: f64,
+    half_width: f64,
+}
+
+/// The library's iRT, its 1st to 99th percentile, mapped linearly onto the 1st to 99th
+/// percentile of the seed's observed retention times, with a half-width of `fraction` of that
+/// span. Non-finite values are ignored. `None` when either side has no spread. The slope is
+/// positive whenever it is `Some`, so the map keeps the predicted elution order.
+fn library_range_map(lib_irt: &[f32], seed_rt: &[f64], fraction: f64) -> Option<LibraryRangeMap> {
+    fn p01_p99(mut v: Vec<f64>) -> Option<(f64, f64)> {
+        if v.is_empty() {
+            return None;
+        }
+        v.sort_unstable_by(f64::total_cmp);
+        // The rank rule of `calibrate::percentile`, on one sort.
+        let at = |p: f64| v[(p * (v.len() - 1) as f64).round() as usize];
+        Some((at(0.01), at(0.99)))
+    }
+    let (x0, x1) = p01_p99(
+        lib_irt
+            .iter()
+            .map(|&v| v as f64)
+            .filter(|v| v.is_finite())
+            .collect(),
+    )?;
+    let (y0, y1) = p01_p99(seed_rt.iter().copied().filter(|v| v.is_finite()).collect())?;
+    if !(x1 > x0 && y1 > y0) {
+        return None;
+    }
+    let slope = (y1 - y0) / (x1 - x0);
+    Some(LibraryRangeMap {
+        irt: (x0, x1),
+        rt: (y0, y1),
+        slope,
+        intercept: y0 - slope * x0,
+        half_width: fraction * (y1 - y0),
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum WindowPlan {
@@ -444,6 +498,9 @@ pub struct RtFit {
     /// Anchors `anchor_x_filter` removed before the fit; recorded in `cal.json` only when
     /// above 0, so a run without removals writes the `cal.json` it always wrote.
     n_rt_outliers_removed: usize,
+    /// The library-range map that stands in for a calibration under `fallback_windows =
+    /// library` (its slope and intercept are the fit's); `None` everywhere else.
+    rt_fallback: Option<LibraryRangeMap>,
 }
 
 /// The fitted windows, handed from `rt-im-train` to `extract` in memory by the
@@ -1073,8 +1130,36 @@ fn fit_anchors(
     };
     let n_train = train_irt.len();
     info!(n_train, "rt-im-train: training points");
-    // The ion-mobility calibration, on a seed with 1/K0 only.
+    // A seed with `observed_im` is a run whose spectra carry 1/K0.
     let im_reported = seed.has_column("observed_im");
+    // `fallback_windows`: a run that cannot define a mapping is refused, or mapped by the
+    // library's iRT range onto its gradient. Without the library (anchors read from the seed)
+    // there is nothing to map, and the windows stay unbounded. `auto` is `library` on a run
+    // with 1/K0 and `unbounded` otherwise, so a 3D run is unchanged.
+    let fallback = cfg.fallback_windows.resolve(im_reported);
+    let rt_fallback = match fallback {
+        _ if !windows_unbounded(n_train) => None,
+        FallbackWindows::Unbounded | FallbackWindows::Auto => None,
+        FallbackWindows::Refuse => anyhow::bail!(
+            "rt-im-train: {seed_psms} gives {n_train} target anchor(s), fewer than the two a \
+             retention-time calibration needs, and rt_im_train.fallback_windows = refuse, so \
+             the run is not searched over the whole gradient. Set fallback_windows = library \
+             for bounded windows from the library, or unbounded to search it anyway; \
+             docs/17_troubleshooting.md, \"Seed: no confident targets\"."
+        ),
+        FallbackWindows::Library => {
+            let m = library_range_map(lib_irt, &s_rt, cfg.fallback_rt_gradient_fraction);
+            if m.is_none() {
+                warn!(
+                    "rt-im-train: fallback_windows = library, but there is no library iRT to \
+                     map (a grouped run reads its anchors from the seed), or it or the seed's \
+                     retention times have no spread; the RT windows stay unbounded"
+                );
+            }
+            m
+        }
+    };
+    // The ion-mobility calibration, on a seed with 1/K0 only.
     let im = if im_reported {
         im_from_seed(
             &seed,
@@ -1090,14 +1175,27 @@ fn fit_anchors(
     } else {
         None
     };
+    // `fallback_windows = library` on a run with 1/K0 that could not be calibrated: the
+    // library's 1/K0 with a fixed half-width rather than no 1/K0 window at all.
+    let im = match im {
+        None if im_reported && lib_im.is_some() && fallback == FallbackWindows::Library => {
+            warn!(
+                w_im = cfg.fallback_im_window,
+                "rt-im-train: no ion-mobility calibration; the 1/K0 window is the library's \
+                 predicted 1/K0 plus or minus rt_im_train.fallback_im_window"
+            );
+            Some(ImCal::library_fallback(cfg.fallback_im_window))
+        }
+        im => im,
+    };
 
     // Fit calibration predicted_irt -> observed RT (seconds).
     // Zero or one point cannot define a useful mapping across the gradient.
-    let calibration_available = !windows_unbounded(n_train);
-    let (slope, intercept) = if calibration_available {
-        linear_fit(&train_irt, &train_rt)
-    } else {
-        (f64::NAN, f64::NAN)
+    let calibration_available = !windows_unbounded(n_train) || rt_fallback.is_some();
+    let (slope, intercept) = match &rt_fallback {
+        _ if !windows_unbounded(n_train) => linear_fit(&train_irt, &train_rt),
+        Some(m) => (m.slope, m.intercept),
+        None => (f64::NAN, f64::NAN),
     };
     let use_loess = calibration_available
         && matches!(cfg.calibration_method, CalibrationMethod::Loess)
@@ -1132,6 +1230,7 @@ fn fit_anchors(
         im,
         im_reported,
         n_rt_outliers_removed,
+        rt_fallback,
     };
 
     // Residuals and RT window. Require enough anchors before trusting the
@@ -1210,14 +1309,29 @@ fn fit_anchors(
         };
 
     let (w_rt, status): (Option<f64>, String) = match plan {
-        WindowPlan::Unbounded => {
-            warn!(
-                n_train,
-                min_anchors,
-                "rt-im-train: fewer than two target anchors; using unbounded RT windows"
-            );
-            (None, INSUFFICIENT_ANCHORS_STATUS.to_string())
-        }
+        WindowPlan::Unbounded => match &fit.rt_fallback {
+            Some(m) => {
+                warn!(
+                    n_train,
+                    half_width_s = m.half_width,
+                    rt_p01_s = m.rt.0,
+                    rt_p99_s = m.rt.1,
+                    fallback_windows = cfg.fallback_windows.as_str(),
+                    "rt-im-train: fewer than two target anchors; using the library's iRT \
+                     range mapped onto the gradient (rt_im_train.fallback_windows resolved to \
+                     library)"
+                );
+                (Some(m.half_width), FALLBACK_LIBRARY_STATUS.to_string())
+            }
+            None => {
+                warn!(
+                    n_train,
+                    min_anchors,
+                    "rt-im-train: fewer than two target anchors; using unbounded RT windows"
+                );
+                (None, INSUFFICIENT_ANCHORS_STATUS.to_string())
+            }
+        },
         WindowPlan::Fixed(width) => {
             warn!(
                 n_train,
@@ -1289,8 +1403,9 @@ fn fit_anchors(
     // RT calibration-quality residuals over the training anchors (seconds):
     // signed median = residual bias, absolute median = typical accuracy, MAD =
     // spread. Diagnostic only (the RT window already derives from these
-    // residuals); surfaced so a run's RT calibration can be judged good or biased.
-    let residuals = if calibration_available {
+    // residuals); surfaced so a run's RT calibration can be judged good or biased. None for
+    // the library-range fallback, which was not fitted to anchors.
+    let residuals = if !windows_unbounded(n_train) {
         let signed: Vec<f64> = train_irt
             .iter()
             .zip(&train_rt)
@@ -1548,6 +1663,8 @@ fn write_windows(
 
     let method = if !fit.calibration_available {
         "unavailable"
+    } else if fit.rt_fallback.is_some() {
+        "library_range"
     } else if fit.use_loess {
         "loess"
     } else {
@@ -1607,10 +1724,28 @@ fn write_windows(
     if fit.n_rt_outliers_removed > 0 {
         cal_json["n_rt_outliers_removed"] = json!(fit.n_rt_outliers_removed);
     }
+    // Only under `fallback_windows = library` on a run without anchors, so every other
+    // `cal.json` is unchanged.
+    if let Some(m) = &fit.rt_fallback {
+        cal_json["rt_fallback"] = json!({
+            "mode": "library",
+            "fallback_windows": p.cfg.fallback_windows.as_str(),
+            "irt_p01": m.irt.0,
+            "irt_p99": m.irt.1,
+            "rt_p01_s": m.rt.0,
+            "rt_p99_s": m.rt.1,
+            "gradient_fraction": p.cfg.fallback_rt_gradient_fraction,
+            "half_width_s": m.half_width,
+        });
+    }
     let im = fit.im.as_ref();
     if fit.im_reported {
         let im_fields = json!({
-            "im_method": if im.is_some() { "per_charge_linear_ccs" } else { "unavailable" },
+            "im_method": match im {
+                Some(c) if c.sizing == IM_FALLBACK_SIZING => "library_uncalibrated",
+                Some(_) => "per_charge_linear_ccs",
+                None => "unavailable",
+            },
             "im_n_train": im.map(|c| c.n_train),
             "im_global": im.map(|c| json!({"a": c.coefs.0 .0, "b": c.coefs.0 .1})),
             "im_per_charge": im.map(|c| c.coefs.1.iter()
@@ -1939,6 +2074,22 @@ struct ImCal {
 }
 
 impl ImCal {
+    /// The 1/K0 window of `fallback_windows = library`: the identity map (`obs_ccs =
+    /// pred_ccs`) with a half-width of `w_im`.
+    fn library_fallback(w_im: f64) -> ImCal {
+        ImCal {
+            coefs: ((0.0, 1.0), Default::default()),
+            w_im,
+            seed: None,
+            sizing: IM_FALLBACK_SIZING,
+            n_train: 0,
+            n_holdout: 0,
+            holdout_abs_median: None,
+            holdout_p_im: None,
+            in_sample_abs_median: f64::NAN,
+        }
+    }
+
     /// The calibrated 1/K0 of a library 1/K0 at a precursor m/z and charge.
     fn predict(&self, pred_im: f64, mz: f64, charge: i32) -> f64 {
         im_predict(&self.coefs, pred_im, mz, charge)
@@ -2886,6 +3037,216 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The library-range map: the iRT 1st-99th percentile onto the RT 1st-99th percentile,
+    /// increasing, ignoring non-finite values and outliers, and `None` without a spread.
+    #[test]
+    fn library_range_map_is_monotone_bounded_and_ignores_nan() {
+        // iRT 0..=100 with an absurd outlier and NaN/inf; RT 600..=1800 s.
+        let mut irt: Vec<f32> = (0..=100).map(|i| i as f32).collect();
+        irt.extend([f32::NAN, f32::INFINITY, -5000.0]);
+        let mut rt: Vec<f64> = (0..=1200).map(|i| 600.0 + i as f64).collect();
+        rt.push(f64::NAN);
+        let m = library_range_map(&irt, &rt, 0.25).unwrap();
+        // The percentile rank rule on the finite values (102 iRT with the outlier, 1201 RT).
+        assert_eq!(m.irt, (0.0, 99.0));
+        assert_eq!(m.rt, (612.0, 1788.0));
+        assert!(m.slope > 0.0);
+        let f = |x: f64| m.slope * x + m.intercept;
+        assert!((f(0.0) - 612.0).abs() < 1e-9 && (f(99.0) - 1788.0).abs() < 1e-9);
+        assert!((m.half_width - 0.25 * 1176.0).abs() < 1e-9);
+        // Monotone over the whole iRT range, outliers included.
+        let xs = [-5000.0, -1.0, 0.0, 50.0, 100.0, 1e4];
+        assert!(xs.windows(2).all(|w| f(w[0]) < f(w[1])));
+        // No spread on either side, or nothing finite: no map.
+        assert!(library_range_map(&[5.0; 10], &rt, 0.25).is_none());
+        assert!(library_range_map(&irt, &[900.0; 10], 0.25).is_none());
+        assert!(library_range_map(&[f32::NAN; 4], &rt, 0.25).is_none());
+        assert!(library_range_map(&irt, &[], 0.25).is_none());
+    }
+
+    /// A 4D run whose seed has no confident target: under `fallback_windows = unbounded` the
+    /// windows stay unbounded in RT and absent in 1/K0, byte for byte as before the key; under
+    /// `library`, and under the default `auto` on a run with 1/K0, the RT window is the
+    /// library-range map with its half-width and the 1/K0 window the library's 1/K0 plus or
+    /// minus `fallback_im_window` (null where the library has none), recorded in `cal.json`;
+    /// under `refuse` the stage fails. On a 3D run `auto` is `unbounded`, and on a calibrated
+    /// 3D run the key changes nothing.
+    #[test]
+    fn fallback_windows_bound_a_run_without_anchors() {
+        let n = 400usize;
+        let irt: Vec<f32> = (0..n)
+            .map(|i| {
+                if i % 97 == 5 {
+                    f32::NAN
+                } else {
+                    i as f32 * 0.25
+                }
+            })
+            .collect();
+        let pred: Vec<Option<f64>> = (0..n)
+            .map(|i| (i % 50 != 7).then_some(0.7 + i as f64 * 0.001))
+            .collect();
+        let mz: Vec<f64> = (0..n).map(|i| 400.0 + i as f64).collect();
+        let z: Vec<i32> = (0..n).map(|i| 2 + (i % 2) as i32).collect();
+        let prec = scratch("fb_prec.parquet");
+        write_table(
+            &prec,
+            vec![
+                Col::U32("candidate_id".into(), (0..n as u32).collect()),
+                Col::F32("predicted_irt".into(), irt.clone()),
+                Col::F64("precursor_mz".into(), mz.clone()),
+                Col::I32("charge".into(), z.clone()),
+                Col::OptF64("predicted_im".into(), pred.clone()),
+            ],
+        )
+        .unwrap();
+        // `confident`: every row a confident target on a line (a calibrated run); otherwise
+        // nothing under the 1% cut (a run without anchors).
+        let seed = |tag: &str, confident: bool, with_im: bool| {
+            let path = scratch(&format!("fb_seed_{tag}.parquet"));
+            let mut cols = vec![
+                Col::U32("candidate_id".into(), (0..n as u32).collect()),
+                Col::U32("base_peptide_id".into(), (0..n as u32).collect()),
+                Col::F64(
+                    "spectrum_q".into(),
+                    vec![if confident { 0.001 } else { 0.4 }; n],
+                ),
+                Col::F64("score".into(), (0..n).map(|i| i as f64).collect()),
+                Col::F64(
+                    "observed_rt".into(),
+                    (0..n).map(|i| 300.0 + 3.0 * i as f64).collect(),
+                ),
+                Col::Str("label".into(), vec!["target".to_string(); n]),
+                Col::F64("precursor_mz".into(), mz.clone()),
+                Col::I32("charge".into(), z.clone()),
+            ];
+            if with_im {
+                cols.push(Col::OptF64("observed_im".into(), vec![Some(0.9); n]));
+            }
+            write_table(&path, cols).unwrap();
+            path
+        };
+        let run_with = |tag: &str, seed_path: &str, cfg: &RtImTrainConfig| {
+            let windows = scratch(&format!("fb_windows_{tag}.parquet"));
+            let cal = scratch(&format!("fb_cal_{tag}.json"));
+            let out = run_in_memory(RtImTrainParams {
+                precursor_span: None,
+                seed_psms: seed_path,
+                library_precursors: &prec,
+                out_windows: &windows,
+                out_cal: &cal,
+                cfg,
+                config_hash: "test",
+                im_window_floor: None,
+                im_anchor_q: None,
+                anchor_irt_from_seed: false,
+            });
+            out.map(|(_, kept)| {
+                let cal_json: serde_json::Value = mumdia_io::json::read_json(&cal).unwrap();
+                (
+                    kept.expect("no NaN bound"),
+                    cal_json,
+                    std::fs::read(&windows).unwrap(),
+                )
+            })
+        };
+        let default = RtImTrainConfig::default();
+        let unbounded = RtImTrainConfig {
+            fallback_windows: FallbackWindows::Unbounded,
+            ..RtImTrainConfig::default()
+        };
+        let library = RtImTrainConfig {
+            fallback_windows: FallbackWindows::Library,
+            ..RtImTrainConfig::default()
+        };
+        let empty_4d = seed("empty_4d", false, true);
+
+        // Unbounded: unbounded RT, no 1/K0 window, no fallback keys.
+        let (kept, cal, _) = run_with("unbounded", &empty_4d, &unbounded).unwrap();
+        assert_eq!(cal["calibration_status"], INSUFFICIENT_ANCHORS_STATUS);
+        assert_eq!(cal["method"], "unavailable");
+        assert_eq!(cal["im_method"], "unavailable");
+        assert!(cal.get("rt_fallback").is_none());
+        assert!(kept.rt_lo.iter().all(|v| *v == f64::NEG_INFINITY));
+        assert!(!kept.has_im());
+
+        // Library: bounded RT around the map, the library's 1/K0 +/- the fallback width.
+        let (kept, cal, _) = run_with("library", &empty_4d, &library).unwrap();
+        assert_eq!(cal["calibration_status"], FALLBACK_LIBRARY_STATUS);
+        assert_eq!(cal["method"], "library_range");
+        assert_eq!(cal["rt_fallback"]["mode"], "library");
+        assert_eq!(cal["rt_fallback"]["fallback_windows"], "library");
+        let seed_rt: Vec<f64> = (0..n).map(|i| 300.0 + 3.0 * i as f64).collect();
+        let m = library_range_map(&irt, &seed_rt, library.fallback_rt_gradient_fraction).unwrap();
+        assert_eq!(cal["w_rt"].as_f64(), Some(m.half_width));
+        let mut last = f64::NEG_INFINITY;
+        for (i, &x) in irt.iter().enumerate() {
+            if !x.is_finite() {
+                // A row without an iRT keeps the documented whole-gradient sentinel.
+                assert!(kept.rt_cal[i].is_nan() && kept.rt_lo[i] == f64::NEG_INFINITY);
+                continue;
+            }
+            let c = kept.rt_cal[i];
+            assert!(c > last, "row {i}: the map keeps the iRT order");
+            last = c;
+            assert_eq!(c, m.slope * x as f64 + m.intercept);
+            assert_eq!(
+                (kept.rt_lo[i], kept.rt_hi[i]),
+                (c - m.half_width, c + m.half_width)
+            );
+        }
+        assert_eq!(cal["im_method"], "library_uncalibrated");
+        assert_eq!(cal["w_im_sizing"], IM_FALLBACK_SIZING);
+        assert_eq!(cal["w_im"].as_f64(), Some(library.fallback_im_window));
+        let (lo, hi) = (kept.im_lo.as_ref().unwrap(), kept.im_hi.as_ref().unwrap());
+        for (i, p) in pred.iter().enumerate() {
+            match *p {
+                None => assert!(lo[i] == f32::NEG_INFINITY && hi[i] == f32::INFINITY),
+                Some(p) => {
+                    assert!((lo[i] as f64 - (p - 0.07)).abs() < 1e-6, "row {i}");
+                    assert!((hi[i] as f64 - (p + 0.07)).abs() < 1e-6, "row {i}");
+                }
+            }
+        }
+
+        // Default `auto` on a run with 1/K0: the library windows, byte for byte, with the
+        // setting that resolved to them recorded.
+        let (_, cal_lib, bytes_lib) = run_with("library_again", &empty_4d, &library).unwrap();
+        let (_, mut cal_auto, bytes_auto) = run_with("auto_4d", &empty_4d, &default).unwrap();
+        assert_eq!(bytes_auto, bytes_lib);
+        assert_eq!(cal_auto["rt_fallback"]["fallback_windows"], "auto");
+        cal_auto["rt_fallback"]["fallback_windows"] = "library".into();
+        assert_eq!(cal_auto, cal_lib);
+
+        // Default `auto` on a run without 1/K0: unbounded, byte for byte.
+        let empty_3d = seed("empty_3d", false, false);
+        let (kept, cal_auto, bytes_auto) = run_with("auto_3d", &empty_3d, &default).unwrap();
+        let (_, cal_unb, bytes_unb) = run_with("unbounded_3d", &empty_3d, &unbounded).unwrap();
+        assert_eq!(cal_auto["calibration_status"], INSUFFICIENT_ANCHORS_STATUS);
+        assert!(cal_auto.get("rt_fallback").is_none());
+        assert!(kept.rt_lo.iter().all(|v| *v == f64::NEG_INFINITY));
+        assert_eq!((bytes_auto, cal_auto), (bytes_unb, cal_unb));
+
+        // Refuse: the stage fails and names the key.
+        let refuse = RtImTrainConfig {
+            fallback_windows: FallbackWindows::Refuse,
+            ..RtImTrainConfig::default()
+        };
+        let err = run_with("refuse", &empty_4d, &refuse).err().unwrap();
+        assert!(
+            err.to_string().contains("fallback_windows = refuse"),
+            "{err}"
+        );
+
+        // A calibrated 3D run: the key changes nothing, byte for byte.
+        let calibrated_3d = seed("calibrated_3d", true, false);
+        let (_, cal_d, bytes_d) = run_with("cal_default", &calibrated_3d, &default).unwrap();
+        let (_, cal_l, bytes_l) = run_with("cal_library", &calibrated_3d, &library).unwrap();
+        assert_eq!(bytes_d, bytes_l);
+        assert_eq!(cal_d, cal_l);
+        assert_ne!(cal_d["calibration_status"], FALLBACK_LIBRARY_STATUS);
     }
 
     #[test]

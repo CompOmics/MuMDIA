@@ -1405,7 +1405,10 @@ second pass is a search hit of its own, scored against its own decoys.
 4. **Second pass per run** (`second_pass/<run>/`). From the run's converted spectra (not
    converted again): a seed against the empirical library, loaded once for every run; the
    run's own retention-time calibration on that seed; extract, features and compete. The
-   fragment-rarity prescreen is off: the library is already the screened set. Runs are
+   fragment-rarity prescreen is off: the library is already the screened set. The extract
+   support gate is `extract.gate_support_min`, or `mbr.second_pass_gate_support_min` when
+   that is set (0 = no support gate in the second pass only; on diaPASEF the gate rejected
+   second-pass precursors at their first-pass apex, docs/35 section 16). Runs are
    scheduled as the first pass's are (`experiment.parallel_runs`).
 5. **Pooled rescore** of the second pass into the experiment's `scored_combined.parquet`,
    with shadow demotion against the empirical library's fragments and each run's

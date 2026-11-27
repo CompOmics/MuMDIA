@@ -5040,6 +5040,8 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
 
     // Rows of a skeleton table left as zeros for retrace (`ExtractParams::retrace_skeleton`).
     let skeleton_rows = std::sync::atomic::AtomicU64::new(0);
+    // Candidates the support gate kept at another of their peaks (`extract.gate_support_peaks`).
+    let support_moved = std::sync::atomic::AtomicU64::new(0);
     let per_candidate = |cid: u32, hits: &mut [Hit]| -> Vec<CandOut> {
         // Under a trace pad the candidate's hits reach `trace_pad_s` beyond its window. Every
         // score below reads only the hits inside the window, which are exactly the hits the
@@ -5360,35 +5362,110 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         // The support gate (`extract.gate_support_min`): the window-mean score plus the
         // apex intensity and MS1 terms the `log_apex_intensity` and `log_mono_ms1` features
         // carry and, on spectra that carry 1/K0, three 1/K0 terms, without the MS1 rescue.
-        if support_min > 0.0 {
-            let ms1 = match (o_ms1_mono, o_ms1_i1, o_ms1_i2) {
-                (Some(mono), Some(_), Some(_)) => (1.0 + mono).ln(),
-                _ => 0.0,
-            };
-            let ln_apex = (1.0 + apex_sum as f64).ln();
-            let support = if has_im {
-                let e = im0_of();
-                let abs_diff = |a: Option<f64>, b: Option<f64>, missing: f64| match (a, b) {
-                    (Some(a), Some(b)) if (a - b).is_finite() => (a - b).abs(),
-                    _ => missing,
+        // `support_base` is the first part, `support_im` subtracts the 1/K0 terms in the order
+        // of the one expression they were, so the score keeps its bits; the 1/K0 terms are
+        // never negative, so `support_base` bounds the score from above.
+        let support_base =
+            |wm: f64, sum: f32, mono: Option<f64>, i1: Option<f64>, i2: Option<f64>| {
+                let ms1 = match (mono, i1, i2) {
+                    (Some(mono), Some(_), Some(_)) => (1.0 + mono).ln(),
+                    _ => 0.0,
                 };
-                window_mean() + GATE_IM_INTENSITY_WEIGHT * ln_apex + GATE_IM_MS1_WEIGHT * ms1
-                    - GATE_IM_ERR_WEIGHT * abs_diff(e.apex_im, e.im_pred_cal, GATE_IM_ERR_MISSING)
-                    - GATE_IM_MAD_WEIGHT
-                        * e.apex_im_mad
-                            .filter(|v| v.is_finite())
-                            .unwrap_or(GATE_IM_MAD_MISSING)
-                    - GATE_IM_MS1_ERR_WEIGHT
-                        * abs_diff(e.ms1_apex_im, e.apex_im, GATE_IM_MS1_ERR_MISSING)
+                let ln_apex = (1.0 + sum as f64).ln();
+                if has_im {
+                    wm + GATE_IM_INTENSITY_WEIGHT * ln_apex + GATE_IM_MS1_WEIGHT * ms1
+                } else {
+                    wm + GATE_SUPPORT_INTENSITY_WEIGHT * ln_apex + GATE_SUPPORT_MS1_WEIGHT * ms1
+                }
+            };
+        let support_im = |base: f64, e: &ApexIm| {
+            let abs_diff = |a: Option<f64>, b: Option<f64>, missing: f64| match (a, b) {
+                (Some(a), Some(b)) if (a - b).is_finite() => (a - b).abs(),
+                _ => missing,
+            };
+            base - GATE_IM_ERR_WEIGHT * abs_diff(e.apex_im, e.im_pred_cal, GATE_IM_ERR_MISSING)
+                - GATE_IM_MAD_WEIGHT
+                    * e.apex_im_mad
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(GATE_IM_MAD_MISSING)
+                - GATE_IM_MS1_ERR_WEIGHT
+                    * abs_diff(e.ms1_apex_im, e.apex_im, GATE_IM_MS1_ERR_MISSING)
+        };
+        // The peak the support gate moved the apex to (`extract.gate_support_peaks`): its
+        // group, MS1 isotopes and 1/K0 evidence. `None` keeps the selected apex.
+        type Moved = (
+            usize,
+            (Option<f64>, Option<f64>, Option<f64>, Option<f64>),
+            ApexIm,
+        );
+        let mut moved: Option<Moved> = None;
+        if support_min > 0.0 {
+            let base = support_base(window_mean(), apex_sum, o_ms1_mono, o_ms1_i1, o_ms1_i2);
+            let support = if has_im {
+                support_im(base, &im0_of())
             } else {
-                window_mean()
-                    + GATE_SUPPORT_INTENSITY_WEIGHT * ln_apex
-                    + GATE_SUPPORT_MS1_WEIGHT * ms1
+                base
             };
             if support < support_min {
-                return Vec::new();
+                if p.cfg.gate_support_peaks <= 1 || groups.is_empty() {
+                    return Vec::new();
+                }
+                // The K best peaks of the count profile, judged at their own apexes; each
+                // must pass the acceptance gate there as well, without the MS1 rescue.
+                let count_prof: Vec<f32> = counts.iter().map(|&n| n as f32).collect();
+                let mut best: Option<(f64, Moved)> = None;
+                for pk in crate::peaks::enumerate_peaks(
+                    &count_prof,
+                    p.cfg.gate_support_peaks,
+                    1.0 / 3.0,
+                    0.1,
+                ) {
+                    let (gi, rt) = (pk.apex_idx, groups.rt(pk.apex_idx));
+                    if rt.to_bits() == apex_rt.to_bits() {
+                        continue;
+                    }
+                    let wm = window_mean_score(
+                        &window_summed(&groups, &grid, rt, fints0.len()),
+                        &pred_f64,
+                        rt,
+                        rt_cal[cid as usize],
+                        rt_lo[cid as usize],
+                        rt_hi[cid as usize],
+                        p.cfg.gate_rt_weight,
+                    );
+                    if wm < p.cfg.gate_min_score {
+                        continue;
+                    }
+                    let ms1 = ms1_at(rt);
+                    let base = support_base(wm, groups.sum(gi), ms1.1, ms1.2, ms1.3);
+                    if base < support_min {
+                        continue;
+                    }
+                    let e = im_at(rt);
+                    let sc = if has_im { support_im(base, &e) } else { base };
+                    if sc >= support_min && best.as_ref().is_none_or(|b| sc > b.0) {
+                        best = Some((sc, (gi, ms1, e)));
+                    }
+                }
+                match best {
+                    Some((_, m)) => moved = Some(m),
+                    None => return Vec::new(),
+                }
+                support_moved.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
+        // Everything below reads the moved apex. The gate diagnostics
+        // (`emit_gate_diagnostics`) stay those of the selected apex the gates judged first.
+        let (apex_rt, apex_sum, apex_gi, (o_ms1_m1, o_ms1_mono, o_ms1_i1, o_ms1_i2)) = match &moved
+        {
+            Some((gi, ms1, _)) => (groups.rt(*gi), groups.sum(*gi), Some(*gi), *ms1),
+            None => (
+                apex_rt,
+                apex_sum,
+                apex_gi,
+                (o_ms1_m1, o_ms1_mono, o_ms1_i1, o_ms1_i2),
+            ),
+        };
 
         // The per-fragment Q1 decision (`extract.q1_fragments`, `stages::q1frag`): the
         // candidate's library fragments as the decision reads them, and the decision of a row
@@ -5624,7 +5701,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         // carries it, and a skeleton table (`ExtractParams::retrace_skeleton`) needs the
         // centre retrace will use to know which rows it rebuilds: this `apex_im`, or
         // `im_pred_cal` where that is not finite (`retrace::Skeleton`).
-        let im0 = im0_of();
+        let im0 = moved.map_or_else(im0_of, |m| m.2);
         let skel_centre = match im0.apex_im.filter(|v| v.is_finite()) {
             Some(v) => v,
             None => im0.im_pred_cal.unwrap_or(f64::NAN),
@@ -6689,6 +6766,16 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         if support_min > 0.0 {
             if let Some(obj) = params.as_object_mut() {
                 obj.insert("gate_support_min".into(), json!(support_min));
+                // The peaks it judges and the candidates it moved, only when K > 1.
+                if p.cfg.gate_support_peaks > 1 {
+                    obj.insert(
+                        "gate_support_peaks".into(),
+                        json!({
+                            "k": p.cfg.gate_support_peaks,
+                            "moved": support_moved.load(std::sync::atomic::Ordering::Relaxed),
+                        }),
+                    );
+                }
             }
         }
         // A skeleton table says so in its own report, with the rows it left for retrace;

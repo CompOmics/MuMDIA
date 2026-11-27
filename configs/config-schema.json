@@ -166,9 +166,9 @@
       "rust_type": "u32",
       "kind": "integer",
       "optional": false,
-      "default": 2,
-      "default_text": "2",
-      "help": "Native diaPASEF reader: a centroid built from fewer raw TOF x scan points than this is dropped. Default 2. Provisional, as `tdf_im_gap_scans`. 1 keeps every centroid, including those of a single ion event, which at low load is most of the real fragment signal; with `extract.gate_support_min` 0 it is the low-input opt-in (docs/35_diapasef.md section 11, \"Low input\"). The two were the default in 0.15.0 and were reverted because 10 of 52 timsTOF diaPASEF benchmark jobs that 0.14.0 ran then failed on memory; which of the two keys caused that is not measured. Measured for the opt-in with the diaPASEF recipe (`extract.gate_min_score` 0.6, `presence_min_coelution` 1, no support gate), three NN seeds, precursors per run at `run_psm_q` 1% against 2: 200 pg HeLa 3,422 -> 7,689, 1 ng 12,542 -> 19,270, 250 pg Ultra 6,912 -> 9,544, 50 ng 5-min Ultra 2 35,710 -> 35,346; E. coli entrapment FDP 0.97% (0.83-1.12%); 0 IDs in three blank runs. The other-species share rose on the 250 pg Ultra set only (1.17% -> 1.40%) and fell elsewhere. The earlier -17% for 1 (docs/35 section 12) was measured under the 0.845 support gate and without the recipe's presence rule.",
+      "default": 1,
+      "default_text": "1",
+      "help": "Native diaPASEF reader: a centroid built from fewer raw TOF x scan points than this is dropped. Default 1 (2 in 0.14.0 and 0.15.1): every centroid, including those of a single ion event, which at low load is most of the real fragment signal. The default keeps the support gate (`extract.gate_support_min` 0.845 on 1/K0 spectra). Measured against 2 with the gate kept, three NN seeds, precursors per run at `run_psm_q` 1%: 200 pg HeLa 1,847 -> 5,418, 250 pg 5-min Ultra 4,775 -> 8,828, 1 ng 7,154 -> 16,279, ProteoBench HYE 90,702 -> 91,826; E. coli entrapment 16,139 -> 16,333 real precursors at an FDP of 0.43-0.47% against 0.41-0.42%; process-tree peaks within 19 GB on the low-input sets and 66 GB against 36 on ProteoBench HYE (docs/35_diapasef.md section 11, \"Low input\"). 1 with `extract.gate_support_min` 0, as in 0.15.0, is the low-input opt-in: more precursors again, but 10 of 52 timsTOF diaPASEF benchmark jobs that 0.14.0 ran failed on memory under it. 2 restores 0.15.1. Measured for that opt-in with the diaPASEF recipe (`extract.gate_min_score` 0.6, `presence_min_coelution` 1, no support gate), three NN seeds, precursors per run at `run_psm_q` 1% against 2: 200 pg HeLa 3,422 -> 7,689, 1 ng 12,542 -> 19,270, 250 pg Ultra 6,912 -> 9,544, 50 ng 5-min Ultra 2 35,710 -> 35,346; E. coli entrapment FDP 0.97% (0.83-1.12%); 0 IDs in three blank runs. The other-species share rose on the 250 pg Ultra set only (1.17% -> 1.40%) and fell elsewhere. The earlier -17% for 1 (docs/35 section 12) was measured under the 0.845 support gate and without the recipe's presence rule.",
       "gates": [],
       "source_struct": "ConvertConfig"
     },
@@ -1484,6 +1484,51 @@
       "source_struct": "RtImTrainConfig"
     },
     {
+      "path": "rt_im_train.fallback_windows",
+      "name": "fallback_windows",
+      "section": "rt_im_train",
+      "rust_type": "FallbackWindows",
+      "kind": "enum",
+      "optional": false,
+      "default": "auto",
+      "default_text": "`auto`",
+      "help": "What a run gets when its seed leaves it without a calibration (docs/08_rt_im_train.md section 4i). `auto` (the default) is `library` on a run whose spectra carry per-peak 1/K0 and `unbounded` otherwise. `unbounded`: fewer than two RT anchors search every candidate over the whole gradient, and a run with 1/K0 but no ion-mobility calibration has no 1/K0 window, as before the key existed. `library`: such a run is searched in bounded windows from the library instead. The RT window is the library's `predicted_irt`, its 1st to 99th percentile mapped linearly onto the 1st to 99th percentile of the seed's observed retention times, with a half-width of `fallback_rt_gradient_fraction` of that span (`calibration_status` `fallback_library`); the 1/K0 window, on a run with 1/K0 whose ion mobility could not be calibrated (too few anchors at the seed's cut), is the library's `predicted_im` plus or minus `fallback_im_window`. Both are recorded in `cal.json`. `refuse`: a run with fewer than two RT anchors fails at `rt-im-train` rather than being searched over the whole gradient. Neither applies to a grouped run (`groups.window_groups > 1`), whose unbounded windows `groups.allow_unbounded_rt` governs. On by default on diaPASEF only (after 0.15.1): on single-cell HeLa diaPASEF plates whose seed left most cells without anchors it held precursors per run (1,282 -> 1,352 and 1,454 -> 1,453) and took the process-tree peak from 193 to 48 GB and 182 to 44 GB, one NN seed; no low-input entrapment set exists yet. Measured on 18 calibrated single-cell diaPASEF runs: the confident anchors' residual to the map had a 99th percentile of 0.10-0.26 of the span, and their uncalibrated 1/K0 residual one of 0.054-0.081 (up to 0.145 on runs with 99-196 anchors). Omitted from the canonical configuration at its default.",
+      "gates": [],
+      "source_struct": "RtImTrainConfig",
+      "choices": [
+        "auto",
+        "unbounded",
+        "library",
+        "refuse"
+      ]
+    },
+    {
+      "path": "rt_im_train.fallback_rt_gradient_fraction",
+      "name": "fallback_rt_gradient_fraction",
+      "section": "rt_im_train",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.25,
+      "default_text": "0.25",
+      "help": "Under `fallback_windows = library`: the RT half-width as a fraction of the seed's observed retention-time span (1st to 99th percentile). Default 0.25; in (0, 1]. Omitted from the canonical configuration at its default.",
+      "gates": [],
+      "source_struct": "RtImTrainConfig"
+    },
+    {
+      "path": "rt_im_train.fallback_im_window",
+      "name": "fallback_im_window",
+      "section": "rt_im_train",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.07,
+      "default_text": "0.07",
+      "help": "Under `fallback_windows = library`: the 1/K0 half-width around the library's `predicted_im`, in V s cm^-2. Default 0.07; > 0. Omitted from the canonical configuration at its default.",
+      "gates": [],
+      "source_struct": "RtImTrainConfig"
+    },
+    {
       "path": "rt_im_train.finetune_deeplc",
       "name": "finetune_deeplc",
       "section": "rt_im_train",
@@ -2462,8 +2507,23 @@
       "optional": true,
       "default": "null",
       "default_text": "null",
-      "help": "A second acceptance threshold under `GateMode::WindowMean`, the diaPASEF gate: a candidate must pass `gate_min_score` and this, without the MS1 rescue. On spectra that carry 1/K0 the score is the window-mean score plus `0.023 ln(1 + apex intensity)` and `0.009 ln(1 + MS1 monoisotopic intensity at the apex)`, minus `1.23` times the apex 1/K0 error against the calibrated prediction, `7.44` times the 1/K0 spread of the matched fragments at the apex (`apex_im_mad`) and `0.18` times the MS1-to-fragment 1/K0 difference: weights fitted on the gate-time quantities of two HYE diaPASEF runs, on targets only. Without 1/K0 it is the window-mean score plus `0.05 ln(1 + apex intensity)` and `0.02 ln(1 + MS1 mono)`. The MS1 term counts only where the apex reads the mono, +1 and +2 isotopes, as the `log_mono_ms1` feature does. 0 is off. Unset (the default) is 0.845 on spectra that carry 1/K0 and off otherwise. It was off in 0.15.0 and was restored because, with `convert.tdf_min_points` 1 as well, 10 of 52 timsTOF diaPASEF benchmark jobs that 0.14.0 ran failed on memory; which of the two keys caused that is not measured. 0, with `convert.tdf_min_points` 1, is the low-input opt-in: on the 2026-11 low-input sets it was +26% precursors per run at 200 pg and +19% at 1 ng with the gate off, +6.1% on 50 ng 5-min Ultra 2 runs, other-species shares unchanged (one NN seed, docs/35_diapasef.md section 16). On the six ProteoBench HYE diaPASEF runs, 0.845 keeps 41% of the candidates the window-mean gate at 0.6 passes, for -1.6% peptides at 1% and -36% wall time (26.8 against 41.6 min); on six 5-min HYE diaPASEF runs -1.75% peptides at -48% wall time; on the E. coli diaPASEF entrapment run -1.6% peptides at an entrapment FDP of 0.32-0.35% against 0.30-0.38% (three NN seeds). A window-mean threshold of 0.75 keeps 45% and loses more identifications. Without 1/K0 the gate is not fitted for a default; 1.215 kept 42% on the same runs (docs/35_diapasef.md section 16).",
+      "help": "A second acceptance threshold under `GateMode::WindowMean`, the diaPASEF gate: a candidate must pass `gate_min_score` and this, without the MS1 rescue. On spectra that carry 1/K0 the score is the window-mean score plus `0.023 ln(1 + apex intensity)` and `0.009 ln(1 + MS1 monoisotopic intensity at the apex)`, minus `1.23` times the apex 1/K0 error against the calibrated prediction, `7.44` times the 1/K0 spread of the matched fragments at the apex (`apex_im_mad`) and `0.18` times the MS1-to-fragment 1/K0 difference: weights fitted on the gate-time quantities of two HYE diaPASEF runs, on targets only. Without 1/K0 it is the window-mean score plus `0.05 ln(1 + apex intensity)` and `0.02 ln(1 + MS1 mono)`. The MS1 term counts only where the apex reads the mono, +1 and +2 isotopes, as the `log_mono_ms1` feature does. 0 is off. Unset (the default) is 0.845 on spectra that carry 1/K0 and off otherwise. It was off in 0.15.0 and was restored because, with `convert.tdf_min_points` 1 as well, 10 of 52 timsTOF diaPASEF benchmark jobs that 0.14.0 ran failed on memory. With `convert.tdf_min_points` 1 (the default after 0.15.1) the gate kept the process-tree peak at 18-19 GB on the 250 pg and 1 ng sets, where turning it off took it to 70-87 GB, so the gate, not the reader, carries the memory. 0 is the low-input opt-in: on the 2026-11 low-input sets it was +26% precursors per run at 200 pg and +19% at 1 ng with the gate off, +6.1% on 50 ng 5-min Ultra 2 runs, other-species shares unchanged (one NN seed, docs/35_diapasef.md section 16). On the six ProteoBench HYE diaPASEF runs, 0.845 keeps 41% of the candidates the window-mean gate at 0.6 passes, for -1.6% peptides at 1% and -36% wall time (26.8 against 41.6 min); on six 5-min HYE diaPASEF runs -1.75% peptides at -48% wall time; on the E. coli diaPASEF entrapment run -1.6% peptides at an entrapment FDP of 0.32-0.35% against 0.30-0.38% (three NN seeds). A window-mean threshold of 0.75 keeps 45% and loses more identifications. Without 1/K0 the gate is not fitted for a default; 1.215 kept 42% on the same runs (docs/35_diapasef.md section 16).",
       "gates": [],
+      "source_struct": "ExtractConfig"
+    },
+    {
+      "path": "extract.gate_support_peaks",
+      "name": "gate_support_peaks",
+      "section": "extract",
+      "rust_type": "usize",
+      "kind": "integer",
+      "optional": false,
+      "default": 1,
+      "default_text": "1",
+      "help": "How many peaks of a candidate the support gate (`gate_support_min`) may judge. 1 (the default) judges the selected apex alone. K > 1: a candidate that fails at its selected apex is judged again at the apexes of the K best peaks of its distinct-fragment count profile (the peaks `retain_top_peaks` enumerates), each of which must also pass `gate_min_score`; it is kept when one passes, with its apex moved to the passing peak of highest support. A candidate that passes at its selected apex is unchanged, so the gate only adds rows. Inert while the support gate is off. Benchmark-gated (docs/09_extract.md section 5); omitted from the canonical configuration at its default.",
+      "gates": [
+        "benchmark-gated"
+      ],
       "source_struct": "ExtractConfig"
     },
     {
@@ -3844,6 +3904,19 @@
       "default": "null",
       "default_text": "null",
       "help": "Under `strategy = second_pass`: the `rescore.prefilter_keep_decoys` of the second-pass rescore only (0 = no prefilter there). Unset, the second pass uses `rescore.prefilter_keep_decoys` like the first. The first pass pools every candidate of every run (59M and 106M PSMs on 18- and 27-run Astral experiments) and needs the cut for memory; the second-pass pool holds the empirical library's candidates (6.6M and 4.1M PSMs on the same two), where the cut cost 4.2-4.8% of the precursors on a plate of single cells. Must be in [0, 1). Left out of the canonical configuration when unset.",
+      "gates": [],
+      "source_struct": "MbrConfig"
+    },
+    {
+      "path": "mbr.second_pass_gate_support_min",
+      "name": "second_pass_gate_support_min",
+      "section": "mbr",
+      "rust_type": "Option<f64>",
+      "kind": "float",
+      "optional": true,
+      "default": "null",
+      "default_text": "null",
+      "help": "Under `strategy = second_pass`: the `extract.gate_support_min` of the second-pass extraction only (0 = no support gate there). Unset, the second pass uses `extract.gate_support_min` like the first. The gate's default (0.845 on spectra that carry 1/K0) bounds the first pass's memory on a full library; the second pass searches the small empirical library, where it rejected precursors at their first-pass apex. Off in the second pass only, on standalone searches of each set's empirical library: 200 pg diaPASEF +35% precursors per run, 250 pg +17%, bulk +5.0%, decoy fraction and peak memory unchanged (one NN seed; docs/12, \"Second pass\"). Must be finite and >= 0. Left out of the canonical configuration when unset.",
       "gates": [],
       "source_struct": "MbrConfig"
     },

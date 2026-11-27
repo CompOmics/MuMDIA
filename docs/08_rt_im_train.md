@@ -291,7 +291,10 @@ variants (rt_im_train.rs:30-40):
   stage warns, sets `w_rt = None`, and uses status
   `"insufficient_anchors_unbounded"` (rt_im_train.rs:160-167). Every candidate then
   gets the unbounded window `(NaN, -inf, +inf)` so extraction scans the full
-  isolation-window RT range.
+  isolation-window RT range. Under `fallback_windows = library`, which the default
+  `auto` is on spectra with 1/K0, the run gets the library-range window of section 4i
+  instead (status `"fallback_library"`), and under `fallback_windows = refuse` the stage
+  fails.
 - **`Fixed(fallback_rt_window_s)`** (`2 <= n_train < min_anchors`): a linear map
   exists but there are too few anchors to estimate its residual distribution. The
   stage warns and retains the configured broad fixed half-window with status
@@ -1054,6 +1057,105 @@ model: they do, to a median of 0.003 steps and a MAD of 0.16 steps after the cal
 and 0.11 steps early before it. Nothing applies the calibration yet; the per-fragment Q1
 decisions it is for are a later change.
 
+### 4i. Runs without anchors: `fallback_windows` (default on diaPASEF, 2026-11-26)
+
+A run whose seed search leaves fewer than two target anchors, even at the last rung of
+`anchor_q_ladder`, has no iRT to RT mapping, and under `fallback_windows = unbounded` every
+candidate is extracted over the whole gradient. On a run with 1/K0 the ion-mobility calibration needs
+`min_seed_for_calibration` anchors at the seed's own cut, so a run short of anchors also has
+no 1/K0 window, whether its RT window is unbounded, the fixed fallback or even calibrated on
+relaxed anchors. Both together are what made extract estimate 290 to 875 GiB of hits on
+single-cell diaPASEF runs of the v0.15.0 benchmark sweep (52-run, 71-run and 67-run
+experiments of one HeLa single-cell dataset), until the memory watchdog or the footprint
+guard stopped them.
+
+Why those seeds had no anchors. The seed's q is `(decoys + 1) / targets`, so a confident
+target at 1% needs at least 100 targets ranked above the first decoy. The cells of those
+plates carry about half the peptides of the plates that worked (a reference search with the
+same library: about 4,500 precursors per run against 9,800), and their seed search ranks a
+few hundred real peptides at best. The anchor counts at 1% are bimodal accordingly: 0, or
+100 to 450, and never between (minimum non-zero 105 and 100 on the 71-run and 67-run plates).
+On the 52-run plate 50 runs had 0 at 1%; of the 15 that reached `rt-im-train` before the
+experiment was stopped, the relaxed ladder gave 11 of them 2 to 49 anchors (the fixed 120 s
+window) and 3 a LOESS, one stayed unbounded, and none of the 15 had an ion-mobility
+calibration. The runs are not blank; the seed's FDR floor at that depth is the cause.
+
+`fallback_windows = library` bounds both windows from the library:
+
+- **RT**: on a run with fewer than two anchors, the library's `predicted_irt` between its
+  1st and 99th percentile is mapped linearly onto the seed's observed retention times
+  between their 1st and 99th percentile (every seed row, targets and decoys, which spans
+  the part of the gradient where spectra match anything), and the half-width is
+  `fallback_rt_gradient_fraction` (0.25) of that span. The map is increasing, so it keeps
+  the predicted elution order; non-finite iRT and RT are ignored, a library row without a
+  finite iRT keeps the whole-gradient sentinel, and a side without spread leaves the
+  windows unbounded with a warning. `calibration_status` is `fallback_library`, `method`
+  is `library_range`, and `cal.json` records the two ranges, the fraction and the
+  half-width under `rt_fallback`. `rt_health` counts it as an uncalibrated run.
+- **1/K0**: on a run whose seed carries 1/K0 and whose library has `predicted_im`, when the
+  ion-mobility calibration is unavailable, the window is the library's `predicted_im` plus
+  or minus `fallback_im_window` (0.07), uncalibrated (`im_method` `library_uncalibrated`,
+  `w_im_sizing` `fallback_library`). This applies whatever the RT window is.
+
+The widths come from 18 calibrated single-cell diaPASEF runs of the same dataset (11 and 7
+runs of two plates, base DeepLC iRT of the imported library, the seed's confident anchors,
+99 to 730 per run): the anchors' absolute residual to the library-range map had a median of
+44 to 142 s, a 95th percentile of 166 to 261 s and a 99th percentile of 175 to 438 s, 0.10
+to 0.26 of the span (1,424 to 1,809 s); their uncalibrated 1/K0 residual (observed minus
+library) had a median of -0.004 to -0.023, a 95th percentile of 0.033 to 0.049 and a 99th
+percentile of 0.054 to 0.081 (0.120 to 0.145 on the three runs with 99 to 196 anchors). In an experiment that adapts the
+library on its first run (`rt_library_scope = first_run_only`) the map is applied to the
+adapted iRT, which is already on that run's gradient.
+
+Measured (2026-11-26, one NN seed, 32 threads, `run-experiment` with the second pass) on
+three cells of the 52-cell plate, G1_30 (218 seed anchors, adapts the library), G1_29 (0
+anchors at any rung: the unbounded case) and G1_24 (0 at 1%, 34 at a relaxed rung: the fixed
+120 s window), with the sweep's diaPASEF configuration at the 0.15.1 reader defaults
+(`tdf_min_points` 2, support gate 0.845) and `fallback_windows = library`:
+
+| | G1_30 | G1_29 | G1_24 |
+|---|---|---|---|
+| status | loess | fallback_library, 320 s | fallback_fixed + 1/K0 fallback |
+| extract estimate, at once / run (GiB) | 3.4 / 7.4 | 10.6 / 22.4 | 5.1 / 10.8 |
+| precursors at `run_psm_q` 1%, first pass | 3,306 | 145 | 220 |
+| same, second pass (reported) | 3,079 | 169 | 1,437 |
+
+Decoy fraction at `run_psm_q` 1% 0.0-0.97% per run; 26:33 wall, 30.4 GB peak RSS. Before, the
+sweep's engine estimated 163 GiB over the run for a fixed-window cell without 1/K0 and
+290-875 GiB for unbounded ones. With the 0.15.0 reader settings (`tdf_min_points` 1, no
+support gate) the same cells estimated 57 / 146 GiB (G1_29, 420 s half-width) and 26 / 65 GiB
+(G1_24), and the experiment finished (2:27:36, 124 GB peak RSS) with no identification at all:
+the pooled rescore of 14.7M PSMs had no training signal, and so had the adapting cell's own
+bootstrap rescore, so the fallback bounds the memory there but cannot rescue the search. `tdf_min_points` 2 did not give these cells anchors: 218 / 0 / 0 at 1% against
+219 / 0 / 0 with 1. `fallback_windows = refuse` stopped G1_29 at `rt-im-train` after 2:19.
+
+`fallback_windows = refuse` fails a run with fewer than two RT anchors at `rt-im-train`
+instead, before extract; under `run-experiment` that ends the experiment. Neither applies to
+a grouped run (`groups.window_groups > 1`), whose anchors are read from the seed with no
+library row: its unbounded windows are governed by `groups.allow_unbounded_rt`.
+
+The default is `auto`: `library` on a run whose spectra carry per-peak 1/K0 (its seed
+records `observed_im`), `unbounded` otherwise. A run without 1/K0 therefore writes every
+artifact byte for byte as before, and the key and its widths are omitted from the canonical
+configuration at their defaults. The explicit `unbounded`, `library` and `refuse` behave as
+they did when the key was opt-in. `cal.json` `rt_fallback.fallback_windows` records the
+setting (`auto` or `library`) that resolved to the library window. `library` only changes runs
+that have no RT calibration or no 1/K0 calibration.
+
+The diaPASEF default rests on whole plates of single-cell HeLa diaPASEF runs (2026-11-26, the
+0.15.1 defaults otherwise, one NN seed, precursors per run at `run_psm_q` 1%, process-tree
+peak):
+
+| plate | `unbounded` | `library` |
+|---|---|---|
+| 52 cells | 1,282 / 193 GB / 203 min | 1,352 / 48 GB / 74 min |
+| 71 cells | 1,454 / 182 GB / 234 min | 1,453 / 44 GB / 88 min |
+| 13 cells | 3,194 / 10 GB | 3,219 / 10 GB |
+
+It holds the identifications and takes the memory of the plates whose cells had no anchors
+to a quarter. Open: one seed, and no low-input entrapment set exists, so the FDP of the
+library-window cells is not measured.
+
 ### 5. Optional adaptive per-region window (default off)
 
 When `adaptive_rt_window` is set (and `n_train >= min_anchors`, which guarantees the
@@ -1435,6 +1537,9 @@ though the enum variant still exists.
 | `min_seed_for_calibration` | `50` | Minimum anchors to (a) use LOESS instead of linear (rt_im_train.rs:135) and (b) trust the residual window instead of the fixed fallback (via `min_anchors = max(this, 2)`, rt_im_train.rs:157). |
 | `loess_span` | `0.3` | LOESS local-fit fraction; passed as `span` to `Loess::fit` (rt_im_train.rs:137). Fraction of anchors in each local window. |
 | `fallback_rt_window_s` | `120.0` | Fixed half-window (seconds) when anchors are too few (`WindowPlan::Fixed`, rt_im_train.rs:168-175); also the upper clamp for adaptive bin widths (rt_im_train.rs:211). |
+| `fallback_windows` | `auto` | What a run without a calibration gets (section 4i). `auto`: `library` on spectra with 1/K0, `unbounded` otherwise. `unbounded`: fewer than two RT anchors search the whole gradient and a 4D run without an IM calibration has no 1/K0 window, as before. `library`: the library-range RT window (`calibration_status` `fallback_library`) and the library's 1/K0 plus or minus `fallback_im_window`. `refuse`: fewer than two RT anchors fail the run at `rt-im-train`. Not applied to grouped runs. Omitted from the canonical configuration at the default. |
+| `fallback_rt_gradient_fraction` | `0.25` | Under `fallback_windows = library`: the RT half-width as a fraction of the seed's observed RT span (1st to 99th percentile). In (0, 1]. Omitted from the canonical configuration at the default. |
+| `fallback_im_window` | `0.07` | Under `fallback_windows = library`: the 1/K0 half-width around the library's `predicted_im`, V s cm^-2. Omitted from the canonical configuration at the default. |
 | `finetune_deeplc` | `false` | Enable the DeepLC multitask fine-tune pre-step in `run` (run.rs:265). Requires `predict_frag.deeplc_python` (preflight, run.rs:62-67). On one measured run it was not needed per file once the library iRT had been fine-tuned once: the per-run LOESS reached the same residuals for much less wall clock (see the fine-tune section for the scope of that measurement). |
 | `multihead_anchors` | `auto` | Anchors of the multi-head calibration on the run that adapts the library. `search` refits it on the confident targets (`precursor_q <= q_train`, observed RT = `apex_rt`) of a bootstrap search of that run in `<run>/rt_bootstrap/`, and falls back to the seed-anchored library with a warning when that is not possible; refused with `finetune_deeplc`, `multihead_calibration = 0` and `groups.window_groups > 1`. `seed` never does. `auto` is `search` on a run whose seed found fewer than `multihead_search_below` anchors (or only at a relaxed q), else `seed` (section 4f). |
 | `multihead_search_below` | `2500` | `auto`'s threshold on the seed anchor count (distinct target base peptides at `q_train`). |

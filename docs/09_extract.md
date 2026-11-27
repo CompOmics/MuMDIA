@@ -742,6 +742,22 @@ All four diagnostic scores are computed for every accepted candidate only when
 `emit_gate_diagnostics` is set (`extract.rs:2035`); otherwise they are zeroed and
 not written, so the default chain pays no extra cost.
 
+The support gate (`extract.gate_support_min`, the diaPASEF gate of docs/35 section 16) is a
+second threshold under `window_mean`, read at the selected apex: the window-mean score plus the
+apex intensity and MS1 terms and, on 1/K0 spectra, three 1/K0 terms. It runs before retrace, so
+it judges the apex extract chose, not the one `retrace.repick` later moves the row to.
+`extract.gate_support_peaks = K` (default 1, the selected apex alone; benchmark-gated) gives a
+candidate that fails there a second chance: the K best peaks of its distinct-fragment count
+profile (`peaks::enumerate_peaks`, the peaks `retain_top_peaks` writes) are judged at their own
+apexes, each must pass `gate_min_score` there too (without the MS1 rescue), and the candidate
+is kept when one passes, with its apex, apex intensity, MS1 isotopes and 1/K0 evidence moved to
+the passing peak of highest support. Every candidate that passes at its selected apex keeps its
+row bit for bit, so the key only adds rows; the gate diagnostics of a moved row stay those of
+the selected apex. Only rejected candidates pay for the extra reads, and a peak whose
+window-mean, intensity and MS1 terms alone fall below the threshold is skipped before its 1/K0
+evidence is read (the 1/K0 terms only subtract). With K > 1 the extract report carries
+`gate_support_peaks: {k, moved}`, `moved` counting the candidates kept at another peak.
+
 ### 6. Chromatograms and MS1 XICs
 
 Per-fragment observed m/z is an intensity-weighted mean per fragment
@@ -1527,6 +1543,7 @@ here for one index.
 |---|---|---|
 | `extract.retain_top_peaks` (`config.rs:635`, default 1) | `<out_psms>.peaks.parquet` sidecar, unscored, written only when K>1 (`extract.rs:2544`); no PSM columns | ID loop not closed (sidecar peaks are unscored); gate pending |
 | `extract.promote_top_peaks` (`config.rs:645`, default 1) | extra `psms_extracted` rows with `peak_rank >= 1` (`extract.rs:2297`); no new columns | **not schema-neutral in rows**: changes the scored population and therefore FDR; on diaPASEF (IM branch, seed 0) K = 2 lost 5.7% and K = 3 5.9%, and `retrace.repick` is the diaPASEF path (docs/35 section 12); gate pending |
+| `extract.gate_support_peaks` (default 1) | none; adds the rows the support gate kept at another of their K best peaks, with the apex moved there (section 5) | pending (docs/35 section 16); gate pending |
 | `extract.emit_candidate_audit` (`config.rs:658`) | none in `extract.rs` (unused there); in `run` it gates the `audit` stage -> `candidate_audit.parquet` (`run.rs:428`) | diagnostic; no ID effect |
 | `extract.emit_gate_diagnostics` (`config.rs:673`) | 4 F32 cols `gate_apex`, `gate_peak_spectral`, `gate_coelution`, `gate_spectral_entropy` (`extract.rs:2511`) | diagnostic; no ID effect |
 | `extract.apex_evidence_rank` (`config.rs:667`) | none; changes the apex-selection score (`extract.rs:1890`) | **the default**, promoted on correctness grounds rather than a count (docs/25 section 2); the legacy score (`false`) was removed in 0.15.0 (HYE: 27.6% more candidates, 1.0% fewer peptides, bench/README.md): it could not distinguish "no signature fragment observed anywhere" from "the earliest qualifying scan is the apex" |
