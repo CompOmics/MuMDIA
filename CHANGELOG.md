@@ -252,6 +252,16 @@ than a number. Both are recorded in every run's `manifest.json`.
   targets above the first decoy for one anchor at 1%, and on plates with about half the
   peptides per cell of those that worked most cells had 0 anchors (the rest 100-450), so they
   had no 1/K0 calibration and, below two anchors, no RT window.
+- **`extract.gate_support_peaks`: the support gate judges a candidate's K best peaks, not only
+  its selected apex (docs/09 section 5, docs/35 section 16).** The support gate
+  (`extract.gate_support_min`) is read at the apex extract chose, before `retrace.repick` moves
+  it, and on ProteoBench diaPASEF HYE most of the precursors it rejected that an independent
+  search on the same library identified sat at another apex, with that apex among extract's
+  five best peaks. With K > 1 a candidate that fails at its selected apex is judged again at the
+  apexes of its K best distinct-fragment count peaks, each of which must pass `gate_min_score`
+  too, and is kept with its apex moved to the passing peak of highest support. The default, 1,
+  is the selected apex alone and leaves every artifact and the config hash unchanged; any K
+  keeps every row the gate kept before bit for bit and only adds rows. Measurement pending.
 - **`mbr.second_pass_gate_support_min`: the extract support gate of the second pass alone
   (docs/12 "Second pass", docs/35 section 16).** Unset, the second pass of `run-experiment` uses
   `extract.gate_support_min` like the first, and every artifact and the config hash are

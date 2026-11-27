@@ -2512,6 +2512,21 @@
       "source_struct": "ExtractConfig"
     },
     {
+      "path": "extract.gate_support_peaks",
+      "name": "gate_support_peaks",
+      "section": "extract",
+      "rust_type": "usize",
+      "kind": "integer",
+      "optional": false,
+      "default": 1,
+      "default_text": "1",
+      "help": "How many peaks of a candidate the support gate (`gate_support_min`) may judge. 1 (the default) judges the selected apex alone. K > 1: a candidate that fails at its selected apex is judged again at the apexes of the K best peaks of its distinct-fragment count profile (the peaks `retain_top_peaks` enumerates), each of which must also pass `gate_min_score`; it is kept when one passes, with its apex moved to the passing peak of highest support. A candidate that passes at its selected apex is unchanged, so the gate only adds rows. Inert while the support gate is off. Benchmark-gated (docs/09_extract.md section 5); omitted from the canonical configuration at its default.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "ExtractConfig"
+    },
+    {
       "path": "extract.im_gate",
       "name": "im_gate",
       "section": "extract",

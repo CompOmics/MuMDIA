@@ -1359,6 +1359,17 @@ other-species precursors at 200 pg fell from 3.35% to 3.11%. Not yet measured th
 `run-experiment`'s own second pass, with seeds, on the entrapment run or on the single-cell
 sets, so the key stays unset by default.
 
+The gate is read at the apex extract chose, before retrace re-picks it. A comparison of the
+first pass on ProteoBench diaPASEF HYE with an independent search on the same library found the
+gate rejecting about 13,900 precursors per run that the other search identified; 81% of them sat
+at a different apex in extract, and 79% had the other search's apex among extract's five best
+peaks. In the second pass (about 5,400 per run) 30% sat at the same apex and 95% had it among
+the five. `extract.gate_support_peaks = K` (default 1) judges a candidate that fails at its
+selected apex again at the apexes of its K best count-profile peaks, and keeps it, with the apex
+moved to the passing peak, when one passes the support and the window-mean thresholds there
+(docs/09 section 5). It only adds rows, so the pool grows by the candidates it rescues and not
+otherwise. Measurement pending.
+
 ### A prefilter before the classifier
 
 On a large pool the classifier is the rescore's cost, and most of what it scores is never

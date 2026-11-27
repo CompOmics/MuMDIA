@@ -2119,6 +2119,12 @@ impl MultiheadAnchors {
     }
 }
 
+/// `ExtractConfig::gate_support_peaks` at its default, which the canonical configuration
+/// omits.
+fn is_default_gate_support_peaks(v: &usize) -> bool {
+    *v == ExtractConfig::default().gate_support_peaks
+}
+
 /// `RtImTrainConfig::multihead_search_below` at its default, which the canonical
 /// configuration omits.
 fn is_default_multihead_search_below(v: &usize) -> bool {
@@ -2628,6 +2634,16 @@ pub struct ExtractConfig {
     /// the same runs (docs/35_diapasef.md section 16).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_support_min: Option<f64>,
+    /// How many peaks of a candidate the support gate (`gate_support_min`) may judge. 1 (the
+    /// default) judges the selected apex alone. K > 1: a candidate that fails at its selected
+    /// apex is judged again at the apexes of the K best peaks of its distinct-fragment count
+    /// profile (the peaks `retain_top_peaks` enumerates), each of which must also pass
+    /// `gate_min_score`; it is kept when one passes, with its apex moved to the passing peak of
+    /// highest support. A candidate that passes at its selected apex is unchanged, so the gate
+    /// only adds rows. Inert while the support gate is off. Benchmark-gated (docs/09_extract.md
+    /// section 5); omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_default_gate_support_peaks")]
+    pub gate_support_peaks: usize,
     /// The 1/K0 gate of a run whose spectra carry ion mobility (a diaPASEF `.d` read by the
     /// native reader): a fragment peak whose 1/K0 lies outside the candidate's calibrated
     /// 1/K0 window (`run_windows.im_lo`/`im_hi`, from `rt-im-train`) is not matched to that
@@ -2910,6 +2926,7 @@ impl Default for ExtractConfig {
             gate_coelution_min: 0.5,         // used only by GateMode::Combined
             gate_rt_weight: 0.2,             // used only by GateMode::WindowMean
             gate_support_min: None,          // 0.845 on 1/K0 spectra, off otherwise
+            gate_support_peaks: 1,           // the selected apex alone; benchmark-gated
             im_gate: ImGate::Off,
         }
     }
@@ -5853,6 +5870,13 @@ impl Config {
                  gate)."
                     .into(),
             ));
+        }
+        if !(1..=64).contains(&self.extract.gate_support_peaks) {
+            return Err(Invalid(format!(
+                "extract.gate_support_peaks must be between 1 (the selected apex alone) and 64, \
+                 not {}",
+                self.extract.gate_support_peaks
+            )));
         }
         if !self.extract.gate_min_score.is_finite()
             || !(0.0..=1.0).contains(&self.extract.gate_min_score)
@@ -10446,6 +10470,14 @@ mod tests {
         assert!(Config::from_json(r#"{"extract":{"gate_min_score":-0.1}}"#).is_err());
         assert!(Config::from_json(r#"{"extract":{"gate_support_min":-0.1}}"#).is_err());
         assert!(Config::from_json(r#"{"extract":{"gate_support_min":1.4}}"#).is_ok());
+        assert!(Config::from_json(r#"{"extract":{"gate_support_peaks":0}}"#).is_err());
+        assert!(Config::from_json(r#"{"extract":{"gate_support_peaks":65}}"#).is_err());
+        let k = Config::from_json(r#"{"extract":{"gate_support_peaks":5}}"#).unwrap();
+        assert_eq!(k.extract.gate_support_peaks, 5);
+        assert!(k.canonical_json().contains(r#""gate_support_peaks":5"#));
+        assert!(!Config::default()
+            .canonical_json()
+            .contains("gate_support_peaks"));
         assert!(Config::from_json(r#"{"extract":{"gate_min_score":1.1}}"#).is_err());
     }
 
