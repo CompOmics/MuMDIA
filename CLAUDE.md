@@ -352,7 +352,7 @@ for -36% wall on six 60-min HYE runs, -1.75% for -48% on six 5-min runs, the E. 
 entrapment FDP unchanged (0.32-0.35% against 0.30-0.38%). It is a speed default that costs
 identifications; 0 restores the previous behaviour. It stays off without 1/K0 (docs/35
 section 16). It was off in 0.15.0 (+26% precursors at 200 pg and +19% at 1 ng with it off) and
-is restored for memory, now with `convert.tdf_min_points` 1; see the low-input bullet under
+is restored for memory, with `convert.tdf_min_points` 2; see the low-input bullet under
 "diaPASEF (timsTOF)".
 
 DeepLC 4.5.0 or newer is required wherever DeepLC runs (`predict-frag` in FASTA mode, the
@@ -457,19 +457,17 @@ fine-tuning also is not guaranteed deterministic.
   `extract.im_gate`, `features.im_features`, `retrace.*`, `rt_im_train.anchor_x_filter`,
   `rescore.shadow_im_tolerance` and the cross-run quant selectors. Promote one only in its
   own change, with entrapment and a second acquisition (docs/35 section 14).
-- Low input: `convert.tdf_min_points` defaults to 1 (keep single-ion centroids; 2 in 0.14.0
-  and 0.15.1) with the support gate kept, and `rt_im_train.fallback_windows` to `auto`, which is
-  `library` on spectra with 1/K0 and `unbounded` without (byte-identical 3D). `gate_support_min`
-  0 as well is the low-input opt-in (the 0.15.0 default, reverted after 10 of 52 diaPASEF sweep
-  jobs failed on memory). Fleet, three NN seeds, precursors per run at `run_psm_q` 1%,
-  0.15.1 / reader 1 + gate / gate off too: 200 pg HeLa 1,847 / 5,418 / 7,744, 250 pg Ultra
-  4,775 / 8,828 / 10,146, 1 ng 7,154 / 16,279 / 21,128, ProteoBench HYE 90,702 / 91,826 /
-  96,966; process-tree peaks 12 / 19 / 87 GB at 250 pg and 36 / 66 / 107 on ProteoBench, so the
-  gate, not the reader, carries the memory; E. coli entrapment FDP 0.41-0.42 / 0.43-0.47 /
-  0.42-0.44%. The library fallback windows held single-cell plates whose seed left most cells
-  without anchors (1,282 -> 1,352 and 1,454 -> 1,453 precursors per run, one seed) at 193 ->
-  48 GB and 182 -> 44 GB. Open: no low-input entrapment (docs/35 section 11, "Low input";
-  docs/08 section 4i). Keep `gate_min_score` 0.6: at 0.3 the pool grew up to 14x for the
+- Low input is an opt-in, not the default: `convert.tdf_min_points` 1 (keep single-ion
+  centroids; default 2) with `extract.gate_support_min` 0. Both were the default in 0.15.0 and
+  are reverted: on the 0.15.0 benchmark sweep 10 of 52 diaPASEF jobs that 0.14.0 ran failed on
+  memory (six single-cell runs without seed anchors whose extract hit store reached 290-875 GiB,
+  bulk runs at peaks of 271-378 GB, an HLA run whose footprint guard estimated 2.7 TB
+  over the run), intermediates 0.7-3.7x and wall about 3.2x against 0.14.0. Which of the two
+  keys causes it is not measured. With the recipe's `presence_min_coelution` 1, gate 0.6 and no
+  support gate, three NN seeds: 200 pg HeLa 3,422 -> 7,689 precursors per run, 1 ng 12,542 ->
+  19,270, 250 pg Ultra 6,912 -> 9,544, 50 ng -1.0%, E. coli entrapment FDP 0.97%, 0 IDs in
+  blanks. Open: the 250 pg Ultra foreign-species share rose 1.17% -> 1.40% (docs/35 section
+  11, "Low input"). Keep `gate_min_score` 0.6 with it: at 0.3 the pool grew up to 14x for the
   same counts.
 - The 1/K0 window sizing is one of the exceptions (with the support gate above), on by
   default since 2026-10-22 and inert without 1/K0: `rt_im_train.im_window_sizing =
