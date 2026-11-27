@@ -1112,7 +1112,9 @@ Before extract, `run` and `run-experiment` learn the MS1 offset from the confide
 anchors (`stages::ms1cal`, `extract.ms1_calibrate = true`, the default since 2026-10-08):
 the median signed ppm error of the most intense MS1 peak within 15 ppm of each anchor's
 precursor m/z, in the MS1 scan nearest its observed RT and one either side (section 8 for
-the 4D rule), and every MS1 read of extract is centred on it, `prec_tol_ppm` (3 ppm) wide.
+the 4D rule), and every MS1 read of extract is centred on it, `prec_tol_ppm` wide: unset
+(the default), 3 ppm, and 10 ppm on spectra that carry per-peak 1/K0 (the diaPASEF default,
+docs/35 section 11, "The diaPASEF default"). An explicit value applies to both.
 
 The standalone `mumdia extract` calibrates MS1 as `run` does when it is given `--ms1` and
 the seed's `--mass-cal`: the seed table is the one `<seed>.masscal.json` is named after.
@@ -1497,7 +1499,7 @@ declutter" commit: `extract.scan_window_mode` (and the `ScanWindowMode` enum),
 | `max_footprint_gib` | unset (`auto`) | Refuse an extraction whose estimated hit store passes this many GiB; `auto` is the machine's memory, `0` is off. See "The footprint guard" |
 | `fixed_scan_window` | 2 (3 before 2026-10-08) | Minimum co-elution run length (`scan_window` floor); `.max(1)` at `extract.rs:1591` |
 | `frag_tol_ppm` | 20.0 | Fragment match tolerance (overridden by `mass_cal`) |
-| `prec_tol_ppm` | 3.0 (20.0 before 2026-10-08) | MS1 isotope integration tolerance, centred on the offset `ms1_calibrate` learns from the seed |
+| `prec_tol_ppm` | unset: 3.0, and 10.0 on spectra with per-peak 1/K0 (20.0 before 2026-10-08; 3.0 on 1/K0 spectra until 0.15.1) | MS1 isotope integration tolerance, centred on the offset `ms1_calibrate` learns from the seed |
 | `ms1_calibrate` | `true` | `true`: one MS1 offset learned from the seed; `false`: none (section 11) |
 | `presence_min_matched` | 3 | Tier-b: minimum distinct matched fragments (`extract.rs:1727`) |
 | `presence_min_fragments` | 3 | Acceptance: minimum distinct fragments (`extract.rs:1926`) |

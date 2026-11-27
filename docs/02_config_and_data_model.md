@@ -718,7 +718,7 @@ selection dominate.
 |---|---|---|
 | `fixed_scan_window` | 2 | scan-window floor around the apex (3 before 2026-10-08) |
 | `frag_tol_ppm` | 20.0 | fragment tolerance |
-| `prec_tol_ppm` | 3.0 | precursor tolerance, centred on the learned MS1 offset when `ms1_calibrate` is on (20.0 before 2026-10-08) |
+| `prec_tol_ppm` | unset: 3.0, 10.0 on spectra with per-peak 1/K0 | precursor tolerance, centred on the learned MS1 offset when `ms1_calibrate` is on (20.0 before 2026-10-08); an explicit value applies to every run |
 | `presence_min_matched` | 3 | tier-(b) min matched fragment count |
 | `presence_min_fragments` | 3 | min distinct fragments for acceptance |
 | `presence_min_coelution` | 2 | min simultaneously-present fragments over the run |

@@ -345,10 +345,15 @@ fn search_second_pass(
     if library.targets == 0 {
         return Ok(None);
     }
+    let has_im = run_dirs.iter().any(|d| {
+        convert::ConvertOutputs::existing(&format!("{d}/spectra"))
+            .is_ok_and(|co| crate::instrument::spectra_has_im(&co.ms2))
+    });
     let mut cfg2 = cfg.clone();
     cfg2.prescreen.enabled = false;
-    // `mbr.second_pass_gate_support_min`, when set, is this extraction's support gate.
-    cfg2.apply_second_pass_extract();
+    // `mbr.second_pass_gate_support_min` is this extraction's support gate: when set, its
+    // value, and unset 0 on 1/K0 spectra (the diaPASEF default).
+    cfg2.apply_second_pass_extract(has_im);
     let cfg2 = &cfg2;
     let t_lib = Instant::now();
     let seed_lib = search_seed::SeedLibrary::load(
@@ -452,10 +457,6 @@ fn search_second_pass(
         );
         return Ok(None);
     }
-    let has_im = run_dirs.iter().any(|d| {
-        convert::ConvertOutputs::existing(&format!("{d}/spectra"))
-            .is_ok_and(|co| crate::instrument::spectra_has_im(&co.ms2))
-    });
     let psms_extracted = names
         .iter()
         .map(|nm| format!("{out}/{nm}/psms_extracted.parquet"))
@@ -1290,6 +1291,9 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // spectra will carry 1/K0 (`instrument::input_has_im`, as the library build decides),
     // so every run is scored with one feature schema and the pooled rescore accepts them.
     resolved.resolve_im_features(p.mzmls.iter().any(|m| crate::instrument::input_has_im(m)));
+    // `extract.prec_tol_ppm` unset is 10 ppm when every run is a diaPASEF `.d`, recorded as
+    // such; in an experiment that mixes the two, each run's extract resolves its own.
+    resolved.resolve_prec_tol_ppm(p.mzmls.iter().all(|m| crate::instrument::input_has_im(m)));
     // The ZT Scan analysis resolves once for the experiment as well, so every run is scored
     // with one feature set: on when every run is a SCIEX ZT Scan DIA run, off otherwise, with a
     // warning when only some are (`ztscan`, docs/37_ztscan.md, "Automatic for ZT Scan files").

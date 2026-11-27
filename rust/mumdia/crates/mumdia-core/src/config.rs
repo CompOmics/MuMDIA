@@ -496,13 +496,16 @@ pub struct ConvertConfig {
     /// drop features no diaPASEF window reaches (windows padded by 3 Th and 0.015 1/K0), and
     /// drop the weak m/z halo of bright ions. Retrace applies the same filter to the raw MS1
     /// frames it holds, so both read the same MS1 events. MS/MS spectra are never filtered.
-    /// Default true since 2026-10-17; only the native diaPASEF reader reads it. On the six
-    /// ProteoBench HYE diaPASEF runs it kept 8.7% of the MS1 points with identical
-    /// identifications (98,524 peptides at 1%, 89,973 ProteoBench ions at k = 3); on the
-    /// 15 min E. coli run 14,121 against 14,044 peptides at 1% and an entrapment FDP of
-    /// 0.30-0.38% against 0.39-0.46% (three NN seeds each; docs/35_diapasef.md section 16).
-    /// `false` restores the unfiltered MS1.
-    #[serde(skip_serializing_if = "is_true")]
+    /// Only the native diaPASEF reader reads it. Default false (true from 2026-10-17 to
+    /// 0.15.1): part of the diaPASEF default, with `extract.prec_tol_ppm` 10 on 1/K0 spectra
+    /// and the second pass without the support gate (docs/35_diapasef.md section 16). With
+    /// the filter's 3 ppm MS1 tolerance it kept 8.7% of the MS1 points at identical
+    /// identifications on the six ProteoBench HYE diaPASEF runs. Off with 10 ppm, against on
+    /// with 3 ppm (measured together, not apart), three NN seeds, precursors per run at
+    /// `run_psm_q` 1%: 200 pg HeLa 7,262 -> 8,680, ProteoBench HYE 96,356 -> 98,306; E. coli
+    /// entrapment 16,415 real precursors at an FDP of 0.41%.
+    /// `true` restores the filtered MS1.
+    #[serde(skip_serializing_if = "is_false")]
     pub tdf_ms1_denoise: bool,
     /// Half-width in m/z of the quadrupole isolation window, for MS2 spectra that name an
     /// isolation window target but no lower or upper offset (docs/04_convert.md, "SCIEX ZT
@@ -548,7 +551,7 @@ impl Default for ConvertConfig {
             tdf_mz_smooth_ppm: 8.0,
             tdf_im_valley: 0.0,
             tdf_im_smooth_scans: 8.0,
-            tdf_ms1_denoise: true,
+            tdf_ms1_denoise: false,
             isolation_half_width: None,
         }
     }
@@ -2359,7 +2362,20 @@ pub struct ExtractConfig {
     /// `min_coelution_run` floors the same run, so the larger of the two applies.
     pub fixed_scan_window: usize,
     pub frag_tol_ppm: f64,
-    pub prec_tol_ppm: f64,
+    /// MS1 precursor tolerance in ppm. Unset (`null` or `"auto"`, the default) it is
+    /// [`PREC_TOL_PPM_IM`] (10) on spectra that carry per-peak 1/K0 and [`PREC_TOL_PPM`] (3)
+    /// otherwise ([`ExtractConfig::prec_tol_ppm_for`]); an explicit value always wins.
+    /// `run` and `run-experiment` resolve it before hashing when every input is a diaPASEF
+    /// `.d` ([`Config::resolve_prec_tol_ppm`]), so the manifest records 10; a standalone
+    /// `extract` resolves it from the reader `convert` recorded. Unset is written as 3 in the
+    /// canonical configuration, so the config hash of a search without 1/K0 is unchanged.
+    /// 10 on diaPASEF is part of the diaPASEF default with `convert.tdf_ms1_denoise` off
+    /// (docs/35_diapasef.md section 16).
+    #[serde(
+        deserialize_with = "de_prec_tol_ppm",
+        serialize_with = "ser_prec_tol_ppm"
+    )]
+    pub prec_tol_ppm: Option<f64>,
     /// Fewest distinct matched fragments a candidate needs before its peak is looked at
     /// (tier b), and a promoted alternative peak (`promote_top_peaks > 1`) within its own
     /// bounds. For the selected peak it floors the same count as `presence_min_fragments`, so
@@ -2873,7 +2889,7 @@ impl Default for ExtractConfig {
             q1_dec_features: false,
             fixed_scan_window: 2,
             frag_tol_ppm: 20.0,
-            prec_tol_ppm: 3.0,
+            prec_tol_ppm: None,
             presence_min_matched: 3,
             presence_min_fragments: 3,
             presence_min_coelution: 2,
@@ -4026,14 +4042,16 @@ pub struct MbrConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub second_pass_prefilter_keep_decoys: Option<f64>,
     /// Under `strategy = second_pass`: the `extract.gate_support_min` of the second-pass
-    /// extraction only (0 = no support gate there). Unset, the second pass uses
-    /// `extract.gate_support_min` like the first. The gate's default (0.845 on spectra that
-    /// carry 1/K0) bounds the first pass's memory on a full library; the second pass searches
-    /// the small empirical library, where it rejected precursors at their first-pass apex. Off
-    /// in the second pass only, on standalone searches of each set's empirical library: 200 pg
-    /// diaPASEF +35% precursors per run, 250 pg +17%, bulk +5.0%, decoy fraction and peak
-    /// memory unchanged (one NN seed; docs/12, "Second pass"). Must be finite and >= 0. Left
-    /// out of the canonical configuration when unset.
+    /// extraction only (0 = no support gate there). Unset (the default), it is 0 when a run of
+    /// the experiment carries per-peak 1/K0 (part of the diaPASEF default), and otherwise the
+    /// second pass uses `extract.gate_support_min` like the first. The gate's default (0.845
+    /// on spectra that carry 1/K0) bounds the first pass's memory on a full library; the
+    /// second pass searches the small empirical library, where it rejected precursors at
+    /// their first-pass apex. Off in the second pass, through `run-experiment`, three NN
+    /// seeds, precursors per run at `run_psm_q` 1%: 200 pg diaPASEF 5,418 -> 7,262, 250 pg
+    /// 8,828 -> 10,111, ProteoBench HYE 91,826 -> 96,356, decoy fraction unchanged
+    /// (docs/12, "Second pass"). Must be finite and >= 0. Left out of the canonical
+    /// configuration when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub second_pass_gate_support_min: Option<f64>,
     /// Under `strategy = second_pass`, `run-experiment` only: write a Boolean
@@ -4454,6 +4472,53 @@ impl ExtractConfig {
             n => n,
         }
     }
+
+    /// The MS1 precursor tolerance (ppm) on this run: the configured one, or unset
+    /// [`PREC_TOL_PPM_IM`] on spectra that carry per-peak 1/K0 (`has_im`) and [`PREC_TOL_PPM`]
+    /// otherwise.
+    pub fn prec_tol_ppm_for(&self, has_im: bool) -> f64 {
+        self.prec_tol_ppm.unwrap_or(if has_im {
+            PREC_TOL_PPM_IM
+        } else {
+            PREC_TOL_PPM
+        })
+    }
+}
+
+/// `extract.prec_tol_ppm` unset, on spectra without 1/K0, and as the canonical configuration
+/// writes it unset.
+pub const PREC_TOL_PPM: f64 = 3.0;
+/// `extract.prec_tol_ppm` unset, on spectra that carry per-peak 1/K0 (the diaPASEF default).
+pub const PREC_TOL_PPM_IM: f64 = 10.0;
+
+/// `extract.prec_tol_ppm`: a tolerance in ppm, or `"auto"` or `null`, both stored as `None`.
+fn de_prec_tol_ppm<'de, D>(d: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Tol {
+        Ppm(f64),
+        Word(String),
+    }
+    match Option::<Tol>::deserialize(d)? {
+        None => Ok(None),
+        Some(Tol::Ppm(v)) => Ok(Some(v)),
+        Some(Tol::Word(w)) if w.trim().eq_ignore_ascii_case("auto") => Ok(None),
+        Some(Tol::Word(w)) => Err(serde::de::Error::custom(format!(
+            "extract.prec_tol_ppm must be a tolerance in ppm or \"auto\" (got \"{w}\")"
+        ))),
+    }
+}
+
+/// `extract.prec_tol_ppm` unset is written as [`PREC_TOL_PPM`], the value it has without
+/// 1/K0, so the canonical configuration (and the config hash) of a 3D search is unchanged.
+/// shortcut: a standalone stage on 1/K0 spectra with the key unset hashes as an explicit 3
+/// would; the extract report records the 10 it used. `run` and `run-experiment` resolve it
+/// before hashing ([`Config::resolve_prec_tol_ppm`]), which is the case that matters.
+fn ser_prec_tol_ppm<S: serde::Serializer>(v: &Option<f64>, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_f64(v.unwrap_or(PREC_TOL_PPM))
 }
 
 /// `extract.apex_count_window`: a window in scans, or `"auto"`, which is stored as `0`
@@ -5377,6 +5442,16 @@ impl Config {
         }
     }
 
+    /// `extract.prec_tol_ppm` unset becomes [`PREC_TOL_PPM_IM`] when every input carries
+    /// per-peak 1/K0 (`all_im`), so the canonical configuration and the manifest record the
+    /// tolerance the search uses. Otherwise it stays unset: 3 without 1/K0 (written as 3, so
+    /// the hash is unchanged), and per run in an experiment that mixes the two.
+    pub fn resolve_prec_tol_ppm(&mut self, all_im: bool) {
+        if all_im && self.extract.prec_tol_ppm.is_none() {
+            self.extract.prec_tol_ppm = Some(PREC_TOL_PPM_IM);
+        }
+    }
+
     /// The keys that ask for the ZT Scan analysis explicitly: an automatic key set to `true`
     /// (a number above 0 for `quant.q1_cycle_halfwidth`, a count other than the default for
     /// `retrace.q1_repick_peaks`), and the opt-in key that reads the Q1 sweep as well
@@ -6075,7 +6150,10 @@ impl Config {
                 self.search_seed.fragment_tol_ppm,
             ),
             ("extract.frag_tol_ppm", self.extract.frag_tol_ppm),
-            ("extract.prec_tol_ppm", self.extract.prec_tol_ppm),
+            (
+                "extract.prec_tol_ppm",
+                self.extract.prec_tol_ppm.unwrap_or(PREC_TOL_PPM),
+            ),
         ] {
             if !value.is_finite() || value <= 0.0 {
                 return Err(Invalid(format!(
@@ -7208,10 +7286,14 @@ impl Config {
     }
 
     /// The extraction configuration of the second pass: `extract`, with
-    /// `mbr.second_pass_gate_support_min` as its support gate when that is set.
-    pub fn apply_second_pass_extract(&mut self) {
-        if let Some(v) = self.mbr.second_pass_gate_support_min {
-            self.extract.gate_support_min = Some(v);
+    /// `mbr.second_pass_gate_support_min` as its support gate when that is set, and unset
+    /// no support gate when a run of the experiment carries 1/K0 (`has_im`; the diaPASEF
+    /// default). Without 1/K0 and unset, the second pass keeps `extract.gate_support_min`.
+    pub fn apply_second_pass_extract(&mut self, has_im: bool) {
+        match self.mbr.second_pass_gate_support_min {
+            Some(v) => self.extract.gate_support_min = Some(v),
+            None if has_im => self.extract.gate_support_min = Some(0.0),
+            None => {}
         }
     }
 
@@ -7991,11 +8073,28 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.mbr.second_pass_gate_support_min, None);
         assert!(!c.canonical_json().contains("second_pass_gate_support"));
+        // Without 1/K0, unset leaves the second pass's extract as it was (3D byte identity).
         let mut c2 = c.clone();
-        c2.apply_second_pass_extract();
+        c2.apply_second_pass_extract(false);
         assert_eq!(c2.extract.gate_support_min, None);
         assert_eq!(c2.canonical_json(), c.canonical_json());
+        let mut explicit = Config::default();
+        explicit.extract.gate_support_min = Some(0.9);
+        explicit.apply_second_pass_extract(false);
+        assert_eq!(explicit.extract.gate_support_min, Some(0.9));
+        // With 1/K0, unset is the diaPASEF default: no support gate in the second pass.
+        let mut d2 = c.clone();
+        d2.apply_second_pass_extract(true);
+        assert_eq!(d2.extract.gate_support_min, Some(0.0));
 
+        // Set, it wins on either kind of spectra.
+        let mut on = Config::default();
+        on.mbr.second_pass_gate_support_min = Some(0.845);
+        for has_im in [false, true] {
+            let mut p2 = on.clone();
+            p2.apply_second_pass_extract(has_im);
+            assert_eq!(p2.extract.gate_support_min, Some(0.845));
+        }
         let mut off = Config::default();
         off.mbr.second_pass_gate_support_min = Some(0.0);
         assert!(off.validate().is_ok());
@@ -8003,7 +8102,7 @@ mod tests {
             .canonical_json()
             .contains(r#""second_pass_gate_support_min":0.0"#));
         let mut p2 = off.clone();
-        p2.apply_second_pass_extract();
+        p2.apply_second_pass_extract(false);
         assert_eq!(p2.extract.gate_support_min, Some(0.0));
         assert_eq!(off.extract.gate_support_min, None);
 
@@ -8141,7 +8240,7 @@ mod tests {
         // HeLa entrapment pools, the single cells and the immuno run.
         let c = Config::default();
         assert_eq!(c.extract.ms1_calibrate, Ms1Calibrate::Offset);
-        assert_eq!(c.extract.prec_tol_ppm, 3.0);
+        assert_eq!(c.extract.prec_tol_ppm_for(false), 3.0);
         assert!(c.extract.emit_rt_window);
         assert_eq!(c.extract.fixed_scan_window, 2);
         assert_eq!(c.extract.ms1_scan_halfwidth, 1);
@@ -8149,8 +8248,70 @@ mod tests {
         assert!(c.rt_im_train.composition_correction);
         assert_eq!(c.rescore.shadow_min_shared, 3);
         let parsed: Config = serde_json::from_str("{}").unwrap();
-        assert_eq!(parsed.extract.prec_tol_ppm, 3.0);
+        assert_eq!(parsed.extract.prec_tol_ppm_for(false), 3.0);
         assert_eq!(parsed.rescore.shadow_min_shared, 3);
+    }
+
+    /// The diaPASEF default of `extract.prec_tol_ppm`: unset is 10 ppm on 1/K0 spectra and 3
+    /// without, an explicit value always wins, and unset is written as 3 so the canonical
+    /// configuration (and the config hash) of a 3D search is unchanged.
+    #[test]
+    fn prec_tol_ppm_resolves_on_1k0_and_keeps_the_3d_canonical_form() {
+        let c = Config::default();
+        assert_eq!(c.extract.prec_tol_ppm, None);
+        assert_eq!(c.extract.prec_tol_ppm_for(false), PREC_TOL_PPM);
+        assert_eq!(c.extract.prec_tol_ppm_for(true), PREC_TOL_PPM_IM);
+        assert!(c.canonical_json().contains(r#""prec_tol_ppm":3.0"#));
+        // "auto" and null are unset; a number is explicit and wins on either kind of spectra.
+        for j in [
+            r#"{}"#,
+            r#"{"prec_tol_ppm": "auto"}"#,
+            r#"{"prec_tol_ppm": null}"#,
+        ] {
+            let e: ExtractConfig = serde_json::from_str(j).unwrap();
+            assert_eq!(e.prec_tol_ppm, None, "{j}");
+        }
+        for v in [3.0, 5.0, 20.0] {
+            let e: ExtractConfig =
+                serde_json::from_str(&format!(r#"{{"prec_tol_ppm": {v}}}"#)).unwrap();
+            assert_eq!(e.prec_tol_ppm_for(false), v);
+            assert_eq!(e.prec_tol_ppm_for(true), v);
+        }
+        assert!(serde_json::from_str::<ExtractConfig>(r#"{"prec_tol_ppm": "wide"}"#).is_err());
+        // An explicit 3 and unset have one canonical form without 1/K0.
+        let mut three = Config::default();
+        three.extract.prec_tol_ppm = Some(3.0);
+        assert_eq!(three.canonical_json(), c.canonical_json());
+        // `run` / `run-experiment`: resolved to 10 before hashing only when every input
+        // carries 1/K0; an explicit value is kept.
+        let mut d = Config::default();
+        d.resolve_prec_tol_ppm(false);
+        assert_eq!(d.canonical_json(), c.canonical_json());
+        d.resolve_prec_tol_ppm(true);
+        assert_eq!(d.extract.prec_tol_ppm, Some(PREC_TOL_PPM_IM));
+        assert!(d.canonical_json().contains(r#""prec_tol_ppm":10.0"#));
+        let mut five = Config::default();
+        five.extract.prec_tol_ppm = Some(5.0);
+        five.resolve_prec_tol_ppm(true);
+        assert_eq!(five.extract.prec_tol_ppm, Some(5.0));
+        // Validated as before: unset passes, a non-positive value does not.
+        assert!(c.validate().is_ok());
+        let mut bad = Config::default();
+        bad.extract.prec_tol_ppm = Some(0.0);
+        assert!(bad.validate().is_err());
+    }
+
+    /// `convert.tdf_ms1_denoise` is off by default (part of the diaPASEF default) and left out
+    /// of the canonical configuration when off, so the config hash of a configuration that
+    /// does not set it is unchanged; on, it is recorded.
+    #[test]
+    fn tdf_ms1_denoise_is_off_by_default_and_absent_when_off() {
+        let c = Config::default();
+        assert!(!c.convert.tdf_ms1_denoise);
+        assert!(!c.canonical_json().contains("tdf_ms1_denoise"));
+        let on: Config = serde_json::from_str(r#"{"convert":{"tdf_ms1_denoise":true}}"#).unwrap();
+        assert!(on.convert.tdf_ms1_denoise);
+        assert!(on.canonical_json().contains(r#""tdf_ms1_denoise":true"#));
     }
 
     #[test]

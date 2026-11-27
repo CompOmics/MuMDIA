@@ -1362,7 +1362,7 @@ fn claim_cue_multiplier(
         let s = &ms1_scans[j];
         let z = (cand.charge.max(1)) as f64;
         let sp = ISOTOPE_SPACING / z;
-        let tol = cfg.prec_tol_ppm;
+        let tol = prec_tol(cfg);
         let mono = sum_near(&s.mz, &s.intensity, cand.precursor_mz, tol);
         if mono <= 0.0 {
             w *= 0.5;
@@ -1678,6 +1678,13 @@ const GATE_IM_MS1_ERR_WEIGHT: f64 = 0.18;
 const GATE_IM_ERR_MISSING: f64 = 0.039;
 const GATE_IM_MAD_MISSING: f64 = 0.024;
 const GATE_IM_MS1_ERR_MISSING: f64 = 0.265;
+
+/// `extract.prec_tol_ppm` as [`run_hashed`] resolved it for this run's spectra. Unset only
+/// when a test calls a helper directly with a bare configuration, which is then 3D.
+fn prec_tol(cfg: &ExtractConfig) -> f64 {
+    cfg.prec_tol_ppm
+        .unwrap_or(mumdia_core::config::PREC_TOL_PPM)
+}
 
 /// [`sum_near`] in the MS1 scan nearest `j` and its `half` neighbours either side: the
 /// maximum over those scans (`extract.ms1_scan_halfwidth`; 0 reads scan `j` only).
@@ -3664,7 +3671,7 @@ fn apex_im_stats(
     } else {
         let s1 = &ms1_scans[nearest_index(ms1_rts, apex_rt)];
         let target = prec_mz * cfg.ms1_shift();
-        crate::spectra::ms1_peak_near(s1, target, cfg.prec_tol_ppm, med)
+        crate::spectra::ms1_peak_near(s1, target, prec_tol(cfg), med)
             .and_then(|k| s1.im.as_ref().map(|v| v[k] as f64))
     };
     ApexIm {
@@ -4174,16 +4181,24 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     let instrument = crate::instrument::recorded(p.ms2);
     let astral = instrument.as_ref().is_some_and(|i| i.is_astral());
     let apex_count_window = p.cfg.apex_count_window_for(astral);
+    // `extract.prec_tol_ppm` unset: 10 ppm on spectra `convert` read with per-peak 1/K0,
+    // 3 otherwise (`run` and `run-experiment` have usually resolved it already).
+    let prec_tol_ppm = p
+        .cfg
+        .prec_tol_ppm_for(crate::instrument::spectra_has_im(p.ms2));
     let resolved_cfg;
     let mut p = p;
-    if p.cfg.apex_count_window != apex_count_window {
-        info!(
-            instrument = %instrument.as_ref().map_or("unknown".to_string(), |i| i.describe()),
-            apex_count_window,
-            "extract: apex_count_window \"auto\" resolved for this instrument"
-        );
+    if p.cfg.apex_count_window != apex_count_window || p.cfg.prec_tol_ppm.is_none() {
+        if p.cfg.apex_count_window != apex_count_window {
+            info!(
+                instrument = %instrument.as_ref().map_or("unknown".to_string(), |i| i.describe()),
+                apex_count_window,
+                "extract: apex_count_window \"auto\" resolved for this instrument"
+            );
+        }
         resolved_cfg = ExtractConfig {
             apex_count_window,
+            prec_tol_ppm: Some(prec_tol_ppm),
             ..p.cfg.clone()
         };
         p.cfg = &resolved_cfg;
@@ -5238,7 +5253,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             let h = p.cfg.ms1_scan_halfwidth;
             let z = c.charge as f64;
             let sp = ISOTOPE_SPACING / z;
-            let tol = p.cfg.prec_tol_ppm;
+            let tol = prec_tol(p.cfg);
             let at = |mz: f64| Some(ms1_near(ms1_scans, j, h, mz * p.cfg.ms1_shift(), tol) as f64);
             (
                 at(c.precursor_mz - sp),
@@ -5864,7 +5879,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         // Ms1.Profile.Corr class). Grid mode only; nearest MS1 scan per grid RT.
         if !ms1_scans.is_empty() && !t_grid.is_empty() {
             let sp = ISOTOPE_SPACING / c.charge as f64;
-            let tol = p.cfg.prec_tol_ppm;
+            let tol = prec_tol(p.cfg);
             for (nm, dmz) in [("ms1_mono", 0.0), ("ms1_iso1", sp), ("ms1_iso2", 2.0 * sp)] {
                 let lib_mz = c.precursor_mz + dmz;
                 let mz = lib_mz * p.cfg.ms1_shift();
@@ -5968,7 +5983,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                     }
                     if !ms1_scans.is_empty() {
                         let sp = ISOTOPE_SPACING / c.charge as f64;
-                        let tol = p.cfg.prec_tol_ppm;
+                        let tol = prec_tol(p.cfg);
                         for (nm, dmz) in
                             [("ms1_mono", 0.0), ("ms1_iso1", sp), ("ms1_iso2", 2.0 * sp)]
                         {
@@ -6715,6 +6730,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             if let Some(obj) = params.as_object_mut() {
                 obj.insert("reader".into(), json!(crate::instrument::READER_TIMSRUST));
                 obj.insert("im_gate".into(), json!(im_gate));
+                obj.insert("prec_tol_ppm".into(), json!(prec_tol(p.cfg)));
             }
         }
         // The per-fragment Q1 decision's model, only under `extract.q1_fragments`, so a report
