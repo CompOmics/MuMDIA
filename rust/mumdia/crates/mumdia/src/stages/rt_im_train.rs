@@ -540,6 +540,10 @@ pub struct RtWindows {
     /// `(library_precursors, run_windows)` of the `rt-im-train` call that fitted these
     /// windows; `None` for windows read back from a file, which are never handed over.
     pub(crate) fitted_for: Option<(String, String)>,
+    /// The RT windows are the library-range fallback of a run without anchors
+    /// (`fallback_windows = library`), not a calibration; `extract` then halves its default
+    /// windows in flight. `false` for windows read back from a file.
+    pub(crate) library_fallback: bool,
 }
 
 impl RtWindows {
@@ -645,6 +649,7 @@ impl RtWindowsBuilder {
                 im_hi: with_im.then(|| vec![f32::INFINITY; n]),
                 im_cal: with_im.then(|| vec![None; n]),
                 fitted_for: None,
+                library_fallback: false,
             },
             poisoned: false,
             n_im: 0,
@@ -1837,7 +1842,11 @@ fn write_windows(
     );
     Ok((
         report.written(),
-        kept.and_then(|b| b.finish(p.library_precursors, p.out_windows)),
+        kept.and_then(|b| b.finish(p.library_precursors, p.out_windows))
+            .map(|w| RtWindows {
+                library_fallback: fit.rt_fallback.is_some(),
+                ..w
+            }),
     ))
 }
 
@@ -3171,9 +3180,12 @@ mod tests {
         assert!(cal.get("rt_fallback").is_none());
         assert!(kept.rt_lo.iter().all(|v| *v == f64::NEG_INFINITY));
         assert!(!kept.has_im());
+        assert!(!kept.library_fallback);
 
-        // Library: bounded RT around the map, the library's 1/K0 +/- the fallback width.
+        // Library: bounded RT around the map, the library's 1/K0 +/- the fallback width, and
+        // the windows handed to extract say so (it halves its default windows in flight).
         let (kept, cal, _) = run_with("library", &empty_4d, &library).unwrap();
+        assert!(kept.library_fallback);
         assert_eq!(cal["calibration_status"], FALLBACK_LIBRARY_STATUS);
         assert_eq!(cal["method"], "library_range");
         assert_eq!(cal["rt_fallback"]["mode"], "library");
@@ -3243,7 +3255,11 @@ mod tests {
         // A calibrated 3D run: the key changes nothing, byte for byte.
         let calibrated_3d = seed("calibrated_3d", true, false);
         let (_, cal_d, bytes_d) = run_with("cal_default", &calibrated_3d, &default).unwrap();
-        let (_, cal_l, bytes_l) = run_with("cal_library", &calibrated_3d, &library).unwrap();
+        let (kept_l, cal_l, bytes_l) = run_with("cal_library", &calibrated_3d, &library).unwrap();
+        assert!(
+            !kept_l.library_fallback,
+            "a calibrated run is not a fallback"
+        );
         assert_eq!(bytes_d, bytes_l);
         assert_eq!(cal_d, cal_l);
         assert_ne!(cal_d["calibration_status"], FALLBACK_LIBRARY_STATUS);

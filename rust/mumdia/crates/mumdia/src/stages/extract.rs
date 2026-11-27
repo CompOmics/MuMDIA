@@ -2842,8 +2842,13 @@ fn support_gate_min(cfg: &ExtractConfig, has_im: bool) -> f64 {
 }
 
 /// `extract.windows_in_flight`, or its default: the rayon thread count capped at 16, and
-/// at [`DEFAULT_MAX_WINDOWS_IN_FLIGHT_IM`] on spectra that carry 1/K0.
-fn groups_in_flight(cfg: &ExtractConfig, has_im: bool) -> usize {
+/// at [`DEFAULT_MAX_WINDOWS_IN_FLIGHT_IM`] on spectra that carry 1/K0, halved when the RT
+/// windows are the library-range fallback of a run without anchors (`library_fallback`,
+/// `RtWindows::library_fallback`). Those windows span half the gradient, and the matches
+/// of a whole batch are held at once (126 against 74 GiB at 4 and 2 on single-cell
+/// diaPASEF, docs/08 section 4i); the batch only bounds memory, so the output is the same
+/// at any setting. An explicit value is kept.
+fn groups_in_flight(cfg: &ExtractConfig, has_im: bool, library_fallback: bool) -> usize {
     let cap = if has_im {
         DEFAULT_MAX_WINDOWS_IN_FLIGHT_IM
     } else {
@@ -2851,7 +2856,14 @@ fn groups_in_flight(cfg: &ExtractConfig, has_im: bool) -> usize {
     };
     cfg.windows_in_flight
         .filter(|&n| n > 0)
-        .unwrap_or_else(|| rayon::current_num_threads().min(cap))
+        .unwrap_or_else(|| {
+            let n = rayon::current_num_threads().min(cap);
+            if library_fallback {
+                n / 2
+            } else {
+                n
+            }
+        })
         .max(1)
 }
 
@@ -3527,6 +3539,7 @@ pub(crate) fn read_run_windows(path: &str, ncand: usize) -> Result<RtWindows> {
         im_hi,
         im_cal,
         fitted_for: None,
+        library_fallback: false,
     })
 }
 
@@ -4654,10 +4667,17 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     {
         let groups = wgroups.as_deref().expect("just built");
         let loads = window_loads(groups, scans, &lib, guard, restrict.as_ref(), frag_tol);
+        if win.library_fallback && p.cfg.windows_in_flight.is_none() {
+            info!(
+                windows_in_flight = groups_in_flight(p.cfg, has_im, true),
+                "extract: the RT windows are the library fallback of a run without anchors; \
+                 half the default windows in flight"
+            );
+        }
         let fp = Footprint::of(
             loads,
             streamed,
-            groups_in_flight(p.cfg, has_im),
+            groups_in_flight(p.cfg, has_im, win.library_fallback),
             scans.len(),
         );
         check_footprint(&fp, p.cfg, p.sibling_bands)?;
@@ -6379,7 +6399,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 n_materialized += c.len() as u64;
                 emit_batch(c)
             };
-            let step = groups_in_flight(p.cfg, has_im);
+            let step = groups_in_flight(p.cfg, has_im, win.library_fallback);
             let mut gi = 0usize;
             while gi < groups.len() {
                 let upto = (gi + step).min(groups.len());
@@ -7466,6 +7486,7 @@ mod accumulate_tests {
             im_hi: None,
             im_cal: None,
             fitted_for: None,
+            library_fallback: false,
         }
     }
 
@@ -8556,6 +8577,37 @@ mod ms1_near_tests {
         assert_eq!(ms1_near(&scans, 0, 1, 600.0, 5.0), 300.0);
         assert_eq!(ms1_near(&scans, 2, 5, 600.0, 5.0), 700.0);
     }
+
+    /// The default windows in flight halve on library-fallback RT windows and nowhere else,
+    /// never below one; an explicit `extract.windows_in_flight` is kept as given.
+    #[test]
+    fn windows_in_flight_halve_on_library_fallback_windows_only() {
+        use super::{groups_in_flight, ExtractConfig};
+        let d = ExtractConfig::default();
+        let set = ExtractConfig {
+            windows_in_flight: Some(3),
+            ..ExtractConfig::default()
+        };
+        let pool = |n| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .build()
+                .unwrap()
+        };
+        pool(16).install(|| {
+            assert_eq!(groups_in_flight(&d, true, false), 4);
+            assert_eq!(groups_in_flight(&d, true, true), 2);
+            assert_eq!(groups_in_flight(&d, false, false), 16);
+            assert_eq!(groups_in_flight(&d, false, true), 8);
+            assert_eq!(groups_in_flight(&set, true, true), 3);
+            assert_eq!(groups_in_flight(&set, false, false), 3);
+        });
+        pool(1).install(|| {
+            assert_eq!(groups_in_flight(&d, true, true), 1);
+            assert_eq!(groups_in_flight(&d, false, true), 1);
+        });
+    }
+
     /// The diaPASEF gate is on by default on 1/K0 spectra only, an explicit setting wins
     /// (0 turns it off), and it never applies outside the window-mean gate.
     #[test]

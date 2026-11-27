@@ -1160,7 +1160,9 @@ the measurements below separate:
 
 ### Extract: windows in flight
 
-`extract.windows_in_flight` defaults to 4 on spectra that carry 1/K0 (16 otherwise). Measured
+`extract.windows_in_flight` defaults to 4 on spectra that carry 1/K0 (16 otherwise), and to 2
+on a run whose RT windows are the library fallback of a run without anchors (docs/08 section
+4i). Measured
 standalone on run A_02 at 20 threads, the accepted candidates (4,907,155) and chromatogram rows
 (73,607,325) identical at every setting:
 
