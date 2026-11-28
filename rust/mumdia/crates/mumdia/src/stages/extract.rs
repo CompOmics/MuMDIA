@@ -8770,7 +8770,12 @@ mod accumulate_tests {
                 memory,
             )
         };
-        let c = ExtractConfig::default();
+        // The machine-memory ceiling of `max_footprint_gib` off, so a small CI runner does not
+        // refuse the 36 GiB hit store below.
+        let c = ExtractConfig {
+            max_footprint_gib: Some(0.0),
+            ..ExtractConfig::default()
+        };
         assert!(check_footprint(&fp(Some((8.0 * GIB, false))), &c, 1).is_ok());
         // A hit budget derived from the budget beside the loaded bytes and the tail fits it.
         let big = WindowLoad {
