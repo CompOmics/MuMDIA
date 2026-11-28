@@ -20,7 +20,7 @@
 //!   "format": "mumdia-desktop-settings",
 //!   "version": 1,
 //!   "name": "Phospho",
-//!   "created_by": "MuMDIA 0.15.1",
+//!   "created_by": "MuMDIA 0.16.0",
 //!   "created": "2026-11-12T09:30:00Z",
 //!   "settings": { "engine": {...}, "digest": {...}, ... }
 //! }

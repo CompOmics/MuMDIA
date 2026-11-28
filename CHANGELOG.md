@@ -7,6 +7,19 @@ All notable changes to MuMDIA are recorded here. The format follows
 `0.1.0` is the first tagged release of the Rust engine. The superseded
 Python implementation remains available at the tag `legacy-python-v1`.
 
+`0.16.0` is a minor release: it changes the defaults of a timsTOF diaPASEF search read natively
+from a Bruker `.d`. The native reader keeps single-ion centroids again, with the support gate
+kept in the first pass; a run whose seed finds no anchors is searched in windows taken from the
+library instead of over the whole gradient; the second pass between runs searches without the
+support gate; and MS1 is read without the noise filter, at a wider precursor tolerance. A
+diaPASEF search therefore finds more precursors, most at low load, quantifies differently, and
+needs more memory on bulk input than with `0.15.1`. The rescore prefilter now also fits on a
+whole single-cell plate, so the pooled rescore of such a plate no longer receives every PSM. New
+opt-in keys judge the support gate at a candidate's best peaks and set the second pass's
+support gate on its own. The desktop application refuses the ZT Scan preset on files that are
+not ZT Scan runs. A search without 1/K0 gives the same output as with `0.15.1`, unless its
+rescore prefilter used to stand aside for lack of confident targets.
+
 `0.15.1` is a patch release. A timsTOF diaPASEF search read natively from a Bruker `.d` is back
 on the extraction settings of `0.14.0`, because the settings `0.15.0` introduced made some
 searches grow past the memory of the machine; those settings remain available as a low-input
@@ -236,18 +249,12 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
-### Fixed
+## [0.16.0] - 2026-11-28
 
-- **Desktop: the "ztscan" preset on files that are not ZT Scan runs.** The preset sets the ZT
-  Scan keys explicitly, and the engine refuses them unless every input is a ZT Scan run, so such
-  a search stopped at the start with an "invalid config" error. The search screen now refuses it
-  before the search starts, names the files it does not recognise as ZT Scan runs, and points to
-  another preset: the engine runs the ZT Scan analysis by itself for ZT Scan files under any
-  preset.
 ### Added
 
 - **`rt_im_train.fallback_windows`: bounded windows for a run whose seed found no anchors
-  (docs/08 section 4i, docs/17 "Seed: no confident targets").** `unbounded` keeps every
+  (#383, #393, docs/08 section 4i, docs/17 "Seed: no confident targets").** `unbounded` keeps every
   artifact byte for byte as before the key; the default is `auto` (see "Changed"). `library`
   gives a run with fewer than two RT
   anchors the library's iRT range (1st-99th percentile) mapped linearly onto the seed's
@@ -261,7 +268,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   peptides per cell of those that worked most cells had 0 anchors (the rest 100-450), so they
   had no 1/K0 calibration and, below two anchors, no RT window.
 - **`extract.gate_support_peaks`: the support gate judges a candidate's K best peaks, not only
-  its selected apex (docs/09 section 5, docs/35 section 16).** The support gate
+  its selected apex (#390, #393, docs/09 section 5, docs/35 section 16).** The support gate
   (`extract.gate_support_min`) is read at the apex extract chose, before `retrace.repick` moves
   it, and on ProteoBench diaPASEF HYE most of the precursors it rejected that an independent
   search on the same library identified sat at another apex, with that apex among extract's
@@ -274,7 +281,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   on six diaPASEF sets (three NN seeds on four) and 16,580 real entrapment precursors at an FDP
   of 0.48%, against 16,333 at 0.45% without it (docs/35 section 11, "The diaPASEF default").
 - **`mbr.second_pass_gate_support_min`: the extract support gate of the second pass alone
-  (docs/12 "Second pass", docs/35 section 16).** A value set is the second pass's support gate
+  (#389, #393, docs/12 "Second pass", docs/35 section 16).** A value set is the second pass's support gate
   on every run (0 = none). Unset, it is 0 when a run of the experiment carries per-peak 1/K0
   (part of the diaPASEF default, see "Changed") and `extract.gate_support_min` otherwise, so a
   search without 1/K0 keeps every artifact and its config hash. The gate's default (0.845 on
@@ -289,7 +296,7 @@ than a number. Both are recorded in every run's `manifest.json`.
 ### Changed
 
 - **The diaPASEF default: single-ion centroids, library windows for a run without anchors, no
-  support gate in the second pass, no MS1 noise filter and a 10 ppm MS1 tolerance (docs/35
+  support gate in the second pass, no MS1 noise filter and a 10 ppm MS1 tolerance (#393, docs/35
   section 11, "The diaPASEF default").** Five settings change together, each only on spectra
   that carry per-peak 1/K0: `convert.tdf_min_points` 1 and `rt_im_train.fallback_windows`
   `auto` (both below), `mbr.second_pass_gate_support_min` unset is 0 (see "Added"),
@@ -308,9 +315,11 @@ than a number. Both are recorded in every run's `manifest.json`.
   wall about x1.35 that of the first two settings (host-adjusted, about x1.2 of it fleet-load
   drift). Open: the entrapment set is one run, so it cannot test the second-pass change; bulk
   memory is about 2.4x that of 0.15.1, mostly from `tdf_min_points` 1 (+1.2% precursors on
-  ProteoBench HYE); single-cell plates whose cells have no seed anchors stay slow and heavy
-  (52 cells: 74 min at 53 GB with 0.15.1's reader and the fallback windows, 278 min at 258 GB
-  with the second pass ungated), and that plate on this default is pending; a second bulk
+  ProteoBench HYE); single-cell plates whose cells have no seed anchors stay slow and heavy:
+  on this default, one NN seed, 52 cells 2,112 precursors per run in 8.4 h at a 158 GB
+  process-tree peak (proportional set size; 74 min at 53 GB with 0.15.1's reader and the
+  fallback windows) and 71 cells 3,043 (2,545 with the first two settings) in 9.3 h at 294 GB;
+  a second bulk
   entrapment acquisition is owed. Quantification (three NN seeds, an older diaPASEF quant recipe
   with `cross_run` fragment selection in every arm): on the precursors every arm identified,
   ratio accuracy and CV are unchanged or slightly better than 0.15.1 on every set, but the
@@ -320,19 +329,20 @@ than a number. Both are recorded in every run's `manifest.json`.
   against an expected -2; 200 pg precursor CV 0.10 -> 0.20, 0.10 on the shared precursors).
   The identification gain holds on the FDR checks; gating the quantities of weak
   identifications is open work.
-- **diaPASEF: `convert.tdf_ms1_denoise` defaults to false (docs/35 section 16, "MS1 noise").**
+- **diaPASEF: `convert.tdf_ms1_denoise` defaults to false (#393, docs/35 section 16, "MS1
+  noise").**
   The native reader keeps every MS1 point again. Measured only with the 10 ppm tolerance below,
   as part of the diaPASEF default. `true` restores 0.15.1's filtered MS1; the key is read only
   by the native diaPASEF reader and is left out of the canonical configuration when false.
 - **diaPASEF: `extract.prec_tol_ppm` unset is 10 ppm on spectra that carry per-peak 1/K0, 3 ppm
-  otherwise (docs/09 section 11, docs/35 section 11).** The key now accepts `"auto"` or `null`
+  otherwise (#393, docs/09 section 11, docs/35 section 11).** The key now accepts `"auto"` or `null`
   (the default) as well as a number, and an explicit number applies to every run. `run` and
   `run-experiment` resolve it to 10 before hashing when every input is a diaPASEF `.d`, so the
   manifest records it; a standalone `extract` resolves it from the reader `convert` recorded
   and writes it into its report on 1/K0 spectra. Unset is written as 3 in the canonical
   configuration, so the config hash and every artifact of a search without 1/K0 are unchanged.
 - **Extract probes half its default windows in flight on a run whose RT windows are the
-  library fallback (docs/09 "The footprint guard", docs/08 section 4i).** A run without
+  library fallback (#391, #393, docs/09 "The footprint guard", docs/08 section 4i).** A run without
   anchors under `rt_im_train.fallback_windows = library` has RT windows of half the gradient,
   and extract holds the fragment-peak matches of a whole batch of isolation window groups at
   once; unset, `extract.windows_in_flight` is now halved there (4 to 2 on diaPASEF). The
@@ -346,11 +356,12 @@ than a number. Both are recorded in every run's `manifest.json`.
   experiment's peak (one process, which is also the process-tree peak) fell from 126.0 to
   74.4 GiB, with those extracts at 161-162 s against 162-172 s and the experiment at 24:43
   against 24:12. All 75 output tables and 59 recorded content hashes are identical. These
-  cells found no identification (no training signal), so the second pass did not run; a
-  whole plate is still to be measured.
+  cells found no identification (no training signal), so the second pass did not run. On whole
+  plates the halving alone does not bound the peak, which sits in the pooled rescore (see the
+  prefilter under "Fixed").
 - **diaPASEF: `convert.tdf_min_points` defaults to 1, with `extract.gate_support_min` kept at
-  0.845 on spectra that carry 1/K0 in the first pass (docs/35 sections 2, 11 "Low input" and
-  16).** The native
+  0.845 on spectra that carry 1/K0 in the first pass (#388, #393, docs/35 sections 2, 11 "Low
+  input" and 16).** The native
   Bruker reader keeps single-ion centroids again; the support gate stays on. Fleet, 0.15.1
   engine with configuration patches, precursors per run at `run_psm_q` 1%, mean of three NN
   seeds (spread at most 1%), process-tree peak, 0.15.1 against this default against 0.15.0
@@ -364,7 +375,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   restores 0.15.1. No low-input set has an entrapment null yet. A search without 1/K0 is
   unaffected, and the config hash of a configuration that does not set the key is unchanged.
 - **`rt_im_train.fallback_windows` defaults to `auto`: `library` on spectra that carry per-peak
-  1/K0, `unbounded` otherwise (docs/08 section 4i).** A diaPASEF run whose seed leaves it
+  1/K0, `unbounded` otherwise (#388, #393, docs/08 section 4i).** A diaPASEF run whose seed leaves it
   without an RT or 1/K0 calibration is searched in the library's windows instead of over the
   whole gradient. Whole single-cell HeLa diaPASEF plates on the 0.15.1 defaults, one NN seed,
   precursors per run at `run_psm_q` 1% / process-tree peak / wall, `unbounded` against
@@ -377,11 +388,11 @@ than a number. Both are recorded in every run's `manifest.json`.
 ### Fixed
 
 - **The configuration reference keeps the documentation of a key whose `#[serde(...)]`
-  attribute spans several lines (`ci/gen_config_reference.py`).** `convert.isolation_half_width`,
+  attribute spans several lines (#393, `ci/gen_config_reference.py`).** `convert.isolation_half_width`,
   `quant.q1_cycle_halfwidth` and `extract.prec_tol_ppm` had an empty description in docs/24
   and `configs/config-schema.json`.
-- **The rescore prefilter no longer stands aside on a whole single-cell diaPASEF plate (docs/35
-  section 16, "A prefilter before the classifier").** Each fold's model is fitted on a
+- **The rescore prefilter no longer stands aside on a whole single-cell diaPASEF plate (#392,
+  #393, docs/35 section 16, "A prefilter before the classifier").** Each fold's model is fitted on a
   400,000-row stride sample of the other folds, from the targets `prelim_score` passes at q
   0.01 to 0.1. Under `convert.tdf_min_points` 1 a 52-cell plate pools about 52 M PSMs, the sample
   is 1 row in 88, and q's (decoys + 1) / targets needs 10 targets above the first decoy, so the
@@ -398,8 +409,18 @@ than a number. Both are recorded in every run's `manifest.json`.
   plate, first-pass rescore on the same competed tables, `nn_torch`, one seed: 35.1% of 52.38 M
   PSMs kept, 750 against 794 target precursors per run at `run_psm_q` 1% (-5.5%; peptides at
   `peptide_q_value` 1% 3,303 against 3,328), rescore 24.5 against 93 min, process-tree peak 60
-  against 151 GB proportional set size. Caveat: one seed of one plate, so the -5.5% is not yet
-  separated from seed noise; seeds, a second plate and the species-entrapment null are owed.
+  against 151 GB proportional set size. Through `run-experiment` on the diaPASEF default the
+  plates pool 115 M (52 cells) and 124 M PSMs (71 cells); the prefilter fitted on both, kept
+  35.0% and 35.1%, and both plates finished, where two of four runs of these plates without
+  the fix were stopped by the memory watchdog at 338-373 GB. Caveat: one seed per plate, so
+  the -5.5% is not yet separated from seed noise; seeds and the species-entrapment null are
+  owed.
+- **Desktop: the "ztscan" preset on files that are not ZT Scan runs (#394).** The preset sets
+  the ZT Scan keys explicitly, and the engine refuses them unless every input is a ZT Scan run,
+  so such a search stopped at the start with an "invalid config" error. The search screen now
+  refuses it before the search starts, names the files it does not recognise as ZT Scan runs,
+  and points to another preset: the engine runs the ZT Scan analysis by itself for ZT Scan
+  files under any preset.
 
 ## [0.15.1] - 2026-11-26
 
