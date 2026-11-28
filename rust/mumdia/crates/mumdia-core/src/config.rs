@@ -2308,11 +2308,12 @@ pub struct ExtractConfig {
     /// twice the estimated matches until a batch has measured how far the estimate reads
     /// low. The footprint guard then compares the corrected estimate (what is loaded plus
     /// the bounded hit store) with the budget. Every table is the same byte for byte: only
-    /// the memory and the wall clock change. `"auto"`: this process's share of the memory it
-    /// can count on (what it holds plus what the system or its cgroup still has, times 0.7),
-    /// divided by the run-experiment chains and the `groups.parallel` bands in flight; a
-    /// corrected estimate past an `auto` budget is a warning, past a number a refusal. Unset
-    /// (the default) or `0`: off, as before. Not part of the canonical configuration.
+    /// the memory and the wall clock change. The budget is the process's extractions
+    /// together: each takes its share of the run-experiment chains and the `groups.parallel`
+    /// bands in flight. `"auto"`: 0.7 of the memory the process can count on (what it holds
+    /// plus what the system or its cgroup still has). A corrected estimate past an `auto`
+    /// budget is a warning, past a number a refusal. Unset (the default) or `0`: off, as
+    /// before. Not part of the canonical configuration.
     #[serde(skip_serializing)]
     pub memory_budget_gib: MemoryBudget,
     /// Scanning-quadrupole spectra: decide for every library fragment of an accepted

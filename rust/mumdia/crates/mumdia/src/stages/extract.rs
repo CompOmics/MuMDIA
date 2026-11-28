@@ -2450,11 +2450,12 @@ const MEMORY_BUDGET_MIN_HITS_GIB: f64 = 0.5;
 /// fills ([`crate::sched::AUTO_MEMORY_FRACTION`]).
 const MEMORY_BUDGET_AUTO_SHARE: f64 = crate::sched::AUTO_MEMORY_FRACTION;
 
-/// The extraction's memory budget (`extract.memory_budget_gib`) in bytes, this band's share
-/// of `sibling_bands`, and whether it is `"auto"`. `"auto"` is
+/// The extraction's memory budget (`extract.memory_budget_gib`) in bytes, and whether it is
+/// `"auto"`: the budget is the process's extractions together, so this extraction takes its
+/// share of the run-experiment chains and the `groups.parallel` bands in flight. `"auto"` is
 /// [`MEMORY_BUDGET_AUTO_SHARE`] of what the process holds plus what the system (or its
-/// cgroup) still has, the machine's memory where that cannot be read, divided by the
-/// run-experiment chains in flight as well. `None` when off, or `"auto"` with no reading.
+/// cgroup) still has, the machine's memory where that cannot be read. `None` when off, or
+/// `"auto"` with no reading.
 fn memory_budget(cfg: &ExtractConfig, sibling_bands: usize) -> Option<(f64, bool)> {
     let countable = || match crate::sched::memory_reading() {
         Some(m) => Some(m.resident.saturating_add(m.available)),
@@ -2475,14 +2476,11 @@ fn memory_budget_of(
     chains: usize,
     countable: impl FnOnce() -> Option<u64>,
 ) -> Option<(f64, bool)> {
-    let bands = sibling_bands.max(1) as f64;
+    let share = (sibling_bands.max(1) * chains.max(1)) as f64;
     match setting {
         MemoryBudget::Off => None,
-        MemoryBudget::Gib(v) => Some((v * GIB / bands, false)),
-        MemoryBudget::Auto => {
-            let share = bands * chains.max(1) as f64;
-            Some((countable()? as f64 * MEMORY_BUDGET_AUTO_SHARE / share, true))
-        }
+        MemoryBudget::Gib(v) => Some((v * GIB / share, false)),
+        MemoryBudget::Auto => Some((countable()? as f64 * MEMORY_BUDGET_AUTO_SHARE / share, true)),
     }
 }
 
@@ -8730,9 +8728,9 @@ mod accumulate_tests {
         let gib = |n: u64| Some(n << 30);
         assert_eq!(memory_budget_of(MemoryBudget::Off, 1, 1, || gib(100)), None);
         assert_eq!(
-            memory_budget_of(MemoryBudget::Gib(32.0), 4, 3, || gib(100)),
-            Some((8.0 * GIB, false)),
-            "a number is split among the bands, not the chains"
+            memory_budget_of(MemoryBudget::Gib(48.0), 4, 3, || gib(100)),
+            Some((4.0 * GIB, false)),
+            "a number is split among the bands and the chains"
         );
         assert_eq!(
             memory_budget_of(MemoryBudget::Auto, 2, 3, || gib(600)),
