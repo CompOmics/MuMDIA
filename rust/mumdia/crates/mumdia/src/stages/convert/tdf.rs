@@ -632,6 +632,19 @@ struct Ctx {
     ms1_kept: AtomicU64,
 }
 
+/// The raw `(tof_index, scan, intensity)` points of a frame's scans.
+fn scan_points(f: &Frame, scans: std::ops::Range<usize>) -> Vec<(u32, u32, u32)> {
+    let n_scans = f.scan_offsets.len().saturating_sub(1);
+    let scans = scans.start.min(n_scans)..scans.end.min(n_scans);
+    let mut pts = Vec::with_capacity(f.scan_offsets[scans.end] - f.scan_offsets[scans.start]);
+    for s in scans {
+        for k in f.scan_offsets[s]..f.scan_offsets[s + 1] {
+            pts.push((f.tof_indices[k], s as u32, f.intensities[k]));
+        }
+    }
+    pts
+}
+
 impl Ctx {
     fn spectrum(
         &self,
@@ -641,13 +654,7 @@ impl Ctx {
         denoise: Option<&Ms1Denoise>,
     ) -> Centroids {
         let n_scans = f.scan_offsets.len().saturating_sub(1);
-        let scans = scans.start.min(n_scans)..scans.end.min(n_scans);
-        let mut pts = Vec::with_capacity(f.scan_offsets[scans.end] - f.scan_offsets[scans.start]);
-        for s in scans {
-            for k in f.scan_offsets[s]..f.scan_offsets[s + 1] {
-                pts.push((f.tof_indices[k], s as u32, f.intensities[k]));
-            }
-        }
+        let mut pts = scan_points(f, scans);
         if let Some(d) = denoise {
             self.ms1_points
                 .fetch_add(pts.len() as u64, Ordering::Relaxed);
@@ -911,6 +918,180 @@ pub(super) fn drive(
     Ok(emitted)
 }
 
+/// MS2 frames [`load`] decodes, spread evenly over the run.
+pub const LOAD_FRAMES: usize = 256;
+
+/// The MS2 load of a diaPASEF run, from [`LOAD_FRAMES`] of its MS2 frames spread evenly over
+/// the run and centroided with the run's settings: how much of the fragment signal
+/// `convert.tdf_min_points` 2 would drop. What `"auto"` decides on (docs/35_diapasef.md,
+/// "Automatic centroid floor").
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
+pub struct TdfLoad {
+    /// MS2 frames in the run, and of them decoded.
+    pub ms2_frames: usize,
+    pub sampled_frames: usize,
+    /// Slot spectra of the sampled frames.
+    pub spectra: u64,
+    /// Centroids of those spectra at `tdf_min_points` 1, and of them the ones below 2 raw
+    /// points (a single ion event), which `tdf_min_points` 2 drops.
+    pub centroids: u64,
+    pub single_ion: u64,
+    /// Summed intensity of those centroids, and of the single-ion ones.
+    pub intensity: f64,
+    pub single_ion_intensity: f64,
+}
+
+impl TdfLoad {
+    /// The share of MS2 centroids that are single ion events.
+    pub fn single_ion_share(&self) -> f64 {
+        self.single_ion as f64 / self.centroids.max(1) as f64
+    }
+
+    /// The share of MS2 intensity in single ion events.
+    pub fn single_ion_intensity_share(&self) -> f64 {
+        self.single_ion_intensity / self.intensity.max(f64::MIN_POSITIVE)
+    }
+
+    /// Centroids of at least 2 raw points per MS2 spectrum (what `tdf_min_points` 2 keeps).
+    pub fn multi_point_per_spectrum(&self) -> f64 {
+        (self.centroids - self.single_ion) as f64 / self.spectra.max(1) as f64
+    }
+
+    /// Summed MS2 intensity per spectrum.
+    pub fn intensity_per_spectrum(&self) -> f64 {
+        self.intensity / self.spectra.max(1) as f64
+    }
+
+    /// Every measure, for a log line and the manifest.
+    pub fn report(&self) -> serde_json::Value {
+        let mut v = serde_json::to_value(self).unwrap_or_default();
+        if let Some(o) = v.as_object_mut() {
+            o.insert("single_ion_share".into(), self.single_ion_share().into());
+            o.insert(
+                "single_ion_intensity_share".into(),
+                self.single_ion_intensity_share().into(),
+            );
+            o.insert(
+                "multi_point_per_spectrum".into(),
+                self.multi_point_per_spectrum().into(),
+            );
+            o.insert(
+                "intensity_per_spectrum".into(),
+                self.intensity_per_spectrum().into(),
+            );
+        }
+        v
+    }
+}
+
+/// `convert.tdf_min_points = "auto"` chooses 2 when the runs' median share of MS2 intensity in
+/// single ion events ([`TdfLoad::single_ion_intensity_share`]) is below this, and 1 otherwise.
+///
+/// Measured on 256 sampled MS2 frames of two runs per set (one where the set has one): 0.72-0.89
+/// on the low-input sets (200 pg HeLa and its blanks, 1 ng HeLa/E. coli, 250 pg 5-min Ultra,
+/// three single-cell HeLa plates), 0.15-0.41 on the bulk sets (ProteoBench HYE, 50 ng 5-min
+/// Ultra 2, the E. coli entrapment run, a synthetic HLA-I pool, 60-min A549/K562). The threshold
+/// sits closer to the bulk side because the costs are not symmetric: 2 on a low-input run lost
+/// 18-74% of the precursors, 1 on a bulk run costs memory and wall.
+pub const AUTO_SINGLE_ION_INTENSITY_SHARE: f64 = 0.5;
+
+/// What `convert.tdf_min_points = "auto"` chose for a search, and on what.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MinPointsAuto {
+    pub min_points: u32,
+    /// The median over the runs of [`TdfLoad::single_ion_intensity_share`].
+    pub measure: f64,
+    pub threshold: f64,
+}
+
+/// The floor `"auto"` chooses for runs of these loads: one value for every run, from the
+/// median run, so one outlying run (a blank, a failed injection) does not decide for the
+/// rest. No load (no diaPASEF run) keeps the default 1.
+pub fn auto_min_points(loads: &[TdfLoad]) -> MinPointsAuto {
+    let mut v: Vec<f64> = loads
+        .iter()
+        .map(TdfLoad::single_ion_intensity_share)
+        .collect();
+    v.sort_by(f64::total_cmp);
+    let measure = match v.len() {
+        0 => 1.0,
+        n if n % 2 == 1 => v[n / 2],
+        n => (v[n / 2 - 1] + v[n / 2]) / 2.0,
+    };
+    MinPointsAuto {
+        min_points: if measure < AUTO_SINGLE_ION_INTENSITY_SHARE {
+            2
+        } else {
+            1
+        },
+        measure,
+        threshold: AUTO_SINGLE_ION_INTENSITY_SHARE,
+    }
+}
+
+/// [`TdfLoad`] of `path` under the centroiding settings `p` (its floor ignored).
+pub fn load(path: &str, p: &TdfParams) -> Result<TdfLoad> {
+    let raw = RawTdf::open(path)?;
+    let ms2: Vec<usize> = (0..raw.reader.len())
+        .filter(|&i| {
+            raw.reader
+                .get_frame_without_coordinates(i)
+                .is_ok_and(|f| f.ms_level == MSLevel::MS2)
+        })
+        .collect();
+    let n = ms2.len().min(LOAD_FRAMES);
+    let picks: Vec<usize> = (0..n).map(|k| ms2[k * ms2.len() / n]).collect();
+    let (one, two) = (
+        TdfParams {
+            min_points: 1,
+            ..*p
+        },
+        TdfParams {
+            min_points: 2,
+            ..*p
+        },
+    );
+    let frames: Vec<Result<TdfLoad>> = picks
+        .par_iter()
+        .map(|&i| {
+            let f = raw
+                .frame(i)
+                .map_err(|e| anyhow!("{path}: frame {i}: {e}"))?;
+            let q = &f.quadrupole_settings;
+            let mut l = TdfLoad::default();
+            for k in 0..q.len() {
+                let mut pts = scan_points(&f, q.scan_starts[k]..q.scan_ends[k]);
+                let mz = |t: u32| raw.mz.mz_u32(t);
+                let im = |s: f64| raw.im.im(s);
+                let all = centroid_2d(&mut pts.clone(), mz, im, &one);
+                let kept = centroid_2d(&mut pts, mz, im, &two);
+                let sum = |c: &Centroids| c.inten.iter().map(|&x| x as f64).sum::<f64>();
+                l.spectra += 1;
+                l.centroids += all.inten.len() as u64;
+                l.single_ion += (all.inten.len() - kept.inten.len()) as u64;
+                l.intensity += sum(&all);
+                l.single_ion_intensity += sum(&all) - sum(&kept);
+            }
+            Ok(l)
+        })
+        .collect();
+    // Summed in frame order, so the result does not depend on the thread count.
+    let mut out = TdfLoad {
+        ms2_frames: ms2.len(),
+        sampled_frames: n,
+        ..TdfLoad::default()
+    };
+    for l in frames {
+        let l = l?;
+        out.spectra += l.spectra;
+        out.centroids += l.centroids;
+        out.single_ion += l.single_ion;
+        out.intensity += l.intensity;
+        out.single_ion_intensity += l.single_ion_intensity;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1033,6 +1214,62 @@ mod tests {
         assert_eq!((d.mz_ppm, d.im_gap_scans, d.min_points), (10.0, 30, 1));
         assert_eq!((d.mz_valley, d.im_valley), (0.0, 0.0));
         assert_eq!((d.mz_smooth_ppm, d.im_smooth_scans), (8.0, 8.0));
+    }
+
+    /// A load whose intensity is `share` in single ion events.
+    fn load_of(share: f64) -> TdfLoad {
+        TdfLoad {
+            spectra: 10,
+            centroids: 1000,
+            single_ion: 900,
+            intensity: 1000.0,
+            single_ion_intensity: share * 1000.0,
+            ..TdfLoad::default()
+        }
+    }
+
+    /// `"auto"` keeps single ion events (1) at or above the threshold share and drops them (2)
+    /// below it, from the median run, and keeps the default without a diaPASEF run.
+    #[test]
+    fn auto_min_points_decides_on_the_median_single_ion_intensity_share() {
+        let t = AUTO_SINGLE_ION_INTENSITY_SHARE;
+        assert_eq!(auto_min_points(&[]).min_points, 1);
+        assert_eq!(auto_min_points(&[load_of(t)]).min_points, 1);
+        assert_eq!(auto_min_points(&[load_of(t - 0.01)]).min_points, 2);
+        assert_eq!(auto_min_points(&[load_of(0.99)]).min_points, 1);
+        // One outlying run does not decide for the rest, in either direction.
+        let low = [load_of(0.8), load_of(0.75), load_of(0.2)];
+        assert_eq!(auto_min_points(&low).min_points, 1);
+        let bulk = [load_of(0.15), load_of(0.4), load_of(0.9)];
+        let d = auto_min_points(&bulk);
+        assert_eq!((d.min_points, d.measure, d.threshold), (2, 0.4, t));
+        // An even count takes the mean of the middle two, whatever the input order.
+        let even = auto_min_points(&[load_of(0.8), load_of(0.2), load_of(0.4), load_of(0.7)]);
+        assert!((even.measure - 0.55).abs() < 1e-12);
+        assert_eq!(even.min_points, 1);
+    }
+
+    #[test]
+    fn tdf_load_shares_and_rates() {
+        let l = TdfLoad {
+            spectra: 4,
+            centroids: 100,
+            single_ion: 75,
+            intensity: 400.0,
+            single_ion_intensity: 100.0,
+            ..TdfLoad::default()
+        };
+        assert_eq!(l.single_ion_share(), 0.75);
+        assert_eq!(l.single_ion_intensity_share(), 0.25);
+        assert_eq!(l.multi_point_per_spectrum(), 6.25);
+        assert_eq!(l.intensity_per_spectrum(), 100.0);
+        // An empty sample reads as shares of 0, not NaN.
+        let e = TdfLoad::default();
+        assert_eq!(e.single_ion_share(), 0.0);
+        assert_eq!(e.single_ion_intensity_share(), 0.0);
+        let r = l.report();
+        assert_eq!(r["single_ion_share"], 0.75);
+        assert_eq!(r["centroids"], 100);
     }
 
     #[test]
@@ -1351,6 +1588,17 @@ mod tests {
                 ]
             );
         }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// The load probe decodes MS2 frames only, every slot of them, and reads an empty frame
+    /// as no centroids.
+    #[test]
+    fn load_samples_ms2_frames_and_their_slots() {
+        let d = headers_only_d("load", 0);
+        let l = load(d.to_str().unwrap(), &TdfParams::default()).unwrap();
+        assert_eq!((l.ms2_frames, l.sampled_frames, l.spectra), (1, 1, 2));
+        assert_eq!((l.centroids, l.single_ion), (0, 0));
         std::fs::remove_dir_all(&d).ok();
     }
 

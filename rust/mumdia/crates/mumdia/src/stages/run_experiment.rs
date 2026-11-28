@@ -1294,6 +1294,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // `extract.prec_tol_ppm` unset is 10 ppm when every run is a diaPASEF `.d`, recorded as
     // such; in an experiment that mixes the two, each run's extract resolves its own.
     resolved.resolve_prec_tol_ppm(p.mzmls.iter().all(|m| crate::instrument::input_has_im(m)));
+    // `convert.tdf_min_points = "auto"` resolves once for the experiment, on the median MS2
+    // load of its diaPASEF runs, so every run is converted with one centroid floor.
+    let tdf_min_points_auto =
+        crate::stages::convert::resolve_tdf_min_points(&mut resolved, p.mzmls, "run-experiment")?;
     // The ZT Scan analysis resolves once for the experiment as well, so every run is scored
     // with one feature set: on when every run is a SCIEX ZT Scan DIA run, off otherwise, with a
     // warning when only some are (`ztscan`, docs/37_ztscan.md, "Automatic for ZT Scan files").
@@ -2972,6 +2976,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             .filter_map(|(n, c)| c.as_ref().map(|c| (n.clone(), json!(c))))
             .collect();
         m.insert("conditions".to_string(), serde_json::Value::Object(map));
+    }
+    // `convert.tdf_min_points = "auto"`: the decision and every run's MS2 load, only then.
+    if let (Some(a), Some(m)) = (&tdf_min_points_auto, manifest.as_object_mut()) {
+        m.insert("tdf_min_points_auto".to_string(), a.clone());
     }
     // The input of each run, when the run names were derived from the inputs.
     if let (Some(ri), Some(m)) = (&run_inputs, manifest.as_object_mut()) {

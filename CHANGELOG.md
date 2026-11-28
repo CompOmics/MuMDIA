@@ -246,6 +246,17 @@ than a number. Both are recorded in every run's `manifest.json`.
   preset.
 ### Added
 
+- **`convert.tdf_min_points = "auto"`: the diaPASEF centroid floor chosen from the MS2 load
+  (opt-in; docs/35_diapasef.md, "Automatic centroid floor").** `run` and `run-experiment`
+  decode 256 MS2 frames of each diaPASEF run before the configuration is hashed and keep single
+  ion events (1) when the median share of MS2 intensity in them is at least 0.5, and drop them
+  (2) below it; one value for every run of an experiment, logged with the measure and recorded
+  in the manifest (`tdf_min_points_auto`) and, as the resolved value, in the config hash and the
+  spectra reports. Measured on two runs per set: 0.72-0.89 on 200 pg, 1 ng, 250 pg and three
+  single-cell plates, 0.15-0.41 on ProteoBench HYE, 50 ng Ultra 2, the E. coli entrapment run,
+  60-min A549/K562 and a synthetic HLA-I pool. `mumdia peak-census` reports the load of a `.d`.
+  Integer values and the default (1) are unchanged. Identifications, memory and FDR under
+  `"auto"` are not yet measured with seeds and entrapment.
 - **`rt_im_train.fallback_windows`: bounded windows for a run whose seed found no anchors
   (docs/08 section 4i, docs/17 "Seed: no confident targets").** `unbounded` keeps every
   artifact byte for byte as before the key; the default is `auto` (see "Changed"). `library`
