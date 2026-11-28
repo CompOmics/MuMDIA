@@ -261,6 +261,200 @@ fn extract_recovers_planted_target_and_is_deterministic() {
     assert_eq!(apex[0], 140.0);
 }
 
+/// `extract.windows_in_flight` is a memory knob only: probing the isolation windows one, two,
+/// three or all at a time writes the same `psms_extracted` and chromatogram bytes. Extract
+/// halves its default on library-fallback RT windows (`RtWindows::library_fallback`), which
+/// rests on this. Six windows of six candidates each, every candidate's three fragments
+/// planted in eight scans of its window, so every batch boundary falls between candidates
+/// that hold evidence.
+#[test]
+fn windows_in_flight_leave_the_extract_bytes_alone() {
+    let (n_win, per_win, n_scan) = (6usize, 6usize, 8usize);
+    let n = n_win * per_win;
+    let prec = tmp("wif_prec.parquet");
+    let frag = tmp("wif_frag.parquet");
+    let ms2 = tmp("wif_ms2.parquet");
+    let win = tmp("wif_windows.parquet");
+    let centre = |w: usize| 500.0 + 10.0 * w as f64;
+    let frag_mz = |c: usize, k: usize| 200.0 + 0.37 * c as f64 + 100.3 * k as f64;
+    let ratio = [1.0f32, 0.8, 0.6];
+    write_table(
+        &prec,
+        vec![
+            Col::U32("candidate_id".into(), (0..n as u32).collect()),
+            Col::U32("peptidoform_id".into(), (0..n as u32).collect()),
+            Col::U32("base_peptide_id".into(), (0..n as u32).collect()),
+            Col::Str(
+                "peptidoform".into(),
+                (0..n).map(|c| format!("PEP{c}K")).collect(),
+            ),
+            Col::I32("charge".into(), vec![2; n]),
+            Col::F64(
+                "precursor_mz".into(),
+                (0..n)
+                    .map(|c| centre(c / per_win) + 0.01 * (c % per_win) as f64)
+                    .collect(),
+            ),
+            Col::F32("predicted_irt".into(), vec![10.0; n]),
+            Col::Str(
+                "label".into(),
+                (0..n)
+                    .map(|c| if c % 2 == 0 { "target" } else { "decoy" }.to_string())
+                    .collect(),
+            ),
+            Col::Str("protein".into(), (0..n).map(|c| format!("P{c}")).collect()),
+            Col::I32("n_fragments".into(), vec![3; n]),
+        ],
+    )
+    .unwrap();
+    write_table(
+        &frag,
+        vec![
+            Col::U32(
+                "candidate_id".into(),
+                (0..n as u32).flat_map(|c| [c; 3]).collect(),
+            ),
+            Col::F64(
+                "mz".into(),
+                (0..n)
+                    .flat_map(|c| (0..3).map(move |k| frag_mz(c, k)))
+                    .collect(),
+            ),
+            Col::F32(
+                "predicted_intensity".into(),
+                (0..n).flat_map(|_| ratio).collect(),
+            ),
+            Col::Str(
+                "name".into(),
+                (0..n)
+                    .flat_map(|_| ["b2", "y3", "y4"].map(String::from))
+                    .collect(),
+            ),
+            Col::Str(
+                "ion_type".into(),
+                (0..n)
+                    .flat_map(|_| ["b", "y", "y"].map(String::from))
+                    .collect(),
+            ),
+            Col::I32("ordinal".into(), (0..n).flat_map(|_| [2, 3, 4]).collect()),
+            Col::I32("frag_charge".into(), vec![1; 3 * n]),
+        ],
+    )
+    .unwrap();
+    // One scan per (cycle, window), cycles 10 s apart; a candidate's fragments rise and fall
+    // over the eight cycles, scaled per candidate so the apexes differ.
+    let (mut rts, mut wids, mut targets) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut mzs, mut ints): (Vec<Vec<f32>>, Vec<Vec<f32>>) = (Vec::new(), Vec::new());
+    for k in 0..n_scan {
+        for w in 0..n_win {
+            rts.push(100.0 + 10.0 * k as f64 + 0.1 * w as f64);
+            wids.push(w as u32);
+            targets.push(centre(w));
+            let shape = 1.0 + (k as f32 - 4.0).abs().mul_add(-0.2, 1.0);
+            let (mut mz, mut it) = (Vec::new(), Vec::new());
+            for c in w * per_win..(w + 1) * per_win {
+                for (f, r) in ratio.iter().enumerate() {
+                    mz.push(frag_mz(c, f) as f32);
+                    it.push(1000.0 * (1 + c % per_win) as f32 * shape * r);
+                }
+            }
+            let mut order: Vec<usize> = (0..mz.len()).collect();
+            order.sort_by(|&a, &b| mz[a].total_cmp(&mz[b]));
+            mzs.push(order.iter().map(|&i| mz[i]).collect());
+            ints.push(order.iter().map(|&i| it[i]).collect());
+        }
+    }
+    let ns = rts.len();
+    write_table(
+        &ms2,
+        vec![
+            Col::U32("scan_index".into(), (0..ns as u32).collect()),
+            Col::Str("id".into(), (0..ns).map(|i| format!("scan={i}")).collect()),
+            Col::F64("rt_seconds".into(), rts),
+            Col::U32("window_id".into(), wids),
+            Col::F64(
+                "window_lower".into(),
+                targets.iter().map(|t| t - 2.0).collect(),
+            ),
+            Col::F64(
+                "window_upper".into(),
+                targets.iter().map(|t| t + 2.0).collect(),
+            ),
+            Col::F64("window_target".into(), targets),
+            Col::OptF64("precursor_mz".into(), vec![None; ns]),
+            Col::OptI32("precursor_charge".into(), vec![None; ns]),
+            Col::ListF32("mz".into(), mzs),
+            Col::ListF32("intensity".into(), ints),
+        ],
+    )
+    .unwrap();
+    write_table(
+        &win,
+        vec![
+            Col::U32("candidate_id".into(), (0..n as u32).collect()),
+            Col::F64("rt_pred_cal".into(), vec![140.0; n]),
+            Col::F64("rt_lo".into(), vec![90.0; n]),
+            Col::F64("rt_hi".into(), vec![200.0; n]),
+            Col::OptF64("im_pred_cal".into(), vec![None; n]),
+            Col::OptF64("im_lo".into(), vec![None; n]),
+            Col::OptF64("im_hi".into(), vec![None; n]),
+        ],
+    )
+    .unwrap();
+    let extract = |in_flight: Option<usize>| -> (Vec<u8>, Vec<u8>, usize) {
+        let mut cfg = Config::default();
+        cfg.extract.apex_count_window = 1;
+        cfg.extract.windows_in_flight = in_flight;
+        let tag = in_flight.map_or("default".to_string(), |k| k.to_string());
+        let psms = tmp(&format!("wif_psms_{tag}.parquet"));
+        let chrom = tmp(&format!("wif_chrom_{tag}.parquet"));
+        stages::extract::run(stages::extract::ExtractParams {
+            precursor_span: None,
+            fragment_offset: None,
+            rt_windows: None,
+            retrace_skeleton: None,
+            trace_pad: None,
+            chrom_im: false,
+            sibling_bands: 1,
+            scans: None,
+            ms2: &ms2,
+            library_precursors: &prec,
+            library_fragments: &frag,
+            run_windows: &win,
+            ms1: None,
+            mass_cal: None,
+            out_psms: &psms,
+            out_chrom: &chrom,
+            restrict_candidates: None,
+            cfg: &cfg.extract,
+            config_hash: "test",
+        })
+        .unwrap();
+        let rows = Table::read(&psms).unwrap().nrows;
+        (
+            std::fs::read(&psms).unwrap(),
+            std::fs::read(&chrom).unwrap(),
+            rows,
+        )
+    };
+    let (psms, chrom, rows) = extract(Some(n_win));
+    assert!(
+        rows > 2 * per_win,
+        "candidates of several windows must be accepted, or no batch boundary is crossed: {rows}"
+    );
+    for k in [Some(1), Some(2), Some(3), None] {
+        let (p, c, _) = extract(k);
+        assert!(
+            p == psms,
+            "{k:?} windows in flight moved a psms_extracted byte"
+        );
+        assert!(
+            c == chrom,
+            "{k:?} windows in flight moved a chromatogram byte"
+        );
+    }
+}
+
 #[test]
 fn features_compete_rescore_run_on_crafted_input() {
     let (prec, frag) = craft_library();
@@ -1607,6 +1801,122 @@ fn extract_im(
     };
     let (rp, rc) = (report(&psms), report(&chrom));
     (psms, chrom, rp, rc)
+}
+
+/// `extract.gate_support_peaks`: a target whose selected apex (the faint peak at its predicted
+/// retention time, chosen by the RT prior) fails the support gate is rejected with K = 1 and
+/// kept with K = 3, at the apex of its bright second peak, which passes; the report counts it.
+#[test]
+fn the_support_gate_judges_the_top_k_peaks_and_moves_the_apex_to_the_one_that_passes() {
+    let (prec, frag) = craft_library();
+    // Twelve scans, 100-210 s: the target's three fragments at 110-130 s (faint) and at
+    // 170-190 s (bright), noise alone elsewhere, so the window grid has two count peaks.
+    let ms2 = tmp("ms2_support_peaks.parquet");
+    let n = 12usize;
+    let scale = |i: usize| match i {
+        1..=3 => Some(2.0f32),
+        7..=9 => Some(1.0e6f32),
+        _ => None,
+    };
+    write_table(
+        &ms2,
+        vec![
+            Col::U32("scan_index".into(), (0..n as u32).collect()),
+            Col::Str("id".into(), (0..n).map(|i| format!("scan={i}")).collect()),
+            Col::F64(
+                "rt_seconds".into(),
+                (0..n).map(|i| 100.0 + 10.0 * i as f64).collect(),
+            ),
+            Col::U32("window_id".into(), vec![0; n]),
+            Col::F64("window_target".into(), vec![500.0; n]),
+            Col::F64("window_lower".into(), vec![498.0; n]),
+            Col::F64("window_upper".into(), vec![502.0; n]),
+            Col::OptF64("precursor_mz".into(), vec![Some(500.0); n]),
+            Col::OptI32("precursor_charge".into(), vec![None; n]),
+            Col::ListF32(
+                "mz".into(),
+                (0..n)
+                    .map(|i| match scale(i) {
+                        Some(_) => vec![120.0, 200.1, 300.2, 400.3, 600.0],
+                        None => vec![120.0, 600.0],
+                    })
+                    .collect(),
+            ),
+            Col::ListF32(
+                "intensity".into(),
+                (0..n)
+                    .map(|i| match scale(i) {
+                        Some(a) => vec![50.0, a, a * 0.8, a * 0.6, 40.0],
+                        None => vec![50.0, 40.0],
+                    })
+                    .collect(),
+            ),
+        ],
+    )
+    .unwrap();
+    let win = tmp("windows_support_peaks.parquet");
+    write_table(
+        &win,
+        vec![
+            Col::U32("candidate_id".into(), vec![0, 1]),
+            Col::F64("rt_pred_cal".into(), vec![120.0, 120.0]),
+            Col::F64("rt_lo".into(), vec![90.0, 90.0]),
+            Col::F64("rt_hi".into(), vec![220.0, 220.0]),
+            Col::OptF64("im_pred_cal".into(), vec![None, None]),
+            Col::OptF64("im_lo".into(), vec![None, None]),
+            Col::OptF64("im_hi".into(), vec![None, None]),
+        ],
+    )
+    .unwrap();
+    let mut cfg = Config::default();
+    cfg.extract.apex_count_window = 1;
+    // The prior puts the selected apex on the faint peak at the predicted 120 s.
+    cfg.extract.apex_rt_prior_s = 10.0;
+    // Window mean about 1.0 at 120 s and 0.9 at 170 s; support 1.09 there and 1.64 here.
+    cfg.extract.gate_support_min = Some(1.3);
+    let run = |k: usize, tag: &str| {
+        let mut c = cfg.extract.clone();
+        c.gate_support_peaks = k;
+        let psms = tmp(&format!("psms_sp_{tag}.parquet"));
+        let chrom = tmp(&format!("chrom_sp_{tag}.parquet"));
+        stages::extract::run(stages::extract::ExtractParams {
+            precursor_span: None,
+            fragment_offset: None,
+            rt_windows: None,
+            retrace_skeleton: None,
+            trace_pad: None,
+            chrom_im: false,
+            sibling_bands: 1,
+            scans: None,
+            ms2: &ms2,
+            library_precursors: &prec,
+            library_fragments: &frag,
+            run_windows: &win,
+            ms1: None,
+            mass_cal: None,
+            out_psms: &psms,
+            out_chrom: &chrom,
+            restrict_candidates: None,
+            cfg: &c,
+            config_hash: "test",
+        })
+        .unwrap();
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{psms}.report.json")).unwrap())
+                .unwrap();
+        (TableFile::open(&psms).unwrap(), report)
+    };
+    let (t1, r1) = run(1, "k1");
+    assert!(
+        t1.u32("candidate_id").unwrap().is_empty(),
+        "K = 1 judges the faint selected apex alone"
+    );
+    assert!(r1["params"].get("gate_support_peaks").is_none());
+    let (t3, r3) = run(3, "k3");
+    assert_eq!(t3.u32("candidate_id").unwrap(), vec![0]);
+    assert_eq!(t3.f64("apex_rt").unwrap(), vec![170.0]);
+    assert_eq!(r3["params"]["gate_support_peaks"]["k"], 3);
+    assert_eq!(r3["params"]["gate_support_peaks"]["moved"], 1);
 }
 
 /// Extract on spectra with per-peak 1/K0 writes psms_extracted v4 with the apex 1/K0

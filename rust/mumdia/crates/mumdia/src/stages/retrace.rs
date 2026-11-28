@@ -1214,7 +1214,8 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
 
     let hw = p.cfg.im_half_width;
     let half1 = p.extract.ms1_scan_halfwidth;
-    let prec_tol = p.extract.prec_tol_ppm * 1e-6;
+    // Retrace reads only a diaPASEF .d, so an unset tolerance is the 1/K0 one.
+    let prec_tol = p.extract.prec_tol_ppm_for(true) * 1e-6;
     let ftol = frag_tol * 1e-6;
     let (ms1_rt, ms1_fi, ms2_rt, ms2_fi) = (&ms1_rt, &ms1_fi, &ms2_rt, &ms2_fi);
     let (scan_im, raw, mass_off) = (&scan_im, &raw, &mass_off);
@@ -1702,11 +1703,11 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
     // carries extract's MS1 offset: near 0 when the inherited offset fits the raw events.
     let residual_rows = residuals.len();
     let ms1_residual = super::quant_pattern::median(&mut residuals);
-    if ms1_residual.is_finite() && ms1_residual.abs() > 0.5 * p.extract.prec_tol_ppm {
+    if ms1_residual.is_finite() && ms1_residual.abs() > 0.5 * p.extract.prec_tol_ppm_for(true) {
         warn!(
             median_ppm = ms1_residual,
             rows = residual_rows,
-            prec_tol_ppm = p.extract.prec_tol_ppm,
+            prec_tol_ppm = p.extract.prec_tol_ppm_for(true),
             "retrace: the raw MS1 events sit off the MS1 rows' m/z by more than half the \
              precursor tolerance; the MS1 offset extract applied does not fit the raw events"
         );
@@ -1732,7 +1733,7 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
         // Removed in 0.15.0; kept so the report of a retraced run stays as it was.
         "apex_features": false,
         "frag_tol_ppm": frag_tol,
-        "prec_tol_ppm": p.extract.prec_tol_ppm,
+        "prec_tol_ppm": p.extract.prec_tol_ppm_for(true),
         "ms1_scan_halfwidth": half1,
         "config_hash": p.config_hash,
     });

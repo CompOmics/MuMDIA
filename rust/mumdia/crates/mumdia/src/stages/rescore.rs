@@ -3091,6 +3091,9 @@ fn for_each_feature_batch_with(
 /// Fewest decoys a pool needs before `rescore.prefilter_keep_decoys` cuts it.
 const PREFILTER_MIN_DECOYS: usize = 100;
 
+/// The prefilter's second starting score (`PrefilterInput::fallback_init`).
+const PREFILTER_SEED_COLUMN: &str = "log_seed_hyperscore";
+
 /// The prefilter's default columns (`rescore.prefilter_features`): the agreement and
 /// co-elution scores that best separated targets from decoys on a HYE diaPASEF run, and one
 /// or two of each other family, so the per-experiment fit has varied evidence to weigh.
@@ -3215,11 +3218,23 @@ fn prefilter_mask(
     if m.find_non_finite().is_some() {
         return skip("a non-finite value in its feature columns");
     }
+    // The second start of a fold whose stride sample cannot be fitted: on a single-cell plate
+    // the seed score is the one column with confident targets (234 at q 0.01 on eight cells,
+    // where `prelim_score` and every prefilter column had none). Read whether used or not.
+    let seed_col = [PREFILTER_SEED_COLUMN.to_string()];
+    let seed: Option<Vec<f64>> = if available.contains(&seed_col[0]) {
+        let s = load_feature_matrix(p.competed, &seed_col, total_rows, None)?;
+        (s.find_non_finite().is_none())
+            .then(|| (0..total_rows).map(|i| s.row(i)[0] as f64).collect())
+    } else {
+        None
+    };
     let Some(scores) = prefilter_scores(PrefilterInput {
         features: &m,
         is_decoy,
         fold_key: base,
         init_score: prelim,
+        fallback_init: seed.as_deref(),
         folds: p.cfg.folds,
         max_train_rows: 400_000,
         num_iter: 3,

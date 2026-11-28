@@ -1362,7 +1362,7 @@ fn claim_cue_multiplier(
         let s = &ms1_scans[j];
         let z = (cand.charge.max(1)) as f64;
         let sp = ISOTOPE_SPACING / z;
-        let tol = cfg.prec_tol_ppm;
+        let tol = prec_tol(cfg);
         let mono = sum_near(&s.mz, &s.intensity, cand.precursor_mz, tol);
         if mono <= 0.0 {
             w *= 0.5;
@@ -1678,6 +1678,13 @@ const GATE_IM_MS1_ERR_WEIGHT: f64 = 0.18;
 const GATE_IM_ERR_MISSING: f64 = 0.039;
 const GATE_IM_MAD_MISSING: f64 = 0.024;
 const GATE_IM_MS1_ERR_MISSING: f64 = 0.265;
+
+/// `extract.prec_tol_ppm` as [`run_hashed`] resolved it for this run's spectra. Unset only
+/// when a test calls a helper directly with a bare configuration, which is then 3D.
+fn prec_tol(cfg: &ExtractConfig) -> f64 {
+    cfg.prec_tol_ppm
+        .unwrap_or(mumdia_core::config::PREC_TOL_PPM)
+}
 
 /// [`sum_near`] in the MS1 scan nearest `j` and its `half` neighbours either side: the
 /// maximum over those scans (`extract.ms1_scan_halfwidth`; 0 reads scan `j` only).
@@ -2842,8 +2849,13 @@ fn support_gate_min(cfg: &ExtractConfig, has_im: bool) -> f64 {
 }
 
 /// `extract.windows_in_flight`, or its default: the rayon thread count capped at 16, and
-/// at [`DEFAULT_MAX_WINDOWS_IN_FLIGHT_IM`] on spectra that carry 1/K0.
-fn groups_in_flight(cfg: &ExtractConfig, has_im: bool) -> usize {
+/// at [`DEFAULT_MAX_WINDOWS_IN_FLIGHT_IM`] on spectra that carry 1/K0, halved when the RT
+/// windows are the library-range fallback of a run without anchors (`library_fallback`,
+/// `RtWindows::library_fallback`). Those windows span half the gradient, and the matches
+/// of a whole batch are held at once (126 against 74 GiB at 4 and 2 on single-cell
+/// diaPASEF, docs/08 section 4i); the batch only bounds memory, so the output is the same
+/// at any setting. An explicit value is kept.
+fn groups_in_flight(cfg: &ExtractConfig, has_im: bool, library_fallback: bool) -> usize {
     let cap = if has_im {
         DEFAULT_MAX_WINDOWS_IN_FLIGHT_IM
     } else {
@@ -2851,7 +2863,14 @@ fn groups_in_flight(cfg: &ExtractConfig, has_im: bool) -> usize {
     };
     cfg.windows_in_flight
         .filter(|&n| n > 0)
-        .unwrap_or_else(|| rayon::current_num_threads().min(cap))
+        .unwrap_or_else(|| {
+            let n = rayon::current_num_threads().min(cap);
+            if library_fallback {
+                n / 2
+            } else {
+                n
+            }
+        })
         .max(1)
 }
 
@@ -3527,6 +3546,7 @@ pub(crate) fn read_run_windows(path: &str, ncand: usize) -> Result<RtWindows> {
         im_hi,
         im_cal,
         fitted_for: None,
+        library_fallback: false,
     })
 }
 
@@ -3651,7 +3671,7 @@ fn apex_im_stats(
     } else {
         let s1 = &ms1_scans[nearest_index(ms1_rts, apex_rt)];
         let target = prec_mz * cfg.ms1_shift();
-        crate::spectra::ms1_peak_near(s1, target, cfg.prec_tol_ppm, med)
+        crate::spectra::ms1_peak_near(s1, target, prec_tol(cfg), med)
             .and_then(|k| s1.im.as_ref().map(|v| v[k] as f64))
     };
     ApexIm {
@@ -4161,16 +4181,24 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     let instrument = crate::instrument::recorded(p.ms2);
     let astral = instrument.as_ref().is_some_and(|i| i.is_astral());
     let apex_count_window = p.cfg.apex_count_window_for(astral);
+    // `extract.prec_tol_ppm` unset: 10 ppm on spectra `convert` read with per-peak 1/K0,
+    // 3 otherwise (`run` and `run-experiment` have usually resolved it already).
+    let prec_tol_ppm = p
+        .cfg
+        .prec_tol_ppm_for(crate::instrument::spectra_has_im(p.ms2));
     let resolved_cfg;
     let mut p = p;
-    if p.cfg.apex_count_window != apex_count_window {
-        info!(
-            instrument = %instrument.as_ref().map_or("unknown".to_string(), |i| i.describe()),
-            apex_count_window,
-            "extract: apex_count_window \"auto\" resolved for this instrument"
-        );
+    if p.cfg.apex_count_window != apex_count_window || p.cfg.prec_tol_ppm.is_none() {
+        if p.cfg.apex_count_window != apex_count_window {
+            info!(
+                instrument = %instrument.as_ref().map_or("unknown".to_string(), |i| i.describe()),
+                apex_count_window,
+                "extract: apex_count_window \"auto\" resolved for this instrument"
+            );
+        }
         resolved_cfg = ExtractConfig {
             apex_count_window,
+            prec_tol_ppm: Some(prec_tol_ppm),
             ..p.cfg.clone()
         };
         p.cfg = &resolved_cfg;
@@ -4654,10 +4682,17 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     {
         let groups = wgroups.as_deref().expect("just built");
         let loads = window_loads(groups, scans, &lib, guard, restrict.as_ref(), frag_tol);
+        if win.library_fallback && p.cfg.windows_in_flight.is_none() {
+            info!(
+                windows_in_flight = groups_in_flight(p.cfg, has_im, true),
+                "extract: the RT windows are the library fallback of a run without anchors; \
+                 half the default windows in flight"
+            );
+        }
         let fp = Footprint::of(
             loads,
             streamed,
-            groups_in_flight(p.cfg, has_im),
+            groups_in_flight(p.cfg, has_im, win.library_fallback),
             scans.len(),
         );
         check_footprint(&fp, p.cfg, p.sibling_bands)?;
@@ -5040,6 +5075,8 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
 
     // Rows of a skeleton table left as zeros for retrace (`ExtractParams::retrace_skeleton`).
     let skeleton_rows = std::sync::atomic::AtomicU64::new(0);
+    // Candidates the support gate kept at another of their peaks (`extract.gate_support_peaks`).
+    let support_moved = std::sync::atomic::AtomicU64::new(0);
     let per_candidate = |cid: u32, hits: &mut [Hit]| -> Vec<CandOut> {
         // Under a trace pad the candidate's hits reach `trace_pad_s` beyond its window. Every
         // score below reads only the hits inside the window, which are exactly the hits the
@@ -5216,7 +5253,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             let h = p.cfg.ms1_scan_halfwidth;
             let z = c.charge as f64;
             let sp = ISOTOPE_SPACING / z;
-            let tol = p.cfg.prec_tol_ppm;
+            let tol = prec_tol(p.cfg);
             let at = |mz: f64| Some(ms1_near(ms1_scans, j, h, mz * p.cfg.ms1_shift(), tol) as f64);
             (
                 at(c.precursor_mz - sp),
@@ -5360,35 +5397,110 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         // The support gate (`extract.gate_support_min`): the window-mean score plus the
         // apex intensity and MS1 terms the `log_apex_intensity` and `log_mono_ms1` features
         // carry and, on spectra that carry 1/K0, three 1/K0 terms, without the MS1 rescue.
-        if support_min > 0.0 {
-            let ms1 = match (o_ms1_mono, o_ms1_i1, o_ms1_i2) {
-                (Some(mono), Some(_), Some(_)) => (1.0 + mono).ln(),
-                _ => 0.0,
-            };
-            let ln_apex = (1.0 + apex_sum as f64).ln();
-            let support = if has_im {
-                let e = im0_of();
-                let abs_diff = |a: Option<f64>, b: Option<f64>, missing: f64| match (a, b) {
-                    (Some(a), Some(b)) if (a - b).is_finite() => (a - b).abs(),
-                    _ => missing,
+        // `support_base` is the first part, `support_im` subtracts the 1/K0 terms in the order
+        // of the one expression they were, so the score keeps its bits; the 1/K0 terms are
+        // never negative, so `support_base` bounds the score from above.
+        let support_base =
+            |wm: f64, sum: f32, mono: Option<f64>, i1: Option<f64>, i2: Option<f64>| {
+                let ms1 = match (mono, i1, i2) {
+                    (Some(mono), Some(_), Some(_)) => (1.0 + mono).ln(),
+                    _ => 0.0,
                 };
-                window_mean() + GATE_IM_INTENSITY_WEIGHT * ln_apex + GATE_IM_MS1_WEIGHT * ms1
-                    - GATE_IM_ERR_WEIGHT * abs_diff(e.apex_im, e.im_pred_cal, GATE_IM_ERR_MISSING)
-                    - GATE_IM_MAD_WEIGHT
-                        * e.apex_im_mad
-                            .filter(|v| v.is_finite())
-                            .unwrap_or(GATE_IM_MAD_MISSING)
-                    - GATE_IM_MS1_ERR_WEIGHT
-                        * abs_diff(e.ms1_apex_im, e.apex_im, GATE_IM_MS1_ERR_MISSING)
+                let ln_apex = (1.0 + sum as f64).ln();
+                if has_im {
+                    wm + GATE_IM_INTENSITY_WEIGHT * ln_apex + GATE_IM_MS1_WEIGHT * ms1
+                } else {
+                    wm + GATE_SUPPORT_INTENSITY_WEIGHT * ln_apex + GATE_SUPPORT_MS1_WEIGHT * ms1
+                }
+            };
+        let support_im = |base: f64, e: &ApexIm| {
+            let abs_diff = |a: Option<f64>, b: Option<f64>, missing: f64| match (a, b) {
+                (Some(a), Some(b)) if (a - b).is_finite() => (a - b).abs(),
+                _ => missing,
+            };
+            base - GATE_IM_ERR_WEIGHT * abs_diff(e.apex_im, e.im_pred_cal, GATE_IM_ERR_MISSING)
+                - GATE_IM_MAD_WEIGHT
+                    * e.apex_im_mad
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(GATE_IM_MAD_MISSING)
+                - GATE_IM_MS1_ERR_WEIGHT
+                    * abs_diff(e.ms1_apex_im, e.apex_im, GATE_IM_MS1_ERR_MISSING)
+        };
+        // The peak the support gate moved the apex to (`extract.gate_support_peaks`): its
+        // group, MS1 isotopes and 1/K0 evidence. `None` keeps the selected apex.
+        type Moved = (
+            usize,
+            (Option<f64>, Option<f64>, Option<f64>, Option<f64>),
+            ApexIm,
+        );
+        let mut moved: Option<Moved> = None;
+        if support_min > 0.0 {
+            let base = support_base(window_mean(), apex_sum, o_ms1_mono, o_ms1_i1, o_ms1_i2);
+            let support = if has_im {
+                support_im(base, &im0_of())
             } else {
-                window_mean()
-                    + GATE_SUPPORT_INTENSITY_WEIGHT * ln_apex
-                    + GATE_SUPPORT_MS1_WEIGHT * ms1
+                base
             };
             if support < support_min {
-                return Vec::new();
+                if p.cfg.gate_support_peaks <= 1 || groups.is_empty() {
+                    return Vec::new();
+                }
+                // The K best peaks of the count profile, judged at their own apexes; each
+                // must pass the acceptance gate there as well, without the MS1 rescue.
+                let count_prof: Vec<f32> = counts.iter().map(|&n| n as f32).collect();
+                let mut best: Option<(f64, Moved)> = None;
+                for pk in crate::peaks::enumerate_peaks(
+                    &count_prof,
+                    p.cfg.gate_support_peaks,
+                    1.0 / 3.0,
+                    0.1,
+                ) {
+                    let (gi, rt) = (pk.apex_idx, groups.rt(pk.apex_idx));
+                    if rt.to_bits() == apex_rt.to_bits() {
+                        continue;
+                    }
+                    let wm = window_mean_score(
+                        &window_summed(&groups, &grid, rt, fints0.len()),
+                        &pred_f64,
+                        rt,
+                        rt_cal[cid as usize],
+                        rt_lo[cid as usize],
+                        rt_hi[cid as usize],
+                        p.cfg.gate_rt_weight,
+                    );
+                    if wm < p.cfg.gate_min_score {
+                        continue;
+                    }
+                    let ms1 = ms1_at(rt);
+                    let base = support_base(wm, groups.sum(gi), ms1.1, ms1.2, ms1.3);
+                    if base < support_min {
+                        continue;
+                    }
+                    let e = im_at(rt);
+                    let sc = if has_im { support_im(base, &e) } else { base };
+                    if sc >= support_min && best.as_ref().is_none_or(|b| sc > b.0) {
+                        best = Some((sc, (gi, ms1, e)));
+                    }
+                }
+                match best {
+                    Some((_, m)) => moved = Some(m),
+                    None => return Vec::new(),
+                }
+                support_moved.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
+        // Everything below reads the moved apex. The gate diagnostics
+        // (`emit_gate_diagnostics`) stay those of the selected apex the gates judged first.
+        let (apex_rt, apex_sum, apex_gi, (o_ms1_m1, o_ms1_mono, o_ms1_i1, o_ms1_i2)) = match &moved
+        {
+            Some((gi, ms1, _)) => (groups.rt(*gi), groups.sum(*gi), Some(*gi), *ms1),
+            None => (
+                apex_rt,
+                apex_sum,
+                apex_gi,
+                (o_ms1_m1, o_ms1_mono, o_ms1_i1, o_ms1_i2),
+            ),
+        };
 
         // The per-fragment Q1 decision (`extract.q1_fragments`, `stages::q1frag`): the
         // candidate's library fragments as the decision reads them, and the decision of a row
@@ -5624,7 +5736,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         // carries it, and a skeleton table (`ExtractParams::retrace_skeleton`) needs the
         // centre retrace will use to know which rows it rebuilds: this `apex_im`, or
         // `im_pred_cal` where that is not finite (`retrace::Skeleton`).
-        let im0 = im0_of();
+        let im0 = moved.map_or_else(im0_of, |m| m.2);
         let skel_centre = match im0.apex_im.filter(|v| v.is_finite()) {
             Some(v) => v,
             None => im0.im_pred_cal.unwrap_or(f64::NAN),
@@ -5767,7 +5879,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         // Ms1.Profile.Corr class). Grid mode only; nearest MS1 scan per grid RT.
         if !ms1_scans.is_empty() && !t_grid.is_empty() {
             let sp = ISOTOPE_SPACING / c.charge as f64;
-            let tol = p.cfg.prec_tol_ppm;
+            let tol = prec_tol(p.cfg);
             for (nm, dmz) in [("ms1_mono", 0.0), ("ms1_iso1", sp), ("ms1_iso2", 2.0 * sp)] {
                 let lib_mz = c.precursor_mz + dmz;
                 let mz = lib_mz * p.cfg.ms1_shift();
@@ -5871,7 +5983,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                     }
                     if !ms1_scans.is_empty() {
                         let sp = ISOTOPE_SPACING / c.charge as f64;
-                        let tol = p.cfg.prec_tol_ppm;
+                        let tol = prec_tol(p.cfg);
                         for (nm, dmz) in
                             [("ms1_mono", 0.0), ("ms1_iso1", sp), ("ms1_iso2", 2.0 * sp)]
                         {
@@ -6302,7 +6414,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 n_materialized += c.len() as u64;
                 emit_batch(c)
             };
-            let step = groups_in_flight(p.cfg, has_im);
+            let step = groups_in_flight(p.cfg, has_im, win.library_fallback);
             let mut gi = 0usize;
             while gi < groups.len() {
                 let upto = (gi + step).min(groups.len());
@@ -6618,6 +6730,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             if let Some(obj) = params.as_object_mut() {
                 obj.insert("reader".into(), json!(crate::instrument::READER_TIMSRUST));
                 obj.insert("im_gate".into(), json!(im_gate));
+                obj.insert("prec_tol_ppm".into(), json!(prec_tol(p.cfg)));
             }
         }
         // The per-fragment Q1 decision's model, only under `extract.q1_fragments`, so a report
@@ -6689,6 +6802,16 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         if support_min > 0.0 {
             if let Some(obj) = params.as_object_mut() {
                 obj.insert("gate_support_min".into(), json!(support_min));
+                // The peaks it judges and the candidates it moved, only when K > 1.
+                if p.cfg.gate_support_peaks > 1 {
+                    obj.insert(
+                        "gate_support_peaks".into(),
+                        json!({
+                            "k": p.cfg.gate_support_peaks,
+                            "moved": support_moved.load(std::sync::atomic::Ordering::Relaxed),
+                        }),
+                    );
+                }
             }
         }
         // A skeleton table says so in its own report, with the rows it left for retrace;
@@ -7379,6 +7502,7 @@ mod accumulate_tests {
             im_hi: None,
             im_cal: None,
             fitted_for: None,
+            library_fallback: false,
         }
     }
 
@@ -8469,6 +8593,37 @@ mod ms1_near_tests {
         assert_eq!(ms1_near(&scans, 0, 1, 600.0, 5.0), 300.0);
         assert_eq!(ms1_near(&scans, 2, 5, 600.0, 5.0), 700.0);
     }
+
+    /// The default windows in flight halve on library-fallback RT windows and nowhere else,
+    /// never below one; an explicit `extract.windows_in_flight` is kept as given.
+    #[test]
+    fn windows_in_flight_halve_on_library_fallback_windows_only() {
+        use super::{groups_in_flight, ExtractConfig};
+        let d = ExtractConfig::default();
+        let set = ExtractConfig {
+            windows_in_flight: Some(3),
+            ..ExtractConfig::default()
+        };
+        let pool = |n| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .build()
+                .unwrap()
+        };
+        pool(16).install(|| {
+            assert_eq!(groups_in_flight(&d, true, false), 4);
+            assert_eq!(groups_in_flight(&d, true, true), 2);
+            assert_eq!(groups_in_flight(&d, false, false), 16);
+            assert_eq!(groups_in_flight(&d, false, true), 8);
+            assert_eq!(groups_in_flight(&set, true, true), 3);
+            assert_eq!(groups_in_flight(&set, false, false), 3);
+        });
+        pool(1).install(|| {
+            assert_eq!(groups_in_flight(&d, true, true), 1);
+            assert_eq!(groups_in_flight(&d, false, true), 1);
+        });
+    }
+
     /// The diaPASEF gate is on by default on 1/K0 spectra only, an explicit setting wins
     /// (0 turns it off), and it never applies outside the window-mean gate.
     #[test]
