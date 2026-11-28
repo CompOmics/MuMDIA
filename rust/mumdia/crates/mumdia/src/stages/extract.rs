@@ -2545,7 +2545,8 @@ fn check_footprint(fp: &Footprint, cfg: &ExtractConfig, sibling_bands: usize) ->
     // leave, so only a library and spectra that fill the budget themselves, or a window a
     // per-peak claim cannot cut, or a path that holds the whole run, can pass it.
     if let Some((budget, auto)) = fp.memory {
-        if fp.corrected_bytes() > budget {
+        // A budget the hit budget was derived from is met to the last bit: allow the rounding.
+        if fp.corrected_bytes() > budget * (1.0 + 1e-9) {
             let msg = format!(
                 "extract: this extraction is estimated to hold {:.1} GiB at once ({:.1} GiB \
                  loaded: the library, the spectra and the RT windows; {:.1} GiB of \
@@ -5114,8 +5115,17 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         }
         let in_flight = groups_in_flight(p.cfg, has_im, win.library_fallback);
         let loaded = loaded_bytes(&lib, scans, ms1_scans, &win, restrict.as_ref());
+        // The short tail a piece leaves for the next (`Footprint::of`) sits beside the bounded
+        // waves, so a memory budget reserves it with the loaded bytes.
+        let tail = FOOTPRINT_UNDERREAD
+            * CAND_CHUNK as f64
+            * loads
+                .iter()
+                .map(|l| l.hits / l.candidates.max(1) as f64)
+                .fold(0.0, f64::max)
+            * FOOTPRINT_HIT_BYTES;
         let budget_hits = streamed
-            .then(|| hit_budget(p.cfg, p.sibling_bands, memory.map(|m| m.0), loaded))
+            .then(|| hit_budget(p.cfg, p.sibling_bands, memory.map(|m| m.0), loaded + tail))
             .flatten();
         let load_hits: Vec<f64> = loads.iter().map(|l| l.hits).collect();
         let per_peak_claim = matches!(
@@ -8760,6 +8770,26 @@ mod accumulate_tests {
         };
         let c = ExtractConfig::default();
         assert!(check_footprint(&fp(Some((8.0 * GIB, false))), &c, 1).is_ok());
+        // A hit budget derived from the budget beside the loaded bytes and the tail fits it.
+        let big = WindowLoad {
+            hits: 4e9,
+            ..load.clone()
+        };
+        let tail = FOOTPRINT_UNDERREAD * CAND_CHUNK as f64 * 4e9 / 1e5 * FOOTPRINT_HIT_BYTES;
+        let budget = 40.0 * GIB;
+        let h = hit_budget(&c, 1, Some(budget), 4.0 * GIB + tail);
+        let fit = Footprint::of(
+            vec![big],
+            true,
+            1,
+            100,
+            h,
+            false,
+            4.0 * GIB,
+            Some((budget, false)),
+        );
+        assert!(fit.corrected_bytes() <= budget * (1.0 + 1e-9));
+        assert!(check_footprint(&fit, &c, 1).is_ok());
         let err = check_footprint(&fp(Some((2.0 * GIB, false))), &c, 1).unwrap_err();
         assert!(
             err.to_string().contains("extract.memory_budget_gib"),
