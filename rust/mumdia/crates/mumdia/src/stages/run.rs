@@ -186,6 +186,8 @@ pub fn run(p: RunParams) -> Result<()> {
     // raw dispatch before anything is converted, as the library-build keys are. Every stage
     // then sees `on` or `off`, and the manifest records what ran.
     resolved.resolve_im_features(crate::instrument::input_has_im(p.mzml));
+    // `extract.prec_tol_ppm` unset is 10 ppm on a diaPASEF `.d`, recorded as such.
+    resolved.resolve_prec_tol_ppm(crate::instrument::input_has_im(p.mzml));
     // The ZT Scan analysis resolves on the input as well: on for a SCIEX ZT Scan DIA run,
     // off for every other run, which then runs exactly as before (`ztscan`, docs/37_ztscan.md,
     // "Automatic for ZT Scan files").

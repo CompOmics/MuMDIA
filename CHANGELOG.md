@@ -236,6 +236,163 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Added
+
+- **`rt_im_train.fallback_windows`: bounded windows for a run whose seed found no anchors
+  (docs/08 section 4i, docs/17 "Seed: no confident targets").** `unbounded` keeps every
+  artifact byte for byte as before the key; the default is `auto` (see "Changed"). `library`
+  gives a run with fewer than two RT
+  anchors the library's iRT range (1st-99th percentile) mapped linearly onto the seed's
+  observed RT range, with a half-width of `fallback_rt_gradient_fraction` (0.25) of that span
+  (`calibration_status` `fallback_library`, `cal.json` `rt_fallback`), and a run with 1/K0 but
+  no ion-mobility calibration the library's `predicted_im` plus or minus `fallback_im_window`
+  (0.07; `im_method` `library_uncalibrated`). `refuse` fails a run with fewer than two RT
+  anchors at `rt-im-train` instead of extracting it over the whole gradient. The cause on the
+  0.15.0 sweep's single-cell diaPASEF failures: the seed's `(decoys + 1) / targets` needs 100
+  targets above the first decoy for one anchor at 1%, and on plates with about half the
+  peptides per cell of those that worked most cells had 0 anchors (the rest 100-450), so they
+  had no 1/K0 calibration and, below two anchors, no RT window.
+- **`extract.gate_support_peaks`: the support gate judges a candidate's K best peaks, not only
+  its selected apex (docs/09 section 5, docs/35 section 16).** The support gate
+  (`extract.gate_support_min`) is read at the apex extract chose, before `retrace.repick` moves
+  it, and on ProteoBench diaPASEF HYE most of the precursors it rejected that an independent
+  search on the same library identified sat at another apex, with that apex among extract's
+  five best peaks. With K > 1 a candidate that fails at its selected apex is judged again at the
+  apexes of its K best distinct-fragment count peaks, each of which must pass `gate_min_score`
+  too, and is kept with its apex moved to the passing peak of highest support. The default, 1,
+  is the selected apex alone and leaves every artifact and the config hash unchanged; any K
+  keeps every row the gate kept before bit for bit and only adds rows. Stays opt-in: on top of
+  the second pass without the support gate, K = 5 measured -0.6% to +1.6% precursors per run
+  on six diaPASEF sets (three NN seeds on four) and 16,580 real entrapment precursors at an FDP
+  of 0.48%, against 16,333 at 0.45% without it (docs/35 section 11, "The diaPASEF default").
+- **`mbr.second_pass_gate_support_min`: the extract support gate of the second pass alone
+  (docs/12 "Second pass", docs/35 section 16).** A value set is the second pass's support gate
+  on every run (0 = none). Unset, it is 0 when a run of the experiment carries per-peak 1/K0
+  (part of the diaPASEF default, see "Changed") and `extract.gate_support_min` otherwise, so a
+  search without 1/K0 keeps every artifact and its config hash. The gate's default (0.845 on
+  spectra that carry 1/K0) bounds the first pass's memory on a full library, but the second
+  pass searches the small empirical library, and there the gate rejected precursors whose apex
+  sat within 5 s of the first pass's in 97-98% of cases. First measured as standalone `run`
+  searches of each set's empirical library, one NN seed, precursors per run at `run_psm_q` 1%,
+  gate on against off: 200 pg HeLa 5,405 against 7,309 (+35%), 250 pg HYE 5-min Ultra 8,592
+  against 10,039 (+17%), ProteoBench diaPASEF HYE 91,921 against 96,504 (+5.0%), other-species
+  share at 200 pg 3.35% against 3.11%; through `run-experiment` see "Changed".
+
+### Changed
+
+- **The diaPASEF default: single-ion centroids, library windows for a run without anchors, no
+  support gate in the second pass, no MS1 noise filter and a 10 ppm MS1 tolerance (docs/35
+  section 11, "The diaPASEF default").** Five settings change together, each only on spectra
+  that carry per-peak 1/K0: `convert.tdf_min_points` 1 and `rt_im_train.fallback_windows`
+  `auto` (both below), `mbr.second_pass_gate_support_min` unset is 0 (see "Added"),
+  `convert.tdf_ms1_denoise` false and `extract.prec_tol_ppm` unset is 10 ppm (both below). A
+  search without 1/K0 keeps every artifact, report and config hash. Fleet, precursors per run
+  at `run_psm_q` 1%, mean of three NN seeds (one seed where marked), 0.15.1 / the first two
+  settings / with the second pass ungated / this default: 200 pg HeLa on a timsTOF Pro 1,847 /
+  5,418 / 7,262 / 8,680, 1 ng HeLa/E. coli Pro 2 7,154 / 16,278 / 20,513 / 23,512, 250 pg HYE
+  5-min Ultra 4,775 / 8,828 / 10,111 / 10,744, ProteoBench diaPASEF HYE 90,702 / 91,826 / 96,356
+  / 98,306, 50 ng 5-min Ultra 2 (one seed) 43,301 / 43,533 / 45,575 / 45,384, 13 HeLa single
+  cells (one seed) 3,194 / 6,783 / 7,902 / 8,560; E. coli Ultra 2 entrapment 16,139 real
+  precursors at an FDP of 0.41% (0.15.1), 16,333 at 0.45% and 16,415 at 0.41% (this default).
+  Blanks 0 identifications in every arm, decoy fraction 0.98-0.99%, foreign-species share at
+  200 pg / 1 ng 0.49 / 0.37% (0.15.1) and 0.19 / 0.14% (this default). Largest process at 200
+  pg / 250 pg / ProteoBench / 50 ng: 9 / 14 / 35 / 37 GB (0.15.1) against 13 / 24 / 85 / 65 GB;
+  wall about x1.35 that of the first two settings (host-adjusted, about x1.2 of it fleet-load
+  drift). Open: the entrapment set is one run, so it cannot test the second-pass change; bulk
+  memory is about 2.4x that of 0.15.1, mostly from `tdf_min_points` 1 (+1.2% precursors on
+  ProteoBench HYE); single-cell plates whose cells have no seed anchors stay slow and heavy
+  (52 cells: 74 min at 53 GB with 0.15.1's reader and the fallback windows, 278 min at 258 GB
+  with the second pass ungated), and that plate on this default is pending; a second bulk
+  entrapment acquisition is owed. Quantification (three NN seeds, an older diaPASEF quant recipe
+  with `cross_run` fragment selection in every arm): on the precursors every arm identified,
+  ratio accuracy and CV are unchanged or slightly better than 0.15.1 on every set, but the
+  added low-abundance identifications quantify worse, so accuracy over each arm's own
+  identifications falls (ProteoBench HYE species-weighted median |eps| 0.196 -> 0.208, CV
+  0.085 -> 0.097; 250 pg raw quantity 0.472 -> 0.639, E. coli log2 A/B -1.19 -> about -0.85
+  against an expected -2; 200 pg precursor CV 0.10 -> 0.20, 0.10 on the shared precursors).
+  The identification gain holds on the FDR checks; gating the quantities of weak
+  identifications is open work.
+- **diaPASEF: `convert.tdf_ms1_denoise` defaults to false (docs/35 section 16, "MS1 noise").**
+  The native reader keeps every MS1 point again. Measured only with the 10 ppm tolerance below,
+  as part of the diaPASEF default. `true` restores 0.15.1's filtered MS1; the key is read only
+  by the native diaPASEF reader and is left out of the canonical configuration when false.
+- **diaPASEF: `extract.prec_tol_ppm` unset is 10 ppm on spectra that carry per-peak 1/K0, 3 ppm
+  otherwise (docs/09 section 11, docs/35 section 11).** The key now accepts `"auto"` or `null`
+  (the default) as well as a number, and an explicit number applies to every run. `run` and
+  `run-experiment` resolve it to 10 before hashing when every input is a diaPASEF `.d`, so the
+  manifest records it; a standalone `extract` resolves it from the reader `convert` recorded
+  and writes it into its report on 1/K0 spectra. Unset is written as 3 in the canonical
+  configuration, so the config hash and every artifact of a search without 1/K0 are unchanged.
+- **Extract probes half its default windows in flight on a run whose RT windows are the
+  library fallback (docs/09 "The footprint guard", docs/08 section 4i).** A run without
+  anchors under `rt_im_train.fallback_windows = library` has RT windows of half the gradient,
+  and extract holds the fragment-peak matches of a whole batch of isolation window groups at
+  once; unset, `extract.windows_in_flight` is now halved there (4 to 2 on diaPASEF). The
+  batch only bounds memory: `psms_extracted`, the chromatograms and every later table are
+  the same bytes, and a calibrated run, an explicit `windows_in_flight` and a standalone
+  `mumdia extract` (which reads `run_windows.parquet` and does not see the flag) are
+  unchanged. Measured on four cells of a single-cell HeLa diaPASEF plate (two on the library
+  fallback, two on the fixed 120 s window; `run-experiment`, 48 threads, one host): the
+  fallback cells' extract matched 15.6-15.8 billion fragment peaks against 5.8-5.9 billion,
+  their largest batch 6.6-6.7 billion at 4 in flight and 3.4 billion at 2, and the
+  experiment's peak (one process, which is also the process-tree peak) fell from 126.0 to
+  74.4 GiB, with those extracts at 161-162 s against 162-172 s and the experiment at 24:43
+  against 24:12. All 75 output tables and 59 recorded content hashes are identical. These
+  cells found no identification (no training signal), so the second pass did not run; a
+  whole plate is still to be measured.
+- **diaPASEF: `convert.tdf_min_points` defaults to 1, with `extract.gate_support_min` kept at
+  0.845 on spectra that carry 1/K0 in the first pass (docs/35 sections 2, 11 "Low input" and
+  16).** The native
+  Bruker reader keeps single-ion centroids again; the support gate stays on. Fleet, 0.15.1
+  engine with configuration patches, precursors per run at `run_psm_q` 1%, mean of three NN
+  seeds (spread at most 1%), process-tree peak, 0.15.1 against this default against 0.15.0
+  (gate off as well): 200 pg HeLa on a timsTOF Pro 1,847 / 5,418 / 7,744 (11 / 10 / 10 GB),
+  250 pg HYE 5-min Ultra 4,775 / 8,828 / 10,146 (12 / 19 / 87 GB), 1 ng HeLa/E. coli Pro 2
+  7,154 / 16,279 / 21,128 (12 / 18 / 70 GB), ProteoBench diaPASEF HYE 90,702 / 91,826 / 96,966
+  (36 / 66 / 107 GB); E. coli Ultra 2 entrapment 16,139 / 16,333 / 16,553 real precursors at
+  an FDP of 0.41-0.42% / 0.43-0.47% / 0.42-0.44% (38 GB each). Wall within about 1.0-1.3x of
+  0.15.1 on the low-input sets. The gate, not the reader, carried the memory growth of 0.15.0;
+  `extract.gate_support_min: 0` remains the low-input opt-in and `convert.tdf_min_points: 2`
+  restores 0.15.1. No low-input set has an entrapment null yet. A search without 1/K0 is
+  unaffected, and the config hash of a configuration that does not set the key is unchanged.
+- **`rt_im_train.fallback_windows` defaults to `auto`: `library` on spectra that carry per-peak
+  1/K0, `unbounded` otherwise (docs/08 section 4i).** A diaPASEF run whose seed leaves it
+  without an RT or 1/K0 calibration is searched in the library's windows instead of over the
+  whole gradient. Whole single-cell HeLa diaPASEF plates on the 0.15.1 defaults, one NN seed,
+  precursors per run at `run_psm_q` 1% / process-tree peak / wall, `unbounded` against
+  `library`: 52 cells 1,282 / 193 GB / 203 min against 1,352 / 48 GB / 74 min, 71 cells 1,454 /
+  182 GB / 234 min against 1,453 / 44 GB / 88 min, 13 cells 3,194 / 10 GB against 3,219 / 10
+  GB. `cal.json` `rt_fallback.fallback_windows` records the setting that resolved to the
+  library window. A run without 1/K0 is byte-identical, and the key stays out of the canonical
+  configuration at `auto`; the explicit `unbounded`, `library` and `refuse` behave as before.
+
+### Fixed
+
+- **The configuration reference keeps the documentation of a key whose `#[serde(...)]`
+  attribute spans several lines (`ci/gen_config_reference.py`).** `convert.isolation_half_width`,
+  `quant.q1_cycle_halfwidth` and `extract.prec_tol_ppm` had an empty description in docs/24
+  and `configs/config-schema.json`.
+- **The rescore prefilter no longer stands aside on a whole single-cell diaPASEF plate (docs/35
+  section 16, "A prefilter before the classifier").** Each fold's model is fitted on a
+  400,000-row stride sample of the other folds, from the targets `prelim_score` passes at q
+  0.01 to 0.1. Under `convert.tdf_min_points` 1 a 52-cell plate pools about 52 M PSMs, the sample
+  is 1 row in 88, and q's (decoys + 1) / targets needs 10 targets above the first decoy, so the
+  sample held none; moreover neither `prelim_score` nor any prefilter column ranks confident
+  targets above the decoys there (eight cells, 7.56 M PSMs: `prelim_score` 21 targets at q 0.1
+  and none at 0.01 over the whole pool), while the seed score `log_seed_hyperscore` passed 234 at
+  0.01. The prefilter then stood aside, and the classifier received the whole pool. A fold whose
+  sample cannot be fitted now starts from whichever of `prelim_score` and `log_seed_hyperscore`
+  passes more targets at q 0.1 over all the rows outside the fold, adds those targets to its
+  sample, and fits the same 32-column model; on the eight cells every fold fitted and the cut
+  kept 35.1% of the PSMs. The second-pass rescore (`mbr.second_pass_prefilter_keep_decoys`)
+  takes the same path. A fold whose sample fits keeps exactly the model it had: a six-run
+  Astral pool (4.99 M PSMs, 43.8% kept) gave a byte-identical scored table. Whole 52-cell
+  plate, first-pass rescore on the same competed tables, `nn_torch`, one seed: 35.1% of 52.38 M
+  PSMs kept, 750 against 794 target precursors per run at `run_psm_q` 1% (-5.5%; peptides at
+  `peptide_q_value` 1% 3,303 against 3,328), rescore 24.5 against 93 min, process-tree peak 60
+  against 151 GB proportional set size. Caveat: one seed of one plate, so the -5.5% is not yet
+  separated from seed noise; seeds, a second plate and the species-entrapment null are owed.
+
 ## [0.15.1] - 2026-11-26
 
 ### Changed
@@ -268,7 +425,6 @@ than a number. Both are recorded in every run's `manifest.json`.
   both readers. Builds without the `thermo` feature, and files that name their model, are
   unchanged.
 
-||||||| d84de316
 ## [0.15.0] - 2026-11-23
 
 ### Changed

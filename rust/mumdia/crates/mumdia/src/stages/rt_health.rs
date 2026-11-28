@@ -34,7 +34,9 @@ use mumdia_core::config::{Config, FragPredictorKind, RtPredictorKind};
 use mumdia_core::manifest::RtCalibrationGap;
 use tracing::warn;
 
-use crate::stages::rt_im_train::{FALLBACK_FIXED_STATUS, INSUFFICIENT_ANCHORS_STATUS};
+use crate::stages::rt_im_train::{
+    FALLBACK_FIXED_STATUS, FALLBACK_LIBRARY_STATUS, INSUFFICIENT_ANCHORS_STATUS,
+};
 
 /// Which predictions of a library are the native fallback models.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -181,7 +183,13 @@ pub fn gap_of(cal_json: &str, run: &str, pass: &str) -> Option<RtCalibrationGap>
     let text = std::fs::read_to_string(cal_json).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     let status = v.get("calibration_status")?.as_str()?;
-    if status != INSUFFICIENT_ANCHORS_STATUS && status != FALLBACK_FIXED_STATUS {
+    if ![
+        INSUFFICIENT_ANCHORS_STATUS,
+        FALLBACK_FIXED_STATUS,
+        FALLBACK_LIBRARY_STATUS,
+    ]
+    .contains(&status)
+    {
         return None;
     }
     Some(RtCalibrationGap {
@@ -222,6 +230,9 @@ pub fn likely_causes(n: &NativePredictions) -> String {
 fn status_phrase(gap: &RtCalibrationGap) -> &'static str {
     if gap.calibration_status == INSUFFICIENT_ANCHORS_STATUS {
         "no retention-time calibration: every candidate is extracted over the whole gradient"
+    } else if gap.calibration_status == FALLBACK_LIBRARY_STATUS {
+        "no retention-time calibration: candidates are extracted in the library-range fallback \
+         window (rt_im_train.fallback_windows = library, which auto is on spectra with 1/K0)"
     } else {
         "too few anchors for a calibrated window: candidates are extracted in the broad \
          fallback window (rt_im_train.fallback_rt_window_s)"
@@ -271,23 +282,38 @@ pub fn summary(gaps: &[RtCalibrationGap], n_runs: usize, n: &NativePredictions) 
         ("first_pass", "the first pass"),
         ("second_pass", "the second pass"),
     ] {
-        let unbounded = count(pass, INSUFFICIENT_ANCHORS_STATUS);
-        let fixed = count(pass, FALLBACK_FIXED_STATUS);
-        if unbounded + fixed == 0 {
+        let kinds = [
+            (
+                count(pass, INSUFFICIENT_ANCHORS_STATUS),
+                "unbounded windows",
+                "with",
+            ),
+            (
+                count(pass, FALLBACK_FIXED_STATUS),
+                "the fixed fallback window",
+                "on",
+            ),
+            (
+                count(pass, FALLBACK_LIBRARY_STATUS),
+                "the library fallback window",
+                "on",
+            ),
+        ];
+        let total: usize = kinds.iter().map(|k| k.0).sum();
+        if total == 0 {
             continue;
         }
-        let mut s = format!(
-            "{} of {n_runs} run(s) in {label} had no retention-time calibration",
-            unbounded + fixed
-        );
-        if unbounded > 0 && fixed > 0 {
-            s.push_str(&format!(
-                " ({unbounded} with unbounded windows, {fixed} on the fixed fallback window)"
-            ));
-        } else if fixed > 0 {
-            s.push_str(" (the fixed fallback window)");
+        let mut s =
+            format!("{total} of {n_runs} run(s) in {label} had no retention-time calibration");
+        let present: Vec<_> = kinds.iter().filter(|k| k.0 > 0).collect();
+        if let [(_, what, _)] = present[..] {
+            s.push_str(&format!(" ({what})"));
         } else {
-            s.push_str(" (unbounded windows)");
+            let each: Vec<String> = present
+                .iter()
+                .map(|(n, what, prep)| format!("{n} {prep} {what}"))
+                .collect();
+            s.push_str(&format!(" ({})", each.join(", ")));
         }
         parts.push(s);
     }
@@ -499,6 +525,7 @@ mod tests {
         for (status, n_train, gap) in [
             (INSUFFICIENT_ANCHORS_STATUS, 0, true),
             (FALLBACK_FIXED_STATUS, 12, true),
+            (FALLBACK_LIBRARY_STATUS, 0, true),
             ("loess", 3000, false),
             ("linear", 80, false),
         ] {
@@ -568,5 +595,24 @@ mod tests {
         let s = summary(&single, 1, &NativePredictions::default()).unwrap();
         assert!(s.contains("1 of 1 run(s) in this search"), "{s}");
         assert!(s.contains("Runs: a."), "{s}");
+
+        // Every kind in one pass, each counted; the two-kind wording is the old one.
+        let mixed = [
+            gap("a", "run", INSUFFICIENT_ANCHORS_STATUS),
+            gap("b", "run", FALLBACK_FIXED_STATUS),
+            gap("c", "run", FALLBACK_LIBRARY_STATUS),
+        ];
+        let s = summary(&mixed, 3, &n).unwrap();
+        assert!(
+            s.contains("3 of 3 run(s) in this search had no retention-time calibration (1 with unbounded windows, 1 on the fixed fallback window, 1 on the library fallback window)"),
+            "{s}"
+        );
+        let s = summary(&mixed[..2], 3, &n).unwrap();
+        assert!(
+            s.contains("(1 with unbounded windows, 1 on the fixed fallback window)"),
+            "{s}"
+        );
+        let s = summary(&mixed[2..], 3, &n).unwrap();
+        assert!(s.contains("(the library fallback window)"), "{s}");
     }
 }

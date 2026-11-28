@@ -581,7 +581,8 @@ pub fn run(mut p: MobilogramParams) -> Result<Mobilograms> {
     let ions = read_ions(&inputs.chromatograms, &want)?;
     let windows = read_im_windows(inputs.run_windows.as_deref(), &want)?;
     let (mass_off, frag_tol) = read_mass_cal(inputs.mass_cal.as_deref(), cfg.extract.frag_tol_ppm)?;
-    let prec_tol = cfg.extract.prec_tol_ppm;
+    // A mobilogram reads only a diaPASEF .d, so an unset tolerance is the 1/K0 one.
+    let prec_tol = cfg.extract.prec_tol_ppm_for(true);
 
     let raw = RawTdf::open(&inputs.raw)?;
     let fx = FrameIndex::read(&raw, &inputs.raw)?;

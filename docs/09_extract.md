@@ -304,6 +304,17 @@ task keeps beside each until it groups them: 20 bytes a match):
   path, every window on the paths that accumulate the whole run (a two-pass peak claim, the
   contested features, the bucketed matcher).
 
+Unset, `windows_in_flight` is halved on a run whose RT windows are the library fallback of
+`rt_im_train.fallback_windows` (a run without anchors, docs/08_rt_im_train.md section 4i):
+4 becomes 2 on diaPASEF. The flag travels with the windows `rt-im-train` hands to extract in
+memory (`RtWindows::library_fallback`), so a standalone `mumdia extract`, which reads
+`run_windows.parquet`, keeps the full default; set the key there by hand. A calibrated run is
+not touched. On the four single-cell runs of docs/08 section 4i every output table and
+recorded content hash was the same at 2 and 4 in flight, as are `psms_extracted` and the
+chromatograms of `windows_in_flight_leave_the_extract_bytes_alone`; the key's reference
+(docs/24) records one band whose chromatogram row groups moved with the setting, values
+unchanged.
+
 The ceiling is `extract.max_footprint_gib`: unset (`auto`), the machine's physical memory
 (the tightest cgroup limit on the process's path when smaller: a container's, or a SLURM or
 systemd job's, read by `memlog::total_memory`),
@@ -742,6 +753,22 @@ All four diagnostic scores are computed for every accepted candidate only when
 `emit_gate_diagnostics` is set (`extract.rs:2035`); otherwise they are zeroed and
 not written, so the default chain pays no extra cost.
 
+The support gate (`extract.gate_support_min`, the diaPASEF gate of docs/35 section 16) is a
+second threshold under `window_mean`, read at the selected apex: the window-mean score plus the
+apex intensity and MS1 terms and, on 1/K0 spectra, three 1/K0 terms. It runs before retrace, so
+it judges the apex extract chose, not the one `retrace.repick` later moves the row to.
+`extract.gate_support_peaks = K` (default 1, the selected apex alone; benchmark-gated) gives a
+candidate that fails there a second chance: the K best peaks of its distinct-fragment count
+profile (`peaks::enumerate_peaks`, the peaks `retain_top_peaks` writes) are judged at their own
+apexes, each must pass `gate_min_score` there too (without the MS1 rescue), and the candidate
+is kept when one passes, with its apex, apex intensity, MS1 isotopes and 1/K0 evidence moved to
+the passing peak of highest support. Every candidate that passes at its selected apex keeps its
+row bit for bit, so the key only adds rows; the gate diagnostics of a moved row stay those of
+the selected apex. Only rejected candidates pay for the extra reads, and a peak whose
+window-mean, intensity and MS1 terms alone fall below the threshold is skipped before its 1/K0
+evidence is read (the 1/K0 terms only subtract). With K > 1 the extract report carries
+`gate_support_peaks: {k, moved}`, `moved` counting the candidates kept at another peak.
+
 ### 6. Chromatograms and MS1 XICs
 
 Per-fragment observed m/z is an intensity-weighted mean per fragment
@@ -1085,7 +1112,9 @@ Before extract, `run` and `run-experiment` learn the MS1 offset from the confide
 anchors (`stages::ms1cal`, `extract.ms1_calibrate = true`, the default since 2026-10-08):
 the median signed ppm error of the most intense MS1 peak within 15 ppm of each anchor's
 precursor m/z, in the MS1 scan nearest its observed RT and one either side (section 8 for
-the 4D rule), and every MS1 read of extract is centred on it, `prec_tol_ppm` (3 ppm) wide.
+the 4D rule), and every MS1 read of extract is centred on it, `prec_tol_ppm` wide: unset
+(the default), 3 ppm, and 10 ppm on spectra that carry per-peak 1/K0 (the diaPASEF default,
+docs/35 section 11, "The diaPASEF default"). An explicit value applies to both.
 
 The standalone `mumdia extract` calibrates MS1 as `run` does when it is given `--ms1` and
 the seed's `--mass-cal`: the seed table is the one `<seed>.masscal.json` is named after.
@@ -1470,7 +1499,7 @@ declutter" commit: `extract.scan_window_mode` (and the `ScanWindowMode` enum),
 | `max_footprint_gib` | unset (`auto`) | Refuse an extraction whose estimated hit store passes this many GiB; `auto` is the machine's memory, `0` is off. See "The footprint guard" |
 | `fixed_scan_window` | 2 (3 before 2026-10-08) | Minimum co-elution run length (`scan_window` floor); `.max(1)` at `extract.rs:1591` |
 | `frag_tol_ppm` | 20.0 | Fragment match tolerance (overridden by `mass_cal`) |
-| `prec_tol_ppm` | 3.0 (20.0 before 2026-10-08) | MS1 isotope integration tolerance, centred on the offset `ms1_calibrate` learns from the seed |
+| `prec_tol_ppm` | unset: 3.0, and 10.0 on spectra with per-peak 1/K0 (20.0 before 2026-10-08; 3.0 on 1/K0 spectra until 0.15.1) | MS1 isotope integration tolerance, centred on the offset `ms1_calibrate` learns from the seed |
 | `ms1_calibrate` | `true` | `true`: one MS1 offset learned from the seed; `false`: none (section 11) |
 | `presence_min_matched` | 3 | Tier-b: minimum distinct matched fragments (`extract.rs:1727`) |
 | `presence_min_fragments` | 3 | Acceptance: minimum distinct fragments (`extract.rs:1926`) |
@@ -1527,6 +1556,7 @@ here for one index.
 |---|---|---|
 | `extract.retain_top_peaks` (`config.rs:635`, default 1) | `<out_psms>.peaks.parquet` sidecar, unscored, written only when K>1 (`extract.rs:2544`); no PSM columns | ID loop not closed (sidecar peaks are unscored); gate pending |
 | `extract.promote_top_peaks` (`config.rs:645`, default 1) | extra `psms_extracted` rows with `peak_rank >= 1` (`extract.rs:2297`); no new columns | **not schema-neutral in rows**: changes the scored population and therefore FDR; on diaPASEF (IM branch, seed 0) K = 2 lost 5.7% and K = 3 5.9%, and `retrace.repick` is the diaPASEF path (docs/35 section 12); gate pending |
+| `extract.gate_support_peaks` (default 1) | none; adds the rows the support gate kept at another of their K best peaks, with the apex moved there (section 5) | pending (docs/35 section 16); gate pending |
 | `extract.emit_candidate_audit` (`config.rs:658`) | none in `extract.rs` (unused there); in `run` it gates the `audit` stage -> `candidate_audit.parquet` (`run.rs:428`) | diagnostic; no ID effect |
 | `extract.emit_gate_diagnostics` (`config.rs:673`) | 4 F32 cols `gate_apex`, `gate_peak_spectral`, `gate_coelution`, `gate_spectral_entropy` (`extract.rs:2511`) | diagnostic; no ID effect |
 | `extract.apex_evidence_rank` (`config.rs:667`) | none; changes the apex-selection score (`extract.rs:1890`) | **the default**, promoted on correctness grounds rather than a count (docs/25 section 2); the legacy score (`false`) was removed in 0.15.0 (HYE: 27.6% more candidates, 1.0% fewer peptides, bench/README.md): it could not distinguish "no signature fragment observed anywhere" from "the earliest qualifying scan is the apex" |
