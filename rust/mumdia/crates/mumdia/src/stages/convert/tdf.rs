@@ -921,7 +921,7 @@ pub(super) fn drive(
 /// MS2 frames [`load`] decodes, spread evenly over the run.
 pub const LOAD_FRAMES: usize = 256;
 
-/// The MS2 load of a diaPASEF run, from [`LOAD_FRAMES`] of its MS2 frames spread evenly over
+/// The MS2 load of a diaPASEF run, from `LOAD_FRAMES` (256) of its MS2 frames spread evenly over
 /// the run and centroided with the run's settings: how much of the fragment signal
 /// `convert.tdf_min_points` 2 would drop. What `"auto"` decides on (docs/35_diapasef.md,
 /// "Automatic centroid floor").
@@ -1012,7 +1012,7 @@ pub struct MinPointsAuto {
     /// The median over the runs of [`TdfLoad::single_ion_intensity_share`].
     pub measure: f64,
     pub threshold: f64,
-    /// Why the search space alone decided for 2 ([`AUTO_LIBRARY_PRECURSORS`]), if it did.
+    /// Why the search space alone decided for 2 (`AUTO_LIBRARY_PRECURSORS`), if it did.
     pub large_search_space: Option<String>,
 }
 

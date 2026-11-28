@@ -2028,7 +2028,7 @@ pub fn tdf_min_points_record(d: &MinPointsAuto, runs: &[(String, TdfLoad)]) -> s
 }
 
 /// Why the search space alone makes `convert.tdf_min_points = "auto"` choose 2, if it does:
-/// an imported library of more than [`tdf::AUTO_LIBRARY_PRECURSORS`] precursors (read from its
+/// an imported library of more than `tdf::AUTO_LIBRARY_PRECURSORS` (100 M) precursors (read from its
 /// parquet footer), or a library built from the FASTA with a non-specific digest.
 fn large_search_space(
     cfg: &mumdia_core::config::Config,
@@ -2052,7 +2052,7 @@ fn large_search_space(
 /// Resolve `convert.tdf_min_points = "auto"` for a search of `paths` (`run`,
 /// `run-experiment`), before the configuration is hashed: one value for every run, from the
 /// MS2 load of its diaPASEF runs and the size of the search space
-/// ([`tdf::auto_min_points`], [`large_search_space`]; `lib_precursors` is the imported
+/// (`tdf::auto_min_points`, `large_search_space`; `lib_precursors` is the imported
 /// library, `None` for a FASTA search), logged with the measure, the threshold and the
 /// choice. Returns the manifest record, or `None` when the key is not
 /// `"auto"`. Without a diaPASEF input the key resolves to the default 1, which no other
