@@ -1143,7 +1143,7 @@ caches are or how much of the computer a search may take (`LOCAL_SETTINGS` in `a
 `rescore.features_file`, the two cache locations
 (`predict_frag.library_cache`, `rt_im_train.deeplc_projection_cache`), the parallelism and
 memory limits (`convert.parallel_conversions`, `extract.windows_in_flight`,
-`extract.max_footprint_gib`, `features.chrom_loaders`, `rescore.max_feature_matrix_gib`,
+`extract.max_footprint_gib`, `extract.hit_budget_gib`, `extract.memory_budget_gib`, `features.chrom_loaders`, `rescore.max_feature_matrix_gib`,
 `rt_im_train.deeplc_predict_shards`, `experiment.parallel_runs`,
 `experiment.overlap_front_threads`) and `experiment.conditions` (conditions by run name).
 

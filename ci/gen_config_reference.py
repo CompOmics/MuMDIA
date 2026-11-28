@@ -339,7 +339,12 @@ CUSTOM_SERDE_SPELLING = {
     "BaselineSubtract": {"Off": "false", "On": "true", "Auto": "auto"},
     "Ms1Calibrate": {"Off": "false", "Offset": "true"},
     "ZtSwitch": {"Auto": "auto", "On": "true", "Off": "false"},
+    "MemoryBudget": {"Off": "0", "Auto": "auto"},
 }
+
+# Enums that also take a number (`Gib(f64)`): a form edits them as free text, not as a list of
+# their keyword variants.
+NUMBER_OR_KEYWORD = {"MemoryBudget"}
 
 
 class Enum:
@@ -2282,7 +2287,9 @@ def build_schema(config_text: str) -> dict:
             return v
 
         kind = (
-            "enum"
+            "other"
+            if base in NUMBER_OR_KEYWORD
+            else "enum"
             if base in enums
             else "bool"
             if base == "bool"
@@ -2301,7 +2308,7 @@ def build_schema(config_text: str) -> dict:
             "rust_type": field.rtype,
             "kind": kind,
             "optional": field.rtype.startswith("Option<"),
-            "default": typed_default(rendered, kind),
+            "default": typed_default(rendered, "float" if base in NUMBER_OR_KEYWORD else kind),
             "default_text": rendered,
             "help": field.doc.strip(),
             "gates": gate_markers(field.doc),
@@ -2309,7 +2316,9 @@ def build_schema(config_text: str) -> dict:
             # above the field, which made this file stale on every other open branch.
             "source_struct": struct.name,
         }
-        if base in enums:
+        if base in NUMBER_OR_KEYWORD:
+            entry["numeric"] = True
+        if base in enums and base not in NUMBER_OR_KEYWORD:
             # A variant kept only so old configurations serialise ("Removed in ...") is refused,
             # so the desktop does not offer it.
             entry["choices"] = [

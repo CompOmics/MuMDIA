@@ -691,6 +691,9 @@ function onSettingChanged(el) {
       return;
     }
     value = n;
+  } else if (f.numeric && raw.trim() !== "" && !Number.isNaN(Number(raw))) {
+    // A number or a keyword (`extract.memory_budget_gib`: GiB or "auto"): a number goes as one.
+    value = Number(raw);
   } else if (f.kind === "other" && /^\s*[\[{]/.test(raw)) {
     // A list or object typed as JSON (the modification lists, for instance).
     try {
@@ -795,6 +798,8 @@ const LOCAL_SETTINGS = new Set([
   "convert.parallel_conversions",
   "extract.windows_in_flight",
   "extract.max_footprint_gib",
+  "extract.hit_budget_gib",
+  "extract.memory_budget_gib",
   "features.chrom_loaders",
   "rescore.max_feature_matrix_gib",
   "rt_im_train.deeplc_predict_shards",

@@ -1326,19 +1326,7 @@ impl Library {
             global_offset: u32::try_from(if span.is_some() { offset } else { frag_offset })
                 .map_err(|_| anyhow::anyhow!("candidate offset does not fit u32"))?,
         };
-        crate::memlog::report(
-            "library steady state",
-            &[
-                ("frag_mz", crate::memlog::bytes_of(&lib.frag_mz)),
-                ("frag_int", crate::memlog::bytes_of(&lib.frag_int)),
-                ("frag_name_id", crate::memlog::bytes_of(&lib.frag_name_id)),
-                ("idx_mz", crate::memlog::bytes_of(&lib.idx_mz)),
-                ("idx_cid", crate::memlog::bytes_of(&lib.idx_cid)),
-                ("idx_int", crate::memlog::bytes_of(&lib.idx_int)),
-                ("precursor_columns", lib.precursor_bytes()),
-                ("frag_offsets", lib.frag_offsets.bytes()),
-            ],
-        );
+        crate::memlog::report("library steady state", &lib.resident_parts());
         tracing::info!(
             library = precursors,
             candidates = ncand,
@@ -1468,6 +1456,25 @@ impl Library {
             is_decoy: self.is_decoy[c],
             protein: self.protein(cid),
         }
+    }
+
+    /// The library's buffers and their payload bytes (the `library steady state` memory log).
+    fn resident_parts(&self) -> [(&'static str, usize); 8] {
+        [
+            ("frag_mz", crate::memlog::bytes_of(&self.frag_mz)),
+            ("frag_int", crate::memlog::bytes_of(&self.frag_int)),
+            ("frag_name_id", crate::memlog::bytes_of(&self.frag_name_id)),
+            ("idx_mz", crate::memlog::bytes_of(&self.idx_mz)),
+            ("idx_cid", crate::memlog::bytes_of(&self.idx_cid)),
+            ("idx_int", crate::memlog::bytes_of(&self.idx_int)),
+            ("precursor_columns", self.precursor_bytes()),
+            ("frag_offsets", self.frag_offsets.bytes()),
+        ]
+    }
+
+    /// The payload bytes the library holds (the total of the `library steady state` log).
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.resident_parts().iter().map(|(_, b)| b).sum()
     }
 
     /// Bytes held by the per-candidate columns (for the memory log).
