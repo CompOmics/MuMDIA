@@ -512,7 +512,24 @@ the collected matches, the hit budget it was planned with, and the process's res
 and high-water mark after it (Linux). Without one the end of the stage logs the collected
 matches and the largest batch (`extract: task-local fragment indexes`).
 
-**Measured:** pending (gate campaign arms `MBoff` / `MB64` / `MB8` / `MB280`).
+**Measured** (2026-11-28, engine of this change; tables compared only between hosts of one CPU
+model, because the DeepLC calibration upstream of extract already differs between an EPYC 9354
+and an EPYC 7H12):
+
+| case | budget | peak | wall | tables |
+|---|---|---|---|---|
+| HLA Ultra RT-bootstrap extract, 379M candidates, standalone, 64 threads | 280 GiB | 259.6 GiB RSS (without a budget the search was stopped at 407 GB) | 2:41:38 | not compared |
+| 3 single cells, `mumdia run`, 2 chains | off / 24 GiB | 97.4 / 29.8 GiB process RSS | 33:11 / 33:44 | identical (62 files, 95 recorded hashes) |
+| Orbitrap Astral 5 min, 3 runs | off / 16 GiB with `hit_budget_gib` 0.01 | 9 / 10 GB process tree | 26:50 / 29:43 | identical (40 files, 100 recorded hashes) |
+
+Against the unbudgeted peaks the corrected estimate was 1.15 times the three single cells'
+process peak (two chains at once) and 1.57 times the HLA extract's (loaded 91 GiB plus 23.0
+billion matches at 20 bytes in its largest batch, the relation the budgeted run held to within 3%);
+the old estimate was 0.70 times the latter. The HLA batches collected 1.11 to 1.66 times their
+estimates, so `FOOTPRINT_UNDERREAD` errs high there until the first batch replaces it. The load
+phase is outside the budget: the HLA extract reached 118 GiB while decoding the library before
+settling at 93.5 GiB. On the 6-run ProteoBench diaPASEF set a budget of 16 GiB over two chains was
+refused, as a number below the loaded bytes (15.4 GiB a run) is.
 
 ### 1. Matcher and mass recalibration
 
