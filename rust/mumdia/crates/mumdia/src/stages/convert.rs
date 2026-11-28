@@ -9,7 +9,7 @@ pub(crate) mod ms1_denoise;
 mod tdf;
 pub(crate) mod tims_frames;
 pub(crate) use tdf::RawTdf;
-pub use tdf::TdfParams;
+pub use tdf::{auto_min_points, load as tdf_load, MinPointsAuto, TdfLoad, TdfParams};
 
 use std::io::SeekFrom;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1671,12 +1671,29 @@ fn drive_mzml(
 /// `force_threads` exists so a test can run the same input down both decode paths
 /// and diff the artifacts, without an environment variable that every other test
 /// in the process would see.
-fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOutputs> {
+fn run_inner(mut p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOutputs> {
     let t0 = Instant::now();
     std::fs::create_dir_all(p.out_dir).ok();
     // A diaPASEF `.d` is read natively and keeps its ion mobility; the routing decision is
     // the one `raw::ensure_mzml` made when it passed the path through unconverted.
     let native_tdf = crate::instrument::input_has_im(p.mzml);
+    // `convert.tdf_min_points = "auto"` reaches this stage only from a standalone `convert`
+    // (`run` and `run-experiment` resolve it first): decided on this run alone.
+    let mut min_points_auto = None;
+    if native_tdf && p.tdf.min_points == mumdia_core::config::TDF_MIN_POINTS_AUTO {
+        let l = tdf::load(p.mzml, &p.tdf)?;
+        // shortcut: a standalone convert does not see the library, so its load alone decides;
+        // `run` and `run-experiment` add the search space.
+        let d = tdf::auto_min_points(&[l], None);
+        info!(
+            single_ion_intensity_share = d.measure,
+            threshold = d.threshold,
+            min_points = d.min_points,
+            "convert: convert.tdf_min_points = \"auto\""
+        );
+        p.tdf.min_points = d.min_points;
+        min_points_auto = Some(tdf_min_points_record(&d, &[(p.mzml.to_string(), l)]));
+    }
     // A Thermo `.raw` reaches this stage only under `convert.thermo_native`: otherwise
     // `raw::ensure_mzml` converted it to mzML first.
     let native_thermo = !native_tdf && crate::raw::detect(p.mzml) == crate::raw::Vendor::Thermo;
@@ -1948,6 +1965,9 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
         if let serde_json::Value::Object(tdf) = p.tdf.report_params() {
             obj.extend(tdf);
         }
+        if let Some(a) = min_points_auto {
+            obj.insert("tdf_min_points_auto".into(), a);
+        }
     }
     let mut hashes = write_reports(
         vec![
@@ -1985,6 +2005,110 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
         },
         schemas,
     })
+}
+
+/// The manifest record of `convert.tdf_min_points = "auto"`: the decision, and every run's
+/// load in input order.
+pub fn tdf_min_points_record(d: &MinPointsAuto, runs: &[(String, TdfLoad)]) -> serde_json::Value {
+    json!({
+        "min_points": d.min_points,
+        "measure": "median single_ion_intensity_share",
+        "value": d.measure,
+        "threshold": d.threshold,
+        "large_search_space": d.large_search_space,
+        "runs": runs
+            .iter()
+            .map(|(path, l)| {
+                let mut v = l.report();
+                v["input"] = json!(path);
+                v
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Why the search space alone makes `convert.tdf_min_points = "auto"` choose 2, if it does:
+/// an imported library of more than `tdf::AUTO_LIBRARY_PRECURSORS` (100 M) precursors (read from its
+/// parquet footer), or a library built from the FASTA with a non-specific digest.
+fn large_search_space(
+    cfg: &mumdia_core::config::Config,
+    lib_precursors: Option<&str>,
+) -> Result<Option<String>> {
+    Ok(match lib_precursors {
+        Some(lib) => {
+            let n = mumdia_io::table::nrows(lib)?;
+            (n > tdf::AUTO_LIBRARY_PRECURSORS).then(|| {
+                format!(
+                    "the library holds {n} precursors, more than {}",
+                    tdf::AUTO_LIBRARY_PRECURSORS
+                )
+            })
+        }
+        None => (cfg.digest.enzyme == mumdia_core::config::Enzyme::NonSpecific)
+            .then(|| "the library is a non-specific digest".to_string()),
+    })
+}
+
+/// Resolve `convert.tdf_min_points = "auto"` for a search of `paths` (`run`,
+/// `run-experiment`), before the configuration is hashed: one value for every run, from the
+/// MS2 load of its diaPASEF runs and the size of the search space
+/// (`tdf::auto_min_points`, `large_search_space`; `lib_precursors` is the imported
+/// library, `None` for a FASTA search), logged with the measure, the threshold and the
+/// choice. Returns the manifest record, or `None` when the key is not
+/// `"auto"`. Without a diaPASEF input the key resolves to the default 1, which no other
+/// reader reads, so such a search hashes and runs as without the key.
+pub fn resolve_tdf_min_points(
+    cfg: &mut mumdia_core::config::Config,
+    paths: &[String],
+    lib_precursors: Option<&str>,
+    caller: &str,
+) -> Result<Option<serde_json::Value>> {
+    use rayon::prelude::*;
+    if cfg.convert.tdf_min_points != mumdia_core::config::TDF_MIN_POINTS_AUTO {
+        return Ok(None);
+    }
+    let p = TdfParams::from_config(&cfg.convert);
+    let runs: Vec<(String, TdfLoad)> = paths
+        .par_iter()
+        .filter(|x| crate::instrument::input_has_im(x))
+        .map(|x| Ok((x.clone(), tdf::load(x, &p)?)))
+        .collect::<Result<_>>()?;
+    for (path, l) in &runs {
+        info!(
+            input = %path,
+            single_ion_share = l.single_ion_share(),
+            single_ion_intensity_share = l.single_ion_intensity_share(),
+            multi_point_per_spectrum = l.multi_point_per_spectrum(),
+            sampled_frames = l.sampled_frames,
+            "{caller}: MS2 load of a diaPASEF run (convert.tdf_min_points = \"auto\")"
+        );
+    }
+    let loads: Vec<TdfLoad> = runs.iter().map(|r| r.1).collect();
+    let d = tdf::auto_min_points(&loads, large_search_space(cfg, lib_precursors)?);
+    cfg.convert.tdf_min_points = d.min_points;
+    if runs.is_empty() {
+        info!("{caller}: convert.tdf_min_points = \"auto\" is 1: no input is a diaPASEF run");
+    } else {
+        let why = match (&d.large_search_space, d.min_points) {
+            (Some(why), _) => format!(
+                "{why}, a search space in which single ion events add noise faster than \
+                 signal: they are dropped"
+            ),
+            (None, 2) => "high load: single ion events are dropped, for memory and wall".into(),
+            _ => "low load: single ion events are kept, they carry much of the fragment signal"
+                .into(),
+        };
+        info!(
+            "{caller}: convert.tdf_min_points = \"auto\" is {} for all {} diaPASEF runs: the \
+             median share of MS2 intensity in single ion events is {:.3} (threshold {}); {why} \
+             (docs/35_diapasef.md, \"Automatic centroid floor\")",
+            d.min_points,
+            runs.len(),
+            d.measure,
+            d.threshold,
+        );
+    }
+    Ok(Some(tdf_min_points_record(&d, &runs)))
 }
 
 /// Peaks per MS2 spectrum, and the MS1 spectrum count, of a timsTOF diaPASEF `.d` after

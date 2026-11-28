@@ -1162,6 +1162,12 @@ fn peak_census(
     if native {
         // Which reader counted, so a census of a `.d` is not read as an msconvert one.
         out["reader"] = serde_json::json!(mumdia::instrument::READER_TIMSRUST);
+        // What `convert.tdf_min_points = "auto"` decides on, from frames over the whole run.
+        let load = stages::convert::tdf_load(mzml, tdf)?;
+        out["tdf_load"] = load.report();
+        out["tdf_min_points_auto"] = stages::convert::auto_min_points(&[load], None)
+            .min_points
+            .into();
     } else {
         out["isolation"] = isolation.to_json();
     }

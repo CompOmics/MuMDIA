@@ -88,6 +88,11 @@ pub struct Manifest {
     /// for a library search without any, so every other manifest keeps its bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protein_annotations_missing: Option<ProteinAnnotationsGap>,
+    /// What `convert.tdf_min_points = "auto"` chose and on what: the decision, the measure,
+    /// the threshold and every diaPASEF run's MS2 load. Written only under `"auto"`, so every
+    /// other manifest keeps its bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tdf_min_points_auto: Option<serde_json::Value>,
 }
 
 /// A search from a library whose reports carry no protein annotations: the library has no
@@ -151,6 +156,7 @@ impl Manifest {
             rt_calibration_missing: Vec::new(),
             retention: None,
             protein_annotations_missing: None,
+            tdf_min_points_auto: None,
         }
     }
 

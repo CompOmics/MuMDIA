@@ -188,6 +188,13 @@ pub fn run(p: RunParams) -> Result<()> {
     resolved.resolve_im_features(crate::instrument::input_has_im(p.mzml));
     // `extract.prec_tol_ppm` unset is 10 ppm on a diaPASEF `.d`, recorded as such.
     resolved.resolve_prec_tol_ppm(crate::instrument::input_has_im(p.mzml));
+    // `convert.tdf_min_points = "auto"` resolves on the run's MS2 load, before hashing.
+    let tdf_min_points_auto = crate::stages::convert::resolve_tdf_min_points(
+        &mut resolved,
+        &[p.mzml.to_string()],
+        p.lib_precursors,
+        "run",
+    )?;
     // The ZT Scan analysis resolves on the input as well: on for a SCIEX ZT Scan DIA run,
     // off for every other run, which then runs exactly as before (`ztscan`, docs/37_ztscan.md,
     // "Automatic for ZT Scan files").
@@ -234,6 +241,7 @@ pub fn run(p: RunParams) -> Result<()> {
         crate::protein_annotations::resolve_input(p.lib_annotations, p.lib_precursors)?;
 
     let mut man = Manifest::new(cfg.canonical_json(), ch.clone());
+    man.tdf_min_points_auto = tdf_min_points_auto;
     info!(provenance = %man.provenance(), "run: build provenance");
     // Hash the inputs, starting now, before any stage reads them. This is what ties a
     // result to the exact bytes it came from; recording only the path does not, because a

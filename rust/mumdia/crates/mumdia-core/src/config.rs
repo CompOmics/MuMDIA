@@ -463,7 +463,22 @@ pub struct ConvertConfig {
     /// Ultra set only (1.17% -> 1.40%) and fell elsewhere. The earlier -17% for 1 (docs/35
     /// section 12) was measured under the 0.845 support gate and without the recipe's presence
     /// rule.
-    #[serde(skip_serializing_if = "is_default_tdf_min_points")]
+    ///
+    /// `"auto"` (also written `0`; opt-in, not measured for a default) chooses 1 or 2 per
+    /// search from the MS2 load of its runs ([`TDF_MIN_POINTS_AUTO`]): `run` and
+    /// `run-experiment` decode a sample of each diaPASEF run's MS2 frames before the
+    /// configuration is hashed and keep single ion events (1) on low-load runs, where they are
+    /// most of the fragment signal, and drop them (2) on high-load runs, where they cost
+    /// memory and wall for few identifications, and in a search space of more than 100 M
+    /// library precursors or a non-specific digest (immunopeptidomics), where they cost the
+    /// seed its anchors. One value for every run of an experiment;
+    /// the measure, threshold and choice are logged and recorded in the manifest
+    /// (`tdf_min_points_auto`), and the resolved value is what the configuration hashes and
+    /// the spectra reports record (docs/35_diapasef.md, "Automatic centroid floor").
+    #[serde(
+        deserialize_with = "de_tdf_min_points",
+        skip_serializing_if = "is_default_tdf_min_points"
+    )]
     pub tdf_min_points: u32,
     /// Native diaPASEF reader: split each m/z x mobility cluster at the valleys of its
     /// m/z profile. A local minimum of the smoothed profile is a cut when it is below this
@@ -684,6 +699,31 @@ fn is_default_tdf_im_gap_scans(v: &u32) -> bool {
 }
 fn is_default_tdf_min_points(v: &u32) -> bool {
     *v == ConvertConfig::default().tdf_min_points
+}
+
+/// `convert.tdf_min_points = "auto"`, as stored: chosen per search from the MS2 load of its
+/// runs (`mumdia::stages::convert::resolve_tdf_min_points`).
+pub const TDF_MIN_POINTS_AUTO: u32 = 0;
+
+/// `convert.tdf_min_points`: a number of raw points, or `"auto"`, which is stored as `0`
+/// (as `extract.apex_count_window` is, so the canonical configuration stays numeric).
+fn de_tdf_min_points<'de, D>(d: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Points {
+        N(u32),
+        Word(String),
+    }
+    match Points::deserialize(d)? {
+        Points::N(n) => Ok(n),
+        Points::Word(w) if w.trim().eq_ignore_ascii_case("auto") => Ok(TDF_MIN_POINTS_AUTO),
+        Points::Word(w) => Err(serde::de::Error::custom(format!(
+            "convert.tdf_min_points must be a number of raw points or \"auto\" (got \"{w}\")"
+        ))),
+    }
 }
 fn is_default_tdf_mz_valley(v: &f64) -> bool {
     *v == ConvertConfig::default().tdf_mz_valley
@@ -6635,10 +6675,8 @@ impl Config {
         let cv = &self.convert;
         let frac = |v: f64| (0.0..1.0).contains(&v);
         let width = |v: f64| v.is_finite() && v >= 0.0;
-        if !(cv.tdf_mz_ppm.is_finite() && cv.tdf_mz_ppm > 0.0) || cv.tdf_min_points == 0 {
-            return Err(Invalid(
-                "convert.tdf_mz_ppm must be finite and > 0, and convert.tdf_min_points >= 1".into(),
-            ));
+        if !(cv.tdf_mz_ppm.is_finite() && cv.tdf_mz_ppm > 0.0) {
+            return Err(Invalid("convert.tdf_mz_ppm must be finite and > 0".into()));
         }
         // What each key of the ZT Scan analysis reads (`validate_ztscan`), checked again
         // once `"auto"` is resolved.
@@ -8803,11 +8841,36 @@ mod tests {
             r#"{"convert":{"tdf_im_valley":-0.1}}"#,
             r#"{"convert":{"tdf_mz_smooth_ppm":-1.0}}"#,
             r#"{"convert":{"tdf_mz_ppm":0.0}}"#,
-            r#"{"convert":{"tdf_min_points":0}}"#,
+            r#"{"convert":{"tdf_min_points":"two"}}"#,
         ] {
             assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
         }
         assert!(Config::from_json(r#"{"convert":{"bruker_reader":"native"}}"#).is_err());
+    }
+
+    /// `convert.tdf_min_points = "auto"` is stored as 0 (also accepted as written) and is part
+    /// of the configuration's identity until a search resolves it; resolved to 1 it hashes as
+    /// the default, resolved to 2 as an explicit 2.
+    #[test]
+    fn tdf_min_points_auto_is_stored_as_zero_and_resolves_to_a_plain_value() {
+        for json in [
+            r#"{"convert":{"tdf_min_points":"auto"}}"#,
+            r#"{"convert":{"tdf_min_points":" AUTO "}}"#,
+            r#"{"convert":{"tdf_min_points":0}}"#,
+        ] {
+            let c = Config::from_json(json).unwrap();
+            assert_eq!(c.convert.tdf_min_points, TDF_MIN_POINTS_AUTO, "{json}");
+            assert!(
+                c.canonical_json().contains(r#""tdf_min_points":0"#),
+                "{json}"
+            );
+        }
+        let mut c = Config::from_json(r#"{"convert":{"tdf_min_points":"auto"}}"#).unwrap();
+        c.convert.tdf_min_points = 1;
+        assert_eq!(c.canonical_json(), Config::default().canonical_json());
+        c.convert.tdf_min_points = 2;
+        let two = Config::from_json(r#"{"convert":{"tdf_min_points":2}}"#).unwrap();
+        assert_eq!(c.canonical_json(), two.canonical_json());
     }
 
     /// `extract.ms1_calibrate` keeps `true` and `false` as they were spelled and hashed;

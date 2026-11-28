@@ -138,6 +138,57 @@ Reader scope: timsrust 0.4.2 classifies frames by `MsMsType` only. Synchro-PASEF
 slice-PASEF, and older TDF compression, are untested. Only Ultra 2 E. coli and HYE runs have been
 searched end to end; a timsTOF Pro run has only been converted.
 
+### Automatic centroid floor
+
+`convert.tdf_min_points = "auto"` (also written `0`) is an opt-in that chooses the floor per
+search: 1, which keeps single ion events, on low-load runs, where they are most of the fragment
+signal, and 2, which drops them, on high-load runs, where they mostly cost memory and wall. `run`
+and `run-experiment` decide before the configuration is hashed. They decode 256 MS2 frames of
+each diaPASEF run, spread evenly over the run and centroided with the run's settings
+(`tdf::load`, a few seconds per run), and take the share of the MS2 intensity that lies in
+single ion events (centroids of one raw point). When the median of that share over the runs is
+below 0.5, the floor is 2 for every run of the search; otherwise it is 1. An experiment gets one
+floor, because the median run decides rather than any single one, so a blank or a failed
+injection does not decide for the rest. The search space decides as well: an imported library of
+more than 100 M precursors (read from its parquet footer), or a library built from the FASTA with
+`digest.enzyme = "non_specific"`, gets 2 whatever the load. That is the immunopeptidomics case:
+non-specific libraries hold 309-379 M precursors against 14.7 M for the tryptic HYE library, and
+HLA-I runs can sit on the low-load side of the intensity share. On the synthetic HLA-I pool with a
+379 M-precursor library, 2 (0.13.0) gave 1,368 peptides per run at a 195 GB peak, while 1
+(0.16.0) raised the seed PSMs from 496k to 772k, cut the confident seed anchors of one run from
+203 to 0, and was stopped at 407 GB: in such a search space single ion events add noise faster
+than signal. The resolved value is what the configuration hashes and
+the spectra reports record, so a search that resolves to 1 is the default search byte for byte.
+The log names the measure, the threshold, the search-space reason when there is one, and the
+choice, and the manifest records them with every run's load under `tdf_min_points_auto`. A
+standalone `mumdia convert` decides on its one run's load alone, since it does not see the
+library. `mumdia peak-census` reports the load (`tdf_load`) and what `"auto"` would choose for the
+file (`tdf_min_points_auto`). Without 1/K0 the key resolves to 1, which nothing reads.
+
+The measure, on two runs per set (one for the entrapment run):
+
+| set | single-ion share of MS2 intensity | single-ion share of centroids | `"auto"` |
+|---|---:|---:|---:|
+| 200 pg HeLa, timsTOF Pro | 0.83-0.89 | 0.97-0.98 | 1 |
+| its blanks | 0.84-0.85 | 0.98 | 1 |
+| 1 ng HeLa/E. coli, timsTOF Pro 2 | 0.81-0.85 | 0.95 | 1 |
+| 250 pg HYE, 5-min Ultra | 0.80-0.81 | 0.92 | 1 |
+| single-cell HeLa, three plates (13, 52 and 71 cells) | 0.72-0.81 | 0.92-0.95 | 1 |
+| ProteoBench HYE | 0.39-0.41 | 0.82 | 2 |
+| 60-min A549/K562, timsTOF Pro | 0.31-0.32 | 0.79-0.81 | 2 |
+| E. coli entrapment, 15-min Ultra 2 | 0.35 | 0.79 | 2 |
+| 50 ng HYE, 5-min Ultra 2 | 0.24 | 0.73-0.74 | 2 |
+| synthetic HLA-I pool, 90-min Ultra (379 M-precursor library) | 0.15-0.16 | 0.73 | 2 |
+| HLA-I of A375, timsTOF SCP | 0.40 | 0.83 | 2 |
+| HLA-I of HeLa with and without Listeria, timsTOF SCP (309 M-precursor library) | 0.55-0.64 | 0.83-0.88 | 2, by the library |
+
+The intensity share separates the two groups more widely than the share of centroids, the MS2
+centroids per spectrum or the summed intensity per spectrum; the last two overlap between the
+250 pg Ultra runs and the HLA-I pool. The threshold sits closer to the bulk side because the
+two errors do not cost the same: 2 on a low-input run lost 18-74% of the precursors per run
+(section 11, "Low input"), 1 on a bulk run costs memory and wall. The single-cell plates resolve
+to 1, so `"auto"` does not address their memory. Not yet measured end to end with seeds and entrapment, so it stays opt-in.
+
 ### Artifacts and provenance
 
 The spectra and isolation-window artifacts of a diaPASEF run are v2 (`artifact::spectra_ms1`,
