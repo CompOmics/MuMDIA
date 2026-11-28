@@ -432,12 +432,9 @@ one store; with pieces that copied the tail at every piece, quadratic in small p
 runs that share no candidate, with nothing gathered yet out of any but the first, are now
 chained part by part instead (`HitAcc::compact`), which reads the same.
 
-**Default.** Unset is `auto`: a quarter of the machine's memory (`memlog::total_memory`,
-the cgroup limit when tighter), looked up only once a batch is estimated past 4 GiB, divided
-among the bands in flight under `groups.parallel`; `0` is off. The quarter leaves room for
-the estimate reading about two times low on diaPASEF (the table above), the library, the
-spectra and the chromatogram buffers. Every run whose largest batch is within it is planned
-as before, so it changes nothing there, not even the schedule. A batch cut to the budget logs
+**Default.** Unset (or `0`) is off: the key binds only where it is set, or where
+`extract.memory_budget_gib` derives it ("Memory budget" below). A batch within the budget is
+planned as before, not even the schedule changes. A batch cut to the budget logs
 `extract: batch cut to the hit budget` with the pieces and waves.
 
 **Measured** (2026-11-26, standalone `mumdia extract` at 48 threads on a shared 256-CPU
@@ -463,6 +460,58 @@ the batches into 6 to 17 waves. End to end, the same run through `mumdia run` (N
 `psms_scored`, quant tables and TSV reports as main (32,510 peptides, 35,590 precursors), at a
 process peak of 11.9 GB against 16.9 GB. The CI smoke (`ci/smoke.sh`, where the budget is inert) wrote
 the same 2,330 parquet and TSV files with both builds, three runs each.
+
+### Memory budget
+
+**What the estimate left out.** The footprint estimate is the hit store alone, and the
+0.16.0 sweep's process-tree traces (one sample a minute, matched to the stage intervals)
+put every traced peak in extract at 1.4 to 2.9 times it. Two terms make the difference:
+
+- what extract loads before it probes a peak: the library (`library steady state`), the MS2
+  and MS1 spectra, the RT and 1/K0 windows (48 bytes a candidate) and the allowlist. On a
+  14.7-million-candidate library that is about 6 GiB per single-cell extraction and 19 GiB per
+  60-min bulk run (15.5 GiB of spectra); on the 379-million-candidate HLA library it is 91 GiB
+  (63 GiB library, 17 GiB windows, 11 GiB spectra), which is the 106 GB floor the HLA trace
+  returned to between batches;
+- the matches the estimate reads low: the largest batch of an extraction collected, median per
+  experiment, 1.67 (41 single cells), 2.07 (27 single cells) and 1.73 (20 bulk runs) times the
+  estimate, all diaPASEF (the 3D layouts of the table above, about 1.15).
+
+The chromatogram and PSM buffers are small beside both (the largest chromatogram chunk in
+flight was 0.07 GiB). The corrected estimate is therefore
+
+```text
+corrected = loaded bytes + 20 bytes * FOOTPRINT_UNDERREAD (2) * resident matches
+```
+
+logged on every run beside the old one (`extract: estimated hit store`, `loaded_gib`,
+`corrected_gib`).
+
+**The budget.** `extract.memory_budget_gib` sets what the extraction may hold. Once the
+loaded bytes are known, the rest of the budget becomes the hit budget (the smaller of the two
+when `hit_budget_gib` is set too; never below 0.5 GiB), and the driver reads the estimate two
+times higher until a batch has measured the ratio, then at the most matches per estimated
+match any batch has collected (never below 1). The budget bounds the matches, so the tables are
+those of the unbudgeted run byte for byte ("Bounded hit memory"). It does not lower
+`windows_in_flight`, which would be the obvious lever: the chromatogram row groups follow the
+flush batches, and a batch of fewer windows moves them (docs/24 on `windows_in_flight`).
+
+The budget is the process's extractions together. A number is split among the run-experiment
+chains in flight (`parallel_runs`, explicit or `"auto"`, `sched::ChainsInFlight`) and the
+`groups.parallel` bands; `"auto"` is 0.7 of what the process holds plus what the system or the
+process's memory cgroup still has (`sched::memory_reading`, the machine's memory where it
+cannot be read), split the same way. Under the budget the footprint guard compares the
+corrected estimate with it: past a number it refuses, naming the loaded bytes and the matches;
+past `"auto"` it warns and extracts with the smallest hit budget. That happens only when the
+loaded bytes themselves fill the budget, a per-peak `peak_claim` keeps a window whole, or a path
+holds the whole run. Unset (or `0`) is off and changes nothing; the key is not part of the
+canonical configuration.
+
+Every streamed batch logs `extract: batch probed`: its windows, the estimated and the collected
+matches, the hit budget it was planned with, and the process's resident memory and high-water
+mark after it (Linux).
+
+**Measured:** pending (gate campaign arms `MBoff` / `MB64` / `MB8` / `MB280`).
 
 ### 1. Matcher and mass recalibration
 
@@ -1602,7 +1651,8 @@ declutter" commit: `extract.scan_window_mode` (and the `ScanWindowMode` enum),
 | Field | Default | Effect |
 |---|---|---|
 | `max_footprint_gib` | unset (`auto`) | Refuse an extraction whose estimated hit store passes this many GiB; `auto` is the machine's memory, `0` is off. See "The footprint guard" |
-| `hit_budget_gib` | unset (`auto`) | Probe a batch estimated past this many GiB of matches in pieces and waves that fit it, with byte-identical tables; `auto` is a quarter of the machine's memory, `0` is off. See "Bounded hit memory" |
+| `hit_budget_gib` | unset (off) | Probe a batch estimated past this many GiB of matches in pieces and waves that fit it, with byte-identical tables. See "Bounded hit memory" |
+| `memory_budget_gib` | unset (off) | Bound the whole extraction (loaded bytes plus matches) to this many GiB, or `"auto"` (0.7 of the memory the process can count on), shared among the chains and bands in flight; byte-identical tables. See "Memory budget" |
 | `fixed_scan_window` | 2 (3 before 2026-10-08) | Minimum co-elution run length (`scan_window` floor); `.max(1)` at `extract.rs:1591` |
 | `frag_tol_ppm` | 20.0 | Fragment match tolerance (overridden by `mass_cal`) |
 | `prec_tol_ppm` | unset: 3.0, and 10.0 on spectra with per-peak 1/K0 (20.0 before 2026-10-08; 3.0 on 1/K0 spectra until 0.15.1) | MS1 isotope integration tolerance, centred on the offset `ms1_calibrate` learns from the seed |

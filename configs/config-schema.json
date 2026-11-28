@@ -1897,7 +1897,20 @@
       "optional": true,
       "default": "null",
       "default_text": "null",
-      "help": "Bound the fragment-peak matches the streamed extraction holds at once to about this many GiB (docs/09_extract.md, \"Bounded hit memory\"). When a batch of `windows_in_flight` is estimated (as for `max_footprint_gib`) to hold more, its candidate sub-ranges are cut into smaller pieces and probed in waves that fit the budget, each finished before the next starts. Every table is the same byte for byte at any budget: the candidates are written in the same batches, so only the memory and the wall clock change. Unset (the default) is `auto`: a quarter of the machine's memory (as `max_footprint_gib` reads it), looked up only once a batch is estimated past 4 GiB; `0` turns the bound off. Under `groups.parallel` each band in flight gets its share. The floor is one candidate per piece, and under a per-peak `peak_claim` (`winner_predicted_intensity`, `proportional`) one window, which is not cut. Not part of the canonical configuration.",
+      "help": "Bound the fragment-peak matches the streamed extraction holds at once to about this many GiB (docs/09_extract.md, \"Bounded hit memory\"). When a batch of `windows_in_flight` is estimated (as for `max_footprint_gib`) to hold more, its candidate sub-ranges are cut into smaller pieces and probed in waves that fit the budget, each finished before the next starts. Every table is the same byte for byte at any budget: the candidates are written in the same batches, so only the memory and the wall clock change. Unset (the default) or `0`: no bound of its own, only the one `memory_budget_gib` derives. Under `groups.parallel` each band in flight gets its share. The floor is one candidate per piece, and under a per-peak `peak_claim` (`winner_predicted_intensity`, `proportional`) one window, which is not cut. Not part of the canonical configuration.",
+      "gates": [],
+      "source_struct": "ExtractConfig"
+    },
+    {
+      "path": "extract.memory_budget_gib",
+      "name": "memory_budget_gib",
+      "section": "extract",
+      "rust_type": "MemoryBudget",
+      "kind": "other",
+      "optional": false,
+      "default": "0",
+      "default_text": "`0`",
+      "help": "Bound the whole extraction's resident memory, not only its hit store, to this many GiB (docs/09_extract.md, \"Memory budget\"). Once the library, the spectra and the RT windows are loaded their bytes are known, and the rest of the budget becomes the hit budget (`hit_budget_gib`, the smaller of the two when both are set), read against twice the estimated matches until a batch has measured how far the estimate reads low. The footprint guard then compares the corrected estimate (what is loaded plus the bounded hit store) with the budget. Every table is the same byte for byte: only the memory and the wall clock change. The budget is the process's extractions together: each takes its share of the run-experiment chains and the `groups.parallel` bands in flight. `\"auto\"`: 0.7 of the memory the process can count on (what it holds plus what the system or its cgroup still has). A corrected estimate past an `auto` budget is a warning, past a number a refusal. Unset (the default) or `0`: off, as before. Not part of the canonical configuration.",
       "gates": [],
       "source_struct": "ExtractConfig"
     },

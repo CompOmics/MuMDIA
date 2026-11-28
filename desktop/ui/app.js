@@ -796,6 +796,7 @@ const LOCAL_SETTINGS = new Set([
   "extract.windows_in_flight",
   "extract.max_footprint_gib",
   "extract.hit_budget_gib",
+  "extract.memory_budget_gib",
   "features.chrom_loaders",
   "rescore.max_feature_matrix_gib",
   "rt_im_train.deeplc_predict_shards",

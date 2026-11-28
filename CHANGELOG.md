@@ -244,7 +244,32 @@ than a number. Both are recorded in every run's `manifest.json`.
   before the search starts, names the files it does not recognise as ZT Scan runs, and points to
   another preset: the engine runs the ZT Scan analysis by itself for ZT Scan files under any
   preset.
+
 ### Added
+
+- **`extract.memory_budget_gib` and `extract.hit_budget_gib`: extract's memory bounded by a
+  budget, with every table the same file (docs/09, "Memory budget" and "Bounded hit memory";
+  supersedes the draft #385).** The streamed extraction probed a batch of `windows_in_flight`
+  windows as one set of tasks, and the stores of the later candidate sub-ranges waited for the
+  earlier ones, so it held about the whole batch: memory grew with the windows in flight times
+  their candidates times the peaks inside each candidate's RT window, which single-ion
+  centroids and seeds without anchors multiplied on diaPASEF. `hit_budget_gib` cuts a batch
+  estimated past it into pieces of its sub-ranges, probed in waves that fit; a piece flushes
+  full batches of candidates only, so the flush calls, and with them every table, are those of
+  the uncut batch. `memory_budget_gib` bounds the whole stage: once the library, the spectra
+  and the RT windows are loaded their bytes are known, and the rest of the budget becomes the
+  hit budget, read against twice the estimated matches until a batch has measured the ratio.
+  The footprint estimate missed exactly those two terms: on the 0.16.0 sweep's process-tree
+  traces the measured peak was 1.4-2.9 times the estimate, the loaded bytes were 6-91 GiB per
+  extraction (91 GiB for a 379-million-candidate HLA library) and the largest batch
+  collected 1.67-2.07 times the estimated matches on three diaPASEF experiments. The guard now
+  logs and compares the corrected estimate (loaded bytes plus twice the matches). `"auto"` is
+  0.7 of the memory the process can count on (cgroup aware), and a budget, explicit or not, is
+  shared among the run-experiment chains and `groups.parallel` bands in flight. Both keys are
+  off by default and outside the canonical configuration; every batch now logs its estimated
+  and collected matches and the process's resident memory (`extract: batch probed`). Open:
+  `parallel_runs = "auto"` still sizes the chains from a measured step, not from extract's
+  estimate.
 
 - **`rt_im_train.fallback_windows`: bounded windows for a run whose seed found no anchors
   (docs/08 section 4i, docs/17 "Seed: no confident targets").** `unbounded` keeps every
@@ -420,17 +445,6 @@ than a number. Both are recorded in every run's `manifest.json`.
   seeds). The diaPASEF recipe keeps `extract.presence_min_coelution` 1, and the rescore
   prefilter's best-column fallback stays. A diaPASEF search read natively from a Bruker `.d`
   finds and quantifies differently from 0.15.0; a search without 1/K0 is unaffected.
-- **extract holds at most about `extract.hit_budget_gib` of fragment-peak matches at once
-  (docs/09, "Bounded hit memory").** The streamed extraction probed a batch of
-  `windows_in_flight` windows as one set of tasks, and the stores of the later candidate
-  sub-ranges waited for the earlier ones, so it held about the whole batch: memory grew with
-  the windows in flight times their candidates times the peaks inside each candidate's RT
-  window, which is what single-ion centroids and seeds without anchors multiplied on
-  diaPASEF. A batch estimated past the budget is now cut into pieces of its sub-ranges and
-  probed in waves that fit it. A piece flushes full batches of candidates only, so every
-  table is the same file at any budget; only the memory and the wall clock change. Unset is
-  `auto`, a quarter of the machine's memory, which leaves every batch within it planned as
-  before; `0` is off. The footprint estimate reports the bounded store.
 
 ### Fixed
 
