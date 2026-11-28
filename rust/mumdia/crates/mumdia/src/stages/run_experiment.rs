@@ -1296,8 +1296,12 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     resolved.resolve_prec_tol_ppm(p.mzmls.iter().all(|m| crate::instrument::input_has_im(m)));
     // `convert.tdf_min_points = "auto"` resolves once for the experiment, on the median MS2
     // load of its diaPASEF runs, so every run is converted with one centroid floor.
-    let tdf_min_points_auto =
-        crate::stages::convert::resolve_tdf_min_points(&mut resolved, p.mzmls, "run-experiment")?;
+    let tdf_min_points_auto = crate::stages::convert::resolve_tdf_min_points(
+        &mut resolved,
+        p.mzmls,
+        p.lib_precursors,
+        "run-experiment",
+    )?;
     // The ZT Scan analysis resolves once for the experiment as well, so every run is scored
     // with one feature set: on when every run is a SCIEX ZT Scan DIA run, off otherwise, with a
     // warning when only some are (`ztscan`, docs/37_ztscan.md, "Automatic for ZT Scan files").

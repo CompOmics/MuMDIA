@@ -469,7 +469,9 @@ pub struct ConvertConfig {
     /// `run-experiment` decode a sample of each diaPASEF run's MS2 frames before the
     /// configuration is hashed and keep single ion events (1) on low-load runs, where they are
     /// most of the fragment signal, and drop them (2) on high-load runs, where they cost
-    /// memory and wall for few identifications. One value for every run of an experiment;
+    /// memory and wall for few identifications, and in a search space of more than 100 M
+    /// library precursors or a non-specific digest (immunopeptidomics), where they cost the
+    /// seed its anchors. One value for every run of an experiment;
     /// the measure, threshold and choice are logged and recorded in the manifest
     /// (`tdf_min_points_auto`), and the resolved value is what the configuration hashes and
     /// the spectra reports record (docs/35_diapasef.md, "Automatic centroid floor").

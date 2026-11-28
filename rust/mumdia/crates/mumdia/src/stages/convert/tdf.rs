@@ -995,19 +995,32 @@ impl TdfLoad {
 /// 18-74% of the precursors, 1 on a bulk run costs memory and wall.
 pub const AUTO_SINGLE_ION_INTENSITY_SHARE: f64 = 0.5;
 
+/// `convert.tdf_min_points = "auto"` chooses 2, whatever the load, for a search whose library
+/// holds more precursors than this (or, built from the FASTA, digests non-specifically).
+///
+/// Immunopeptidomics searches are the case: non-specific libraries of 309-379 M precursors
+/// against 14.7 M for the tryptic HYE library, and runs that can sit on the low-load side of
+/// the intensity share (0.55-0.64 on two timsTOF SCP HLA-I runs). On a 379 M-precursor HLA-I
+/// search, 2 (0.13.0) gave 1,368 peptides per run at 195 GB; 1 (0.16.0) cut the confident seed
+/// anchors of one run from 203 to 0 and stopped at 407 GB.
+pub const AUTO_LIBRARY_PRECURSORS: u64 = 100_000_000;
+
 /// What `convert.tdf_min_points = "auto"` chose for a search, and on what.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MinPointsAuto {
     pub min_points: u32,
     /// The median over the runs of [`TdfLoad::single_ion_intensity_share`].
     pub measure: f64,
     pub threshold: f64,
+    /// Why the search space alone decided for 2 ([`AUTO_LIBRARY_PRECURSORS`]), if it did.
+    pub large_search_space: Option<String>,
 }
 
 /// The floor `"auto"` chooses for runs of these loads: one value for every run, from the
 /// median run, so one outlying run (a blank, a failed injection) does not decide for the
-/// rest. No load (no diaPASEF run) keeps the default 1.
-pub fn auto_min_points(loads: &[TdfLoad]) -> MinPointsAuto {
+/// rest; 2 whatever the load when `large_search_space` names a reason. No load (no
+/// diaPASEF run) keeps the default 1, which nothing else reads.
+pub fn auto_min_points(loads: &[TdfLoad], large_search_space: Option<String>) -> MinPointsAuto {
     let mut v: Vec<f64> = loads
         .iter()
         .map(TdfLoad::single_ion_intensity_share)
@@ -1018,14 +1031,14 @@ pub fn auto_min_points(loads: &[TdfLoad]) -> MinPointsAuto {
         n if n % 2 == 1 => v[n / 2],
         n => (v[n / 2 - 1] + v[n / 2]) / 2.0,
     };
+    let large_search_space = large_search_space.filter(|_| !v.is_empty());
+    let two = !v.is_empty()
+        && (measure < AUTO_SINGLE_ION_INTENSITY_SHARE || large_search_space.is_some());
     MinPointsAuto {
-        min_points: if measure < AUTO_SINGLE_ION_INTENSITY_SHARE {
-            2
-        } else {
-            1
-        },
+        min_points: if two { 2 } else { 1 },
         measure,
         threshold: AUTO_SINGLE_ION_INTENSITY_SHARE,
+        large_search_space,
     }
 }
 
@@ -1233,20 +1246,37 @@ mod tests {
     #[test]
     fn auto_min_points_decides_on_the_median_single_ion_intensity_share() {
         let t = AUTO_SINGLE_ION_INTENSITY_SHARE;
-        assert_eq!(auto_min_points(&[]).min_points, 1);
-        assert_eq!(auto_min_points(&[load_of(t)]).min_points, 1);
-        assert_eq!(auto_min_points(&[load_of(t - 0.01)]).min_points, 2);
-        assert_eq!(auto_min_points(&[load_of(0.99)]).min_points, 1);
+        let mp = |l: &[TdfLoad]| auto_min_points(l, None).min_points;
+        assert_eq!(mp(&[]), 1);
+        assert_eq!(mp(&[load_of(t)]), 1);
+        assert_eq!(mp(&[load_of(t - 0.01)]), 2);
+        assert_eq!(mp(&[load_of(0.99)]), 1);
         // One outlying run does not decide for the rest, in either direction.
         let low = [load_of(0.8), load_of(0.75), load_of(0.2)];
-        assert_eq!(auto_min_points(&low).min_points, 1);
+        assert_eq!(mp(&low), 1);
         let bulk = [load_of(0.15), load_of(0.4), load_of(0.9)];
-        let d = auto_min_points(&bulk);
+        let d = auto_min_points(&bulk, None);
         assert_eq!((d.min_points, d.measure, d.threshold), (2, 0.4, t));
         // An even count takes the mean of the middle two, whatever the input order.
-        let even = auto_min_points(&[load_of(0.8), load_of(0.2), load_of(0.4), load_of(0.7)]);
+        let even = auto_min_points(
+            &[load_of(0.8), load_of(0.2), load_of(0.4), load_of(0.7)],
+            None,
+        );
         assert!((even.measure - 0.55).abs() < 1e-12);
         assert_eq!(even.min_points, 1);
+    }
+
+    /// A large search space (an immunopeptidomics library) decides for 2 on low-load runs
+    /// too, and is moot without a diaPASEF run.
+    #[test]
+    fn a_large_search_space_decides_for_two_on_any_load() {
+        let why = || Some("the library holds 379312896 precursors".to_string());
+        let d = auto_min_points(&[load_of(0.64), load_of(0.55)], why());
+        assert_eq!(d.min_points, 2);
+        assert!(d.measure > AUTO_SINGLE_ION_INTENSITY_SHARE);
+        assert_eq!(d.large_search_space, why());
+        let none = auto_min_points(&[], why());
+        assert_eq!((none.min_points, none.large_search_space), (1, None));
     }
 
     #[test]

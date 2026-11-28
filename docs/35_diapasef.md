@@ -149,11 +149,20 @@ each diaPASEF run, spread evenly over the run and centroided with the run's sett
 single ion events (centroids of one raw point). When the median of that share over the runs is
 below 0.5, the floor is 2 for every run of the search; otherwise it is 1. An experiment gets one
 floor, because the median run decides rather than any single one, so a blank or a failed
-injection does not decide for the rest. The resolved value is what the configuration hashes and
+injection does not decide for the rest. The search space decides as well: an imported library of
+more than 100 M precursors (read from its parquet footer), or a library built from the FASTA with
+`digest.enzyme = "non_specific"`, gets 2 whatever the load. That is the immunopeptidomics case:
+non-specific libraries hold 309-379 M precursors against 14.7 M for the tryptic HYE library, and
+HLA-I runs can sit on the low-load side of the intensity share. On the synthetic HLA-I pool with a
+379 M-precursor library, 2 (0.13.0) gave 1,368 peptides per run at a 195 GB peak, while 1
+(0.16.0) raised the seed PSMs from 496k to 772k, cut the confident seed anchors of one run from
+203 to 0, and was stopped at 407 GB: in such a search space single ion events add noise faster
+than signal. The resolved value is what the configuration hashes and
 the spectra reports record, so a search that resolves to 1 is the default search byte for byte.
-The log names the measure, the threshold and the choice, and the manifest records them with
-every run's load under `tdf_min_points_auto`. A standalone `mumdia convert` decides on its one
-run. `mumdia peak-census` reports the load (`tdf_load`) and what `"auto"` would choose for the
+The log names the measure, the threshold, the search-space reason when there is one, and the
+choice, and the manifest records them with every run's load under `tdf_min_points_auto`. A
+standalone `mumdia convert` decides on its one run's load alone, since it does not see the
+library. `mumdia peak-census` reports the load (`tdf_load`) and what `"auto"` would choose for the
 file (`tdf_min_points_auto`). Without 1/K0 the key resolves to 1, which nothing reads.
 
 The measure, on two runs per set (one for the entrapment run):
@@ -169,7 +178,9 @@ The measure, on two runs per set (one for the entrapment run):
 | 60-min A549/K562, timsTOF Pro | 0.31-0.32 | 0.79-0.81 | 2 |
 | E. coli entrapment, 15-min Ultra 2 | 0.35 | 0.79 | 2 |
 | 50 ng HYE, 5-min Ultra 2 | 0.24 | 0.73-0.74 | 2 |
-| synthetic HLA-I pool, 90-min Ultra | 0.15-0.16 | 0.73 | 2 |
+| synthetic HLA-I pool, 90-min Ultra (379 M-precursor library) | 0.15-0.16 | 0.73 | 2 |
+| HLA-I of A375, timsTOF SCP | 0.40 | 0.83 | 2 |
+| HLA-I of HeLa with and without Listeria, timsTOF SCP (309 M-precursor library) | 0.55-0.64 | 0.83-0.88 | 2, by the library |
 
 The intensity share separates the two groups more widely than the share of centroids, the MS2
 centroids per spectrum or the summed intensity per spectrum; the last two overlap between the

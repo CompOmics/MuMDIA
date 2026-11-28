@@ -192,6 +192,7 @@ pub fn run(p: RunParams) -> Result<()> {
     let tdf_min_points_auto = crate::stages::convert::resolve_tdf_min_points(
         &mut resolved,
         &[p.mzml.to_string()],
+        p.lib_precursors,
         "run",
     )?;
     // The ZT Scan analysis resolves on the input as well: on for a SCIEX ZT Scan DIA run,
