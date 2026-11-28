@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 use anyhow::Result;
-use mumdia_core::config::{ExtractConfig, GateMode, PeakClaim};
+use mumdia_core::config::{ExtractConfig, GateMode, MemoryBudget, PeakClaim};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
 use mumdia_io::table::{
@@ -2276,7 +2276,8 @@ fn window_loads(
         .collect()
 }
 
-/// What extract's hit store is estimated to hold ([`window_loads`]).
+/// What extract's hit store is estimated to hold ([`window_loads`]), and the whole stage
+/// beside it.
 #[derive(Clone, Debug)]
 struct Footprint {
     loads: Vec<WindowLoad>,
@@ -2284,15 +2285,60 @@ struct Footprint {
     /// streamed path (under the hit budget, at most about the budget), every window's on the
     /// paths that accumulate the whole run.
     resident_hits: f64,
+    /// The same with every window's estimate read [`FOOTPRINT_UNDERREAD`] times higher, in
+    /// matches the probing actually collects.
+    corrected_hits: f64,
     total_hits: f64,
     streamed: bool,
     in_flight: usize,
     ms2_scans: usize,
     /// The streamed path's hit budget in matches ([`hit_budget`]), `None` without one.
     budget_hits: Option<f64>,
+    /// What is loaded before the probing starts ([`loaded_bytes`]).
+    loaded: f64,
+    /// The memory budget, in bytes, and whether it is `"auto"` ([`memory_budget`]).
+    memory: Option<(f64, bool)>,
+}
+
+/// The matches the probing holds at once over `loads` with every window's estimate times
+/// `scale`: the largest batch of `in_flight` consecutive window groups on the streamed path,
+/// every window's otherwise. A batch past `budget_hits` holds the budget, or its widest task
+/// when that cannot be cut (a whole window under a per-peak claim), plus the short tail of up
+/// to `CAND_CHUNK` candidates a piece leaves for the next (`accumulate_groups`).
+fn resident_hits_of(
+    loads: &[WindowLoad],
+    streamed: bool,
+    in_flight: usize,
+    budget_hits: Option<f64>,
+    per_peak_claim: bool,
+    scale: f64,
+) -> f64 {
+    if !streamed {
+        return scale * loads.iter().map(|l| l.hits).sum::<f64>();
+    }
+    loads
+        .chunks(in_flight.max(1))
+        .map(|b| {
+            let sum = scale * b.iter().map(|l| l.hits).sum::<f64>();
+            match budget_hits {
+                Some(h) if sum > h => {
+                    let per_cand = |l: &WindowLoad| l.hits / l.candidates.max(1) as f64;
+                    let widest = if per_peak_claim {
+                        b.iter().map(|l| l.hits).fold(0.0, f64::max)
+                    } else {
+                        0.0
+                    };
+                    let tail = CAND_CHUNK as f64 * b.iter().map(per_cand).fold(0.0, f64::max);
+                    h.max(scale * widest) + scale * tail
+                }
+                _ => sum,
+            }
+        })
+        .fold(0.0, f64::max)
 }
 
 impl Footprint {
+    #[allow(clippy::too_many_arguments)]
     fn of(
         loads: Vec<WindowLoad>,
         streamed: bool,
@@ -2300,45 +2346,39 @@ impl Footprint {
         ms2_scans: usize,
         budget_hits: Option<f64>,
         per_peak_claim: bool,
+        loaded: f64,
+        memory: Option<(f64, bool)>,
     ) -> Self {
         let total_hits: f64 = loads.iter().map(|l| l.hits).sum();
-        // The batches the streamed driver probes: `in_flight` consecutive window groups. A
-        // batch past the budget holds the budget, or its widest task when that cannot be
-        // cut (a whole window under a per-peak claim), plus the short tail of up to
-        // `CAND_CHUNK` candidates a piece leaves for the next (`accumulate_groups`).
-        let resident_hits = if streamed {
-            loads
-                .chunks(in_flight.max(1))
-                .map(|b| {
-                    let sum = b.iter().map(|l| l.hits).sum::<f64>();
-                    match budget_hits {
-                        Some(h) if sum > h => {
-                            let per_cand = |l: &WindowLoad| l.hits / l.candidates.max(1) as f64;
-                            let widest = if per_peak_claim {
-                                b.iter().map(|l| l.hits).fold(0.0, f64::max)
-                            } else {
-                                0.0
-                            };
-                            let tail =
-                                CAND_CHUNK as f64 * b.iter().map(per_cand).fold(0.0, f64::max);
-                            h.max(widest) + tail
-                        }
-                        _ => sum,
-                    }
-                })
-                .fold(0.0, f64::max)
-        } else {
-            total_hits
+        let at = |scale| {
+            resident_hits_of(
+                &loads,
+                streamed,
+                in_flight,
+                budget_hits,
+                per_peak_claim,
+                scale,
+            )
         };
+        let (resident_hits, corrected_hits) = (at(1.0), at(FOOTPRINT_UNDERREAD));
         Footprint {
             loads,
             resident_hits,
+            corrected_hits,
             total_hits,
             streamed,
             in_flight,
             ms2_scans,
             budget_hits,
+            loaded,
+            memory,
         }
+    }
+
+    /// The whole stage, corrected: what is loaded plus the matches the probing is expected
+    /// to hold at once (docs/09_extract.md, "Memory budget").
+    fn corrected_bytes(&self) -> f64 {
+        self.loaded + self.corrected_hits * FOOTPRINT_HIT_BYTES
     }
 
     fn resident_bytes(&self) -> f64 {
@@ -2371,36 +2411,110 @@ fn footprint_ceiling(cfg: &ExtractConfig, estimate: f64) -> Option<(f64, String)
     }
 }
 
-/// The share of the machine's memory the `auto` hit budget takes. The estimate reads up to
-/// about two times low on diaPASEF (docs/09_extract.md, "The footprint guard"), and the
-/// library, the spectra and the chromatogram buffers come on top.
-const HIT_BUDGET_AUTO_SHARE: f64 = 0.25;
-
-/// The streamed path's hit budget (`extract.hit_budget_gib`) in matches, this band's share
-/// of `sibling_bands`: `None` when it is off (0), or under `auto` while no batch of
-/// `in_flight` windows is estimated past [`FOOTPRINT_AUTO_FLOOR_GIB`] or the machine's
-/// memory cannot be read.
+/// The streamed path's hit budget in matches, this band's share of `sibling_bands`: the
+/// smaller of `extract.hit_budget_gib` and what `memory` (the memory budget, in bytes, this
+/// band's share already) leaves beside the `loaded` bytes, never below
+/// [`MEMORY_BUDGET_MIN_HITS_GIB`]. `None` when neither is set.
 fn hit_budget(
     cfg: &ExtractConfig,
     sibling_bands: usize,
-    loads: &[WindowLoad],
-    in_flight: usize,
+    memory: Option<f64>,
+    loaded: f64,
 ) -> Option<f64> {
-    let bytes = match cfg.hit_budget_gib {
-        Some(v) if v <= 0.0 => return None,
-        Some(v) => v * GIB,
-        None => {
-            let batch = loads
-                .chunks(in_flight.max(1))
-                .map(|b| b.iter().map(|l| l.hits).sum::<f64>())
-                .fold(0.0, f64::max);
-            if batch * FOOTPRINT_HIT_BYTES < FOOTPRINT_AUTO_FLOOR_GIB * GIB {
-                return None;
-            }
-            crate::memlog::total_memory()? as f64 * HIT_BUDGET_AUTO_SHARE
-        }
+    let own = cfg
+        .hit_budget_gib
+        .filter(|&v| v > 0.0)
+        .map(|v| v * GIB / sibling_bands.max(1) as f64);
+    let left = memory.map(|m| (m - loaded).max(MEMORY_BUDGET_MIN_HITS_GIB * GIB));
+    let bytes = match (own, left) {
+        (Some(a), Some(b)) => a.min(b),
+        (a, b) => a.or(b)?,
     };
-    Some(bytes / sibling_bands.max(1) as f64 / FOOTPRINT_HIT_BYTES)
+    Some(bytes / FOOTPRINT_HIT_BYTES)
+}
+
+/// How many times the estimate's matches a batch is assumed to collect until one has been
+/// measured (`extract.memory_budget_gib`). The estimate reads low wherever the peptides
+/// present match their own fragments more often than chance: the largest batch of an
+/// extract against the estimate's, median per experiment, was 1.67 (41 single cells),
+/// 2.07 (27 single cells) and 1.73 (20 bulk runs), all diaPASEF, and 2.5 on one 50 ng run.
+const FOOTPRINT_UNDERREAD: f64 = 2.0;
+
+/// The least hit store a memory budget leaves the probing, in GiB, when what is loaded
+/// already fills the budget: one candidate per task and one task per wave would leave the
+/// pool idle for no memory worth having. The footprint guard reports the shortfall.
+const MEMORY_BUDGET_MIN_HITS_GIB: f64 = 0.5;
+
+/// The share of the memory this process can count on that an `"auto"` memory budget takes,
+/// before the chains and bands in flight divide it: the share `parallel_runs = "auto"`
+/// fills ([`crate::sched::AUTO_MEMORY_FRACTION`]).
+const MEMORY_BUDGET_AUTO_SHARE: f64 = crate::sched::AUTO_MEMORY_FRACTION;
+
+/// The extraction's memory budget (`extract.memory_budget_gib`) in bytes, this band's share
+/// of `sibling_bands`, and whether it is `"auto"`. `"auto"` is
+/// [`MEMORY_BUDGET_AUTO_SHARE`] of what the process holds plus what the system (or its
+/// cgroup) still has, the machine's memory where that cannot be read, divided by the
+/// run-experiment chains in flight as well. `None` when off, or `"auto"` with no reading.
+fn memory_budget(cfg: &ExtractConfig, sibling_bands: usize) -> Option<(f64, bool)> {
+    let countable = || match crate::sched::memory_reading() {
+        Some(m) => Some(m.resident.saturating_add(m.available)),
+        None => crate::memlog::total_memory(),
+    };
+    memory_budget_of(
+        cfg.memory_budget_gib,
+        sibling_bands,
+        crate::sched::chains_in_flight(),
+        countable,
+    )
+}
+
+/// [`memory_budget`] on a given count of chains in flight and memory reading.
+fn memory_budget_of(
+    setting: MemoryBudget,
+    sibling_bands: usize,
+    chains: usize,
+    countable: impl FnOnce() -> Option<u64>,
+) -> Option<(f64, bool)> {
+    let bands = sibling_bands.max(1) as f64;
+    match setting {
+        MemoryBudget::Off => None,
+        MemoryBudget::Gib(v) => Some((v * GIB / bands, false)),
+        MemoryBudget::Auto => {
+            let share = bands * chains.max(1) as f64;
+            Some((countable()? as f64 * MEMORY_BUDGET_AUTO_SHARE / share, true))
+        }
+    }
+}
+
+/// What the extraction holds before it probes a peak, in payload bytes: the library, the
+/// MS2 and MS1 spectra, the RT and 1/K0 windows and the allowlist. Spectra lent to several
+/// bands are counted by each, which errs towards a smaller hit budget.
+fn loaded_bytes(
+    lib: &Library,
+    scans: &[Ms2Scan],
+    ms1: &[Ms1Scan],
+    win: &RtWindows,
+    restrict: Option<&CandMask>,
+) -> f64 {
+    use crate::memlog::bytes_of;
+    let ms2: usize = scans
+        .iter()
+        .map(|s| bytes_of(&s.peaks) + s.im.as_deref().map_or(0, bytes_of))
+        .sum::<usize>()
+        + bytes_of(scans);
+    let ms1: usize = ms1
+        .iter()
+        .map(|s| bytes_of(&s.mz) + bytes_of(&s.intensity) + s.im.as_deref().map_or(0, bytes_of))
+        .sum::<usize>()
+        + bytes_of(ms1);
+    let windows = bytes_of(&win.rt_cal)
+        + bytes_of(&win.rt_lo)
+        + bytes_of(&win.rt_hi)
+        + win.im_lo.as_deref().map_or(0, bytes_of)
+        + win.im_hi.as_deref().map_or(0, bytes_of)
+        + win.im_cal.as_deref().map_or(0, bytes_of);
+    let mask = restrict.map_or(0, |m| bytes_of(&m.bits));
+    (lib.resident_bytes() + ms2 + ms1 + windows + mask) as f64
 }
 
 /// Log the estimate, and refuse when it passes the ceiling (divided among `sibling_bands`
@@ -2419,8 +2533,52 @@ fn check_footprint(fp: &Footprint, cfg: &ExtractConfig, sibling_bands: usize) ->
             h * FOOTPRINT_HIT_BYTES / GIB
         )),
         busiest_window_scans = busiest.map_or(0, |l| l.scans),
+        loaded_gib = format!("{:.2}", fp.loaded / GIB),
+        corrected_gib = format!("{:.2}", fp.corrected_bytes() / GIB),
+        memory_budget_gib = fp.memory.map_or("off".to_string(), |(b, auto)| format!(
+            "{:.2}{}",
+            b / GIB,
+            if auto { " (auto)" } else { "" }
+        )),
         "extract: estimated hit store"
     );
+    // The memory budget (`extract.memory_budget_gib`): the corrected estimate of the whole
+    // stage against it. Under the budget the hit store is bounded to what the loaded bytes
+    // leave, so only a library and spectra that fill the budget themselves, or a window a
+    // per-peak claim cannot cut, or a path that holds the whole run, can pass it.
+    if let Some((budget, auto)) = fp.memory {
+        if fp.corrected_bytes() > budget {
+            let msg = format!(
+                "extract: this extraction is estimated to hold {:.1} GiB at once ({:.1} GiB \
+                 loaded: the library, the spectra and the RT windows; {:.1} GiB of \
+                 fragment-peak matches), more than extract.memory_budget_gib ({:.1} GiB{}{})",
+                fp.corrected_bytes() / GIB,
+                fp.loaded / GIB,
+                fp.corrected_hits * FOOTPRINT_HIT_BYTES / GIB,
+                budget / GIB,
+                if auto {
+                    ", this extraction's share of the memory the process can count on"
+                } else {
+                    ""
+                },
+                if sibling_bands > 1 {
+                    format!(", this band's share of {sibling_bands} bands in flight")
+                } else {
+                    String::new()
+                },
+            );
+            if auto {
+                warn!("{msg}; extracting with the smallest hit budget");
+            } else {
+                anyhow::bail!(
+                    "{msg}. Raise the budget, search the run in isolation-window groups \
+                     (groups.window_groups), each of which holds a band of the library, or set \
+                     extract.memory_budget_gib to \"auto\" to run past it with a warning \
+                     (docs/09_extract.md, \"Memory budget\")."
+                );
+            }
+        }
+    }
     let bands = sibling_bands.max(1) as f64;
     let Some((ceiling, what)) = footprint_ceiling(cfg, fp.resident_bytes() * bands) else {
         return Ok(());
@@ -4942,20 +5100,24 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     let streamed = !two_pass && stream_bins.is_some();
     // The footprint guard (`extract.max_footprint_gib`): estimate what the hit store will
     // hold at once, and refuse a layout that cannot fit before anything is probed.
-    // The streamed path's hit budget (`extract.hit_budget_gib`) and the estimate per window it
+    // The streamed path's hit budget (`extract.hit_budget_gib`, or what the memory budget
+    // `extract.memory_budget_gib` leaves beside what is loaded) and the estimate per window it
     // plans the batches with.
+    let memory = memory_budget(p.cfg, p.sibling_bands);
     let (budget_hits, load_hits) = {
         let groups = wgroups.as_deref().expect("just built");
         let loads = window_loads(groups, scans, &lib, guard, restrict.as_ref(), frag_tol);
         if win.library_fallback && p.cfg.windows_in_flight.is_none() {
             info!(
                 windows_in_flight = groups_in_flight(p.cfg, has_im, true),
-                "extract: the RT windows are the library fallback of a run without anchors;                  half the default windows in flight"
+                "extract: the RT windows are the library fallback of a run without anchors; \
+                 half the default windows in flight"
             );
         }
         let in_flight = groups_in_flight(p.cfg, has_im, win.library_fallback);
+        let loaded = loaded_bytes(&lib, scans, ms1_scans, &win, restrict.as_ref());
         let budget_hits = streamed
-            .then(|| hit_budget(p.cfg, p.sibling_bands, &loads, in_flight))
+            .then(|| hit_budget(p.cfg, p.sibling_bands, memory.map(|m| m.0), loaded))
             .flatten();
         let load_hits: Vec<f64> = loads.iter().map(|l| l.hits).collect();
         let per_peak_claim = matches!(
@@ -4969,6 +5131,8 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             scans.len(),
             budget_hits,
             per_peak_claim,
+            loaded,
+            memory,
         );
         check_footprint(&fp, p.cfg, p.sibling_bands)?;
         (budget_hits, load_hits)
@@ -6692,8 +6856,18 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             };
             let step = groups_in_flight(p.cfg, has_im, win.library_fallback);
             let mut gi = 0usize;
-            let mut est_scale = 1.0f64;
+            // Matches collected per estimated match: under a memory budget assumed
+            // `FOOTPRINT_UNDERREAD` until a batch has measured it, then the most seen so far
+            // (never below 1, as the hit budget alone has always read it).
+            let prior = if memory.is_some() {
+                FOOTPRINT_UNDERREAD
+            } else {
+                1.0
+            };
+            let mut seen_scale: Option<f64> = None;
+            let mut batch_no = 0usize;
             while gi < groups.len() {
+                let est_scale = seen_scale.unwrap_or(prior).max(1.0);
                 let upto = (gi + step).min(groups.len());
                 // Everything below the next batch's first candidate is final: windows are
                 // processed in ascending m/z and precursors are sorted by m/z, so no later
@@ -6733,8 +6907,25 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 // budget is read against the most matches per estimated match seen so far.
                 let est: f64 = load_hits[gi..upto].iter().sum();
                 if est > 0.0 {
-                    est_scale = est_scale.max(batch_hits as f64 / est);
+                    let r = batch_hits as f64 / est;
+                    seen_scale = Some(seen_scale.map_or(r, |s| s.max(r)));
                 }
+                // Per batch, what the estimate said against what the probing collected, and
+                // the process's resident memory after it (Linux): the calibration of
+                // `FOOTPRINT_UNDERREAD` and of the memory budget.
+                batch_no += 1;
+                let mem = crate::sched::memory_reading();
+                let gib = |b: u64| format!("{:.2}", b as f64 / GIB);
+                info!(
+                    batch = batch_no,
+                    windows = upto - gi,
+                    estimated_hits = est.round() as u64,
+                    hits = batch_hits,
+                    hit_budget = budget_hits.map_or(0, |h| (h / est_scale).round() as u64),
+                    rss_gib = mem.map_or("-".to_string(), |m| gib(m.resident)),
+                    peak_rss_gib = mem.map_or("-".to_string(), |m| gib(m.peak)),
+                    "extract: batch probed"
+                );
                 gi = upto;
                 open_hits_max = open_hits_max.max(acc_stream.n_hits());
                 batch_hits_max = batch_hits_max.max(batch_hits);
@@ -8467,39 +8658,116 @@ mod accumulate_tests {
         };
         let loads = || vec![load(4e8), load(2e8), load(1e8), load(1e8)];
         let fp = |budget: Option<f64>, per_peak: bool| {
-            Footprint::of(loads(), true, 2, 400, budget, per_peak).resident_hits
+            Footprint::of(loads(), true, 2, 400, budget, per_peak, 0.0, None)
         };
-        assert_eq!(fp(None, false), 6e8, "the largest batch of two");
-        assert_eq!(fp(Some(1e9), false), 6e8, "within the budget");
+        assert_eq!(
+            fp(None, false).resident_hits,
+            6e8,
+            "the largest batch of two"
+        );
+        assert_eq!(fp(Some(1e9), false).resident_hits, 6e8, "within the budget");
         let tail = CAND_CHUNK as f64 * 4e8 / 1e5;
-        assert_eq!(fp(Some(1e8), false), 1e8 + tail, "the budget plus a tail");
-        assert_eq!(fp(Some(1e8), true), 4e8 + tail, "a window is not cut");
-        let unbudgeted = Footprint::of(loads(), false, 2, 400, Some(1e8), false);
+        assert_eq!(
+            fp(Some(1e8), false).resident_hits,
+            1e8 + tail,
+            "the budget plus a tail"
+        );
+        assert_eq!(
+            fp(Some(1e8), true).resident_hits,
+            4e8 + tail,
+            "a window is not cut"
+        );
+        let unbudgeted = Footprint::of(loads(), false, 2, 400, Some(1e8), false, 0.0, None);
         assert_eq!(
             unbudgeted.resident_hits, 8e8,
             "the whole run off the streamed path"
+        );
+        // The corrected estimate reads every window `FOOTPRINT_UNDERREAD` times higher, and
+        // the budget, in collected matches, then binds on the corrected batch.
+        let u = FOOTPRINT_UNDERREAD;
+        assert_eq!(fp(None, false).corrected_hits, u * 6e8);
+        assert_eq!(fp(Some(1e10), false).corrected_hits, u * 6e8);
+        assert_eq!(fp(Some(5e8), false).corrected_hits, 5e8 + u * tail);
+        let with_loaded = Footprint::of(loads(), true, 2, 400, None, false, 3.0 * GIB, None);
+        assert_eq!(
+            with_loaded.corrected_bytes(),
+            3.0 * GIB + u * 6e8 * FOOTPRINT_HIT_BYTES
         );
 
         let cfg = |gib: Option<f64>| ExtractConfig {
             hit_budget_gib: gib,
             ..ExtractConfig::default()
         };
+        assert_eq!(hit_budget(&cfg(None), 1, None, 0.0), None, "off by default");
+        assert_eq!(hit_budget(&cfg(Some(0.0)), 1, None, 0.0), None, "0 is off");
         assert_eq!(
-            hit_budget(&cfg(Some(0.0)), 1, &loads(), 2),
-            None,
-            "0 is off"
-        );
-        assert_eq!(
-            hit_budget(&cfg(Some(10.0)), 4, &loads(), 2),
+            hit_budget(&cfg(Some(10.0)), 4, None, 0.0),
             Some(10.0 * GIB / 4.0 / FOOTPRINT_HIT_BYTES),
             "a band's share"
         );
-        let small = vec![load(1e6)];
+        // A memory budget leaves the hit store what the loaded bytes do not take.
         assert_eq!(
-            hit_budget(&cfg(None), 1, &small, 2),
-            None,
-            "auto below the floor"
+            hit_budget(&cfg(None), 1, Some(40.0 * GIB), 15.0 * GIB),
+            Some(25.0 * GIB / FOOTPRINT_HIT_BYTES)
         );
+        assert_eq!(
+            hit_budget(&cfg(Some(8.0)), 1, Some(40.0 * GIB), 15.0 * GIB),
+            Some(8.0 * GIB / FOOTPRINT_HIT_BYTES),
+            "the smaller of the two"
+        );
+        assert_eq!(
+            hit_budget(&cfg(None), 1, Some(10.0 * GIB), 15.0 * GIB),
+            Some(MEMORY_BUDGET_MIN_HITS_GIB * GIB / FOOTPRINT_HIT_BYTES),
+            "never below the floor"
+        );
+    }
+
+    /// `extract.memory_budget_gib`: off unless set; a number is this extraction's, split
+    /// among the bands in flight; `"auto"` a share of the memory the process can count on,
+    /// split among the chains in flight as well.
+    #[test]
+    fn the_memory_budget_is_a_share() {
+        let gib = |n: u64| Some(n << 30);
+        assert_eq!(memory_budget_of(MemoryBudget::Off, 1, 1, || gib(100)), None);
+        assert_eq!(
+            memory_budget_of(MemoryBudget::Gib(32.0), 4, 3, || gib(100)),
+            Some((8.0 * GIB, false)),
+            "a number is split among the bands, not the chains"
+        );
+        assert_eq!(
+            memory_budget_of(MemoryBudget::Auto, 2, 3, || gib(600)),
+            Some((600.0 * GIB * MEMORY_BUDGET_AUTO_SHARE / 6.0, true))
+        );
+        assert_eq!(memory_budget_of(MemoryBudget::Auto, 1, 1, || None), None);
+
+        // The guard: past an explicit budget a refusal, past `auto` a warning.
+        let load = WindowLoad {
+            lower_mz: 400.0,
+            upper_mz: 410.0,
+            scans: 100,
+            candidates: 100_000,
+            hits: 1e6,
+        };
+        let fp = |memory| {
+            Footprint::of(
+                vec![load.clone()],
+                true,
+                1,
+                100,
+                None,
+                false,
+                4.0 * GIB,
+                memory,
+            )
+        };
+        let c = ExtractConfig::default();
+        assert!(check_footprint(&fp(Some((8.0 * GIB, false))), &c, 1).is_ok());
+        let err = check_footprint(&fp(Some((2.0 * GIB, false))), &c, 1).unwrap_err();
+        assert!(
+            err.to_string().contains("extract.memory_budget_gib"),
+            "{err}"
+        );
+        assert!(check_footprint(&fp(Some((2.0 * GIB, true))), &c, 1).is_ok());
     }
 
     /// Flush the whole accumulator through the chunked gather the driver uses, and read the

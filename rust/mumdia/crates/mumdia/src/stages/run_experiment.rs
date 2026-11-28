@@ -1580,6 +1580,11 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     let mut plan =
         crate::sched::resolve_for_host(cfg.experiment.parallel_runs, n_runs, threads_budget);
     let par = plan.par;
+    // An explicit count runs its chains in chunks of `par` (here and in the second pass), so
+    // an `"auto"` extract memory budget takes that share from here on. The automatic plan
+    // declares its own count per phase (`RunConcurrency::map_pooled`).
+    let _chains = (!plan.is_auto() && par > 1 && n_runs > 1)
+        .then(|| crate::sched::ChainsInFlight::declare(par.min(n_runs)));
     if plan.is_auto() {
         info!(
             parallel_runs = plan.par,

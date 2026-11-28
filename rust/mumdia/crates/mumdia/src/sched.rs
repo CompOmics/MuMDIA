@@ -21,6 +21,33 @@ use tracing::{info, warn};
 /// for a debug build and costs nothing in a release one: only touched pages are committed.
 pub const WORKER_STACK_BYTES: usize = 64 << 20;
 
+/// Per-run chains this process runs at once ([`chains_in_flight`]).
+static CHAINS_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+/// How many per-run chains this process runs at once, as the orchestrator last declared it
+/// ([`ChainsInFlight::declare`]); 1 outside `run-experiment`. An `"auto"`
+/// `extract.memory_budget_gib` takes this share of the process's memory.
+pub fn chains_in_flight() -> usize {
+    CHAINS_IN_FLIGHT
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(1)
+}
+
+/// Declares the chains in flight until dropped, then restores the previous count.
+pub struct ChainsInFlight(usize);
+
+impl ChainsInFlight {
+    pub fn declare(n: usize) -> Self {
+        Self(CHAINS_IN_FLIGHT.swap(n.max(1), std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Drop for ChainsInFlight {
+    fn drop(&mut self) {
+        CHAINS_IN_FLIGHT.store(self.0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Sets `failed` when dropped during a panic, so a panicking item stops the other workers
 /// from claiming more items just as a returned error does.
 struct SetOnPanic<'a>(&'a std::sync::atomic::AtomicBool);
@@ -169,6 +196,7 @@ impl RunConcurrency {
         if self.par <= 1 && width == rayon::current_num_threads() {
             return map_bounded(items, 1, f);
         }
+        let _chains = ChainsInFlight::declare(self.par.min(items.len()));
         map_bounded(items, self.par, |item| {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(width)

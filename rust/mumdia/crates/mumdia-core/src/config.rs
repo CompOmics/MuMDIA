@@ -2294,14 +2294,27 @@ pub struct ExtractConfig {
     /// candidate sub-ranges are cut into smaller pieces and probed in waves that fit the
     /// budget, each finished before the next starts. Every table is the same byte for byte at
     /// any budget: the candidates are written in the same batches, so only the memory and
-    /// the wall clock change. Unset (the default) is `auto`: a quarter of the machine's
-    /// memory (as `max_footprint_gib` reads it), looked up only once a batch is estimated
-    /// past 4 GiB; `0` turns the bound off. Under `groups.parallel` each band in flight gets
-    /// its share. The floor is one candidate per piece, and under a per-peak `peak_claim`
+    /// the wall clock change. Unset (the default) or `0`: no bound of its own, only the one
+    /// `memory_budget_gib` derives. Under `groups.parallel` each band in flight gets its
+    /// share. The floor is one candidate per piece, and under a per-peak `peak_claim`
     /// (`winner_predicted_intensity`, `proportional`) one window, which is not cut. Not part
     /// of the canonical configuration.
     #[serde(skip_serializing)]
     pub hit_budget_gib: Option<f64>,
+    /// Bound the whole extraction's resident memory, not only its hit store, to this many
+    /// GiB (docs/09_extract.md, "Memory budget"). Once the library, the spectra and the RT
+    /// windows are loaded their bytes are known, and the rest of the budget becomes the hit
+    /// budget (`hit_budget_gib`, the smaller of the two when both are set), read against
+    /// twice the estimated matches until a batch has measured how far the estimate reads
+    /// low. The footprint guard then compares the corrected estimate (what is loaded plus
+    /// the bounded hit store) with the budget. Every table is the same byte for byte: only
+    /// the memory and the wall clock change. `"auto"`: this process's share of the memory it
+    /// can count on (what it holds plus what the system or its cgroup still has, times 0.7),
+    /// divided by the run-experiment chains and the `groups.parallel` bands in flight; a
+    /// corrected estimate past an `auto` budget is a warning, past a number a refusal. Unset
+    /// (the default) or `0`: off, as before. Not part of the canonical configuration.
+    #[serde(skip_serializing)]
+    pub memory_budget_gib: MemoryBudget,
     /// Scanning-quadrupole spectra: decide for every library fragment of an accepted
     /// candidate whether its signal belongs to the candidate's precursor (`stages::q1frag`,
     /// psms_extracted v6). For each fragment the matched intensity is read in every Q1 step
@@ -2893,6 +2906,7 @@ impl Default for ExtractConfig {
             windows_in_flight: None,
             max_footprint_gib: None,
             hit_budget_gib: None,
+            memory_budget_gib: MemoryBudget::Off,
             q1_fragments: ZtSwitch::Auto,
             q1_traces: ZtSwitch::Auto,
             q1_model: None,
@@ -3665,6 +3679,67 @@ impl QuantResolved {
             "quant.{} = {} in place of the default {}: {}",
             self.key, self.value, self.default, self.reason
         )
+    }
+}
+
+/// `extract.memory_budget_gib`: unset or `0` (off), a number of GiB, or `"auto"`. See
+/// [`ExtractConfig::memory_budget_gib`].
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum MemoryBudget {
+    /// No budget (unset or `0`, the default): extract plans its batches as before.
+    #[default]
+    Off,
+    /// This process's share of the memory it can count on (`"auto"`).
+    Auto,
+    /// A budget of this many GiB.
+    Gib(f64),
+}
+
+impl Serialize for MemoryBudget {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Off => s.serialize_f64(0.0),
+            Self::Auto => s.serialize_str("auto"),
+            Self::Gib(v) => s.serialize_f64(*v),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MemoryBudget {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = MemoryBudget;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a number of GiB >= 0 or \"auto\"")
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                if !v.is_finite() || v < 0.0 {
+                    return Err(E::invalid_value(serde::de::Unexpected::Float(v), &self));
+                }
+                Ok(if v == 0.0 {
+                    MemoryBudget::Off
+                } else {
+                    MemoryBudget::Gib(v)
+                })
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                self.visit_f64(v as f64)
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                self.visit_f64(v as f64)
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(MemoryBudget::Off)
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                match v {
+                    "auto" => Ok(MemoryBudget::Auto),
+                    _ => Err(E::invalid_value(serde::de::Unexpected::Str(v), &self)),
+                }
+            }
+        }
+        d.deserialize_any(V)
     }
 }
 
@@ -9066,6 +9141,37 @@ mod tests {
         assert_eq!(fp.canonical_json(), canon);
         assert!(Config::from_json(r#"{"extract":{"max_footprint_gib":0}}"#).is_ok());
         // `extract.hit_budget_gib` changes the memory and the wall clock, never a table.
+        // `extract.memory_budget_gib` likewise: off when unset, null or 0.
+        assert_eq!(d.extract.memory_budget_gib, MemoryBudget::Off);
+        for (json, want) in [
+            (
+                r#"{"extract":{"memory_budget_gib":"auto"}}"#,
+                MemoryBudget::Auto,
+            ),
+            (
+                r#"{"extract":{"memory_budget_gib":48}}"#,
+                MemoryBudget::Gib(48.0),
+            ),
+            (
+                r#"{"extract":{"memory_budget_gib":1.5}}"#,
+                MemoryBudget::Gib(1.5),
+            ),
+            (r#"{"extract":{"memory_budget_gib":0}}"#, MemoryBudget::Off),
+            (
+                r#"{"extract":{"memory_budget_gib":null}}"#,
+                MemoryBudget::Off,
+            ),
+        ] {
+            let c = Config::from_json(json).unwrap();
+            assert_eq!(c.extract.memory_budget_gib, want, "{json}");
+            assert_eq!(c.canonical_json(), canon, "{json}");
+        }
+        for bad in [
+            r#"{"extract":{"memory_budget_gib":-1}}"#,
+            r#"{"extract":{"memory_budget_gib":"half"}}"#,
+        ] {
+            assert!(Config::from_json(bad).is_err(), "{bad}");
+        }
         let hb = Config::from_json(r#"{"extract":{"hit_budget_gib":8}}"#).unwrap();
         assert_eq!(hb.extract.hit_budget_gib, Some(8.0));
         assert_eq!(hb.canonical_json(), canon);
