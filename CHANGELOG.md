@@ -236,6 +236,14 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Desktop: the "ztscan" preset on files that are not ZT Scan runs.** The preset sets the ZT
+  Scan keys explicitly, and the engine refuses them unless every input is a ZT Scan run, so such
+  a search stopped at the start with an "invalid config" error. The search screen now refuses it
+  before the search starts, names the files it does not recognise as ZT Scan runs, and points to
+  another preset: the engine runs the ZT Scan analysis by itself for ZT Scan files under any
+  preset.
 ### Added
 
 - **`rt_im_train.fallback_windows`: bounded windows for a run whose seed found no anchors
