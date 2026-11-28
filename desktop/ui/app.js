@@ -691,6 +691,9 @@ function onSettingChanged(el) {
       return;
     }
     value = n;
+  } else if (f.numeric && raw.trim() !== "" && !Number.isNaN(Number(raw))) {
+    // A number or a keyword (`extract.memory_budget_gib`: GiB or "auto"): a number goes as one.
+    value = Number(raw);
   } else if (f.kind === "other" && /^\s*[\[{]/.test(raw)) {
     // A list or object typed as JSON (the modification lists, for instance).
     try {

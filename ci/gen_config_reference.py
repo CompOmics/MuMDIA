@@ -2308,7 +2308,7 @@ def build_schema(config_text: str) -> dict:
             "rust_type": field.rtype,
             "kind": kind,
             "optional": field.rtype.startswith("Option<"),
-            "default": typed_default(rendered, kind),
+            "default": typed_default(rendered, "float" if base in NUMBER_OR_KEYWORD else kind),
             "default_text": rendered,
             "help": field.doc.strip(),
             "gates": gate_markers(field.doc),
@@ -2316,6 +2316,8 @@ def build_schema(config_text: str) -> dict:
             # above the field, which made this file stale on every other open branch.
             "source_struct": struct.name,
         }
+        if base in NUMBER_OR_KEYWORD:
+            entry["numeric"] = True
         if base in enums and base not in NUMBER_OR_KEYWORD:
             # A variant kept only so old configurations serialise ("Removed in ...") is refused,
             # so the desktop does not offer it.
