@@ -443,14 +443,19 @@ pub struct ConvertConfig {
     #[serde(skip_serializing_if = "is_default_tdf_im_gap_scans")]
     pub tdf_im_gap_scans: u32,
     /// Native diaPASEF reader: a centroid built from fewer raw TOF x scan points than this
-    /// is dropped. Default 2. Provisional, as `tdf_im_gap_scans`.
+    /// is dropped. Default 1 (2 in 0.14.0 and 0.15.1): every centroid, including those of a
+    /// single ion event, which at low load is most of the real fragment signal.
     ///
-    /// 1 keeps every centroid, including those of a single ion event, which at low load is
-    /// most of the real fragment signal; with `extract.gate_support_min` 0 it is the low-input
-    /// opt-in (docs/35_diapasef.md section 11, "Low input"). The two were the default in
-    /// 0.15.0 and were reverted because 10 of 52 timsTOF diaPASEF benchmark jobs that 0.14.0
-    /// ran then failed on memory; which of the two keys caused that is not measured. Measured
-    /// for the opt-in with the diaPASEF recipe (`extract.gate_min_score` 0.6,
+    /// The default keeps the support gate (`extract.gate_support_min` 0.845 on 1/K0 spectra).
+    /// Measured against 2 with the gate kept, three NN seeds, precursors per run at
+    /// `run_psm_q` 1%: 200 pg HeLa 1,847 -> 5,418, 250 pg 5-min Ultra 4,775 -> 8,828, 1 ng
+    /// 7,154 -> 16,279, ProteoBench HYE 90,702 -> 91,826; E. coli entrapment 16,139 -> 16,333
+    /// real precursors at an FDP of 0.43-0.47% against 0.41-0.42%; process-tree peaks within
+    /// 19 GB on the low-input sets and 66 GB against 36 on ProteoBench HYE (docs/35_diapasef.md
+    /// section 11, "Low input"). 1 with `extract.gate_support_min` 0, as in 0.15.0, is the
+    /// low-input opt-in: more precursors again, but 10 of 52 timsTOF diaPASEF benchmark jobs
+    /// that 0.14.0 ran failed on memory under it. 2 restores 0.15.1. Measured
+    /// for that opt-in with the diaPASEF recipe (`extract.gate_min_score` 0.6,
     /// `presence_min_coelution` 1, no support gate), three NN seeds, precursors per run at
     /// `run_psm_q` 1% against 2: 200 pg HeLa 3,422 -> 7,689, 1 ng 12,542 -> 19,270, 250 pg
     /// Ultra 6,912 -> 9,544, 50 ng 5-min Ultra 2 35,710 -> 35,346; E. coli entrapment FDP 0.97%
@@ -491,13 +496,16 @@ pub struct ConvertConfig {
     /// drop features no diaPASEF window reaches (windows padded by 3 Th and 0.015 1/K0), and
     /// drop the weak m/z halo of bright ions. Retrace applies the same filter to the raw MS1
     /// frames it holds, so both read the same MS1 events. MS/MS spectra are never filtered.
-    /// Default true since 2026-10-17; only the native diaPASEF reader reads it. On the six
-    /// ProteoBench HYE diaPASEF runs it kept 8.7% of the MS1 points with identical
-    /// identifications (98,524 peptides at 1%, 89,973 ProteoBench ions at k = 3); on the
-    /// 15 min E. coli run 14,121 against 14,044 peptides at 1% and an entrapment FDP of
-    /// 0.30-0.38% against 0.39-0.46% (three NN seeds each; docs/35_diapasef.md section 16).
-    /// `false` restores the unfiltered MS1.
-    #[serde(skip_serializing_if = "is_true")]
+    /// Only the native diaPASEF reader reads it. Default false (true from 2026-10-17 to
+    /// 0.15.1): part of the diaPASEF default, with `extract.prec_tol_ppm` 10 on 1/K0 spectra
+    /// and the second pass without the support gate (docs/35_diapasef.md section 16). With
+    /// the filter's 3 ppm MS1 tolerance it kept 8.7% of the MS1 points at identical
+    /// identifications on the six ProteoBench HYE diaPASEF runs. Off with 10 ppm, against on
+    /// with 3 ppm (measured together, not apart), three NN seeds, precursors per run at
+    /// `run_psm_q` 1%: 200 pg HeLa 7,262 -> 8,680, ProteoBench HYE 96,356 -> 98,306; E. coli
+    /// entrapment 16,415 real precursors at an FDP of 0.41%.
+    /// `true` restores the filtered MS1.
+    #[serde(skip_serializing_if = "is_false")]
     pub tdf_ms1_denoise: bool,
     /// Half-width in m/z of the quadrupole isolation window, for MS2 spectra that name an
     /// isolation window target but no lower or upper offset (docs/04_convert.md, "SCIEX ZT
@@ -538,12 +546,12 @@ impl Default for ConvertConfig {
             parallel_conversions: 4,
             tdf_mz_ppm: 10.0,
             tdf_im_gap_scans: 30,
-            tdf_min_points: 2,
+            tdf_min_points: 1,
             tdf_mz_valley: 0.0,
             tdf_mz_smooth_ppm: 8.0,
             tdf_im_valley: 0.0,
             tdf_im_smooth_scans: 8.0,
-            tdf_ms1_denoise: true,
+            tdf_ms1_denoise: false,
             isolation_half_width: None,
         }
     }
@@ -591,6 +599,57 @@ fn is_default_im_window_sizing(v: &ImWindowSizing) -> bool {
 }
 fn is_default_im_window_sizing_q(v: &f64) -> bool {
     *v == RtImTrainConfig::default().im_window_sizing_q
+}
+fn is_default_fallback_rt_gradient_fraction(v: &f64) -> bool {
+    *v == RtImTrainConfig::default().fallback_rt_gradient_fraction
+}
+fn is_default_fallback_im_window(v: &f64) -> bool {
+    *v == RtImTrainConfig::default().fallback_im_window
+}
+
+/// What `rt-im-train` gives a run the seed left without a calibration
+/// (`rt_im_train.fallback_windows`, docs/08_rt_im_train.md section 4i).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FallbackWindows {
+    /// `library` on a run whose spectra carry per-peak 1/K0 (its seed records `observed_im`),
+    /// `unbounded` otherwise, so a run without 1/K0 is unchanged. The default.
+    #[default]
+    Auto,
+    /// Fewer than two RT anchors: every candidate is searched over the whole gradient; no
+    /// 1/K0 calibration: no 1/K0 window. The behaviour before the key existed.
+    Unbounded,
+    /// Bounded windows from the library: its iRT mapped onto the run's gradient, and on a
+    /// run with 1/K0 its predicted 1/K0, each with a fixed half-width.
+    Library,
+    /// Fail the run at `rt-im-train` instead of searching it over the whole gradient.
+    Refuse,
+}
+
+impl FallbackWindows {
+    /// The default, omitted from the canonical configuration.
+    pub fn is_auto(&self) -> bool {
+        matches!(self, FallbackWindows::Auto)
+    }
+
+    /// The value a run uses: `auto` is `library` on spectra with 1/K0, `unbounded` without.
+    pub fn resolve(self, has_im: bool) -> FallbackWindows {
+        match self {
+            FallbackWindows::Auto if has_im => FallbackWindows::Library,
+            FallbackWindows::Auto => FallbackWindows::Unbounded,
+            v => v,
+        }
+    }
+
+    /// The name the configuration spells it with.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FallbackWindows::Auto => "auto",
+            FallbackWindows::Unbounded => "unbounded",
+            FallbackWindows::Library => "library",
+            FallbackWindows::Refuse => "refuse",
+        }
+    }
 }
 
 /// How `rt-im-train` sizes the ion-mobility half-window `w_im`
@@ -1697,6 +1756,41 @@ pub struct RtImTrainConfig {
     pub composition_correction: bool,
     /// Fallback fixed RT window in seconds when calibration cannot be fit.
     pub fallback_rt_window_s: f64,
+    /// What a run gets when its seed leaves it without a calibration
+    /// (docs/08_rt_im_train.md section 4i). `auto` (the default) is `library` on a run whose
+    /// spectra carry per-peak 1/K0 and `unbounded` otherwise. `unbounded`: fewer than two RT
+    /// anchors search every candidate over the whole gradient, and a run with 1/K0 but no
+    /// ion-mobility calibration has no 1/K0 window, as before the key existed. `library`:
+    /// such a run is searched in bounded windows from the library instead. The RT window is
+    /// the library's `predicted_irt`, its 1st to 99th percentile mapped linearly onto the 1st
+    /// to 99th percentile of the seed's observed retention times, with a half-width of
+    /// `fallback_rt_gradient_fraction` of that span (`calibration_status`
+    /// `fallback_library`); the 1/K0 window, on a run with 1/K0 whose ion mobility could not
+    /// be calibrated (too few anchors at the seed's cut), is the library's `predicted_im`
+    /// plus or minus `fallback_im_window`. Both are recorded in `cal.json`. `refuse`: a run
+    /// with fewer than two RT anchors fails at `rt-im-train` rather than being searched over
+    /// the whole gradient. Neither applies to a grouped run (`groups.window_groups > 1`),
+    /// whose unbounded windows `groups.allow_unbounded_rt` governs. On by default on diaPASEF
+    /// only (after 0.15.1): on single-cell HeLa diaPASEF plates whose seed left most cells
+    /// without anchors it held precursors per run (1,282 -> 1,352 and 1,454 -> 1,453) and
+    /// took the process-tree peak from 193 to 48 GB and 182 to 44 GB, one NN seed; no
+    /// low-input entrapment set exists yet. Measured on 18
+    /// calibrated single-cell diaPASEF runs: the confident anchors' residual to the map had
+    /// a 99th percentile of 0.10-0.26 of the span, and their uncalibrated 1/K0 residual one
+    /// of 0.054-0.081 (up to 0.145 on runs with 99-196 anchors). Omitted from the
+    /// canonical configuration at its default.
+    #[serde(skip_serializing_if = "FallbackWindows::is_auto")]
+    pub fallback_windows: FallbackWindows,
+    /// Under `fallback_windows = library`: the RT half-width as a fraction of the seed's
+    /// observed retention-time span (1st to 99th percentile). Default 0.25; in (0, 1].
+    /// Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_default_fallback_rt_gradient_fraction")]
+    pub fallback_rt_gradient_fraction: f64,
+    /// Under `fallback_windows = library`: the 1/K0 half-width around the library's
+    /// `predicted_im`, in V s cm^-2. Default 0.07; > 0. Omitted from the canonical
+    /// configuration at its default.
+    #[serde(skip_serializing_if = "is_default_fallback_im_window")]
+    pub fallback_im_window: f64,
     /// Fine-tune the DeepLC multitask model on this run's confident seed PSMs
     /// and rewrite the library's `predicted_irt` before RT calibration. Requires
     /// `predict_frag.deeplc_python` (the DeepLC interpreter). Off by default; the
@@ -2028,6 +2122,12 @@ impl MultiheadAnchors {
     }
 }
 
+/// `ExtractConfig::gate_support_peaks` at its default, which the canonical configuration
+/// omits.
+fn is_default_gate_support_peaks(v: &usize) -> bool {
+    *v == ExtractConfig::default().gate_support_peaks
+}
+
 /// `RtImTrainConfig::multihead_search_below` at its default, which the canonical
 /// configuration omits.
 fn is_default_multihead_search_below(v: &usize) -> bool {
@@ -2110,6 +2210,9 @@ impl Default for RtImTrainConfig {
             anchor_x_filter: false,
             composition_correction: true,
             fallback_rt_window_s: 120.0,
+            fallback_windows: FallbackWindows::Auto,
+            fallback_rt_gradient_fraction: 0.25,
+            fallback_im_window: 0.07,
             finetune_deeplc: false,
             multihead_calibration: None,
             multihead_anchors: MultiheadAnchors::Auto,
@@ -2143,7 +2246,9 @@ impl Default for RtImTrainConfig {
 pub struct ExtractConfig {
     /// Isolation windows probed per batch before the candidates no later window can touch
     /// are scored and written. `None` (the default) uses the rayon thread count capped at
-    /// 16, and at 4 on spectra that carry 1/K0 (diaPASEF). The hit accumulator holds the
+    /// 16, and at 4 on spectra that carry 1/K0 (diaPASEF), and half that on a run whose RT
+    /// windows are the library fallback of `rt_im_train.fallback_windows` (a run without
+    /// anchors, docs/08_rt_im_train.md section 4i), never below 1. The hit accumulator holds the
     /// windows in flight, so this sets the stage's peak almost linearly: on the HYE benchmark
     /// at 32 threads, 32 in flight is 24.65 GiB, 16 is 16.57 GiB and 8 is 12.31 GiB, with
     /// identical output (docs/27 section 3.10). A diaPASEF run has few, dense window groups,
@@ -2257,7 +2362,20 @@ pub struct ExtractConfig {
     /// `min_coelution_run` floors the same run, so the larger of the two applies.
     pub fixed_scan_window: usize,
     pub frag_tol_ppm: f64,
-    pub prec_tol_ppm: f64,
+    /// MS1 precursor tolerance in ppm. Unset (`null` or `"auto"`, the default) it is
+    /// [`PREC_TOL_PPM_IM`] (10) on spectra that carry per-peak 1/K0 and [`PREC_TOL_PPM`] (3)
+    /// otherwise ([`ExtractConfig::prec_tol_ppm_for`]); an explicit value always wins.
+    /// `run` and `run-experiment` resolve it before hashing when every input is a diaPASEF
+    /// `.d` ([`Config::resolve_prec_tol_ppm`]), so the manifest records 10; a standalone
+    /// `extract` resolves it from the reader `convert` recorded. Unset is written as 3 in the
+    /// canonical configuration, so the config hash of a search without 1/K0 is unchanged.
+    /// 10 on diaPASEF is part of the diaPASEF default with `convert.tdf_ms1_denoise` off
+    /// (docs/35_diapasef.md section 16).
+    #[serde(
+        deserialize_with = "de_prec_tol_ppm",
+        serialize_with = "ser_prec_tol_ppm"
+    )]
+    pub prec_tol_ppm: Option<f64>,
     /// Fewest distinct matched fragments a candidate needs before its peak is looked at
     /// (tier b), and a promoted alternative peak (`promote_top_peaks > 1`) within its own
     /// bounds. For the selected peak it floors the same count as `presence_min_fragments`, so
@@ -2518,9 +2636,11 @@ pub struct ExtractConfig {
     ///
     /// Unset (the default) is 0.845 on spectra that carry 1/K0 and off otherwise. It was off in
     /// 0.15.0 and was restored because, with `convert.tdf_min_points` 1 as well, 10 of 52
-    /// timsTOF diaPASEF benchmark jobs that 0.14.0 ran failed on memory; which of the two keys
-    /// caused that is not measured. 0, with `convert.tdf_min_points` 1, is the low-input
-    /// opt-in: on the 2026-11 low-input sets it was +26% precursors per run at 200 pg and +19%
+    /// timsTOF diaPASEF benchmark jobs that 0.14.0 ran failed on memory. With
+    /// `convert.tdf_min_points` 1 (the default after 0.15.1) the gate kept the process-tree
+    /// peak at 18-19 GB on the 250 pg and 1 ng sets, where turning it off took it to 70-87 GB,
+    /// so the gate, not the reader, carries the memory. 0 is the low-input opt-in: on the
+    /// 2026-11 low-input sets it was +26% precursors per run at 200 pg and +19%
     /// at 1 ng with the gate off, +6.1% on 50 ng 5-min Ultra 2 runs, other-species shares
     /// unchanged (one NN seed, docs/35_diapasef.md section 16). On the six
     /// ProteoBench HYE diaPASEF runs, 0.845 keeps 41% of the candidates the window-mean gate
@@ -2532,6 +2652,16 @@ pub struct ExtractConfig {
     /// the same runs (docs/35_diapasef.md section 16).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_support_min: Option<f64>,
+    /// How many peaks of a candidate the support gate (`gate_support_min`) may judge. 1 (the
+    /// default) judges the selected apex alone. K > 1: a candidate that fails at its selected
+    /// apex is judged again at the apexes of the K best peaks of its distinct-fragment count
+    /// profile (the peaks `retain_top_peaks` enumerates), each of which must also pass
+    /// `gate_min_score`; it is kept when one passes, with its apex moved to the passing peak of
+    /// highest support. A candidate that passes at its selected apex is unchanged, so the gate
+    /// only adds rows. Inert while the support gate is off. Benchmark-gated (docs/09_extract.md
+    /// section 5); omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_default_gate_support_peaks")]
+    pub gate_support_peaks: usize,
     /// The 1/K0 gate of a run whose spectra carry ion mobility (a diaPASEF `.d` read by the
     /// native reader): a fragment peak whose 1/K0 lies outside the candidate's calibrated
     /// 1/K0 window (`run_windows.im_lo`/`im_hi`, from `rt-im-train`) is not matched to that
@@ -2759,7 +2889,7 @@ impl Default for ExtractConfig {
             q1_dec_features: false,
             fixed_scan_window: 2,
             frag_tol_ppm: 20.0,
-            prec_tol_ppm: 3.0,
+            prec_tol_ppm: None,
             presence_min_matched: 3,
             presence_min_fragments: 3,
             presence_min_coelution: 2,
@@ -2814,6 +2944,7 @@ impl Default for ExtractConfig {
             gate_coelution_min: 0.5,         // used only by GateMode::Combined
             gate_rt_weight: 0.2,             // used only by GateMode::WindowMean
             gate_support_min: None,          // 0.845 on 1/K0 spectra, off otherwise
+            gate_support_peaks: 1,           // the selected apex alone; benchmark-gated
             im_gate: ImGate::Off,
         }
     }
@@ -3910,6 +4041,19 @@ pub struct MbrConfig {
     /// single cells. Must be in [0, 1). Left out of the canonical configuration when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub second_pass_prefilter_keep_decoys: Option<f64>,
+    /// Under `strategy = second_pass`: the `extract.gate_support_min` of the second-pass
+    /// extraction only (0 = no support gate there). Unset (the default), it is 0 when a run of
+    /// the experiment carries per-peak 1/K0 (part of the diaPASEF default), and otherwise the
+    /// second pass uses `extract.gate_support_min` like the first. The gate's default (0.845
+    /// on spectra that carry 1/K0) bounds the first pass's memory on a full library; the
+    /// second pass searches the small empirical library, where it rejected precursors at
+    /// their first-pass apex. Off in the second pass, through `run-experiment`, three NN
+    /// seeds, precursors per run at `run_psm_q` 1%: 200 pg diaPASEF 5,418 -> 7,262, 250 pg
+    /// 8,828 -> 10,111, ProteoBench HYE 91,826 -> 96,356, decoy fraction unchanged
+    /// (docs/12, "Second pass"). Must be finite and >= 0. Left out of the canonical
+    /// configuration when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub second_pass_gate_support_min: Option<f64>,
     /// Under `strategy = second_pass`, `run-experiment` only: write a Boolean
     /// `first_pass_id` into every run's `peptide_quant` (v3), true where the row's precursor
     /// had a first-pass identification in that run (`run_psm_q <= q_anchor`, target), and a
@@ -3932,6 +4076,7 @@ impl Default for MbrConfig {
             consensus_corr_min: 0.0,
             python: None,
             second_pass_prefilter_keep_decoys: None,
+            second_pass_gate_support_min: None,
             first_pass_flag: false,
         }
     }
@@ -3965,8 +4110,11 @@ pub struct RescoreConfig {
     /// the decoys (default 0.35); 0 keeps every PSM. The model is fitted per experiment on
     /// `prefilter_features` (a default list when unset): for each fold a logistic regression
     /// of the targets at `train_fdr` against the decoys of a 400,000-row sample of the other
-    /// folds, refitted three times, and every PSM is scored by the model of the fold it is
-    /// held out of, on the rescore's own fold keys. Targets and decoys above the cut are all
+    /// folds (when that sample holds too few confident targets, the fold starts from
+    /// `prelim_score` or the seed score `log_seed_hyperscore`, whichever passes more targets at
+    /// q 0.1 over all the other folds, and those targets join the sample), refitted three times, and
+    /// every PSM is scored by the model of the fold it is held out of, on the rescore's own
+    /// fold keys. Targets and decoys above the cut are all
     /// kept, so the share of rows kept follows the pool: 36% on a six-run diaPASEF pool, 49%
     /// on a six-run Astral pool at 0.35. The classifier, its q values and the scored table
     /// see only the kept rows; a dropped PSM is not identified. When the model cannot be
@@ -4324,6 +4472,53 @@ impl ExtractConfig {
             n => n,
         }
     }
+
+    /// The MS1 precursor tolerance (ppm) on this run: the configured one, or unset
+    /// [`PREC_TOL_PPM_IM`] on spectra that carry per-peak 1/K0 (`has_im`) and [`PREC_TOL_PPM`]
+    /// otherwise.
+    pub fn prec_tol_ppm_for(&self, has_im: bool) -> f64 {
+        self.prec_tol_ppm.unwrap_or(if has_im {
+            PREC_TOL_PPM_IM
+        } else {
+            PREC_TOL_PPM
+        })
+    }
+}
+
+/// `extract.prec_tol_ppm` unset, on spectra without 1/K0, and as the canonical configuration
+/// writes it unset.
+pub const PREC_TOL_PPM: f64 = 3.0;
+/// `extract.prec_tol_ppm` unset, on spectra that carry per-peak 1/K0 (the diaPASEF default).
+pub const PREC_TOL_PPM_IM: f64 = 10.0;
+
+/// `extract.prec_tol_ppm`: a tolerance in ppm, or `"auto"` or `null`, both stored as `None`.
+fn de_prec_tol_ppm<'de, D>(d: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Tol {
+        Ppm(f64),
+        Word(String),
+    }
+    match Option::<Tol>::deserialize(d)? {
+        None => Ok(None),
+        Some(Tol::Ppm(v)) => Ok(Some(v)),
+        Some(Tol::Word(w)) if w.trim().eq_ignore_ascii_case("auto") => Ok(None),
+        Some(Tol::Word(w)) => Err(serde::de::Error::custom(format!(
+            "extract.prec_tol_ppm must be a tolerance in ppm or \"auto\" (got \"{w}\")"
+        ))),
+    }
+}
+
+/// `extract.prec_tol_ppm` unset is written as [`PREC_TOL_PPM`], the value it has without
+/// 1/K0, so the canonical configuration (and the config hash) of a 3D search is unchanged.
+/// shortcut: a standalone stage on 1/K0 spectra with the key unset hashes as an explicit 3
+/// would; the extract report records the 10 it used. `run` and `run-experiment` resolve it
+/// before hashing ([`Config::resolve_prec_tol_ppm`]), which is the case that matters.
+fn ser_prec_tol_ppm<S: serde::Serializer>(v: &Option<f64>, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_f64(v.unwrap_or(PREC_TOL_PPM))
 }
 
 /// `extract.apex_count_window`: a window in scans, or `"auto"`, which is stored as `0`
@@ -5247,6 +5442,16 @@ impl Config {
         }
     }
 
+    /// `extract.prec_tol_ppm` unset becomes [`PREC_TOL_PPM_IM`] when every input carries
+    /// per-peak 1/K0 (`all_im`), so the canonical configuration and the manifest record the
+    /// tolerance the search uses. Otherwise it stays unset: 3 without 1/K0 (written as 3, so
+    /// the hash is unchanged), and per run in an experiment that mixes the two.
+    pub fn resolve_prec_tol_ppm(&mut self, all_im: bool) {
+        if all_im && self.extract.prec_tol_ppm.is_none() {
+            self.extract.prec_tol_ppm = Some(PREC_TOL_PPM_IM);
+        }
+    }
+
     /// The keys that ask for the ZT Scan analysis explicitly: an automatic key set to `true`
     /// (a number above 0 for `quant.q1_cycle_halfwidth`, a count other than the default for
     /// `retrace.q1_repick_peaks`), and the opt-in key that reads the Q1 sweep as well
@@ -5746,6 +5951,13 @@ impl Config {
                     .into(),
             ));
         }
+        if !(1..=64).contains(&self.extract.gate_support_peaks) {
+            return Err(Invalid(format!(
+                "extract.gate_support_peaks must be between 1 (the selected apex alone) and 64, \
+                 not {}",
+                self.extract.gate_support_peaks
+            )));
+        }
         if !self.extract.gate_min_score.is_finite()
             || !(0.0..=1.0).contains(&self.extract.gate_min_score)
         {
@@ -5938,7 +6150,10 @@ impl Config {
                 self.search_seed.fragment_tol_ppm,
             ),
             ("extract.frag_tol_ppm", self.extract.frag_tol_ppm),
-            ("extract.prec_tol_ppm", self.extract.prec_tol_ppm),
+            (
+                "extract.prec_tol_ppm",
+                self.extract.prec_tol_ppm.unwrap_or(PREC_TOL_PPM),
+            ),
         ] {
             if !value.is_finite() || value <= 0.0 {
                 return Err(Invalid(format!(
@@ -5988,6 +6203,17 @@ impl Config {
                         .into(),
                 ));
             }
+        }
+        if self
+            .mbr
+            .second_pass_gate_support_min
+            .is_some_and(|v| !v.is_finite() || v < 0.0)
+        {
+            return Err(Invalid(
+                "mbr.second_pass_gate_support_min must be finite and >= 0 (0 disables the \
+                 support gate in the second pass)."
+                    .into(),
+            ));
         }
         if self.rescore.num_iter == 0 {
             return Err(Invalid(
@@ -6062,6 +6288,15 @@ impl Config {
                 strategy = ?self.mbr.strategy,
                 "mbr.second_pass_prefilter_keep_decoys is set but mbr.strategy is not \
                  second_pass: there is no second-pass rescore, and the setting has no effect"
+            );
+        }
+        if self.mbr.strategy != MbrStrategy::SecondPass
+            && self.mbr.second_pass_gate_support_min.is_some()
+        {
+            tracing::warn!(
+                strategy = ?self.mbr.strategy,
+                "mbr.second_pass_gate_support_min is set but mbr.strategy is not second_pass: \
+                 there is no second-pass extraction, and the setting has no effect"
             );
         }
         if self.mbr.strategy != MbrStrategy::SecondPass && self.mbr.first_pass_flag {
@@ -6154,6 +6389,21 @@ impl Config {
             return Err(Invalid(format!(
                 "rt_im_train.im_window_min must be finite and >= 0 (got {})",
                 self.rt_im_train.im_window_min
+            )));
+        }
+        let f = self.rt_im_train.fallback_rt_gradient_fraction;
+        if !(f.is_finite() && f > 0.0 && f <= 1.0) {
+            return Err(Invalid(format!(
+                "rt_im_train.fallback_rt_gradient_fraction must be finite and in (0, 1] (got \
+                 {f}): it is the half-width of the fallback RT window as a fraction of the run's \
+                 gradient"
+            )));
+        }
+        let w = self.rt_im_train.fallback_im_window;
+        if !(w.is_finite() && w > 0.0) {
+            return Err(Invalid(format!(
+                "rt_im_train.fallback_im_window must be finite and > 0 (got {w}): it is the \
+                 half-width of the fallback 1/K0 window, in V s cm^-2"
             )));
         }
         if !(self.rt_im_train.im_window_sizing_q > 0.0
@@ -7035,6 +7285,18 @@ impl Config {
         }
     }
 
+    /// The extraction configuration of the second pass: `extract`, with
+    /// `mbr.second_pass_gate_support_min` as its support gate when that is set, and unset
+    /// no support gate when a run of the experiment carries 1/K0 (`has_im`; the diaPASEF
+    /// default). Without 1/K0 and unset, the second pass keeps `extract.gate_support_min`.
+    pub fn apply_second_pass_extract(&mut self, has_im: bool) {
+        match self.mbr.second_pass_gate_support_min {
+            Some(v) => self.extract.gate_support_min = Some(v),
+            None if has_im => self.extract.gate_support_min = Some(0.0),
+            None => {}
+        }
+    }
+
     /// Canonical JSON of the fully-resolved config, for hashing into the
     /// manifest (docs/02_config_and_data_model.md).
     pub fn canonical_json(&self) -> String {
@@ -7803,6 +8065,57 @@ mod tests {
         assert_eq!(parsed.second_pass_prefilter_keep_decoys, Some(0.5));
     }
 
+    /// `mbr.second_pass_gate_support_min` unset leaves the canonical configuration and the
+    /// second pass's `extract` as they were; set, it replaces only the support gate of the
+    /// second pass, and it is validated like `extract.gate_support_min`.
+    #[test]
+    fn second_pass_gate_support_overrides_only_the_second_pass_and_is_absent_when_unset() {
+        let c = Config::default();
+        assert_eq!(c.mbr.second_pass_gate_support_min, None);
+        assert!(!c.canonical_json().contains("second_pass_gate_support"));
+        // Without 1/K0, unset leaves the second pass's extract as it was (3D byte identity).
+        let mut c2 = c.clone();
+        c2.apply_second_pass_extract(false);
+        assert_eq!(c2.extract.gate_support_min, None);
+        assert_eq!(c2.canonical_json(), c.canonical_json());
+        let mut explicit = Config::default();
+        explicit.extract.gate_support_min = Some(0.9);
+        explicit.apply_second_pass_extract(false);
+        assert_eq!(explicit.extract.gate_support_min, Some(0.9));
+        // With 1/K0, unset is the diaPASEF default: no support gate in the second pass.
+        let mut d2 = c.clone();
+        d2.apply_second_pass_extract(true);
+        assert_eq!(d2.extract.gate_support_min, Some(0.0));
+
+        // Set, it wins on either kind of spectra.
+        let mut on = Config::default();
+        on.mbr.second_pass_gate_support_min = Some(0.845);
+        for has_im in [false, true] {
+            let mut p2 = on.clone();
+            p2.apply_second_pass_extract(has_im);
+            assert_eq!(p2.extract.gate_support_min, Some(0.845));
+        }
+        let mut off = Config::default();
+        off.mbr.second_pass_gate_support_min = Some(0.0);
+        assert!(off.validate().is_ok());
+        assert!(off
+            .canonical_json()
+            .contains(r#""second_pass_gate_support_min":0.0"#));
+        let mut p2 = off.clone();
+        p2.apply_second_pass_extract(false);
+        assert_eq!(p2.extract.gate_support_min, Some(0.0));
+        assert_eq!(off.extract.gate_support_min, None);
+
+        for bad in [-0.1, f64::NAN, f64::INFINITY] {
+            let mut c = Config::default();
+            c.mbr.second_pass_gate_support_min = Some(bad);
+            assert!(c.validate().is_err(), "{bad} accepted");
+        }
+        let parsed: MbrConfig =
+            serde_json::from_str(r#"{"second_pass_gate_support_min": 0}"#).unwrap();
+        assert_eq!(parsed.second_pass_gate_support_min, Some(0.0));
+    }
+
     /// `mbr.first_pass_flag` is off by default and absent from the canonical configuration
     /// then, so no configuration hash moves; on, it is recorded and parses back.
     #[test]
@@ -7927,7 +8240,7 @@ mod tests {
         // HeLa entrapment pools, the single cells and the immuno run.
         let c = Config::default();
         assert_eq!(c.extract.ms1_calibrate, Ms1Calibrate::Offset);
-        assert_eq!(c.extract.prec_tol_ppm, 3.0);
+        assert_eq!(c.extract.prec_tol_ppm_for(false), 3.0);
         assert!(c.extract.emit_rt_window);
         assert_eq!(c.extract.fixed_scan_window, 2);
         assert_eq!(c.extract.ms1_scan_halfwidth, 1);
@@ -7935,8 +8248,70 @@ mod tests {
         assert!(c.rt_im_train.composition_correction);
         assert_eq!(c.rescore.shadow_min_shared, 3);
         let parsed: Config = serde_json::from_str("{}").unwrap();
-        assert_eq!(parsed.extract.prec_tol_ppm, 3.0);
+        assert_eq!(parsed.extract.prec_tol_ppm_for(false), 3.0);
         assert_eq!(parsed.rescore.shadow_min_shared, 3);
+    }
+
+    /// The diaPASEF default of `extract.prec_tol_ppm`: unset is 10 ppm on 1/K0 spectra and 3
+    /// without, an explicit value always wins, and unset is written as 3 so the canonical
+    /// configuration (and the config hash) of a 3D search is unchanged.
+    #[test]
+    fn prec_tol_ppm_resolves_on_1k0_and_keeps_the_3d_canonical_form() {
+        let c = Config::default();
+        assert_eq!(c.extract.prec_tol_ppm, None);
+        assert_eq!(c.extract.prec_tol_ppm_for(false), PREC_TOL_PPM);
+        assert_eq!(c.extract.prec_tol_ppm_for(true), PREC_TOL_PPM_IM);
+        assert!(c.canonical_json().contains(r#""prec_tol_ppm":3.0"#));
+        // "auto" and null are unset; a number is explicit and wins on either kind of spectra.
+        for j in [
+            r#"{}"#,
+            r#"{"prec_tol_ppm": "auto"}"#,
+            r#"{"prec_tol_ppm": null}"#,
+        ] {
+            let e: ExtractConfig = serde_json::from_str(j).unwrap();
+            assert_eq!(e.prec_tol_ppm, None, "{j}");
+        }
+        for v in [3.0, 5.0, 20.0] {
+            let e: ExtractConfig =
+                serde_json::from_str(&format!(r#"{{"prec_tol_ppm": {v}}}"#)).unwrap();
+            assert_eq!(e.prec_tol_ppm_for(false), v);
+            assert_eq!(e.prec_tol_ppm_for(true), v);
+        }
+        assert!(serde_json::from_str::<ExtractConfig>(r#"{"prec_tol_ppm": "wide"}"#).is_err());
+        // An explicit 3 and unset have one canonical form without 1/K0.
+        let mut three = Config::default();
+        three.extract.prec_tol_ppm = Some(3.0);
+        assert_eq!(three.canonical_json(), c.canonical_json());
+        // `run` / `run-experiment`: resolved to 10 before hashing only when every input
+        // carries 1/K0; an explicit value is kept.
+        let mut d = Config::default();
+        d.resolve_prec_tol_ppm(false);
+        assert_eq!(d.canonical_json(), c.canonical_json());
+        d.resolve_prec_tol_ppm(true);
+        assert_eq!(d.extract.prec_tol_ppm, Some(PREC_TOL_PPM_IM));
+        assert!(d.canonical_json().contains(r#""prec_tol_ppm":10.0"#));
+        let mut five = Config::default();
+        five.extract.prec_tol_ppm = Some(5.0);
+        five.resolve_prec_tol_ppm(true);
+        assert_eq!(five.extract.prec_tol_ppm, Some(5.0));
+        // Validated as before: unset passes, a non-positive value does not.
+        assert!(c.validate().is_ok());
+        let mut bad = Config::default();
+        bad.extract.prec_tol_ppm = Some(0.0);
+        assert!(bad.validate().is_err());
+    }
+
+    /// `convert.tdf_ms1_denoise` is off by default (part of the diaPASEF default) and left out
+    /// of the canonical configuration when off, so the config hash of a configuration that
+    /// does not set it is unchanged; on, it is recorded.
+    #[test]
+    fn tdf_ms1_denoise_is_off_by_default_and_absent_when_off() {
+        let c = Config::default();
+        assert!(!c.convert.tdf_ms1_denoise);
+        assert!(!c.canonical_json().contains("tdf_ms1_denoise"));
+        let on: Config = serde_json::from_str(r#"{"convert":{"tdf_ms1_denoise":true}}"#).unwrap();
+        assert!(on.convert.tdf_ms1_denoise);
+        assert!(on.canonical_json().contains(r#""tdf_ms1_denoise":true"#));
     }
 
     #[test]
@@ -8387,7 +8762,7 @@ mod tests {
         let canon = d.canonical_json();
         assert!(!canon.contains("tdf_"), "{canon}");
         let explicit = Config::from_json(
-            r#"{"convert":{"tdf_mz_ppm":10.0,"tdf_im_gap_scans":30,"tdf_min_points":2,
+            r#"{"convert":{"tdf_mz_ppm":10.0,"tdf_im_gap_scans":30,"tdf_min_points":1,
                 "tdf_mz_valley":0.0,"tdf_mz_smooth_ppm":8.0,"tdf_im_valley":0.0,
                 "tdf_im_smooth_scans":8.0}}"#,
         )
@@ -8400,8 +8775,8 @@ mod tests {
                 r#""tdf_im_gap_scans":20"#,
             ),
             (
-                r#"{"convert":{"tdf_min_points":3}}"#,
-                r#""tdf_min_points":3"#,
+                r#"{"convert":{"tdf_min_points":2}}"#,
+                r#""tdf_min_points":2"#,
             ),
             (
                 r#"{"convert":{"tdf_mz_valley":0.7}}"#,
@@ -10130,6 +10505,68 @@ mod tests {
         assert!(Config::from_json(r#"{"groups":{"allow_unbounded_rt":"yes"}}"#).is_err());
     }
 
+    /// `rt_im_train.fallback_windows` and its two widths are omitted from the canonical
+    /// configuration at their defaults, so the config hash of every configuration that does not
+    /// set them is unchanged; a set value is part of the identity, and bad widths are refused.
+    /// The default `auto` is `library` on spectra with 1/K0 and `unbounded` without, so a 3D
+    /// run keeps the behaviour (and the canonical configuration) it had before the key.
+    #[test]
+    fn fallback_windows_default_auto_and_leave_the_default_config_hash_alone() {
+        let d = Config::default();
+        assert_eq!(d.rt_im_train.fallback_windows, FallbackWindows::Auto);
+        assert_eq!(
+            d.rt_im_train.fallback_windows.resolve(true),
+            FallbackWindows::Library
+        );
+        assert_eq!(
+            d.rt_im_train.fallback_windows.resolve(false),
+            FallbackWindows::Unbounded
+        );
+        for v in [
+            FallbackWindows::Unbounded,
+            FallbackWindows::Library,
+            FallbackWindows::Refuse,
+        ] {
+            assert_eq!(v.resolve(true), v);
+            assert_eq!(v.resolve(false), v);
+        }
+        let canon = d.canonical_json();
+        assert!(!canon.contains("fallback_windows"), "{canon}");
+        assert!(!canon.contains("fallback_rt_gradient_fraction"), "{canon}");
+        assert!(!canon.contains("fallback_im_window"), "{canon}");
+        let explicit = Config::from_json(
+            r#"{"rt_im_train":{"fallback_windows":"auto",
+                "fallback_rt_gradient_fraction":0.25,"fallback_im_window":0.07}}"#,
+        )
+        .unwrap();
+        assert_eq!(explicit.canonical_json(), canon);
+        let unbounded =
+            Config::from_json(r#"{"rt_im_train":{"fallback_windows":"unbounded"}}"#).unwrap();
+        let c = unbounded.canonical_json();
+        assert!(c.contains(r#""fallback_windows":"unbounded""#), "{c}");
+        assert_eq!(Config::from_json(&c).unwrap().canonical_json(), c);
+        let on = Config::from_json(
+            r#"{"rt_im_train":{"fallback_windows":"library","fallback_im_window":0.1}}"#,
+        )
+        .unwrap();
+        assert_eq!(on.rt_im_train.fallback_windows, FallbackWindows::Library);
+        let c = on.canonical_json();
+        assert!(c.contains(r#""fallback_windows":"library""#), "{c}");
+        assert!(c.contains(r#""fallback_im_window":0.1"#), "{c}");
+        assert_eq!(Config::from_json(&c).unwrap().canonical_json(), c);
+        let refuse = Config::from_json(r#"{"rt_im_train":{"fallback_windows":"refuse"}}"#).unwrap();
+        assert_eq!(refuse.rt_im_train.fallback_windows, FallbackWindows::Refuse);
+        for bad in [
+            r#"{"rt_im_train":{"fallback_windows":"wide"}}"#,
+            r#"{"rt_im_train":{"fallback_rt_gradient_fraction":0}}"#,
+            r#"{"rt_im_train":{"fallback_rt_gradient_fraction":1.5}}"#,
+            r#"{"rt_im_train":{"fallback_im_window":0}}"#,
+            r#"{"rt_im_train":{"fallback_im_window":-0.1}}"#,
+        ] {
+            assert!(Config::from_json(bad).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn multihead_calibration_and_the_fine_tune_are_alternatives() {
         // Both adapt the same step against the same anchors, so asking for both is a
@@ -10199,6 +10636,14 @@ mod tests {
         assert!(Config::from_json(r#"{"extract":{"gate_min_score":-0.1}}"#).is_err());
         assert!(Config::from_json(r#"{"extract":{"gate_support_min":-0.1}}"#).is_err());
         assert!(Config::from_json(r#"{"extract":{"gate_support_min":1.4}}"#).is_ok());
+        assert!(Config::from_json(r#"{"extract":{"gate_support_peaks":0}}"#).is_err());
+        assert!(Config::from_json(r#"{"extract":{"gate_support_peaks":65}}"#).is_err());
+        let k = Config::from_json(r#"{"extract":{"gate_support_peaks":5}}"#).unwrap();
+        assert_eq!(k.extract.gate_support_peaks, 5);
+        assert!(k.canonical_json().contains(r#""gate_support_peaks":5"#));
+        assert!(!Config::default()
+            .canonical_json()
+            .contains("gate_support_peaks"));
         assert!(Config::from_json(r#"{"extract":{"gate_min_score":1.1}}"#).is_err());
     }
 

@@ -479,6 +479,10 @@ def parse_struct_body(
             i += 1
             continue
         if stripped.startswith("#["):
+            # An attribute rustfmt splits over lines (`#[serde(` ... `)]`) is one attribute.
+            while not stripped.endswith("]") and i + 1 < len(lines):
+                i += 1
+                stripped += " " + lines[i].strip()
             attrs.append(stripped)
             i += 1
             continue

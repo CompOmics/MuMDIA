@@ -718,7 +718,7 @@ selection dominate.
 |---|---|---|
 | `fixed_scan_window` | 2 | scan-window floor around the apex (3 before 2026-10-08) |
 | `frag_tol_ppm` | 20.0 | fragment tolerance |
-| `prec_tol_ppm` | 3.0 | precursor tolerance, centred on the learned MS1 offset when `ms1_calibrate` is on (20.0 before 2026-10-08) |
+| `prec_tol_ppm` | unset: 3.0, 10.0 on spectra with per-peak 1/K0 | precursor tolerance, centred on the learned MS1 offset when `ms1_calibrate` is on (20.0 before 2026-10-08); an explicit value applies to every run |
 | `presence_min_matched` | 3 | tier-(b) min matched fragment count |
 | `presence_min_fragments` | 3 | min distinct fragments for acceptance |
 | `presence_min_coelution` | 2 | min simultaneously-present fragments over the run |
@@ -825,7 +825,7 @@ requiring entrapment/target-decoy FDR validation before use.
 
 Read by `run-experiment` only. Fields: `strategy` (`second_pass` default), `q_anchor` 0.01,
 `min_anchor_runs` 2, `q_transfer` 0.01, `consensus_corr_min` 0.0, `python` `None`,
-`second_pass_prefilter_keep_decoys`, `first_pass_flag`. `min_anchor_runs`, `q_transfer`,
+`second_pass_prefilter_keep_decoys`, `second_pass_gate_support_min`, `first_pass_flag`. `min_anchor_runs`, `q_transfer`,
 `consensus_corr_min` and `python` configured the rescuable-tier transfer, removed in 0.15.0:
 they still parse, so the configuration hash does not move, and `validate()` warns that they
 do nothing. `rt_window_s`, `decoy_transfer` and `requant_all` were removed in 0.15.0
