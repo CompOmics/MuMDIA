@@ -352,8 +352,8 @@ for -36% wall on six 60-min HYE runs, -1.75% for -48% on six 5-min runs, the E. 
 entrapment FDP unchanged (0.32-0.35% against 0.30-0.38%). It is a speed default that costs
 identifications; 0 restores the previous behaviour. It stays off without 1/K0 (docs/35
 section 16). It was off in 0.15.0 (+26% precursors at 200 pg and +19% at 1 ng with it off) and
-is restored for memory, with `convert.tdf_min_points` 2; see the low-input bullet under
-"diaPASEF (timsTOF)".
+is restored for memory in the first pass, now with `convert.tdf_min_points` 1; the second pass
+runs without it on diaPASEF. See "The diaPASEF default" under "diaPASEF (timsTOF)".
 
 DeepLC 4.5.0 or newer is required wherever DeepLC runs (`predict-frag` in FASTA mode, the
 optional fine-tune, the multi-head calibration; 4.5.0 since 2026-09-28, for the default
@@ -451,24 +451,34 @@ fine-tuning also is not guaranteed deterministic.
 - A Bruker `.d` with diaPASEF frames is read natively (timsrust, 1/K0 per peak); every
   other `.d` goes to msconvert as a 3D run. The one 4D predicate is "the spectra carry
   per-peak 1/K0" (`instrument`, `params.reader = "timsrust"`), never the instrument name.
-- Every TIMS key except `convert.tdf_ms1_denoise` (the native MS1 noise filter, on by
-  default since 0.7.0) is off by default: `convert.tdf_mz_valley`/`tdf_im_valley`,
-  `predict_frag.im_predictor`, `search_seed.count_fragments_once`, `frag_tol_mad_k`,
-  `extract.im_gate`, `features.im_features`, `retrace.*`, `rt_im_train.anchor_x_filter`,
-  `rescore.shadow_im_tolerance` and the cross-run quant selectors. Promote one only in its
-  own change, with entrapment and a second acquisition (docs/35 section 14).
-- Low input is an opt-in, not the default: `convert.tdf_min_points` 1 (keep single-ion
-  centroids; default 2) with `extract.gate_support_min` 0. Both were the default in 0.15.0 and
-  are reverted: on the 0.15.0 benchmark sweep 10 of 52 diaPASEF jobs that 0.14.0 ran failed on
-  memory (six single-cell runs without seed anchors whose extract hit store reached 290-875 GiB,
-  bulk runs at peaks of 271-378 GB, an HLA run whose footprint guard estimated 2.7 TB
-  over the run), intermediates 0.7-3.7x and wall about 3.2x against 0.14.0. Which of the two
-  keys causes it is not measured. With the recipe's `presence_min_coelution` 1, gate 0.6 and no
-  support gate, three NN seeds: 200 pg HeLa 3,422 -> 7,689 precursors per run, 1 ng 12,542 ->
-  19,270, 250 pg Ultra 6,912 -> 9,544, 50 ng -1.0%, E. coli entrapment FDP 0.97%, 0 IDs in
-  blanks. Open: the 250 pg Ultra foreign-species share rose 1.17% -> 1.40% (docs/35 section
-  11, "Low input"). Keep `gate_min_score` 0.6 with it: at 0.3 the pool grew up to 14x for the
-  same counts.
+- Every TIMS key is off by default: `convert.tdf_ms1_denoise` (the native MS1 noise filter; on
+  from 0.7.0 to 0.15.1), `convert.tdf_mz_valley`/`tdf_im_valley`, `predict_frag.im_predictor`,
+  `search_seed.count_fragments_once`, `frag_tol_mad_k`, `extract.im_gate`,
+  `extract.gate_support_peaks`, `features.im_features`, `retrace.*`,
+  `rt_im_train.anchor_x_filter`, `rescore.shadow_im_tolerance` and the cross-run quant
+  selectors. Promote one only in its own change, with entrapment and a second acquisition
+  (docs/35 section 14).
+- The diaPASEF default (since 0.16.0; docs/35 section 11, "The diaPASEF default"), five settings
+  that act only on spectra with per-peak 1/K0: `convert.tdf_min_points` 1 (keep single-ion
+  centroids; 2 in 0.14.0 and 0.15.1) with the support gate kept in the first pass;
+  `rt_im_train.fallback_windows = auto` (`library` on 1/K0, `unbounded` without), with half the
+  default windows in flight on such a run; `mbr.second_pass_gate_support_min` unset = 0 (no
+  support gate in the second pass); `convert.tdf_ms1_denoise` false; `extract.prec_tol_ppm`
+  unset = 10 ppm (3 without 1/K0; resolved before hashing when every input is a diaPASEF `.d`,
+  written as 3 unset so 3D hashes stay). Fleet, three NN seeds, precursors per run at
+  `run_psm_q` 1%, 0.15.1 -> default: 200 pg HeLa 1,847 -> 8,680, 1 ng 7,154 -> 23,512, 250 pg
+  Ultra 4,775 -> 10,744, ProteoBench HYE 90,702 -> 98,306; E. coli entrapment 16,139 real
+  precursors at FDP 0.41% -> 16,415 at 0.41%; 0 IDs in blanks; decoy fraction 0.98-0.99%.
+  Costs: bulk largest process 35 -> 85 GB on ProteoBench (mostly `tdf_min_points` 1), wall
+  about x1.35 against #388's arm, and the added low-abundance identifications quantify worse
+  (own-ID species-weighted |eps| 0.196 -> 0.208 on ProteoBench, 250 pg E. coli log2 A/B -1.19
+  -> -0.85 against -2; shared precursors unchanged). Open: the entrapment set is one run and
+  cannot test the second pass; no second bulk entrapment; single-cell plates with zero-anchor
+  cells stay slow and heavy (one seed: 52 cells 8.4 h at a 158 GB process-tree peak, 71 cells
+  9.3 h at 294 GB, both bounded by the rescore prefilter's seed-score start).
+  `extract.gate_support_min` 0 in the first pass as well is the 0.15.0 low-input setting that
+  failed 10 of 52 sweep jobs on memory; keep `gate_min_score` 0.6: at 0.3 the pool grew up to
+  14x for the same counts.
 - The 1/K0 window sizing is one of the exceptions (with the support gate above), on by
   default since 2026-10-22 and inert without 1/K0: `rt_im_train.im_window_sizing =
   seed_decoy_corrected` widens the anchors' `w_im` to 1.3x the decoy-corrected p95 of every
@@ -965,7 +975,8 @@ Measured single seed, against the previous defaults with the same gate where ava
 
 Open: seeds; the measured FDP at a reported q of 1% is still 1.25-1.39% on the Astral
 HeLa entrapment pool (DIA-NN 0.48%), so compare at a measured FDP; the immuno gain has
-no entrapment check; 3 ppm MS1 is unmeasured on timsTOF.
+no entrapment check; on timsTOF the MS1 tolerance is 10 ppm by default since the diaPASEF
+default (docs/35 section 11).
 
 ## The ZT Scan analysis is automatic for ZT Scan files (2026-11-11)
 
