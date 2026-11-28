@@ -266,8 +266,8 @@ than a number. Both are recorded in every run's `manifest.json`.
   logs and compares the corrected estimate (loaded bytes plus twice the matches). `"auto"` is
   0.7 of the memory the process can count on (cgroup aware), and a budget, explicit or not, is
   shared among the run-experiment chains and `groups.parallel` bands in flight. Both keys are
-  off by default and outside the canonical configuration; every batch now logs its estimated
-  and collected matches and the process's resident memory (`extract: batch probed`). Open:
+  off by default and outside the canonical configuration; under a budget every batch logs its
+  estimated and collected matches and the process's resident memory (`extract: batch probed`). Open:
   `parallel_runs = "auto"` still sizes the chains from a measured step, not from extract's
   estimate.
 

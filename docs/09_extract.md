@@ -507,9 +507,10 @@ loaded bytes themselves fill the budget, a per-peak `peak_claim` keeps a window 
 holds the whole run. Unset (or `0`) is off and changes nothing; the key is not part of the
 canonical configuration.
 
-Every streamed batch logs `extract: batch probed`: its windows, the estimated and the collected
-matches, the hit budget it was planned with, and the process's resident memory and high-water
-mark after it (Linux).
+Under a budget every streamed batch logs `extract: batch probed`: its windows, the estimated and
+the collected matches, the hit budget it was planned with, and the process's resident memory
+and high-water mark after it (Linux). Without one the end of the stage logs the collected
+matches and the largest batch (`extract: task-local fragment indexes`).
 
 **Measured:** pending (gate campaign arms `MBoff` / `MB64` / `MB8` / `MB280`).
 

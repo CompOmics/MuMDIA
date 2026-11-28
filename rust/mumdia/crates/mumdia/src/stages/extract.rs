@@ -6918,22 +6918,24 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                     let r = batch_hits as f64 / est;
                     seen_scale = Some(seen_scale.map_or(r, |s| s.max(r)));
                 }
-                // Per batch, what the estimate said against what the probing collected, and
-                // the process's resident memory after it (Linux): the calibration of
-                // `FOOTPRINT_UNDERREAD` and of the memory budget.
+                // Under a budget, per batch, what the estimate said against what the probing
+                // collected, and the process's resident memory after it (Linux): what the
+                // budget planned against what it held.
                 batch_no += 1;
-                let mem = crate::sched::memory_reading();
-                let gib = |b: u64| format!("{:.2}", b as f64 / GIB);
-                info!(
-                    batch = batch_no,
-                    windows = upto - gi,
-                    estimated_hits = est.round() as u64,
-                    hits = batch_hits,
-                    hit_budget = budget_hits.map_or(0, |h| (h / est_scale).round() as u64),
-                    rss_gib = mem.map_or("-".to_string(), |m| gib(m.resident)),
-                    peak_rss_gib = mem.map_or("-".to_string(), |m| gib(m.peak)),
-                    "extract: batch probed"
-                );
+                if budget_hits.is_some() {
+                    let mem = crate::sched::memory_reading();
+                    let gib = |b: u64| format!("{:.2}", b as f64 / GIB);
+                    info!(
+                        batch = batch_no,
+                        windows = upto - gi,
+                        estimated_hits = est.round() as u64,
+                        hits = batch_hits,
+                        hit_budget = budget_hits.map_or(0, |h| (h / est_scale).round() as u64),
+                        rss_gib = mem.map_or("-".to_string(), |m| gib(m.resident)),
+                        peak_rss_gib = mem.map_or("-".to_string(), |m| gib(m.peak)),
+                        "extract: batch probed"
+                    );
+                }
                 gi = upto;
                 open_hits_max = open_hits_max.max(acc_stream.n_hits());
                 batch_hits_max = batch_hits_max.max(batch_hits);
