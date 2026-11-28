@@ -1889,6 +1889,19 @@
       "source_struct": "ExtractConfig"
     },
     {
+      "path": "extract.hit_budget_gib",
+      "name": "hit_budget_gib",
+      "section": "extract",
+      "rust_type": "Option<f64>",
+      "kind": "float",
+      "optional": true,
+      "default": "null",
+      "default_text": "null",
+      "help": "Bound the fragment-peak matches the streamed extraction holds at once to about this many GiB (docs/09_extract.md, \"Bounded hit memory\"). When a batch of `windows_in_flight` is estimated (as for `max_footprint_gib`) to hold more, its candidate sub-ranges are cut into smaller pieces and probed in waves that fit the budget, each finished before the next starts. Every table is the same byte for byte at any budget: the candidates are written in the same batches, so only the memory and the wall clock change. Unset (the default) is `auto`: a quarter of the machine's memory (as `max_footprint_gib` reads it), looked up only once a batch is estimated past 4 GiB; `0` turns the bound off. Under `groups.parallel` each band in flight gets its share. The floor is one candidate per piece, and under a per-peak `peak_claim` (`winner_predicted_intensity`, `proportional`) one window, which is not cut. Not part of the canonical configuration.",
+      "gates": [],
+      "source_struct": "ExtractConfig"
+    },
+    {
       "path": "extract.q1_fragments",
       "name": "q1_fragments",
       "section": "extract",

@@ -301,7 +301,8 @@ task keeps beside each until it groups them: 20 bytes a match):
   the share of the slot's 1/K0 range the candidate's window overlaps counts, and an
   allowlist drops the candidates it excludes;
 - held at once: the largest batch of `windows_in_flight` consecutive windows on the streamed
-  path, every window on the paths that accumulate the whole run (a two-pass peak claim, the
+  path (about the hit budget plus a tail when the batch passes it, "Bounded hit memory"
+  below), every window on the paths that accumulate the whole run (a two-pass peak claim, the
   contested features, the bucketed matcher).
 
 Unset, `windows_in_flight` is halved on a run whose RT windows are the library fallback of
@@ -358,6 +359,110 @@ m/z range, which every spectrum then shares, so that every spectrum reaches ever
 and no candidate can be written before the end of the run. A SCIEX ZT Scan DIA run read
 without isolation offsets was such a layout (one window, 2.15 million spectra) and grew past
 521 GB in 3.5 minutes; docs/04_convert.md, "SCIEX ZT Scan DIA".
+
+### Bounded hit memory
+
+**What held the memory.** On the streamed path (`accumulate_groups`) the driver probes the
+window groups in batches of `W = windows_in_flight` (4 on spectra with 1/K0, 16 otherwise).
+Inside a batch it cuts the candidate axis into a grid of sub-ranges of width
+`w = max(4096, ceil(mean window span / ceil(2T / W)))` (`T` the threads of this band) and
+launches one probing task per (sub-range, window) pair, all of them at once. A task keeps
+every match of its window's peaks against its candidates' fragments until it ends, and its
+store then waits in `pending` until every lower sub-range has reported, because sub-ranges
+are flushed in ascending order. Rayon hands each thread a slice of the task list from its
+start, middle and end, so the later sub-ranges finish early and wait: the resident hit store
+is about the whole batch, not one sub-range of it. With `H(c)` the matches candidate `c`
+collects in one window,
+
+```text
+H(c)      = n_frag(c) * P(c) * rho
+P(c)      = peaks of the window's scans inside c's RT (and 1/K0) window, widened by the pad
+resident  ~ sum over the W windows of the batch, sum over their candidates, of H(c)
+          + up to CAND_CHUNK (8,192) candidates held for the next batch or the flush
+bytes     = 20 per match while a task runs (16-byte Hit + 4-byte id), 16 once grouped
+```
+
+`rho` is the chance that one peak meets one fragment (`window_loads`). Streaming bounded the
+store by windows, then: neither by candidates nor by scans. `P(c)` grows with the peaks per
+spectrum and with the RT window, so the two diaPASEF cases of the 0.15.0 sweep multiply:
+`convert.tdf_min_points` 1 keeps single-ion centroids (more peaks per scan), and a run on
+which the seed found no anchors gives every candidate an RT window of the whole gradient
+(every scan of the window). One single-cell HeLa timsTOF Pro run estimated 387 GiB resident
+(20.8 billion matches) and 898 GiB over the run, at 4 windows in flight of 24. The gates
+(`gate_min_score`, `gate_support_min`, the presence tiers) do not help: they run in the
+per-candidate pass, on a candidate's complete hits, and decide what is written, not what is
+held.
+
+**The bound.** `extract.hit_budget_gib` caps the matches a batch holds at once. When a
+batch is estimated past it (the footprint estimate, per window, read as spread evenly over
+the window's candidates), `accumulate_groups` cuts every sub-range into pieces of about
+`budget / (2T)` estimated matches (at least one candidate; a per-peak `peak_claim` keeps a
+window whole, as it always has) and probes the tasks in waves: consecutive tasks whose
+estimates fit the budget, at least one each, every wave finished and flushed before the next
+starts. Then
+
+```text
+resident  ~ min(batch, budget)                     (waves)
+          + CAND_CHUNK * max_g (load_g / candidates_g)   (the tail a piece leaves)
+          [ + the widest window under a per-peak claim, when wider than the budget ]
+```
+
+which is what the footprint estimate now reports for a batch past the budget (`Footprint::of`).
+A batch within the budget is planned exactly as before: one wave, no pieces. The budget is
+compared with estimates, and the estimate reads low on dense spectra, so from the second
+batch on the driver divides it by the most matches collected per estimated match in any batch
+so far (`est_scale`): the bound then holds in matches actually collected, not only in
+estimated ones. The first batch is planned on the estimate alone.
+
+**Byte identity.** The tables follow the flush calls, not only the candidates: each call to
+the flush is one chromatogram chunk, and the parquet writer cuts its pages on the chunks
+(`mumdia_io::codec`). Before, the calls of a sub-range were its candidates with hits, in
+ascending id, cut every `CAND_CHUNK`, with a short tail at the sub-range's end. A piece that
+does not close its sub-range therefore flushes full batches of `CAND_CHUNK` only
+(`flush_below(.., full_only)`) and leaves the short tail for the next piece; the piece that
+closes it flushes the tail. The calls are the uncut sub-range's call for call, candidate for
+candidate and hit for hit, at every budget, so every table is the same file, and the budget,
+like `max_footprint_gib`, is not part of the canonical configuration.
+`the_hit_budget_flushes_the_unbudgeted_batches` holds this for budgets from one match (every
+sub-range cut into single candidates, one task a wave) to one past the batch, at two pool
+sizes, with and without candidates left for a later batch.
+
+Between pieces the accumulator compacts its runs. The merge copied the open candidates into
+one store; with pieces that copied the tail at every piece, quadratic in small pieces, so
+runs that share no candidate, with nothing gathered yet out of any but the first, are now
+chained part by part instead (`HitAcc::compact`), which reads the same.
+
+**Default.** Unset is `auto`: a quarter of the machine's memory (`memlog::total_memory`,
+the cgroup limit when tighter), looked up only once a batch is estimated past 4 GiB, divided
+among the bands in flight under `groups.parallel`; `0` is off. The quarter leaves room for
+the estimate reading about two times low on diaPASEF (the table above), the library, the
+spectra and the chromatogram buffers. Every run whose largest batch is within it is planned
+as before, so it changes nothing there, not even the schedule. A batch cut to the budget logs
+`extract: batch cut to the hit budget` with the pieces and waves.
+
+**Measured** (2026-11-26, standalone `mumdia extract` at 48 threads on a shared 256-CPU
+host, two repetitions each, one timsTOF Ultra 2 diaPASEF 5-min 50 ng HYE run read with
+`convert.tdf_min_points` 1 and `extract.gate_support_min` 0, on the inputs the run's own
+search wrote: 24 windows, 4 in flight, largest batch 377 million matches against an estimate
+of 151 million):
+
+| build, `hit_budget_gib` | peak RSS (GB) | wall | CPU (s) | tables |
+|---|---|---|---|---|
+| main | 15.10 / 15.34 | 3:20 / 2:49 | 2,411 / 2,308 | reference |
+| this change, unset (`auto`: inert, the estimate is under 4 GiB) | 15.30 / 15.30 | 3:06 / 2:29 | 2,461 / 2,269 | identical |
+| this change, 2 | 12.87 / 12.60 | 3:17 / 6:05 | 2,775 / 2,661 | identical |
+| this change, 0.5 | 9.74 / 9.57 | 3:59 / 4:13 | 4,401 / 4,341 | identical |
+
+"Identical" is the SHA-256 of `psms_extracted.parquet`, its `.peaks.parquet` and
+`chromatograms.parquet` (6.7 GB). The second wall at 2 GiB ran while the host's load rose
+from about 75 to over 200 (728% CPU against 1,400% for the others). About 9 GB of the peak is
+the rest of the stage, so 0.5 GiB took the hit store from about 6 GB to under 1 GB, for about
+1.8 times the CPU: every wave ends at a barrier where the pool spins idle, and 0.5 GiB cut
+the batches into 6 to 17 waves. End to end, the same run through `mumdia run` (NN seed 0) at
+`hit_budget_gib` 1 wrote the same `psms_extracted`, `features`, `psms_competed`,
+`psms_scored`, quant tables and TSV reports as main (32,510 peptides, 35,590 precursors), at a
+process peak of 11.9 GB against 16.9 GB. The CI smoke (`ci/smoke.sh`, where the budget is inert) wrote
+the same 2,330 parquet and TSV files with both builds, three runs each.
 
 ### 1. Matcher and mass recalibration
 
@@ -1497,6 +1602,7 @@ declutter" commit: `extract.scan_window_mode` (and the `ScanWindowMode` enum),
 | Field | Default | Effect |
 |---|---|---|
 | `max_footprint_gib` | unset (`auto`) | Refuse an extraction whose estimated hit store passes this many GiB; `auto` is the machine's memory, `0` is off. See "The footprint guard" |
+| `hit_budget_gib` | unset (`auto`) | Probe a batch estimated past this many GiB of matches in pieces and waves that fit it, with byte-identical tables; `auto` is a quarter of the machine's memory, `0` is off. See "Bounded hit memory" |
 | `fixed_scan_window` | 2 (3 before 2026-10-08) | Minimum co-elution run length (`scan_window` floor); `.max(1)` at `extract.rs:1591` |
 | `frag_tol_ppm` | 20.0 | Fragment match tolerance (overridden by `mass_cal`) |
 | `prec_tol_ppm` | unset: 3.0, and 10.0 on spectra with per-peak 1/K0 (20.0 before 2026-10-08; 3.0 on 1/K0 spectra until 0.15.1) | MS1 isotope integration tolerance, centred on the offset `ms1_calibrate` learns from the seed |
